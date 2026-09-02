@@ -40,6 +40,10 @@ from autohelix.state import (
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+class AutoHelixRunError(RuntimeError):
+    """A run could not safely continue because infrastructure failed."""
+
+
 class _IterationSpinner:
     """A Rich renderable showing iteration progress across all phases.
 
@@ -691,26 +695,41 @@ class Harness:
             if self.verbose:
                 self.console.print()
 
-            # Save review file
-            if result.success:
-                saved = self.sandbox.save_review(worktree, iteration)
-                if saved:
-                    # Also copy into logs for this iteration
-                    review_src = self.project_path / ".autohelix" / "reviews" / f"iter-{iteration}.md"
-                    iter_logs = self.project_path / ".autohelix" / "logs" / f"iter-{iteration}"
-                    iter_logs.mkdir(parents=True, exist_ok=True)
-                    if review_src.exists():
-                        shutil.copy2(review_src, iter_logs / "review.md")
-                    if self.verbose:
-                        self.console.print(f"  [green]✓[/green] Review saved to reviews/iter-{iteration}.md")
-                else:
-                    self.console.print(f"  [yellow]![/yellow] Reviewer did not create review.md")
-                    return False
+            if not result.success:
+                return False
 
-            return result.success
+            # Save review file
+            saved = self.sandbox.save_review(worktree, iteration)
+            if not saved:
+                self.console.print(
+                    f"  [yellow]![/yellow] Reviewer did not create review.md"
+                )
+                return False
+
+            # Also copy into logs for this iteration
+            review_src = (
+                self.project_path
+                / ".autohelix"
+                / "reviews"
+                / f"iter-{iteration}.md"
+            )
+            iter_logs = self.project_path / ".autohelix" / "logs" / f"iter-{iteration}"
+            iter_logs.mkdir(parents=True, exist_ok=True)
+            if review_src.exists():
+                shutil.copy2(review_src, iter_logs / "review.md")
+            if self.verbose:
+                self.console.print(
+                    f"  [green]✓[/green] Review saved to reviews/iter-{iteration}.md"
+                )
+
+            return True
         except KeyboardInterrupt:
             self._status("Interrupted - stopping reviewer...")
             raise
+        except Exception as e:
+            self._status(f"Reviewer error: {e}")
+            self.log.info(f"iter {iteration} reviewer error — {e}")
+            return False
 
     def run_iteration(self, iteration: int) -> IterationResult:
         """Run a single iteration."""
@@ -752,6 +771,26 @@ class Harness:
 
             if not agent_result.success and self.verbose:
                 self._status("Agent did not complete successfully")
+            if not agent_result.success:
+                detail = agent_result.error or (
+                    f"agent exited with status {agent_result.exit_code}"
+                )
+                raise AutoHelixRunError(f"Iteration {iteration} agent failed: {detail}")
+
+            # Agents occasionally create commits despite operating inside an
+            # iteration worktree. Convert them back to ordinary changes so scope
+            # enforcement, validation, and AutoHelix's own commit all see the
+            # complete candidate diff.
+            agent_commits = self.sandbox.uncommit_agent_changes(worktree)
+            if agent_commits:
+                self.log.info(
+                    f"iter {iteration} normalized {agent_commits} agent-created commit(s)"
+                )
+                if self.verbose:
+                    self.console.print(
+                        f"  [yellow]![/yellow] Reopened {agent_commits} "
+                        "agent-created commit(s) for validation"
+                    )
 
             # Resolve effective editable scope and revert out-of-scope changes
             effective_editable = self.sandbox.resolve_editable(
@@ -874,11 +913,15 @@ class Harness:
                             reviewer_failed = True
 
                     if reviewer_failed:
-                        # Write a placeholder review so this iteration is recorded
+                        # Keep reviewer failures advisory so validated agent work
+                        # is not discarded after an infrastructure failure.
                         reviews_dir = self.project_path / ".autohelix" / "reviews"
                         reviews_dir.mkdir(parents=True, exist_ok=True)
                         review_path = reviews_dir / f"iter-{iteration}.md"
                         review_path.write_text("# Review\n\nReviewer failed.\n")
+                        # TODO: After preserving and merging this candidate, halt
+                        # the run so persistent reviewer failures do not silently
+                        # affect subsequent iterations.
 
                     # Accept: merge changes (only editable files are committed)
                     if self.verbose:
@@ -908,20 +951,27 @@ class Harness:
                     usage=agent_usage,
                 )
 
+        except AutoHelixRunError as e:
+            self._status(str(e))
+            self.log.info(f"iter {iteration} infrastructure failure — {e}")
+            raise
         except Exception as e:
             self._status(f"Error: {e}")
-            traceback.print_exc()
-            result = IterationResult(
-                iteration=iteration,
-                accepted=False,
-                metrics={},
-                reason=f"error: {e}",
-                usage=agent_usage,
-            )
+            if self.verbose:
+                traceback.print_exc()
+            self.log.info(f"iter {iteration} unexpected failure — {e}")
+            raise AutoHelixRunError(
+                f"Iteration {iteration} failed unexpectedly: {e}"
+            ) from e
         finally:
             self.sandbox.save_notes(worktree)
             if worktree.path.exists():
                 self.sandbox.discard_worktree(worktree)
+
+        if result is None:
+            raise AutoHelixRunError(
+                f"Iteration {iteration} ended without producing a result"
+            )
 
         # Record total wall-clock time for this iteration (includes all overhead)
         result.usage["wall_clock_ms"] = int((time.monotonic() - iter_start) * 1000)
@@ -960,10 +1010,22 @@ class Harness:
             for cap_path in mc.capture:
                 self.history.save_capture(0, self.project_path / cap_path)
 
+        missing_metrics = set(self.config.metric_directions()) - set(metrics)
+        if missing_metrics:
+            names = ", ".join(sorted(missing_metrics))
+            self.log.info(f"baseline FAILED — missing metrics: {names}")
+            raise RuntimeError(
+                f"Baseline benchmark did not produce required metric(s): {names}"
+            )
+
         if metrics:
             metric_str = ", ".join(f"{name}: {value:g}" for name, value in metrics.items())
             self.console.print(f"  baseline │ {metric_str}", highlight=False)
             self.log.info(f"baseline: {metric_str}")
+
+        # Run baseline review if reviewer is configured
+        if self.config.reviewer:
+            self._run_baseline_review()
 
         baseline = IterationResult(
             iteration=0,
@@ -977,10 +1039,6 @@ class Harness:
             generate_dashboard(self.project_path, self.config.metric_directions())
         except Exception:
             pass
-
-        # Run baseline review if reviewer is configured
-        if self.config.reviewer:
-            self._run_baseline_review()
 
     def _run_baseline_review(self) -> None:
         """Run reviewer on the baseline state (before any iterations)."""
@@ -998,9 +1056,9 @@ class Harness:
         try:
             reviewer_success = self.run_reviewer(worktree, 0)
             if not reviewer_success:
-                self.console.print(f"  [yellow]![/yellow] Baseline review failed, continuing anyway")
-        except Exception as e:
-            self._status(f"Baseline review error: {e}")
+                self.console.print(
+                    f"  [yellow]![/yellow] Baseline review failed, continuing anyway"
+                )
         finally:
             self.sandbox.discard_worktree(worktree)
 

@@ -5,8 +5,8 @@ Bundled examples are copy-and-run: this copies the example directory, git-inits
 it, and prints run instructions. A bundled example is any directory here that
 contains an `autohelix.yaml`.
 
-AlgoTune tasks live under `examples/algotune/` with their own `setup.py` — it
-fetches a task from an upstream suite rather than ship a ready-to-run project.
+AlgoTune and KernelBench tasks have their own `setup.py` under `examples/` —
+they fetch tasks from upstream suites rather than ship ready-to-run projects.
 
 Usage:
     python examples/setup_example.py sorting
@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # environment, agent-written code, etc.) — they aren't copy-and-run, so setup
 # points at their README instead of scaffolding.
 REFERENCE_EXAMPLES = {"posttrain"}
+CUSTOM_SETUP_EXAMPLES = {"nested-autohelix"}
 
 
 def git_init_repo(directory: Path) -> None:
@@ -61,7 +62,7 @@ def list_bundled() -> list[str]:
     return sorted(
         d.name for d in SCRIPT_DIR.iterdir()
         if d.is_dir()
-        and d.name not in REFERENCE_EXAMPLES
+        and d.name not in REFERENCE_EXAMPLES | CUSTOM_SETUP_EXAMPLES
         and (d / "autohelix.yaml").exists()
     )
 
@@ -105,22 +106,24 @@ def setup_bundled(name: str, output_dir: Path) -> bool:
 
 
 def print_list() -> None:
-    bundled = list_bundled()
-    if bundled:
-        print("Bundled examples (copy-and-run):")
-        for name in bundled:
-            print(f"  {name}")
-        print()
+    bundled = set(list_bundled())
+    reference = set(list_reference())
+    entries = {
+        name: (
+            "manual setup - see README"
+            if name in reference
+            else "copy-and-run"
+        )
+        for name in bundled | reference
+    }
+    entries["nested-autohelix"] = "dedicated setup - see README"
+    entries["algotune"] = "fetch tasks with examples/algotune/setup.py"
+    entries["kernelbench"] = "download tasks with examples/kernelbench/setup.py"
 
-    reference = list_reference()
-    if reference:
-        print("Reference examples (manual setup — see each dir's README):")
-        for name in reference:
-            print(f"  {name}")
-        print()
-
-    print("AlgoTune tasks (fetch a task from an upstream suite):")
-    print("  examples/algotune/setup.py <task>")
+    width = max(len(name) for name in entries)
+    print("Examples:")
+    for name, setup in sorted(entries.items()):
+        print(f"  {name:<{width}}  {setup}")
 
 
 def main() -> int:
@@ -133,8 +136,9 @@ Examples:
   %(prog)s ml-recipe --dir ./run   # custom output dir
   %(prog)s --list                  # show all examples
 
-AlgoTune tasks live under examples/algotune/ with their own setup.py:
+Fetched task suites have their own setup.py:
   python examples/algotune/setup.py eigenvalues_real
+  python examples/kernelbench/setup.py L1_1_Square_matrix_multiplication
 """,
     )
     parser.add_argument("name", nargs="?", help="Example name (e.g. sorting)")
@@ -159,11 +163,18 @@ AlgoTune tasks live under examples/algotune/ with their own setup.py:
         print(f"See {readme} for instructions.")
         return 1
 
+    if name in CUSTOM_SETUP_EXAMPLES:
+        readme = SCRIPT_DIR / name / "README.md"
+        print(f"'{name}' has a dedicated task-suite setup.")
+        print(f"See {readme} for instructions.")
+        return 1
+
     if name not in list_bundled():
         print(f"Error: '{name}' is not a bundled example.")
         print()
         print(f"Bundled examples: {', '.join(list_bundled())}")
         print("AlgoTune tasks live under examples/algotune/ (see its setup.py).")
+        print("KernelBench tasks live under examples/kernelbench/ (see its setup.py).")
         print("Use --list to see everything.")
         return 1
 

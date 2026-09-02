@@ -95,22 +95,36 @@ below. Other commands are described in the [CLI reference](docs/cli.md).
 
 ## Examples
 
-The [`examples/`](examples/) directory has ready-to-run tasks across different domains, from
-a 2-minute [sorting function](examples/sorting/) example to algorithm optimization and model training. To list what's available:
+The [`examples/`](examples/) directory includes concrete tasks ranging from
+reviewer-driven refinement to workflow and algorithm optimization. To list
+what's available:
 
 ```bash
 python examples/setup_example.py --list
 ```
 
-**Code optimization.** [AlgoTune](https://github.com/oripress/AlgoTune) is a benchmark for optimizing widely used
-algorithms in math, physics, and CS. AutoHelix can scaffold any of them via
-[`examples/algotune`](examples/algotune) (we measure speedup with our own eval setup, not identical
-to AlgoTune's official harness). The plot below shows a run with Claude Opus 4.8: across 154 tasks,
-the median speedup climbs each iteration, reaching ~8.5× by iteration 5.
+**Code optimization.** AutoHelix can iteratively improve the performance of
+existing code while preserving user-defined correctness constraints. We tested
+this capability on two established benchmarks:
+[AlgoTune](https://github.com/oripress/AlgoTune) for CPU algorithms and
+[KernelBench](https://github.com/ScalingIntelligence/KernelBench) for GPU
+kernels. In both evaluations, median speedup increased with each iteration,
+reaching approximately **8.5× across 154 AlgoTune tasks** and **3.12× across
+270 KernelBench tasks** after five iterations.
 
-<table align="center"><tr>
-<td><img src="assets/progression_algotune.png" width="400"></td>
-</tr></table>
+<table align="center">
+<tr>
+<td align="center"><img alt="Median AlgoTune speedup over five AutoHelix iterations" src="assets/progression_algotune.png" width="400"><br><sub>AlgoTune · CPU algorithms</sub></td>
+<td align="center"><img alt="Median KernelBench speedup over five AutoHelix iterations" src="assets/progression_kernelbench.png" width="400"><br><sub>KernelBench · GPU kernels</sub></td>
+</tr>
+</table>
+
+Both runs used Claude Opus 4.8; KernelBench ran on an H200. The AlgoTune result
+uses our own evaluation setup, which is not identical to its official harness.
+See the [`examples/algotune`](examples/algotune) and
+[`examples/kernelbench`](examples/kernelbench) setups, plus the
+[`results/algotune`](results/algotune) and
+[`results/kernelbench`](results/kernelbench) methodology and per-task results.
 
 **Model training.** The same loop works when each iteration is a training run rather than a
 code edit: the agent writes the training code and trains a model, and AutoHelix scores the
@@ -126,6 +140,14 @@ learning (GRPO) — reaching **93%** accuracy over 8 iterations on one H200. See
   <img alt="GSM8K accuracy climbing from 41% to 93% over AutoHelix iterations"
        src="assets/progression_posttrain_gsm8k.png" width="640">
 </p>
+
+**Advanced agent loops.** AutoHelix can also support longer-running autonomous
+work. The [`research`](examples/research) example iterates through experiments,
+evidence, and reports; [`task-queue`](examples/task-queue) works through a
+persistent list of coding tasks; and
+[`workflow-optimization`](examples/workflow-optimization) improves a
+model-powered workflow's prompts, skills, context, and orchestration against a
+frozen evaluator.
 
 **In the wild.** Beyond the bundled examples, we've used AutoHelix on real projects. In
 [Hybrid Model Factory](https://github.com/awslabs/hybrid-model-factory) — an open-source
@@ -228,6 +250,16 @@ at the start of its next iteration. Useful to steer a run without stopping it. S
 </details>
 
 <details>
+<summary><b>Full customization</b></summary>
+
+Beyond `autohelix.yaml`, you can edit the full per-iteration prompt template
+and control how the agent organizes its persistent notes. See
+[Concepts → Prompt Template](docs/concepts.md#prompt-template) and
+[Concepts → Notes](docs/concepts.md#notes).
+
+</details>
+
+<details>
 <summary><b>Parallel runs</b> (alpha)</summary>
 
 `autohelix parallel` executes multiple AutoHelix runs concurrently, each with its own config and
@@ -316,7 +348,7 @@ use cases you'd like to share. Contributions are welcome.
   title   = {AutoHelix: Verified Iteration for AI Agents},
   author  = {Trager, Matthew and Mansimov, Elman and Zhang, Yi and Xia, Wei and Soatto, Stefano},
   year    = {2026},
-  version = {0.1.0},
+  version = {0.1.1},
   url     = {https://github.com/awslabs/AutoHelix}
 }
 ```
