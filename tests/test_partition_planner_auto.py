@@ -204,7 +204,7 @@ def test_tied_embeddings_reuse_embed_weights_for_the_head(tmp_path):
     graph = plan(inventory, budget_bytes=GIB, options=PlanOptions(seq_len=8))
     head = graph.by_id("lm_head")
     assert "tied" in head.notes
-    assert head.submodules == ["model.embed_tokens.weight"]
+    assert head.submodules == ["model.embed_tokens"]
 
 
 def test_kv_bytes_recorded_for_decoder_modules():
@@ -240,6 +240,19 @@ def test_empty_stack_yields_embed_and_head_only():
 ])
 def test_classify_global(name, expected):
     assert classify_global(name) == expected
+
+
+@pytest.mark.parametrize("tensor_name,expected", [
+    ("model.embed_tokens.weight", "model.embed_tokens"),
+    ("model.layers.0.self_attn.q_proj.bias", "model.layers.0.self_attn.q_proj"),
+    ("model.layers.0.mlp.experts.3.up_proj.weight_scale_inv", "model.layers.0.mlp.experts.3.up_proj"),
+    ("model.layers.0.linear_attn.A_log", "model.layers.0.linear_attn"),
+    ("model.norm", "model.norm"),
+])
+def test_module_path_of_strips_parameter_suffix(tensor_name, expected):
+    """Hooks attach to modules, so plan submodules must name modules."""
+    from model_partition.planner.auto import module_path_of
+    assert module_path_of(tensor_name) == expected
 
 
 def test_layer_role_bytes_buckets_by_role():

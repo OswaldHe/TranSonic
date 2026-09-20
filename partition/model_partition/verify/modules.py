@@ -1,0 +1,190 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Verify each module reproduces its traced output from its dumped artifacts.
+
+The model is poisoned with NaN before each module's dumped weights are applied,
+so a parameter the dump forgot shows up as a non-finite result rather than
+passing on whatever happened to be in memory.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from model_partition.planner.graph import PartitionGraph
+from model_partition.runtime.module_runner import (
+    TraceBundle,
+    apply_dumped_weights,
+    expected_output,
+    first_tensor,
+    replay_record,
+)
+from model_partition.verify.numerics import Comparison, Tolerance, compare
+
+
+def poison_parameters(model: Any, value: float = float("nan")) -> int:
+    """Fill every parameter and buffer with ``value``; returns how many."""
+    import torch
+
+    count = 0
+    with torch.no_grad():
+        for _, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            if tensor.is_floating_point():
+                tensor.fill_(value)
+                count += 1
+    return count
+
+
+@dataclass
+class ModuleVerification:
+    """Verification outcome for one module on one sample."""
+
+    module_id: str
+    sample_id: str
+    passed: bool
+    weights_applied: int = 0
+    comparisons: list[Comparison] = field(default_factory=list)
+    error: str = ""
+
+    def summary(self) -> str:
+        if self.error:
+            return f"{self.module_id} [{self.sample_id}]: ERROR {self.error}"
+        head = "ok" if self.passed else "FAIL"
+        detail = "; ".join(c.summary() for c in self.comparisons if not c.passed) or "all tensors match"
+        return f"{self.module_id} [{self.sample_id}]: {head} ({self.weights_applied} weights) {detail}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "module_id": self.module_id, "sample_id": self.sample_id,
+            "passed": self.passed, "weights_applied": self.weights_applied,
+            "error": self.error,
+            "comparisons": [c.to_dict() for c in self.comparisons],
+        }
+
+
+@dataclass
+class VerifyReport:
+    """All module verifications for a run."""
+
+    results: list[ModuleVerification] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.results) and all(r.passed for r in self.results)
+
+    @property
+    def failures(self) -> list[ModuleVerification]:
+        return [r for r in self.results if not r.passed]
+
+    def module_ids(self) -> list[str]:
+        return sorted({r.module_id for r in self.results})
+
+    def worst_cosine(self) -> float:
+        values = [c.cosine for r in self.results for c in r.comparisons]
+        return min(values) if values else 1.0
+
+    def max_abs_err(self) -> float:
+        values = [c.max_abs_err for r in self.results for c in r.comparisons]
+        return max(values) if values else 0.0
+
+    def render(self) -> str:
+        lines = [r.summary() for r in self.results]
+        lines.append(
+            f"{len(self.results) - len(self.failures)}/{len(self.results)} module checks passed"
+        )
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "n_checks": len(self.results),
+            "n_failed": len(self.failures),
+            "worst_cosine": self.worst_cosine(),
+            "max_abs_err": self.max_abs_err(),
+            "results": [r.to_dict() for r in self.results],
+        }
+
+
+def verify_modules(
+    build_model: Callable[[], Any],
+    bundle: TraceBundle,
+    graph: PartitionGraph,
+    sample_ids: list[str] | None = None,
+    module_ids: list[str] | None = None,
+    device: str = "cpu",
+    tolerance: Tolerance | None = None,
+    poison: bool = True,
+) -> VerifyReport:
+    """Replay every module from its dumps and compare against the trace."""
+    report = VerifyReport()
+    model = build_model()
+    if poison:
+        poison_parameters(model)
+
+    wanted_modules = module_ids or bundle.module_ids()
+    wanted_samples = sample_ids or bundle.sample_ids()
+
+    for module_id in wanted_modules:
+        try:
+            graph_module = graph.by_id(module_id)
+        except KeyError:
+            report.results.append(ModuleVerification(
+                module_id=module_id, sample_id="-", passed=False,
+                error="module is not in the partition graph",
+            ))
+            continue
+
+        applied = apply_dumped_weights(model, bundle, module_id, graph_module, device=device)
+        for sample_id in wanted_samples:
+            records = bundle.select(module_id=module_id, sample_id=sample_id)
+            if not records:
+                continue
+            for record in records:
+                comparisons: list[Comparison] = []
+                try:
+                    actual = replay_record(model, record, bundle.store, device=device)
+                    reference = expected_output(record, bundle.store, device=device)
+                    comparisons = _compare_outputs(actual, reference, module_id, tolerance)
+                except Exception as exc:
+                    report.results.append(ModuleVerification(
+                        module_id=module_id, sample_id=sample_id, passed=False,
+                        weights_applied=applied, error=str(exc),
+                    ))
+                    continue
+                report.results.append(ModuleVerification(
+                    module_id=module_id, sample_id=sample_id,
+                    passed=bool(comparisons) and all(c.passed for c in comparisons),
+                    weights_applied=applied, comparisons=comparisons,
+                ))
+    return report
+
+
+def _compare_outputs(actual: Any, reference: Any, label: str,
+                     tolerance: Tolerance | None) -> list[Comparison]:
+    """Compare every tensor in a possibly-nested output structure."""
+    from model_partition.trace import is_tensor
+
+    pairs = list(_walk_pairs(actual, reference, label))
+    if not pairs:
+        primary = compare(first_tensor(actual), first_tensor(reference), label, tolerance)
+        return [primary]
+    return [compare(a, b, name, tolerance) for name, a, b in pairs if is_tensor(b)]
+
+
+def _walk_pairs(actual: Any, reference: Any, path: str):
+    from model_partition.trace import is_tensor
+
+    if is_tensor(reference):
+        yield path, actual, reference
+        return
+    if isinstance(reference, dict):
+        for key, value in reference.items():
+            child = actual.get(key) if isinstance(actual, dict) else None
+            yield from _walk_pairs(child, value, f"{path}.{key}")
+        return
+    if isinstance(reference, (list, tuple)):
+        for i, value in enumerate(reference):
+            child = actual[i] if isinstance(actual, (list, tuple)) and i < len(actual) else None
+            yield from _walk_pairs(child, value, f"{path}[{i}]")

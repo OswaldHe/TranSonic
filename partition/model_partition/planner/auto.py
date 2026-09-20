@@ -47,6 +47,23 @@ def classify_global(name: str) -> tuple[str, str] | None:
     return None
 
 
+#: Trailing components of a tensor name that belong to the parameter, not the module.
+PARAM_SUFFIXES = (
+    "weight", "bias", "scale", "weight_scale", "weight_scale_inv",
+    "scale_inv", "A_log", "dt_bias", "e_score_correction_bias",
+)
+
+
+def module_path_of(tensor_name: str) -> str:
+    """The owning module's path for a tensor, e.g. ``model.embed_tokens``.
+
+    Hooks attach to modules, so a module's ``submodules`` must name modules even
+    when the plan was derived from tensor names.
+    """
+    head, _, tail = tensor_name.rpartition(".")
+    return head if head and tail in PARAM_SUFFIXES else tensor_name
+
+
 def _group_layers(inventory: ModelInventory, per_module: int, options: PlanOptions) -> list[list[int]]:
     """Split layer indices into consecutive, signature-homogeneous groups."""
     indices = [layer.index for layer in inventory.layers]
@@ -113,7 +130,9 @@ def plan(
         classified = classify_global(name)
         key = classified[1] if classified else "other_globals"
         global_bytes[key] = global_bytes.get(key, 0) + _tensor_bytes(inventory, name)
-        global_names.setdefault(key, []).append(name)
+        path = module_path_of(name)
+        if path not in global_names.setdefault(key, []):
+            global_names[key].append(path)
 
     layer_groups = _group_layers(
         inventory,
