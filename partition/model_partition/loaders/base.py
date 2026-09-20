@@ -43,6 +43,10 @@ class LoadedModel:
     dtype: str = "bfloat16"
     device: str = "cpu"
     meta: bool = False
+    #: ``"single"`` when every parameter is on ``device``; ``"auto"`` when layers
+    #: are spread across GPU and host. An auto-placed model must never be moved
+    #: with ``.to()`` — that would undo the placement.
+    placement: str = "single"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def named_modules(self) -> dict[str, Any]:

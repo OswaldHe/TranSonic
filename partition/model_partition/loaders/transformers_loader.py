@@ -29,6 +29,11 @@ class TransformersLoader:
     config: dict[str, Any]
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
+    #: Passed to ``from_pretrained``. ``"auto"`` puts as many layers on the GPU as
+    #: fit and the rest on the host, so a checkpoint larger than the GPU still
+    #: does most of its compute there.
+    device_map: str | dict | None = None
+    max_memory: dict | None = None
 
     def _auto_classes(self):
         import transformers
@@ -106,12 +111,18 @@ class TransformersLoader:
         errors: list[str] = []
         model = None
         used = ""
+        placement = "auto" if self.device_map else "single"
+        extra: dict[str, Any] = {}
+        if self.device_map:
+            extra["device_map"] = self.device_map
+            if self.max_memory:
+                extra["max_memory"] = self.max_memory
         for name, auto_class in self._auto_classes():
             try:
                 if state_dict is None:
                     model = auto_class.from_pretrained(
                         str(self.root), dtype=torch_dtype(self.dtype),
-                        trust_remote_code=self.trust_remote_code,
+                        trust_remote_code=self.trust_remote_code, **extra,
                     )
                 else:
                     with torch.device("meta"):
@@ -128,8 +139,14 @@ class TransformersLoader:
         if model is None:
             raise LoaderError(f"Could not load weights from {self.root}:\n  " + "\n  ".join(errors))
 
-        model = model.to(device=device, dtype=torch_dtype(self.dtype))
+        if placement == "single":
+            model = model.to(device=device, dtype=torch_dtype(self.dtype))
         model.eval()
         torch.set_grad_enabled(False)
-        return LoadedModel(model=model, config=self.config, dtype=self.dtype,
-                           device=device, metadata={"loader": "transformers", "auto_class": used})
+        return LoadedModel(
+            model=model, config=self.config, dtype=self.dtype,
+            device=device if placement == "single" else "auto",
+            placement=placement,
+            metadata={"loader": "transformers", "auto_class": used,
+                      "device_map": str(self.device_map) if self.device_map else None},
+        )

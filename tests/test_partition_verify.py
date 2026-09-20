@@ -239,3 +239,58 @@ def test_empty_report_does_not_count_as_passed():
 
 def test_comparison_defaults_are_passing():
     assert Comparison(name="x", passed=True).pass_fraction == 1.0
+
+
+# -- per-module GPU residency ------------------------------------------------
+
+
+def test_module_device_moves_only_the_module_under_test(tiny_run):
+    """The plan sizes each module to fit the GPU, so each is verified there even
+    when the whole model is resident on the host."""
+    from model_partition.verify.modules import move_submodules
+
+    model = tiny_run.build_model()
+    target = next(m for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    other = next(m for m in tiny_run.graph.partitioned_modules if m.kind == "lm_head")
+
+    moved = move_submodules(model, target, "cpu")
+    assert moved == len(target.submodules)
+    # Nothing outside the module is touched.
+    assert all(p.device.type == "cpu" for p in model.parameters())
+    assert move_submodules(model, other, "cpu") == len(other.submodules)
+
+
+def test_move_submodules_ignores_absent_names(tiny_run):
+    from model_partition.planner.graph import ModuleNode
+    from model_partition.verify.modules import move_submodules
+
+    node = ModuleNode(id="x", kind="other", submodules=["nope.at.all"])
+    assert move_submodules(tiny_run.build_model(), node, "cpu") == 0
+
+
+def test_verification_records_where_each_module_ran(tiny_run):
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            model_device="cpu", module_device="cpu")
+    assert report.passed
+    assert {r.device for r in report.results} == {"cpu"}
+    assert report.to_dict()["results"][0]["device"] == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_modules_verify_on_the_gpu_with_the_model_on_the_host(tiny_run):
+    """The 27B case in miniature: host-resident model, GPU-resident module."""
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            model_device="cpu", module_device="cuda")
+    assert report.passed, report.render()
+    assert {r.device for r in report.results} == {"cuda"}
+    assert "on cuda" in report.render()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_modules_are_returned_to_the_host_after_verification(tiny_run):
+    """Otherwise every verified module would accumulate on the GPU."""
+    model = tiny_run.build_model().to("cpu")
+    verify_modules(lambda: model, tiny_run.bundle, tiny_run.graph,
+                   model_device="cpu", module_device="cuda")
+    assert all(p.device.type == "cpu" for p in model.parameters())

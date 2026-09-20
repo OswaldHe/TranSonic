@@ -46,6 +46,34 @@ def poison_parameters(model: Any, value: float = float("nan"),
     return count
 
 
+def move_submodules(model: Any, graph_module: Any, device: str) -> int:
+    """Move just one module's submodules to ``device``; returns how many moved.
+
+    This is what makes the plan's guarantee testable: a module sized to fit the
+    GPU is verified *on* the GPU even when the whole model never could be
+    resident there.
+    """
+    from model_partition.trace import _lookup
+
+    moved = 0
+    for submodule_name in graph_module.submodules:
+        submodule = _lookup(model, submodule_name)
+        if submodule is not None and hasattr(submodule, "to"):
+            submodule.to(device)
+            moved += 1
+    return moved
+
+
+def _release(device: str) -> None:
+    if device.startswith("cuda"):
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def plan_owned_parameters(model: Any, graph: PartitionGraph) -> set[str]:
     """Names of parameters and buffers the plan's modules are responsible for."""
     from model_partition.trace import _lookup
@@ -71,19 +99,22 @@ class ModuleVerification:
     weights_applied: int = 0
     comparisons: list[Comparison] = field(default_factory=list)
     error: str = ""
+    #: Where the module actually ran.
+    device: str = ""
 
     def summary(self) -> str:
         if self.error:
             return f"{self.module_id} [{self.sample_id}]: ERROR {self.error}"
         head = "ok" if self.passed else "FAIL"
         detail = "; ".join(c.summary() for c in self.comparisons if not c.passed) or "all tensors match"
-        return f"{self.module_id} [{self.sample_id}]: {head} ({self.weights_applied} weights) {detail}"
+        where = f" on {self.device}" if self.device else ""
+        return f"{self.module_id} [{self.sample_id}]: {head} ({self.weights_applied} weights{where}) {detail}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "module_id": self.module_id, "sample_id": self.sample_id,
             "passed": self.passed, "weights_applied": self.weights_applied,
-            "error": self.error,
+            "error": self.error, "device": self.device,
             "comparisons": [c.to_dict() for c in self.comparisons],
         }
 
@@ -141,12 +172,21 @@ def verify_modules(
     tolerance: Tolerance | None = None,
     poison: bool = True,
     model_device: str | None = None,
+    module_device: str | None = None,
 ) -> VerifyReport:
-    """Replay every module from its dumps and compare against the trace."""
+    """Replay every module from its dumps and compare against the trace.
+
+    ``model_device`` holds the whole model — the host, for a checkpoint larger
+    than the GPU. ``module_device`` is where each module under test is moved for
+    its replay, defaulting to ``model_device``. Setting it to a GPU verifies each
+    module on the accelerator one at a time, which is exactly what the plan's
+    per-module budget promises.
+    """
     report = VerifyReport()
     model = build_model()
-    if model_device:
-        model = model.to(model_device)
+    host = model_device or device
+    model = model.to(host)
+    target = module_device or host
     if poison:
         poison_parameters(model, only=plan_owned_parameters(model, graph))
 
@@ -163,28 +203,44 @@ def verify_modules(
             ))
             continue
 
-        applied = apply_dumped_weights(model, bundle, module_id, graph_module, device=device)
-        for sample_id in wanted_samples:
-            records = bundle.select(module_id=module_id, sample_id=sample_id)
-            if not records:
-                continue
-            for record in records:
-                comparisons: list[Comparison] = []
-                try:
-                    actual = replay_record(model, record, bundle.store, device=device)
-                    reference = expected_output(record, bundle.store, device=device)
-                    comparisons = _compare_outputs(actual, reference, module_id, tolerance)
-                except Exception as exc:
-                    report.results.append(ModuleVerification(
-                        module_id=module_id, sample_id=sample_id, passed=False,
-                        weights_applied=applied, error=str(exc),
-                    ))
-                    continue
+        applied = apply_dumped_weights(model, bundle, module_id, graph_module, device=host)
+        residency = target
+        if target != host:
+            try:
+                move_submodules(model, graph_module, target)
+            except RuntimeError as exc:
+                # The module did not fit after all; fall back rather than abort.
+                move_submodules(model, graph_module, host)
+                _release(target)
+                residency = host
                 report.results.append(ModuleVerification(
-                    module_id=module_id, sample_id=sample_id,
-                    passed=bool(comparisons) and all(c.passed for c in comparisons),
-                    weights_applied=applied, comparisons=comparisons,
+                    module_id=module_id, sample_id="-", passed=True,
+                    weights_applied=applied,
+                    error=f"ran on {host}: {exc}",
                 ))
+        try:
+            for sample_id in wanted_samples:
+                for record in bundle.select(module_id=module_id, sample_id=sample_id):
+                    comparisons: list[Comparison] = []
+                    try:
+                        actual = replay_record(model, record, bundle.store, device=residency)
+                        reference = expected_output(record, bundle.store, device=residency)
+                        comparisons = _compare_outputs(actual, reference, module_id, tolerance)
+                    except Exception as exc:
+                        report.results.append(ModuleVerification(
+                            module_id=module_id, sample_id=sample_id, passed=False,
+                            weights_applied=applied, error=str(exc), device=residency,
+                        ))
+                        continue
+                    report.results.append(ModuleVerification(
+                        module_id=module_id, sample_id=sample_id,
+                        passed=bool(comparisons) and all(c.passed for c in comparisons),
+                        weights_applied=applied, comparisons=comparisons, device=residency,
+                    ))
+        finally:
+            if residency != host:
+                move_submodules(model, graph_module, host)
+                _release(residency)
     return report
 
 

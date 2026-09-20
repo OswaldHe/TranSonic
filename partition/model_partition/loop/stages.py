@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from model_partition.hardware import MemoryBudget, format_bytes, move_to_device
+from model_partition.hardware import GIB, MemoryBudget, format_bytes, move_to_device
 from model_partition.inputs import SampleInput, load_input_set, summarize
 from model_partition.ingest import IngestResult, ingest
 from model_partition.layout import RunLayout
@@ -30,6 +30,11 @@ from model_partition.runtime.module_runner import TraceBundle
 from model_partition.verify.emulate import EmulationInput, emulate
 from model_partition.verify.judge import Judge, StubJudge
 from model_partition.verify.modules import verify_modules
+
+
+#: Fraction of GPU memory offered to a whole-model stage. Lower than 1.0 so
+#: activations and workspaces still fit alongside the resident layers.
+WHOLE_MODEL_GPU_FRACTION = 0.80
 
 
 @dataclass
@@ -113,18 +118,40 @@ class LoopContext:
     samples: list[SampleInput] = field(default_factory=list)
     tokenizer: Any = None
     judge: Judge | None = None
-    build_model: Callable[[], Any] | None = None
+    build_model: Callable[..., Any] | None = None
     build_meta_model: Callable[[], Any] | None = None
     verify_report: Any = None
     emulate_report: Any = None
     retention: Any = None
     notes: list[str] = field(default_factory=list)
+    #: Placement the last built model actually got: "single" or "auto".
+    last_placement: str = "single"
 
     @property
     def seq_len(self) -> int:
         if self.options.seq_len:
             return self.options.seq_len
         return max((s.n_tokens for s in self.samples), default=2048)
+
+    def placement(self) -> tuple[str | None, dict | None]:
+        """Layer placement for whole-model stages.
+
+        Returns ``(device_map, max_memory)``. A checkpoint that fits the GPU needs
+        no map — it goes there wholesale. One that does not gets ``"auto"``, which
+        fills the GPU with as many layers as possible and leaves the remainder on
+        the host, rather than abandoning the GPU entirely.
+        """
+        gpu = self.budget.gpu
+        if gpu is None or not self.options.device.startswith("cuda"):
+            return None, None
+        needed = self.result.index.total_bytes if self.result else 0
+        if needed and needed <= gpu.total_bytes * WHOLE_MODEL_GPU_FRACTION:
+            return None, None
+        host = _host(self)
+        return "auto", {
+            gpu.index: f"{int(gpu.total_bytes * WHOLE_MODEL_GPU_FRACTION / GIB)}GiB",
+            "cpu": f"{max(int(host.ram_available_bytes * 0.8 / GIB), 1)}GiB",
+        }
 
 
 # -- stage: ingest -----------------------------------------------------------
@@ -340,22 +367,34 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         return StageResult(ok=False, detail=(
             "no sample inputs: set inputs.short (and optionally inputs.long) in the spec"
         ))
-    device = ctx.options.trace_device or _compute_device(ctx)
-    model, device = move_to_device(ctx.build_model(), device)
-
     store = TensorStore(ctx.layout.trace_dir)
-    tracer = Tracer(model, ctx.graph, store, policy=ctx.options.dump_policy())
+    policy = ctx.options.dump_policy()
+
+    # Weights are read straight off the parameters, and layer placement leaves
+    # host-assigned layers on the meta device between forwards, so dump from a
+    # single-device copy and release it before placing the model for the forward.
+    weights: dict[str, list[str]] = {}
+    if policy.cache_weights:
+        host_model = ctx.build_model()
+        unresolved = Tracer(host_model, ctx.graph, store).unresolved_submodules()
+        if unresolved:
+            return _unresolved_result(ctx, unresolved)
+        weight_tracer = Tracer(host_model, ctx.graph, store, policy=policy)
+        weights = weight_tracer.dump_weights()
+        del host_model, weight_tracer
+        _collect()
+
+    model = ctx.build_model(placed=True)
+    if ctx.last_placement == "auto":
+        device = input_device(model)
+    else:
+        device = ctx.options.trace_device or _accelerator(ctx)
+        model, device = move_to_device(model, device)
+
+    tracer = Tracer(model, ctx.graph, store, policy=policy)
     unresolved = tracer.unresolved_submodules()
     if unresolved:
-        return StageResult(
-            ok=False, repairable=True,
-            detail=(f"{len(unresolved)} plan submodule(s) do not exist in the model: "
-                    f"{', '.join(unresolved[:8])}"),
-            failing_modules=[m.id for m in ctx.graph.partitioned_modules
-                             if set(m.submodules) & set(unresolved)],
-        )
-
-    weights = tracer.dump_weights() if ctx.options.cache_weights else {}
+        return _unresolved_result(ctx, unresolved)
     for sample in ctx.samples:
         tracer.trace_sample(sample.id, sample.tensor(device))
 
@@ -383,6 +422,32 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     })
 
 
+def _unresolved_result(ctx: LoopContext, unresolved: list[str]) -> StageResult:
+    """A plan naming submodules the model does not have is the agent's to fix."""
+    assert ctx.graph is not None
+    return StageResult(
+        ok=False, repairable=True,
+        detail=(f"{len(unresolved)} plan submodule(s) do not exist in the model: "
+                f"{', '.join(unresolved[:8])}"),
+        failing_modules=[m.id for m in ctx.graph.partitioned_modules
+                         if set(m.submodules) & set(unresolved)],
+    )
+
+
+def _collect() -> None:
+    """Release a freed model's memory before the next one is built."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def hash_trace(ctx: LoopContext) -> list[Any]:
     options = ctx.options
     return [
@@ -406,12 +471,17 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
             f"trace was pruned to layers {kept}; verification covers the kept "
             "modules only. Re-trace for full coverage."
         )
-    device = _compute_device(ctx)
+    host = _host_device(ctx)
+    target = _accelerator(ctx)
     report = verify_modules(
-        ctx.build_model, bundle, ctx.graph, device=device,
-        model_device=device,
+        ctx.build_model, bundle, ctx.graph,
+        model_device=host, module_device=target,
     )
     ctx.verify_report = report
+    if target != host:
+        ctx.notes.append(
+            f"modules verified one at a time on {target} with the model resident on {host}"
+        )
     (ctx.layout.reports_dir / "verify.json").write_text(json.dumps(report.to_dict(), indent=2))
 
     if not report.passed:
@@ -433,7 +503,39 @@ def _verify_metrics(report) -> dict[str, Any]:
         "n_failed": len(report.failures),
         "worst_cosine": report.worst_cosine(),
         "max_abs_err": report.max_abs_err(),
+        "devices": sorted({r.device for r in report.results if r.device}),
     }
+
+
+def _host_device(ctx: LoopContext) -> str:
+    """Where a single-device whole model can be held.
+
+    The GPU when the checkpoint fits, the host otherwise — module verification
+    then moves one module at a time onto the accelerator.
+    """
+    target = _accelerator(ctx)
+    if target == "cpu" or not ctx.budget.gpu:
+        return "cpu"
+    needed = ctx.result.index.total_bytes if ctx.result else 0
+    fits = needed and needed <= ctx.budget.gpu.total_bytes * WHOLE_MODEL_GPU_FRACTION
+    return target if fits else "cpu"
+
+
+def _accelerator(ctx: LoopContext) -> str:
+    """The device a single module should run on, ignoring whole-model size.
+
+    Per-module verification is the one stage that can always use the GPU: the
+    plan sizes every module to fit, which is the guarantee being tested.
+    """
+    requested = ctx.options.device or "cpu"
+    if not requested.startswith("cuda"):
+        return requested
+    try:
+        import torch
+
+        return requested if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def hash_verify(ctx: LoopContext) -> list[Any]:
@@ -452,32 +554,16 @@ def _trace_fingerprint(ctx: LoopContext) -> str:
     return content_hash(records.read_text()) if records.is_file() else ""
 
 
-def _compute_device(ctx: LoopContext) -> str:
-    """Device for replay and emulation.
+def input_device(model: Any) -> str:
+    """Device a model's inputs should be placed on.
 
-    Whole-model stages need the whole model resident, so a checkpoint larger than
-    the GPU runs on the host even when the per-module budget would fit.
+    With layer placement the first parameter's device is where the embedding
+    lives; accelerate's hooks move activations onward from there.
     """
-    requested = ctx.options.device or "cpu"
-    if not requested.startswith("cuda"):
-        return requested
     try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return "cpu"
-    except ImportError:
+        return str(next(model.parameters()).device)
+    except StopIteration:
         return "cpu"
-
-    needed = ctx.result.index.total_bytes if ctx.result else 0
-    gpu_total = ctx.budget.gpu.total_bytes if ctx.budget.gpu else 0
-    if needed and gpu_total and needed > gpu_total * 0.85:
-        ctx.notes.append(
-            f"whole-model stages on cpu: checkpoint {format_bytes(needed)} exceeds "
-            f"{format_bytes(gpu_total)} of GPU memory"
-        )
-        return "cpu"
-    return requested
 
 
 
@@ -492,7 +578,10 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     ctx.bundle = bundle
     judge = ctx.judge or StubJudge()
     eos = getattr(ctx.tokenizer, "eos_token_id", None)
-    device = _compute_device(ctx)
+    # Emulation overwrites parameters with dumped values, so the model must be on
+    # a single writable device: layer placement leaves host-assigned layers on
+    # meta. The GPU when the model fits, the host otherwise.
+    device = _host_device(ctx)
 
     report = emulate(
         ctx.build_model, bundle, ctx.graph,

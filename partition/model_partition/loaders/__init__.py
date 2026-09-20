@@ -15,8 +15,13 @@ __all__ = [
 ]
 
 
-def build_loader(result) -> ModelLoader:
-    """Construct the loader named by an :class:`~model_partition.ingest.IngestResult`."""
+def build_loader(result, device_map=None, max_memory=None) -> ModelLoader:
+    """Construct the loader named by an :class:`~model_partition.ingest.IngestResult`.
+
+    ``device_map``/``max_memory`` request layer placement across GPU and host, so
+    a checkpoint larger than the GPU still runs most of its compute there. Only
+    the transformers path supports it; vendor code is loaded on one device.
+    """
     spec = result.spec
     if result.loader == "repo_code":
         return RepoCodeLoader(
@@ -33,5 +38,7 @@ def build_loader(result) -> ModelLoader:
             config=result.config,
             dtype=spec.dtype,
             trust_remote_code=spec.trust_remote_code,
+            device_map=device_map,
+            max_memory=max_memory,
         )
     raise LoaderError(f"Unknown loader {result.loader!r}")

@@ -39,7 +39,9 @@ def build_model(config, state_dict=None):
         k: v for k, v in config.items() if k in TinyConfig.__dataclass_fields__
     }))
     if state_dict is not None:
-        model.load_state_dict(state_dict)
+        # Non-strict, as real vendor loaders are: a tied-embedding checkpoint
+        # omits lm_head.weight, and out-of-scope subtrees add extra keys.
+        model.load_state_dict(state_dict, strict=False)
     return model.eval()
 '''
 

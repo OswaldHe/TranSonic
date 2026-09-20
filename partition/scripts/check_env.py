@@ -30,9 +30,9 @@ def main() -> int:
     if not gpus:
         print("  no GPU detected (plan with --gpu-memory-gib)")
     for gpu in gpus:
-        print(f"  gpu {gpu.index}: {gpu.name}  {format_bytes(gpu.total_bytes)}"
-              f"  sm_{gpu.capability[0]}{gpu.capability[1]}" if gpu.capability
-              else f"  gpu {gpu.index}: {gpu.name}  {format_bytes(gpu.total_bytes)}")
+        arch = f"  sm_{gpu.capability[0]}{gpu.capability[1]}" if gpu.capability else ""
+        fp8 = "  fp8-capable" if gpu.supports_fp8() else "  no fp8 (DeepSeek needs dequant)"
+        print(f"  gpu {gpu.index}: {gpu.name}  {format_bytes(gpu.total_bytes)}{arch}{fp8}")
     if gpus:
         budget = resolve_budget(gpus)
         print(f"  per-module budget: {format_bytes(budget.usable_bytes)}"

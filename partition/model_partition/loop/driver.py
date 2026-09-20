@@ -104,11 +104,16 @@ class PartitionLoop:
             return build_judge("claude", model=self.options.judge_model)
         return build_judge(self.options.judge_kind)
 
-    def _model_builder(self, ctx: LoopContext) -> Callable[[], Any]:
-        """Lazily build the model, fetching weights the first time it is needed."""
+    def _model_builder(self, ctx: LoopContext) -> Callable[..., Any]:
+        """Lazily build the model, fetching weights the first time it is needed.
+
+        With ``placed=True`` the model is spread across GPU and host so a
+        checkpoint larger than the GPU still runs most of its compute there;
+        otherwise it lands on one device for the caller to move.
+        """
         fetched = {"done": False}
 
-        def build():
+        def build(placed: bool = False):
             from model_partition.ingest import ensure_weights, ingest
             from model_partition.loaders import build_loader
 
@@ -121,7 +126,11 @@ class PartitionLoop:
                                 f" ({format_bytes(sum(result.index.shard_bytes[s] for s in missing))})")
                 ensure_weights(result)
                 fetched["done"] = True
-            return build_loader(result).build().model
+
+            device_map, max_memory = ctx.placement() if placed else (None, None)
+            loaded = build_loader(result, device_map=device_map, max_memory=max_memory).build()
+            ctx.last_placement = loaded.placement
+            return loaded.model
 
         return build
 

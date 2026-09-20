@@ -95,16 +95,23 @@ class RepoCodeLoader:
                 try:
                     return factory(self.config, state_dict)
                 except TypeError:
-                    model = factory(self.config)
-                    if state_dict is not None:
-                        model.load_state_dict(state_dict)
-                    return model
-            model = factory(self.config)
-            if state_dict is not None:
-                model.load_state_dict(state_dict)
-            return model
+                    return self._load_into(factory(self.config), state_dict)
+            return self._load_into(factory(self.config), state_dict)
         except Exception as exc:
             raise LoaderError(f"{self.entry} factory failed: {exc}") from exc
+
+    @staticmethod
+    def _load_into(model: Any, state_dict: dict[str, Any] | None) -> Any:
+        """Apply a state dict non-strictly.
+
+        A real checkpoint carries tensors for parts this run excludes (MTP, a
+        vision tower), and a strict load would reject the whole thing. Weights
+        that genuinely fail to arrive are caught later: verification NaN-poisons
+        each module before applying its dump.
+        """
+        if state_dict is not None:
+            model.load_state_dict(state_dict, strict=False)
+        return model
 
     def build_meta(self) -> LoadedModel:
         import torch
@@ -114,14 +121,37 @@ class RepoCodeLoader:
         return LoadedModel(model=model, config=self.config, dtype=self.dtype,
                            device="meta", meta=True, metadata={"loader": "repo_code"})
 
+    def load_checkpoint(self) -> dict[str, Any] | None:
+        """Merge the repo's safetensors shards into one state dict."""
+        shards = sorted(self.root.glob("*.safetensors"))
+        if not shards:
+            return None
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:  # pragma: no cover
+            raise LoaderError("safetensors is required to load vendor-code weights") from exc
+        state: dict[str, Any] = {}
+        for shard in shards:
+            state.update(load_file(str(shard)))
+        return state
+
     def build_config_only(self, device: str = "cpu") -> LoadedModel:
-        """Instantiate from config with real storage and normal initialization."""
-        return self.build(state_dict=None, device=device)
+        """Instantiate from config, without reading the checkpoint."""
+        return self._finalize(self._instantiate(None), device)
 
     def build(self, state_dict: dict[str, Any] | None = None, device: str = "cpu") -> LoadedModel:
+        """Instantiate with real weights.
+
+        Reads the repo's checkpoint when no ``state_dict`` is supplied — otherwise
+        the model would silently run on freshly initialized weights.
+        """
+        if state_dict is None:
+            state_dict = self.load_checkpoint()
+        return self._finalize(self._instantiate(state_dict), device)
+
+    def _finalize(self, model: Any, device: str) -> LoadedModel:
         import torch
 
-        model = self._instantiate(state_dict)
         model = model.to(device=device, dtype=torch_dtype(self.dtype))
         model.eval()
         torch.set_grad_enabled(False)

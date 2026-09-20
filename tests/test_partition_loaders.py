@@ -264,3 +264,40 @@ def test_evict_shards_is_a_no_op_for_local_weights(repo):
     result = ingest(local_spec(repo))
     assert evict_shards(result, ["model.safetensors"]) == 0
     assert (repo / "model.safetensors").is_file()
+
+
+def test_repo_code_build_reads_the_checkpoint_without_being_handed_one(repo):
+    """Regression: build() with no state_dict silently ran on fresh weights."""
+    from safetensors.torch import load_file
+
+    expected = load_file(str(repo / "model.safetensors"))
+    loaded = build_loader(ingest(local_spec(repo))).build()
+    actual = dict(loaded.model.state_dict())
+    assert torch.allclose(actual["model.layers.0.self_attn.q_proj.weight"],
+                          expected["model.layers.0.self_attn.q_proj.weight"])
+
+
+def test_two_builds_agree_because_both_read_the_checkpoint(repo):
+    """Tracing dumps weights from one instance and activations from another."""
+    loader = build_loader(ingest(local_spec(repo)))
+    first = loader.build().model.state_dict()
+    second = loader.build().model.state_dict()
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+
+
+def test_build_config_only_does_not_read_the_checkpoint(repo):
+    from safetensors.torch import load_file
+
+    expected = load_file(str(repo / "model.safetensors"))
+    fresh = build_loader(ingest(local_spec(repo))).build_config_only().model.state_dict()
+    key = "model.layers.0.self_attn.q_proj.weight"
+    assert not torch.allclose(fresh[key], expected[key])
+
+
+def test_tied_checkpoint_loads_despite_the_missing_head(tmp_path):
+    """A tied-embedding checkpoint omits lm_head.weight; a strict load would fail."""
+    tied = write_tiny_repo(tmp_path / "tied", TinyConfig(tie_word_embeddings=True))
+    loaded = build_loader(ingest(local_spec(tied))).build()
+    out = loaded.model(torch.zeros(1, 4, dtype=torch.long))
+    assert out.shape == (1, 4, 128)

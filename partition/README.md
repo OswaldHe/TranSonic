@@ -76,6 +76,13 @@ tensor fails loudly instead of quietly reusing whatever was in memory. Poisoning
 is limited to plan-owned tensors: non-persistent buffers like rotary `inv_freq`
 are computed at init and no dump can restore them.
 
+**Use the GPU as far as it goes.** Module verification always runs on the GPU:
+the plan sizes every module to fit, so each is moved onto the accelerator, replayed
+and moved back — the whole model never needs to be resident. Tracing and
+emulation do need the whole model, so a checkpoint larger than the GPU is spread
+across GPU and host by layer placement rather than abandoning the GPU. On one
+L40S, 33 of Qwen3.8-27B's 51.7 GiB sit on the card.
+
 **A module replays without the checkpoint.** Structure comes from config and
 code, weights and inputs from the dumps. So a module of a model far too large to
 hold locally stays replayable — which is also what makes the artifacts useful to
@@ -89,7 +96,7 @@ partition/
 │   ├── defaults.yaml            # loop defaults, all overridable on the CLI
 │   └── models/*.yaml            # model specs
 ├── inputs/
-│   ├── short.jsonl              # ~128-token prompts (committed)
+│   ├── short.jsonl              # complete instructions, 120-142 tokens (committed)
 │   └── fetch_long_inputs.py     # generates long.jsonl at 2k/8k/16k
 └── model_partition/
     ├── spec.py                  # what to partition and how to load it
@@ -207,5 +214,7 @@ generated module harness as a subprocess to confirm it actually replays.
   within a layer when a single layer exceeds the budget.
 - Decode-step tracing is accounted for in the storage estimate but not yet
   captured; prefill IO is.
-- Whole-model stages fall back to the host when the checkpoint exceeds GPU
-  memory, which is correct but slow for a 27B-class model on CPU.
+- Tracing and emulation need the whole model resident, so a checkpoint larger
+  than the GPU is spread across GPU and host by layer placement. Most of the
+  compute still lands on the GPU, but the host-resident layers are slow. Full
+  GPU residency for such models needs sequential module streaming.

@@ -148,12 +148,19 @@ def emulate(
     min_score: int = 4,
     strict_fill: bool = True,
     check_boundaries: bool = True,
+    move_model: bool = True,
 ) -> EmulationReport:
-    """Assemble from dumps, generate, and judge."""
+    """Assemble from dumps, generate, and judge.
+
+    ``move_model=False`` leaves an already-placed model alone: a model spread
+    across GPU and host must not be collapsed onto one device.
+    """
     judge = judge or StubJudge()
     report = EmulationReport(min_score=min_score)
 
-    model, device = move_to_device(build_model(), device)
+    model = build_model()
+    if move_model:
+        model, device = move_to_device(model, device)
     poison_parameters(model, only=plan_owned_parameters(model, graph))
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
 

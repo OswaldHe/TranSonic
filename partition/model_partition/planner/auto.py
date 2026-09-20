@@ -14,7 +14,7 @@ kernel-development convenience.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from model_partition.planner.graph import ModuleNode, PartitionGraph, TensorRef
 from model_partition.sizing import CostModel, ModelInventory, config_get
