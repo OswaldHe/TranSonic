@@ -224,6 +224,15 @@ def verify_modules(
                     error=f"ran on {host}: {exc}",
                 ))
         impl_dir = (impl_dirs or {}).get(module_id)
+        # Built once per module: the baseline instantiates the model's structure,
+        # which is far too expensive to repeat for every recorded call.
+        impl_callable = None
+        impl_error = ""
+        if impl_dir is not None:
+            try:
+                impl_callable = _build_impl(impl_dir, bundle, module_id, residency)
+            except Exception as exc:
+                impl_error = str(exc)
         try:
             for sample_id in wanted_samples:
                 records = bundle.select(module_id=module_id, sample_id=sample_id)
@@ -237,8 +246,9 @@ def verify_modules(
                 for source, reference_record in pairs:
                     comparisons: list[Comparison] = []
                     try:
-                        actual = _run_once(model, source, bundle, module_id,
-                                          impl_dir, residency)
+                        if impl_error:
+                            raise RuntimeError(f"implementation unusable: {impl_error}")
+                        actual = _run_once(model, source, bundle, impl_callable, residency)
                         reference = expected_output(reference_record, bundle.store,
                                                    device=residency)
                         comparisons = _compare_outputs(actual, reference, module_id, tolerance)
@@ -260,31 +270,43 @@ def verify_modules(
     return report
 
 
-def _run_once(model: Any, record: Any, bundle: TraceBundle, module_id: str,
-              impl_dir: Any, device: str) -> Any:
+def _build_impl(impl_dir: Any, bundle: TraceBundle, module_id: str, device: str) -> Any:
+    """Build a module's extracted implementation once, ready to call."""
+    from model_partition.runtime.module_impl import load_impl
+    from model_partition.runtime.module_runner import load_named_weights
+
+    impl = load_impl(impl_dir)
+    weights = load_named_weights(bundle, module_id, device=device)
+    if not weights:
+        raise RuntimeError(f"no dumped weights for {module_id!r}")
+    built = impl.build(bundle.metadata.get("config") or {}, weights, device)
+    if not callable(built):
+        raise RuntimeError(f"{impl.path}: build_module() returned a non-callable")
+    return built
+
+
+def _run_once(model: Any, record: Any, bundle: TraceBundle,
+              impl_callable: Any, device: str) -> Any:
     """Produce a module's output for one recorded call.
 
-    Prefers the extracted implementation when one exists, so verification
-    exercises the code the loop owns; falls back to replaying the original
-    submodule when extraction has not run yet.
+    Calls the extracted implementation when one was built, so verification
+    exercises the code the loop owns; otherwise replays the original submodule,
+    which is the case before extraction has run.
     """
-    if impl_dir is None:
+    import torch
+
+    if impl_callable is None:
         return replay_record(model, record, bundle.store, device=device)
 
-    from model_partition.runtime.module_impl import ImplError, load_impl, run_impl
-    from model_partition.runtime.module_runner import decode_call, load_named_weights
+    from model_partition.runtime.module_runner import decode_call
 
-    try:
-        impl = load_impl(impl_dir)
-        weights = load_named_weights(bundle, module_id, device=device)
-        args, kwargs = decode_call(record, bundle.store, device)
-        return run_impl(impl, bundle.metadata.get("config") or {}, weights,
-                        args, kwargs, device=device)
-    except ImplError:
-        # A group without a usable implementation still gets checked against the
-        # original submodule, so a broken generated file is reported as a
-        # numeric failure rather than skipping the module entirely.
-        return replay_record(model, record, bundle.store, device=device)
+    if record.has_unsupported():
+        raise RuntimeError(
+            f"{record.module_id}: recorded arguments include an unserializable value"
+        )
+    args, kwargs = decode_call(record, bundle.store, device)
+    with torch.no_grad():
+        return impl_callable(*args, **kwargs)
 
 
 def _compare_outputs(actual: Any, reference: Any, label: str,

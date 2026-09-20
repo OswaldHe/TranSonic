@@ -319,3 +319,130 @@ def test_accumulated_tolerance_still_rejects_a_wrong_tensor():
     reference = torch.randn(4096)
     assert not compare(reference * 1.5, reference, "wrong", Tolerance.accumulated()).passed
     assert not compare(-reference, reference, "flipped", Tolerance.accumulated()).passed
+
+
+# -- extracted implementations ------------------------------------------------
+
+
+def _extract_impls(run, tmp_path):
+    from model_partition.extract import extract
+    from model_partition.runtime.module_impl import find_impl_dirs
+
+    extract(run.graph, run.build_model(), tmp_path / "modules",
+            run_root=run.layout.root, sample_ids=run.sample_ids,
+            weight_tensors=run.bundle.weights)
+    return find_impl_dirs(tmp_path / "modules")
+
+
+def test_verification_runs_the_extracted_implementation(tiny_run, tmp_path):
+    """The check must exercise the code the loop owns, not the original model."""
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    assert impl_dirs
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    assert report.passed, report.render()
+
+
+def test_a_wrong_implementation_is_reported(tiny_run, tmp_path):
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    target = next(m.id for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    (impl_dirs[target] / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu'):\n"
+        "    return lambda *a, **k: a[0] * 2.0\n"
+    )
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    assert not report.passed
+    assert target in {r.module_id for r in report.failures}
+
+
+def test_an_unimportable_implementation_is_reported_not_skipped(tiny_run, tmp_path):
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    target = next(iter(impl_dirs))
+    (impl_dirs[target] / "inference.py").write_text("raise RuntimeError('boom')\n")
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    assert not report.passed
+    assert any("unusable" in r.error for r in report.failures)
+
+
+def test_an_implementation_returning_a_non_callable_is_reported(tiny_run, tmp_path):
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    target = next(iter(impl_dirs))
+    (impl_dirs[target] / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu'):\n    return 42\n"
+    )
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    assert not report.passed
+
+
+def test_the_baseline_identifies_the_module_from_its_weights(tiny_deep_run, tmp_path):
+    """One implementation serves many modules; the weights say which instance."""
+    from model_partition.runtime.baseline import _module_for_weights
+    from model_partition.runtime.module_runner import load_named_weights
+
+    graph = tiny_deep_run.graph
+    group = [m.id for m in graph.partitioned_modules if m.kind == "decoder_layers"]
+    assert len(group) > 1
+    for module_id in group[:3]:
+        weights = load_named_weights(tiny_deep_run.bundle, module_id)
+        assert _module_for_weights(graph, group, weights) == module_id
+
+
+def test_every_module_of_a_shared_group_verifies(tiny_deep_run, tmp_path):
+    """Regression: the baseline built the group's first module for all of them."""
+    impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
+    report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
+                            tiny_deep_run.graph, impl_dirs=impl_dirs)
+    assert report.passed, report.render()
+    decoders = [m.id for m in tiny_deep_run.graph.partitioned_modules
+                if m.kind == "decoder_layers"]
+    checked = {r.module_id for r in report.results}
+    assert set(decoders) <= checked
+
+
+def test_structure_is_reused_across_modules(tiny_deep_run, tmp_path):
+    """Instantiating the model per module made verification 80x slower."""
+    from model_partition.runtime import baseline
+
+    baseline.clear_structure_cache()
+    built = {"n": 0}
+    original = baseline._structure
+
+    def counting(run, device):
+        if (str(run.layout.root), device) not in baseline._STRUCTURE_CACHE:
+            built["n"] += 1
+        return original(run, device)
+
+    baseline._structure = counting
+    try:
+        impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
+        report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
+                                tiny_deep_run.graph, impl_dirs=impl_dirs)
+    finally:
+        baseline._structure = original
+        baseline.clear_structure_cache()
+    assert report.passed, report.render()
+    assert len(report.results) > 5
+    assert built["n"] == 1, f"structure built {built['n']} times"
+
+
+def test_reuse_does_not_let_one_module_cover_another_s_missing_dump(tiny_deep_run, tmp_path):
+    """The shared structure is poisoned per module, so a gap still shows."""
+    from model_partition.runtime import baseline
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
+        decoders = [m.id for m in tiny_deep_run.graph.partitioned_modules
+                    if m.kind == "decoder_layers"]
+        victim = decoders[-1]
+        tiny_deep_run.bundle.weights[victim] = tiny_deep_run.bundle.weights[victim][:1]
+        report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
+                                tiny_deep_run.graph, impl_dirs=impl_dirs)
+    finally:
+        baseline.clear_structure_cache()
+    assert not report.passed
+    assert victim in {r.module_id for r in report.failures}

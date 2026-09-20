@@ -86,15 +86,6 @@ def build_structure_only(spec, device: str = "cpu") -> Any:
         return model
 
 
-@dataclass
-class ModuleCall:
-    """One submodule invocation of a module, with what inference produced."""
-
-    submodule: str
-    output: Any
-    record: Any
-
-
 def load_module(
     run_dir: str | Path,
     module_id: str,
@@ -117,30 +108,6 @@ def load_module(
             "have been pruned by retention"
         )
     return run, model, graph_module
-
-
-def run_module(
-    run_dir: str | Path,
-    module_id: str,
-    sample_id: str | None = None,
-    device: str = "cpu",
-) -> list[ModuleCall]:
-    """Run a module's inference from its dumped inputs and weights.
-
-    A module spanning several layers is run as the sequence of its submodule
-    calls, each with the arguments the trace recorded for it.
-    """
-    run, model, _ = load_module(run_dir, module_id, device=device)
-    sample = sample_id or (run.bundle.sample_ids() or [None])[0]
-    records = run.bundle.select(module_id=module_id, sample_id=sample)
-    if not records:
-        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
-    return [
-        ModuleCall(submodule=record.submodule,
-                   output=replay_record(model, record, run.bundle.store, device=device),
-                   record=record)
-        for record in records
-    ]
 
 
 def replay_module(

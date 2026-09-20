@@ -20,6 +20,45 @@ class BaselineError(RuntimeError):
     """Raised when the baseline cannot assemble a module."""
 
 
+#: Instantiating a model's structure is the expensive part and is identical for
+#: every module of a run, so it is built once per (run, device). Each module's
+#: parameters are poisoned before its own weights are applied, so reuse cannot let
+#: one module's weights stand in for another's missing dump.
+_STRUCTURE_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def clear_structure_cache() -> None:
+    """Drop cached structures. Call when a run's code or config changed."""
+    _STRUCTURE_CACHE.clear()
+
+
+def _structure(run: Any, device: str) -> Any:
+    from model_partition.runtime.standalone import build_structure_only
+
+    key = (str(run.layout.root), device)
+    model = _STRUCTURE_CACHE.get(key)
+    if model is None:
+        model = build_structure_only(run.spec, device=device)
+        _STRUCTURE_CACHE[key] = model
+    return model
+
+
+def _poison(model: Any, graph_module: Any) -> None:
+    """NaN a module's parameters so a weight the dump omits cannot pass."""
+    import torch
+
+    from model_partition.trace import _lookup
+
+    with torch.no_grad():
+        for submodule_name in graph_module.submodules:
+            submodule = _lookup(model, submodule_name)
+            if submodule is None or not hasattr(submodule, "parameters"):
+                continue
+            for tensor in list(submodule.parameters()) + list(submodule.buffers()):
+                if tensor.is_floating_point():
+                    tensor.fill_(float("nan"))
+
+
 def build_from_dumps(
     config: dict[str, Any],
     weights: dict[str, Any],
@@ -32,19 +71,23 @@ def build_from_dumps(
     Returns a callable with the same signature the traced submodule had, so the
     recorded arguments apply unchanged.
     """
-    from model_partition.runtime.standalone import build_structure_only, load_run
+    from model_partition.runtime.standalone import load_run
     from model_partition.trace import _lookup
 
     if run_dir is None or not module_ids:
         raise BaselineError("build_from_dumps needs a run directory and module ids")
 
     run = load_run(run_dir)
-    module_id = next((m for m in module_ids if _in_graph(run.graph, m)), None)
+    module_id = _module_for_weights(run.graph, module_ids, weights)
     if module_id is None:
-        raise BaselineError(f"None of {module_ids} are in the plan at {run_dir}")
+        raise BaselineError(
+            f"Could not tell which of {module_ids} these weights belong to; "
+            f"keys look like {next(iter(weights), '(none supplied)')}"
+        )
     graph_module = run.graph.by_id(module_id)
 
-    model = build_structure_only(run.spec, device=device)
+    model = _structure(run, device)
+    _poison(model, graph_module)
     applied = _apply_named(model, graph_module, weights)
     if not applied:
         raise BaselineError(
@@ -76,12 +119,26 @@ def build_from_dumps(
     return run_sequence
 
 
-def _in_graph(graph: Any, module_id: str) -> bool:
-    try:
-        graph.by_id(module_id)
-    except KeyError:
-        return False
-    return True
+def _module_for_weights(graph: Any, module_ids: list[str],
+                        weights: dict[str, Any]) -> str | None:
+    """Which module of a group these weights belong to.
+
+    One implementation serves every module sharing a signature, so the group alone
+    does not say *which* instance is being run — layers 4-6 and layers 0-2 use the
+    same code. The weight names do say: they are original parameter names, so the
+    module whose submodules prefix the most of them is the one.
+    """
+    best: tuple[int, str] | None = None
+    for module_id in module_ids:
+        try:
+            module = graph.by_id(module_id)
+        except KeyError:
+            continue
+        matches = sum(1 for key in weights
+                      if any(key.startswith(f"{s}.") or key == s for s in module.submodules))
+        if matches and (best is None or matches > best[0]):
+            best = (matches, module_id)
+    return best[1] if best else None
 
 
 def _apply_named(model: Any, graph_module: Any, weights: dict[str, Any]) -> int:

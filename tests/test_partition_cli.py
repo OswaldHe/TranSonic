@@ -4,7 +4,6 @@
 """Tests for the partition CLI and its registration under autohelix."""
 
 import json
-from pathlib import Path
 
 import pytest
 import yaml
