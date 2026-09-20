@@ -183,7 +183,8 @@ def emulate(
 
         if check_boundaries and not outcome.error:
             outcome.boundary_checks = _check_boundaries(
-                sink, bundle, graph, item.sample_id, device, tolerance,
+                sink, bundle, graph, item.sample_id, device,
+                tolerance or Tolerance.accumulated(),
             )
 
         if outcome.token_ids:

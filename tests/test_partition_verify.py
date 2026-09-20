@@ -294,3 +294,28 @@ def test_modules_are_returned_to_the_host_after_verification(tiny_run):
     verify_modules(lambda: model, tiny_run.bundle, tiny_run.graph,
                    model_device="cpu", module_device="cuda")
     assert all(p.device.type == "cpu" for p in model.parameters())
+
+
+def test_accumulated_tolerance_is_looser_than_single_step():
+    """A boundary many layers deep accumulates bf16 drift by construction."""
+    single = Tolerance.for_dtype("bfloat16")
+    deep = Tolerance.accumulated("bfloat16")
+    assert deep.min_pass_fraction < single.min_pass_fraction
+    assert deep.min_cosine < single.min_cosine
+    assert deep.rtol > single.rtol
+
+
+def test_accumulated_tolerance_accepts_realistic_depth_drift():
+    """The 27B case: 0.996 of elements within tolerance at layer 31."""
+    reference = torch.randn(4096, dtype=torch.float32)
+    actual = reference.clone()
+    drifted = torch.randperm(reference.numel())[:16]
+    actual[drifted] += 0.5
+    assert not compare(actual, reference, "deep", Tolerance.for_dtype("bfloat16")).passed
+    assert compare(actual, reference, "deep", Tolerance.accumulated()).passed
+
+
+def test_accumulated_tolerance_still_rejects_a_wrong_tensor():
+    reference = torch.randn(4096)
+    assert not compare(reference * 1.5, reference, "wrong", Tolerance.accumulated()).passed
+    assert not compare(-reference, reference, "flipped", Tolerance.accumulated()).passed

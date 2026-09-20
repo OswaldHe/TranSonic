@@ -40,6 +40,28 @@ class Tolerance:
         rtol, atol = TOLERANCES.get(dtype, DEFAULT_TOLERANCE)
         return cls(rtol=rtol, atol=atol, **overrides)
 
+    @classmethod
+    def accumulated(cls, dtype: str = "bfloat16") -> Tolerance:
+        """Bar for a tensor many layers deep in a whole-model forward.
+
+        Replaying one module against its own recorded input is a single step and
+        should be near-exact. A module *boundary* observed during end-to-end
+        emulation is the product of every layer before it, so bf16 rounding
+        accumulates — and trace and emulation need not have run with identical
+        device placement, which shifts kernel selection and accumulation order.
+
+        Cosine is the discriminator here, not the elementwise pass fraction. Deep
+        in a 64-layer stack the residual stream is large, so a *relative* per-element
+        tolerance is uninformative: a measured-good boundary at layer 63 had only
+        64% of elements within 2e-2 yet cosine 0.9997, while a genuine wiring
+        error — comparing a layer group against the wrong submodule's output —
+        scored cosine 0.707. The pass fraction is kept as a coarse floor and is
+        still reported for diagnosis.
+        """
+        rtol, atol = TOLERANCES.get(dtype, DEFAULT_TOLERANCE)
+        return cls(rtol=rtol * 2, atol=atol * 2,
+                   min_pass_fraction=0.50, min_cosine=0.999)
+
 
 @dataclass
 class Comparison:
