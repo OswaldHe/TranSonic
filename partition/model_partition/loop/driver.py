@@ -214,13 +214,18 @@ class PartitionLoop:
             self.report(f"\nSampled tokens: {ctx.layout.tokens_file}")
 
     def _run_stages(self, ctx: LoopContext, state: LoopState) -> tuple[str, StageResult] | None:
-        """Run every stage in order; return the first failure, or None."""
+        """Run every stage in order; return the first failure, or None.
+
+        State is persisted after each stage, not just at the end: tracing is
+        expensive enough that an interrupted run must not have to redo it.
+        """
         for name in STAGES:
             runner, hasher = STAGE_FUNCTIONS[name]
             try:
                 stage_hash = content_hash(*hasher(ctx))
             except Exception as exc:
                 state.mark(name, FAILED, detail=f"could not hash inputs: {exc}")
+                state.save(ctx.layout.state_file)
                 return name, StageResult(ok=False, detail=f"could not hash inputs: {exc}")
 
             if state.is_fresh(name, stage_hash) and self._rehydrate(ctx, name):
@@ -236,12 +241,14 @@ class PartitionLoop:
                 elapsed = time.time() - started
                 detail = f"{type(exc).__name__}: {exc}"
                 state.mark(name, FAILED, stage_hash, detail, duration_s=elapsed)
+                state.save(ctx.layout.state_file)
                 self.report(f"  {name:<15} FAIL  {detail}")
                 return name, StageResult(ok=False, detail=detail, repairable=(name != "ingest"))
 
             elapsed = time.time() - started
             state.mark(name, OK if result.ok else FAILED, stage_hash,
                        result.detail, result.metrics, elapsed)
+            state.save(ctx.layout.state_file)
             marker = "ok" if result.ok else "FAIL"
             self.report(f"  {name:<15} {marker:<5} {result.detail}  ({elapsed:.1f}s)")
             if not result.ok:

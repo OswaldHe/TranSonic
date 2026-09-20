@@ -388,3 +388,59 @@ def test_failed_refinement_keeps_the_seed_plan(tiny_run, tmp_path, monkeypatch):
                       use_agent_planner=True).run()
     assert result.passed
     assert any("refinement failed" in note for note in result.context.notes)
+
+
+def test_state_is_persisted_after_each_stage(tiny_run, tmp_path, monkeypatch):
+    """An interrupted run must not have to redo tracing."""
+    from model_partition.loop import stages as stages_module
+    from model_partition.loop.state import LoopState
+
+    loop = loop_for(tiny_run, tmp_path, retain=False)
+    ctx = loop.build_context()
+
+    original = stages_module.stage_verify_modules
+    seen: dict[str, str] = {}
+
+    def failing(inner_ctx):
+        # By the time a later stage runs, the earlier ones are already on disk.
+        saved = LoopState.load(inner_ctx.layout.state_file)
+        seen["trace"] = saved.record("trace").status
+        seen["ingest"] = saved.record("ingest").status
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(stages_module, "stage_verify_modules", failing)
+    monkeypatch.setitem(stages_module.STAGE_FUNCTIONS, "verify_modules",
+                        (failing, stages_module.hash_verify))
+    try:
+        result = loop_for(tiny_run, tmp_path, retain=False).run()
+    finally:
+        monkeypatch.setitem(stages_module.STAGE_FUNCTIONS, "verify_modules",
+                            (original, stages_module.hash_verify))
+    assert not result.passed
+    assert seen == {"trace": "ok", "ingest": "ok"}
+    del ctx
+
+
+def test_an_interrupted_run_reuses_its_trace(tiny_run, tmp_path):
+    """The stage after an interruption starts from the persisted trace."""
+    from model_partition.loop import stages as stages_module
+    from model_partition.loop.state import LoopState
+
+    original = stages_module.STAGE_FUNCTIONS["verify_modules"]
+    stages_module.STAGE_FUNCTIONS["verify_modules"] = (
+        lambda ctx: (_ for _ in ()).throw(RuntimeError("interrupted")),
+        original[1],
+    )
+    try:
+        first = loop_for(tiny_run, tmp_path, retain=False).run()
+        assert not first.passed
+        saved = LoopState.load(first.context.layout.state_file)
+        assert saved.record("trace").status == "ok"
+    finally:
+        stages_module.STAGE_FUNCTIONS["verify_modules"] = original
+
+    messages: list[str] = []
+    second = loop_for(tiny_run, tmp_path, retain=False)
+    second.report = messages.append
+    assert second.run().passed
+    assert any("trace" in m and "cached" in m for m in messages)

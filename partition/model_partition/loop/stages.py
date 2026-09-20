@@ -578,10 +578,12 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     ctx.bundle = bundle
     judge = ctx.judge or StubJudge()
     eos = getattr(ctx.tokenizer, "eos_token_id", None)
-    # Emulation overwrites parameters with dumped values, so the model must be on
-    # a single writable device: layer placement leaves host-assigned layers on
-    # meta. The GPU when the model fits, the host otherwise.
+    # Emulation overwrites parameters with dumped values, so the model is
+    # assembled on a single writable device — layer placement would leave
+    # host-assigned layers on meta. Once assembled it is dispatched across GPU and
+    # host so generation still uses the accelerator.
     device = _host_device(ctx)
+    _, place_max_memory = ctx.placement() if device == "cpu" else (None, None)
 
     report = emulate(
         ctx.build_model, bundle, ctx.graph,
@@ -590,7 +592,7 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
         judge=judge, max_new_tokens=ctx.options.max_new_tokens,
         temperature=ctx.options.temperature, seed=ctx.options.seed,
         eos_token_id=eos, device=device, min_score=ctx.options.min_judge_score,
-        strict_fill=True,
+        strict_fill=True, place_max_memory=place_max_memory,
     )
     ctx.emulate_report = report
     (ctx.layout.reports_dir / "emulate.json").write_text(json.dumps(report.to_dict(), indent=2))

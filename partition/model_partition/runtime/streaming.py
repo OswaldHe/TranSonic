@@ -97,6 +97,34 @@ def fill_from_dumps(
     return report
 
 
+def place_across_devices(model: Any, max_memory: dict) -> tuple[Any, str]:
+    """Spread an already-materialized model across GPU and host for the forward.
+
+    Assembling from dumps needs writable parameters, which rules out loading with
+    a device map. Dispatching afterwards gets the GPU back: the weights already
+    exist, so placement only decides where each layer runs. Returns
+    ``(model, input_device)``; on any failure the model is left untouched on its
+    current device.
+    """
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+    except ImportError:
+        return model, _first_param_device(model)
+    try:
+        device_map = infer_auto_device_map(model, max_memory=max_memory)
+        placed = dispatch_model(model, device_map=device_map)
+    except Exception:
+        return model, _first_param_device(model)
+    return placed, _first_param_device(placed)
+
+
+def _first_param_device(model: Any) -> str:
+    try:
+        return str(next(model.parameters()).device)
+    except StopIteration:
+        return "cpu"
+
+
 def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[str, Any]]:
     """Hook every partitioned module to record its output on the *first* forward.
 

@@ -25,6 +25,7 @@ from model_partition.runtime.streaming import (
     capture_boundaries,
     fill_from_dumps,
     generate,
+    place_across_devices,
 )
 from model_partition.verify.judge import Judge, StubJudge, Verdict
 from model_partition.verify.modules import plan_owned_parameters, poison_parameters
@@ -148,21 +149,21 @@ def emulate(
     min_score: int = 4,
     strict_fill: bool = True,
     check_boundaries: bool = True,
-    move_model: bool = True,
+    place_max_memory: dict | None = None,
 ) -> EmulationReport:
     """Assemble from dumps, generate, and judge.
 
-    ``move_model=False`` leaves an already-placed model alone: a model spread
-    across GPU and host must not be collapsed onto one device.
+    ``place_max_memory`` spreads the assembled model across GPU and host for the
+    generation pass, for a model too large to hold on the GPU whole.
     """
     judge = judge or StubJudge()
     report = EmulationReport(min_score=min_score)
 
-    model = build_model()
-    if move_model:
-        model, device = move_to_device(model, device)
+    model, device = move_to_device(build_model(), device)
     poison_parameters(model, only=plan_owned_parameters(model, graph))
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
+    if place_max_memory:
+        model, device = place_across_devices(model, place_max_memory)
 
     for item in inputs:
         outcome = EmulationOutcome(sample_id=item.sample_id, prompt=item.prompt)
