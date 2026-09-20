@@ -160,6 +160,22 @@ def test_boundary_checks_compare_against_the_right_record(tiny_run):
     assert all(c.passed for o in report.outcomes for c in o.boundary_checks)
 
 
+def test_emulated_tokens_match_the_pristine_model_exactly(tiny_run):
+    """The point of the whole pipeline: a model assembled from dumps must
+    generate the same tokens as the original."""
+    pristine = tiny_run.build_model()
+    items = inputs_for(tiny_run)
+    expected = {
+        item.sample_id: generate(pristine, item.input_ids, max_new_tokens=6)[0]
+        for item in items
+    }
+    report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                     inputs=items, judge=AcceptAll(), max_new_tokens=6)
+    assert report.passed, report.render()
+    for outcome in report.outcomes:
+        assert outcome.token_ids == expected[outcome.sample_id], outcome.sample_id
+
+
 def test_a_rejecting_judge_fails_the_report(tiny_run):
     report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
                      inputs=inputs_for(tiny_run), judge=RejectAll(), max_new_tokens=2)

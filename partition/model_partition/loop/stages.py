@@ -64,6 +64,8 @@ class LoopOptions:
     retention_layers: tuple[int, ...] = (1, 5)
     trace_device: str | None = None
     strict_storage: bool = True
+    #: Re-run a completed run even though retention already pruned its artifacts.
+    force: bool = False
 
     def dump_policy(self) -> DumpPolicy:
         return DumpPolicy(
@@ -396,6 +398,12 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
     assert ctx.graph is not None and ctx.build_model is not None
     bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
     ctx.bundle = bundle
+    if bundle.metadata.get("retention"):
+        kept = bundle.metadata["retention"].get("kept_layers")
+        ctx.notes.append(
+            f"trace was pruned to layers {kept}; verification covers the kept "
+            "modules only. Re-trace for full coverage."
+        )
     device = _compute_device(ctx)
     report = verify_modules(
         ctx.build_model, bundle, ctx.graph, device=device,

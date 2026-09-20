@@ -197,8 +197,10 @@ def plan_only(target: str, config: Path | None, **kwargs: Any) -> None:
 @click.option("--no-retain", is_flag=True, default=False, help="Keep all traced layers")
 @click.option("--allow-overflow", is_flag=True, default=False,
               help="Warn instead of failing when projected artifacts exceed disk")
+@click.option("--force", is_flag=True, default=False,
+              help="Re-run even if this run already passed and was pruned")
 def run_loop(target: str, config: Path | None, iterations: int | None, no_agent: bool,
-             no_retain: bool, allow_overflow: bool, **kwargs: Any) -> None:
+             no_retain: bool, allow_overflow: bool, force: bool, **kwargs: Any) -> None:
     """Run the partition loop until verification passes."""
     from model_partition.loop.driver import PartitionLoop
 
@@ -213,6 +215,7 @@ def run_loop(target: str, config: Path | None, iterations: int | None, no_agent:
         use_agent_planner=False if no_agent else None,
         retain=False if no_retain else None,
         strict_storage=False if allow_overflow else None,
+        force=True if force else None,
         **kwargs,
     )
     result = PartitionLoop(spec=spec, options=options).run()

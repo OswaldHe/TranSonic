@@ -135,6 +135,9 @@ class PartitionLoop:
         self.report(f"gpu       : {ctx.budget.gpu.name if ctx.budget.gpu else 'none'}"
                     f"  per-module budget {format_bytes(ctx.budget.usable_bytes)}")
 
+        if (short_circuit := self._already_complete(ctx, state)) is not None:
+            return short_circuit
+
         last_failure: tuple[str, StageResult] | None = None
         for iteration in range(1, self.options.max_iterations + 1):
             state.iteration = iteration
@@ -172,6 +175,32 @@ class PartitionLoop:
         return LoopResult(passed=False, state=state, context=ctx,
                           iterations=state.iteration, error=f"{stage}: {detail}",
                           summary_path=ctx.layout.summary_file)
+
+    def _already_complete(self, ctx: LoopContext, state: LoopState) -> LoopResult | None:
+        """Short-circuit a run that already passed and had its artifacts pruned.
+
+        Retention deletes the dumps for non-representative layers, so re-running
+        verification against the pruned trace would fail for a reason that has
+        nothing to do with correctness. ``--force`` re-runs anyway.
+        """
+        if self.options.force or not state.passed:
+            return None
+        retention = state.record("retain").metrics
+        if not retention.get("kept_layers"):
+            return None
+        self.report(
+            f"\nThis run already passed (iteration {state.iteration}) and its artifacts "
+            f"were pruned to layers {retention['kept_layers']}.\n"
+            f"Nothing to do. Pass --force to re-run, or --no-retain on a fresh run "
+            f"to keep every layer's artifacts."
+        )
+        self._print_tokens_from_disk(ctx)
+        return LoopResult(passed=True, state=state, context=ctx,
+                          iterations=state.iteration, summary_path=ctx.layout.summary_file)
+
+    def _print_tokens_from_disk(self, ctx: LoopContext) -> None:
+        if ctx.layout.tokens_file.is_file():
+            self.report(f"\nSampled tokens: {ctx.layout.tokens_file}")
 
     def _run_stages(self, ctx: LoopContext, state: LoopState) -> tuple[str, StageResult] | None:
         """Run every stage in order; return the first failure, or None."""
