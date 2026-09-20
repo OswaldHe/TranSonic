@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from model_partition.hardware import move_to_device
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import (
     TraceBundle,
@@ -26,7 +27,7 @@ from model_partition.runtime.streaming import (
     generate,
 )
 from model_partition.verify.judge import Judge, StubJudge, Verdict
-from model_partition.verify.modules import poison_parameters
+from model_partition.verify.modules import plan_owned_parameters, poison_parameters
 from model_partition.verify.numerics import Comparison, Tolerance, compare
 
 
@@ -81,6 +82,7 @@ class EmulationReport:
     def passed(self) -> bool:
         return bool(self.outcomes) and all(o.passed(self.min_score) for o in self.outcomes)
 
+    @property
     def failures(self) -> list[EmulationOutcome]:
         return [o for o in self.outcomes if not o.passed(self.min_score)]
 
@@ -103,7 +105,7 @@ class EmulationReport:
                 lines.append(f"    {comparison.summary()}")
             if outcome.verdict and outcome.verdict.reason:
                 lines.append(f"    judge: {outcome.verdict.reason}")
-        lines.append(f"{len(self.outcomes) - len(self.failures())}/{len(self.outcomes)} samples passed")
+        lines.append(f"{len(self.outcomes) - len(self.failures)}/{len(self.outcomes)} samples passed")
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -111,7 +113,7 @@ class EmulationReport:
             "passed": self.passed,
             "mean_score": self.mean_score(),
             "n_samples": len(self.outcomes),
-            "n_failed": len(self.failures()),
+            "n_failed": len(self.failures),
             "fill": {
                 "applied": self.fill.applied,
                 "missing": self.fill.missing[:32],
@@ -151,8 +153,8 @@ def emulate(
     judge = judge or StubJudge()
     report = EmulationReport(min_score=min_score)
 
-    model = build_model()
-    poison_parameters(model)
+    model, device = move_to_device(build_model(), device)
+    poison_parameters(model, only=plan_owned_parameters(model, graph))
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
 
     for item in inputs:
@@ -173,7 +175,7 @@ def emulate(
 
         if check_boundaries and not outcome.error:
             outcome.boundary_checks = _check_boundaries(
-                sink, bundle, item.sample_id, device, tolerance,
+                sink, bundle, graph, item.sample_id, device, tolerance,
             )
 
         if outcome.token_ids:
@@ -186,6 +188,7 @@ def emulate(
 def _check_boundaries(
     sink: dict[str, Any],
     bundle: TraceBundle,
+    graph: PartitionGraph,
     sample_id: str,
     device: str,
     tolerance: Tolerance | None,
@@ -193,20 +196,27 @@ def _check_boundaries(
     """Compare captured module outputs against the traced ones.
 
     Only the first forward is compared: later generation steps run on a longer
-    sequence than the trace recorded.
+    sequence than the trace recorded. The hook fires on the module's *last*
+    submodule, so the matching record is that submodule's, not the group's first.
     """
     comparisons: list[Comparison] = []
     for module_id, observed in sink.items():
         records = bundle.select(module_id=module_id, sample_id=sample_id, step=0)
         if not records:
             continue
-        reference = first_tensor(expected_output(records[0], bundle.store, device=device))
+        try:
+            last_submodule = graph.by_id(module_id).submodules[-1]
+        except (KeyError, IndexError):
+            last_submodule = records[-1].submodule
+        matching = [r for r in records if r.submodule == last_submodule] or records[-1:]
+        record = matching[-1]
+        reference = first_tensor(expected_output(record, bundle.store, device=device))
         actual = first_tensor(observed)
         if reference is None or actual is None:
             continue
         if tuple(actual.shape) != tuple(reference.shape):
             # A sliced long-context dump covers only head+tail positions.
-            actual = _match_slice(actual, reference, records[0], bundle)
+            actual = _match_slice(actual, reference, record, bundle)
         comparisons.append(compare(actual, reference, f"boundary:{module_id}", tolerance))
     return comparisons
 

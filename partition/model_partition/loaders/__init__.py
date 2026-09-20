@@ -21,10 +21,10 @@ def build_loader(result) -> ModelLoader:
     if result.loader == "repo_code":
         return RepoCodeLoader(
             root=result.root,
-            entry=spec.entry or "",
+            entry=result.entry or spec.entry or "",
             config=result.config,
             dtype=spec.dtype,
-            code_paths=tuple(spec.code_paths),
+            code_paths=tuple(result.code_paths or spec.code_paths),
             trust_remote_code=spec.trust_remote_code,
         )
     if result.loader == "transformers":

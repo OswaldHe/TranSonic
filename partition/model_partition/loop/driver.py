@@ -64,6 +64,8 @@ class PartitionLoop:
     spec: ModelSpec
     options: LoopOptions = field(default_factory=LoopOptions)
     report: Reporter = _print
+    #: Overrides ``options.judge_kind``. Lets callers and tests supply their own.
+    judge: Any = None
 
     def build_context(self) -> LoopContext:
         layout = RunLayout.create(self.spec.slug, self.options.artifact_root).ensure()
@@ -75,17 +77,11 @@ class PartitionLoop:
         ctx = LoopContext(spec=self.spec, layout=layout, options=self.options, budget=budget)
         ctx.judge = self._build_judge()
         ctx.build_model = self._model_builder(ctx)
+        ctx.build_meta_model = self._meta_builder(ctx)
         return ctx
 
-    def _build_judge(self):
-        from model_partition.verify.judge import build_judge
-
-        if self.options.judge_kind == "claude":
-            return build_judge("claude", model=self.options.judge_model)
-        return build_judge(self.options.judge_kind)
-
-    def _model_builder(self, ctx: LoopContext) -> Callable[[], Any]:
-        """Lazily build the model, reusing the resolved ingest result."""
+    def _meta_builder(self, ctx: LoopContext) -> Callable[[], Any]:
+        """Structure-only builder: no weights, so it works for any model size."""
 
         def build():
             from model_partition.ingest import ingest
@@ -93,6 +89,36 @@ class PartitionLoop:
 
             result = ctx.result or ingest(ctx.spec)
             ctx.result = result
+            return build_loader(result).build_meta().model
+
+        return build
+
+    def _build_judge(self):
+        from model_partition.verify.judge import build_judge
+
+        if self.judge is not None:
+            return self.judge
+        if self.options.judge_kind == "claude":
+            return build_judge("claude", model=self.options.judge_model)
+        return build_judge(self.options.judge_kind)
+
+    def _model_builder(self, ctx: LoopContext) -> Callable[[], Any]:
+        """Lazily build the model, fetching weights the first time it is needed."""
+        fetched = {"done": False}
+
+        def build():
+            from model_partition.ingest import ensure_weights, ingest
+            from model_partition.loaders import build_loader
+
+            result = ctx.result or ingest(ctx.spec)
+            ctx.result = result
+            if not fetched["done"]:
+                missing = result.missing_shards()
+                if missing:
+                    self.report(f"  fetching {len(missing)} weight shard(s)"
+                                f" ({format_bytes(sum(result.index.shard_bytes[s] for s in missing))})")
+                ensure_weights(result)
+                fetched["done"] = True
             return build_loader(result).build().model
 
         return build
@@ -181,10 +207,16 @@ class PartitionLoop:
         return None
 
     def _rehydrate(self, ctx: LoopContext, name: str) -> bool:
-        """Reload what a cached stage would have produced. False forces a re-run."""
+        """Reload what a cached stage would have produced. False forces a re-run.
+
+        Ingest is metadata-only and cheap, but later stages depend on the context
+        it populates, so a fresh process must re-run it rather than skip it.
+        """
         from model_partition.planner.graph import PartitionGraph
         from model_partition.runtime.module_runner import TraceBundle
 
+        if name == "ingest":
+            return ctx.result is not None and ctx.inventory is not None and bool(ctx.samples)
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)

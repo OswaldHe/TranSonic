@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import yaml
 
-from model_partition.hardware import MemoryBudget, format_bytes
+from model_partition.hardware import MemoryBudget, format_bytes, move_to_device
 from model_partition.inputs import SampleInput, load_input_set, summarize
 from model_partition.ingest import IngestResult, ingest
 from model_partition.layout import RunLayout
@@ -110,6 +110,7 @@ class LoopContext:
     tokenizer: Any = None
     judge: Judge | None = None
     build_model: Callable[[], Any] | None = None
+    build_meta_model: Callable[[], Any] | None = None
     verify_report: Any = None
     emulate_report: Any = None
     retention: Any = None
@@ -138,10 +139,16 @@ def stage_ingest(ctx: LoopContext) -> StageResult:
         vocab_size=ctx.inventory.vocab_size or None,
     )
     short, long = ctx.spec.inputs.resolve(ctx.spec.base_dir())
-    ctx.samples = load_input_set(
-        short, long, ctx.tokenizer,
-        max_short=ctx.spec.inputs.max_short, max_long=ctx.spec.inputs.max_long,
-    )
+    if short or long:
+        ctx.samples = load_input_set(
+            short, long, ctx.tokenizer,
+            max_short=ctx.spec.inputs.max_short, max_long=ctx.spec.inputs.max_long,
+        )
+    else:
+        # Planning only needs a sequence length, so a spec with no inputs can
+        # still be inspected and planned; tracing reports the gap instead.
+        ctx.samples = []
+        ctx.notes.append("spec declares no input set; tracing will have nothing to run")
 
     estimate = _storage_estimate(ctx)
     warnings = preflight(estimate, strict=ctx.options.strict_storage)
@@ -215,32 +222,61 @@ def _host(ctx: LoopContext):
 
 
 def stage_plan(ctx: LoopContext) -> StageResult:
-    """Produce (or reuse) the partition graph."""
+    """Produce (or reuse) the partition graph, reconciled against the model."""
     assert ctx.inventory is not None and ctx.result is not None
+    reused = False
+    graph: PartitionGraph | None = None
     if ctx.layout.graph_path.is_file():
         try:
             graph = PartitionGraph.load(ctx.layout.graph_path)
             graph.validate(ctx.budget.usable_bytes)
-            ctx.graph = graph
-            return StageResult(ok=True, detail=f"reused plan: {len(graph.partitioned_modules)} modules",
-                               metrics=_plan_metrics(graph))
+            reused = True
         except Exception as exc:
             ctx.notes.append(f"existing plan rejected, regenerating: {exc}")
+            graph = None
 
-    cost = CostModel.from_config(ctx.result.config, dtype_bytes=2, seq_len=ctx.seq_len)
-    graph = auto.plan(
-        ctx.inventory, ctx.budget.usable_bytes, ctx.options.plan_options(ctx.seq_len),
-        cost=cost, model_name=ctx.spec.source, revision=ctx.result.revision,
-    )
-    warnings = graph.validate(ctx.budget.usable_bytes)
-    ctx.notes.extend(warnings)
+    if graph is None:
+        cost = CostModel.from_config(ctx.result.config, dtype_bytes=2, seq_len=ctx.seq_len)
+        graph = auto.plan(
+            ctx.inventory, ctx.budget.usable_bytes, ctx.options.plan_options(ctx.seq_len),
+            cost=cost, model_name=ctx.spec.source, revision=ctx.result.revision,
+        )
+        ctx.notes.extend(graph.validate(ctx.budget.usable_bytes))
+
+    detail = f"{'reused' if reused else 'planned'} {len(graph.partitioned_modules)} modules"
+    reconcile = _reconcile(ctx, graph)
+    if reconcile is not None and (reconcile.changed or reconcile.unresolved):
+        detail += f"; {reconcile.summary()}"
+        if reconcile.unresolved:
+            ctx.notes.append(f"plan submodules not found in the model: "
+                             f"{', '.join(sorted(set(reconcile.unresolved))[:8])}")
+
     ctx.graph = graph
     graph.save(ctx.layout.graph_path)
-    _write_valid_submodules(ctx)
     return StageResult(ok=True, detail=(
-        f"{len(graph.partitioned_modules)} modules in "
-        f"{len(graph.signature_groups())} implementation groups"
+        f"{detail}; {len(graph.signature_groups())} implementation groups"
     ), metrics=_plan_metrics(graph))
+
+
+def _reconcile(ctx: LoopContext, graph: PartitionGraph):
+    """Remap plan submodule names onto the real module tree.
+
+    Uses the meta-device structure so no weights are needed.
+    """
+    from model_partition.planner.reconcile import reconcile_submodules
+
+    if ctx.build_meta_model is None:
+        return None
+    try:
+        model = ctx.build_meta_model()
+    except Exception as exc:
+        ctx.notes.append(f"could not instantiate structure for reconciliation: {exc}")
+        return None
+    report = reconcile_submodules(graph, model)
+    names = sorted(name for name, _ in model.named_modules() if name)
+    ctx.layout.plan_dir.mkdir(parents=True, exist_ok=True)
+    (ctx.layout.plan_dir / "valid_submodules.txt").write_text("\n".join(names) + "\n")
+    return report
 
 
 def hash_plan(ctx: LoopContext) -> list[Any]:
@@ -264,19 +300,6 @@ def _plan_metrics(graph: PartitionGraph) -> dict[str, Any]:
         "n_groups": len(graph.signature_groups()),
         "max_module_bytes": max((m.resident_bytes for m in graph.partitioned_modules), default=0),
     }
-
-
-def _write_valid_submodules(ctx: LoopContext) -> None:
-    """List hookable module names so the agent edits the plan against reality."""
-    if ctx.build_model is None:
-        return
-    try:
-        model = ctx.build_model()
-        names = sorted(name for name, _ in model.named_modules() if name)
-    except Exception as exc:
-        ctx.notes.append(f"could not enumerate submodules: {exc}")
-        return
-    (ctx.layout.plan_dir / "valid_submodules.txt").write_text("\n".join(names) + "\n")
 
 
 # -- stage: extract ----------------------------------------------------------
@@ -309,14 +332,12 @@ def hash_extract(ctx: LoopContext) -> list[Any]:
 def stage_trace(ctx: LoopContext) -> StageResult:
     """Capture real per-module IO and weights for every sample."""
     assert ctx.graph is not None and ctx.build_model is not None
-    device = ctx.options.trace_device or ctx.options.device
-    model = ctx.build_model()
-    try:
-        model = model.to(device)
-    except Exception as exc:
-        ctx.notes.append(f"tracing on cpu ({exc})")
-        device = "cpu"
-        model = model.to(device)
+    if not ctx.samples:
+        return StageResult(ok=False, detail=(
+            "no sample inputs: set inputs.short (and optionally inputs.long) in the spec"
+        ))
+    device = ctx.options.trace_device or _compute_device(ctx)
+    model, device = move_to_device(ctx.build_model(), device)
 
     store = TensorStore(ctx.layout.trace_dir)
     tracer = Tracer(model, ctx.graph, store, policy=ctx.options.dump_policy())
@@ -375,7 +396,11 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
     assert ctx.graph is not None and ctx.build_model is not None
     bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
     ctx.bundle = bundle
-    report = verify_modules(ctx.build_model, bundle, ctx.graph, device="cpu")
+    device = _compute_device(ctx)
+    report = verify_modules(
+        ctx.build_model, bundle, ctx.graph, device=device,
+        model_device=device,
+    )
     ctx.verify_report = report
     (ctx.layout.reports_dir / "verify.json").write_text(json.dumps(report.to_dict(), indent=2))
 
@@ -406,10 +431,45 @@ def hash_verify(ctx: LoopContext) -> list[Any]:
 
 
 def _trace_fingerprint(ctx: LoopContext) -> str:
+    """Content hash of the trace records.
+
+    Content rather than mtime, so the fingerprint survives copying a run
+    directory between machines and does not churn on a no-op rewrite.
+    """
     from model_partition.loop.state import content_hash
 
     records = ctx.layout.trace_dir / "records.yaml"
-    return content_hash(records.stat().st_mtime_ns, records.stat().st_size) if records.is_file() else ""
+    return content_hash(records.read_text()) if records.is_file() else ""
+
+
+def _compute_device(ctx: LoopContext) -> str:
+    """Device for replay and emulation.
+
+    Whole-model stages need the whole model resident, so a checkpoint larger than
+    the GPU runs on the host even when the per-module budget would fit.
+    """
+    requested = ctx.options.device or "cpu"
+    if not requested.startswith("cuda"):
+        return requested
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return "cpu"
+    except ImportError:
+        return "cpu"
+
+    needed = ctx.result.index.total_bytes if ctx.result else 0
+    gpu_total = ctx.budget.gpu.total_bytes if ctx.budget.gpu else 0
+    if needed and gpu_total and needed > gpu_total * 0.85:
+        ctx.notes.append(
+            f"whole-model stages on cpu: checkpoint {format_bytes(needed)} exceeds "
+            f"{format_bytes(gpu_total)} of GPU memory"
+        )
+        return "cpu"
+    return requested
+
+
 
 
 # -- stage: emulate ----------------------------------------------------------
@@ -422,14 +482,15 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     ctx.bundle = bundle
     judge = ctx.judge or StubJudge()
     eos = getattr(ctx.tokenizer, "eos_token_id", None)
+    device = _compute_device(ctx)
 
     report = emulate(
         ctx.build_model, bundle, ctx.graph,
-        inputs=[EmulationInput(s.id, s.tensor("cpu"), prompt=s.prompt) for s in ctx.samples],
+        inputs=[EmulationInput(s.id, s.tensor(device), prompt=s.prompt) for s in ctx.samples],
         decode=(lambda ids: ctx.tokenizer.decode(ids)) if ctx.tokenizer else None,
         judge=judge, max_new_tokens=ctx.options.max_new_tokens,
         temperature=ctx.options.temperature, seed=ctx.options.seed,
-        eos_token_id=eos, device="cpu", min_score=ctx.options.min_judge_score,
+        eos_token_id=eos, device=device, min_score=ctx.options.min_judge_score,
         strict_fill=True,
     )
     ctx.emulate_report = report
@@ -437,7 +498,7 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     _write_tokens(ctx, report)
 
     if not report.passed:
-        failures = report.failures()
+        failures = report.failures
         boundary_failures = sorted({
             c.name.removeprefix("boundary:")
             for o in failures for c in o.failed_boundaries()
@@ -456,7 +517,7 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
 def _emulate_metrics(report) -> dict[str, Any]:
     return {
         "n_samples": len(report.outcomes),
-        "n_failed": len(report.failures()),
+        "n_failed": len(report.failures),
         "mean_judge_score": report.mean_score(),
         "weights_filled": report.fill.applied if report.fill else 0,
     }

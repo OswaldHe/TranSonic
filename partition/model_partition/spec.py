@@ -39,6 +39,16 @@ def slugify(value: str) -> str:
     return _SLUG_RE.sub("-", value.strip().lower()).strip("-")
 
 
+def detect_entry(available_files: list[str]) -> str | None:
+    """First vendor-code marker present in a repo, if any.
+
+    Lets ``loader: auto`` pick ``repo_code`` and know which module to import,
+    so a bare repo id or directory needs no hand-written spec.
+    """
+    present = set(available_files)
+    return next((marker for marker in REPO_CODE_MARKERS if marker in present), None)
+
+
 @dataclass
 class InputSpec:
     """Sample input sets. Paths are relative to the spec file, or absolute."""
@@ -129,11 +139,7 @@ class ModelSpec:
         """
         if self.loader != "auto":
             return self.loader
-        present = set(available_files)
-        for marker in REPO_CODE_MARKERS:
-            if marker in present:
-                return "repo_code"
-        return "transformers"
+        return "repo_code" if detect_entry(available_files) else "transformers"
 
     # -- (de)serialization -----------------------------------------------------
 

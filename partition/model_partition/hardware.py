@@ -198,6 +198,20 @@ def resolve_budget(
                         usable_bytes=int(chosen.total_bytes * headroom))
 
 
+def move_to_device(model, device: str):
+    """Move a model, falling back to the host on OOM. Returns ``(model, device)``.
+
+    ``torch.cuda.OutOfMemoryError`` subclasses ``RuntimeError``, so one except
+    covers it and the allocator's other placement failures.
+    """
+    if device == "cpu":
+        return model.to("cpu"), "cpu"
+    try:
+        return model.to(device), device
+    except RuntimeError:
+        return model.to("cpu"), "cpu"
+
+
 def format_bytes(nbytes: float) -> str:
     """Human-readable byte count (base-1024), e.g. ``55.6 GiB``."""
     step = 1024.0

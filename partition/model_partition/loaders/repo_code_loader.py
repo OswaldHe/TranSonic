@@ -114,6 +114,10 @@ class RepoCodeLoader:
         return LoadedModel(model=model, config=self.config, dtype=self.dtype,
                            device="meta", meta=True, metadata={"loader": "repo_code"})
 
+    def build_config_only(self, device: str = "cpu") -> LoadedModel:
+        """Instantiate from config with real storage and normal initialization."""
+        return self.build(state_dict=None, device=device)
+
     def build(self, state_dict: dict[str, Any] | None = None, device: str = "cpu") -> LoadedModel:
         import torch
 

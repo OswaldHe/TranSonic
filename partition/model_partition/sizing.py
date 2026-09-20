@@ -190,8 +190,11 @@ class ModelInventory:
         excluded = {name: markers for name, markers in SUBTREE_MARKERS.items() if name not in include}
 
         def subtree_of(entry: TensorEntry) -> str | None:
+            # Match against a leading dot so a marker like ".mtp." also catches a
+            # top-level "mtp.norm.weight".
+            padded = f".{entry.name}"
             for name, markers in excluded.items():
-                if any(marker in entry.name for marker in markers):
+                if any(marker in padded for marker in markers):
                     return name
             return None
 

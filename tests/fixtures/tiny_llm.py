@@ -21,13 +21,15 @@ from pathlib import Path
 import torch
 from torch import nn
 
+#: Written into each generated repo as ``inference/model.py``. ``__REPO_ROOT__``
+#: is substituted with an absolute path so the generated repo works from any
+#: working directory. (Plain replacement, not str.format — the body has braces.)
 VENDOR_CODE = '''\
 """Reference implementation for the tiny test model."""
 
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, "__REPO_ROOT__")
 
 from tests.fixtures.tiny_llm import TinyCausalLM, TinyConfig
 
@@ -218,7 +220,10 @@ def write_tiny_repo(
     if with_vendor_code:
         inference = root / "inference"
         inference.mkdir(exist_ok=True)
-        (inference / "model.py").write_text(VENDOR_CODE)
+        project_root = Path(__file__).resolve().parents[2]
+        (inference / "model.py").write_text(
+            VENDOR_CODE.replace("__REPO_ROOT__", str(project_root))
+        )
     return root
 
 

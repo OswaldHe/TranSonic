@@ -25,6 +25,28 @@ class Tokenizer(Protocol):
     def decode(self, ids: list[int]) -> str: ...
 
 
+def _as_ids(value: Any) -> list[int]:
+    """Normalize tokenizer output to a flat list of ids.
+
+    Encoders return a bare list, a nested batch, or a BatchEncoding depending on
+    the call; iterating a BatchEncoding yields its *keys*, which silently
+    produces a 2-token "prompt".
+    """
+    if hasattr(value, "input_ids"):
+        value = value.input_ids
+    elif isinstance(value, dict):
+        if "input_ids" not in value:
+            raise TokenizerError(f"Tokenizer returned a mapping without input_ids: {list(value)}")
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], (list, tuple)):
+        value = value[0]
+    if not isinstance(value, (list, tuple)):
+        raise TokenizerError(f"Tokenizer returned an unusable type: {type(value).__name__}")
+    return [int(token) for token in value]
+
+
 @dataclass
 class HFTokenizer:
     """Wraps a transformers tokenizer, applying a chat template when present."""
@@ -35,11 +57,14 @@ class HFTokenizer:
 
     def encode(self, text: str, role: str = "raw") -> list[int]:
         if self.use_chat_template and role == "user" and getattr(self.impl, "chat_template", None):
-            return list(self.impl.apply_chat_template(
-                [{"role": "user", "content": text}],
-                add_generation_prompt=True, tokenize=True,
-            ))
-        return list(self.impl.encode(text, add_special_tokens=True))
+            try:
+                return _as_ids(self.impl.apply_chat_template(
+                    [{"role": "user", "content": text}],
+                    add_generation_prompt=True, tokenize=True,
+                ))
+            except Exception:
+                pass
+        return _as_ids(self.impl.encode(text, add_special_tokens=True))
 
     def decode(self, ids: list[int]) -> str:
         return self.impl.decode(ids, skip_special_tokens=True)
@@ -58,7 +83,7 @@ class RawTokenizer:
     eos_token_id: int | None = None
 
     def encode(self, text: str, role: str = "raw") -> list[int]:
-        return list(self.impl.encode(text).ids)
+        return _as_ids(self.impl.encode(text).ids)
 
     def decode(self, ids: list[int]) -> str:
         return self.impl.decode(ids)

@@ -64,20 +64,26 @@ def load_run(run_dir: str | Path) -> LoadedRun:
 
 
 def build_structure_only(spec, device: str = "cpu") -> Any:
-    """Instantiate the model's structure with uninitialized storage.
+    """Instantiate the model's structure without reading the checkpoint.
 
-    Meta-device construction reads only config and code, then ``to_empty`` gives
-    real (garbage) storage that dumped weights overwrite.
+    Prefers normal from-config initialization so non-persistent buffers (rotary
+    ``inv_freq``, masks) are correct; falls back to meta + ``to_empty`` when the
+    model is too large to initialize, in which case such buffers hold garbage and
+    only modules that receive everything through recorded arguments are reliable.
     """
     from model_partition.ingest import ingest
     from model_partition.loaders import build_loader
 
-    result = ingest(spec)
-    loaded = build_loader(result).build_meta()
-    model = loaded.model
-    model.to_empty(device=device)
-    model.eval()
-    return model
+    # No tensor inventory: structure comes from config and code only.
+    result = ingest(spec, with_index=False)
+    loader = build_loader(result)
+    try:
+        return loader.build_config_only(device=device).model
+    except Exception:
+        model = loader.build_meta().model
+        model.to_empty(device=device)
+        model.eval()
+        return model
 
 
 def replay_module(
@@ -96,10 +102,10 @@ def replay_module(
         raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
 
     if model is None:
-        from model_partition.verify.modules import poison_parameters
+        from model_partition.verify.modules import plan_owned_parameters, poison_parameters
 
         model = build_structure_only(run.spec, device=device)
-        poison_parameters(model)
+        poison_parameters(model, only=plan_owned_parameters(model, run.graph))
     apply_dumped_weights(model, run.bundle, module_id, graph_module, device=device)
 
     results: list[Comparison] = []

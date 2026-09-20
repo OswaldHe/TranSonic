@@ -61,9 +61,10 @@ def fill_from_dumps(
     claimed: set[str] = set()
 
     for module in graph.partitioned_modules:
+        # Do not skip a module with no dumped weights: if it owns parameters,
+        # every one of them is missing, and that must be reported rather than
+        # leaving them silently unclaimed.
         dumped = load_dumped_weights(bundle, module.id, device=device)
-        if not dumped:
-            continue
         count = 0
         for submodule_name in module.submodules:
             submodule = _lookup(model, submodule_name)
@@ -162,13 +163,15 @@ def generate(
     """
     import torch
 
+    from model_partition.trace import forward_no_cache
+
     extract = logits_of or (lambda out: out.logits if hasattr(out, "logits") else out)
     sequence = input_ids
     produced: list[int] = []
     logits = None
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = extract(model(sequence))
+            logits = extract(forward_no_cache(model, sequence))
             token = greedy_step(logits, temperature=temperature, seed=seed)
             produced.append(token)
             if eos_token_id is not None and token == eos_token_id:

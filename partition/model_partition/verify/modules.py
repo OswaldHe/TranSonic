@@ -24,17 +24,41 @@ from model_partition.runtime.module_runner import (
 from model_partition.verify.numerics import Comparison, Tolerance, compare
 
 
-def poison_parameters(model: Any, value: float = float("nan")) -> int:
-    """Fill every parameter and buffer with ``value``; returns how many."""
+def poison_parameters(model: Any, value: float = float("nan"),
+                      only: set[str] | None = None) -> int:
+    """Fill parameters and buffers with ``value``; returns how many.
+
+    With ``only``, restricted to those names. Poisoning everything is wrong for a
+    real model: non-persistent buffers such as rotary ``inv_freq`` are computed at
+    init and never appear in a checkpoint, so no dump can restore them and the
+    NaNs propagate.
+    """
     import torch
 
     count = 0
     with torch.no_grad():
-        for _, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            if only is not None and name not in only:
+                continue
             if tensor.is_floating_point():
                 tensor.fill_(value)
                 count += 1
     return count
+
+
+def plan_owned_parameters(model: Any, graph: PartitionGraph) -> set[str]:
+    """Names of parameters and buffers the plan's modules are responsible for."""
+    from model_partition.trace import _lookup
+
+    owned: set[str] = set()
+    for module in graph.partitioned_modules:
+        for submodule_name in module.submodules:
+            submodule = _lookup(model, submodule_name)
+            if submodule is None or not hasattr(submodule, "named_parameters"):
+                continue
+            for param_name, _ in list(submodule.named_parameters()) + list(submodule.named_buffers()):
+                owned.add(f"{submodule_name}.{param_name}" if param_name else submodule_name)
+    return owned
 
 
 @dataclass
@@ -116,12 +140,15 @@ def verify_modules(
     device: str = "cpu",
     tolerance: Tolerance | None = None,
     poison: bool = True,
+    model_device: str | None = None,
 ) -> VerifyReport:
     """Replay every module from its dumps and compare against the trace."""
     report = VerifyReport()
     model = build_model()
+    if model_device:
+        model = model.to(model_device)
     if poison:
-        poison_parameters(model)
+        poison_parameters(model, only=plan_owned_parameters(model, graph))
 
     wanted_modules = module_ids or bundle.module_ids()
     wanted_samples = sample_ids or bundle.sample_ids()

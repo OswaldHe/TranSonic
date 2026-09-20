@@ -93,6 +93,20 @@ def _contains_key(value: Any, key: str) -> bool:
     return False
 
 
+def forward_no_cache(model: Any, input_ids: Any) -> Any:
+    """Run a forward with caching disabled, falling back if unsupported.
+
+    A KV/hybrid cache object reaches each decoder layer's kwargs and cannot be
+    serialized or rebuilt, which would make every layer unreplayable. Disabling
+    the cache keeps recorded arguments to tensors and plain values. Nothing is
+    lost for tracing: the emulator re-runs the full prefill per step anyway.
+    """
+    try:
+        return model(input_ids, use_cache=False)
+    except TypeError:
+        return model(input_ids)
+
+
 def is_tensor(value: Any) -> bool:
     try:
         import torch
@@ -230,7 +244,7 @@ class Tracer:
             ))
         try:
             with torch.no_grad():
-                self.model(input_ids)
+                forward_no_cache(self.model, input_ids)
         finally:
             for handle in handles:
                 handle.remove()
