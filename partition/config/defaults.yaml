@@ -1,0 +1,38 @@
+# Defaults for the partition loop. Every key maps to a LoopOptions field and can
+# be overridden on the command line.
+loop:
+  # --- placement -------------------------------------------------------------
+  device: cuda              # device used for tracing; falls back to cpu if it fails
+  headroom: 0.60            # fraction of GPU memory one module may occupy
+  # gpu_memory_gib: 46      # plan for a GPU of this size without one attached
+
+  # --- partitioning ----------------------------------------------------------
+  # seq_len: 16384          # sizing sequence length (default: longest sample)
+  # max_layers_per_module: 4
+  one_layer_per_module: false
+  # experts_per_group: 8
+
+  # --- dumps -----------------------------------------------------------------
+  cache_weights: true       # persist per-module weight dumps
+  cache_dequant: true       # persist the bf16 mirror of fp8/fp4 weights
+  full_dumps: false         # true dumps long-context feature maps whole (large)
+  decode_steps: 4
+
+  # --- emulation and judging -------------------------------------------------
+  max_new_tokens: 32
+  temperature: 0.0          # 0 = greedy, reproducible
+  seed: 0
+  judge_kind: claude        # claude | stub (stub is offline)
+  # judge_model: <id>       # defaults to $ANTHROPIC_DEFAULT_SONNET_MODEL
+  min_judge_score: 4
+
+  # --- loop ------------------------------------------------------------------
+  max_iterations: 5
+  use_agent_planner: true
+  # agent_model: <id>
+  agent_timeout_seconds: 1800
+  strict_storage: true      # fail rather than run out of disk mid-trace
+
+  # --- retention (applied after the loop passes) -----------------------------
+  retain: true
+  retention_layers: [1, 5]  # plus first, middle, last, and one per signature

@@ -43,6 +43,14 @@ examples = [
     "scipy>=1.10",
     "scikit-learn>=1.4",
 ]
+# Model partitioning / tracing / verification (partition/, `autohelix partition`)
+partition = [
+    "torch>=2.4",
+    "safetensors>=0.4",
+    "transformers>=4.45",
+    "huggingface-hub>=0.25",
+    "numpy>=1.20",
+]
 
 [project.scripts]
 autohelix = "autohelix.cli:main"

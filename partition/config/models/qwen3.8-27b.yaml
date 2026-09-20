@@ -1,0 +1,22 @@
+# Primary development target: 27.8 B params, ~51.7 GiB bf16 — larger than one
+# L40S (46 GiB), so partitioning is mandatory. 64 layers with two distinct layer
+# signatures (linear attention 3:1 with full attention), which the seed planner
+# resolves into ~32 modules sharing 5 implementations. Same hidden size (5120)
+# as DeepSeek V4.1, so module shapes rehearse the real target.
+name: qwen3.8-27b
+source: hf:Qwen/Qwen3.8-27B
+loader: auto
+dtype: bfloat16
+trust_remote_code: false
+
+scope:
+  vision: false     # 878 MiB vision tower, recorded but out of scope
+  mtp: false
+  engram: false
+
+inputs:
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  long_token_budgets: [2048, 8192, 16384]
+  max_short: 4
+  max_long: 3

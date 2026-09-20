@@ -1,0 +1,30 @@
+# Quantization rehearsal for the DeepSeek line: text-only, fp8 weights with
+# fp4-packed experts, ~291 GB on disk (fits the 465 GB volume). Ships its own
+# reference implementation under inference/, which the loader prefers over
+# transformers -- transformers has no deepseek_v4 text+MoE path for this repo.
+name: deepseek-v4-flash
+source: hf:deepseek-ai/DeepSeek-V4-Flash
+loader: repo_code
+entry: inference/model.py
+code_paths: [inference]
+config_file: inference/config.json
+dtype: bfloat16
+trust_remote_code: true     # required: importing inference/model.py runs repo code
+
+scope:
+  vision: false
+  mtp: false
+  engram: false
+
+inputs:
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  max_short: 2
+  max_long: 1
+
+overrides:
+  cache_dequant: false      # a bf16 mirror of 291 GB of fp8/fp4 will not fit
+
+notes: |
+  Not yet exercised end to end. Requires fp8 block dequantization (weight_block_size
+  32x32, ue8m0 scales) and fp4 expert unpacking to run on an L40S.

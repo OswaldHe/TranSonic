@@ -1,0 +1,24 @@
+# Smoke-test model: small enough to run the whole loop in minutes on one L40S.
+# Hybrid stack (linear attention 3:1 with full attention), MTP layer, tied
+# embeddings, and a vision tower that stays out of scope.
+name: qwen3.5-0.8b
+source: hf:Qwen/Qwen3.5-0.8B
+loader: auto            # no vendor inference code in this repo -> transformers
+dtype: bfloat16
+trust_remote_code: false
+
+scope:
+  vision: false
+  mtp: false
+  engram: false
+
+inputs:
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  long_token_budgets: [2048, 8192, 16384]
+  max_short: 4
+  max_long: 3
+
+notes: |
+  0.87 B parameters, ~1.7 GiB bf16 — fits entirely on one L40S, so the partition
+  here is driven by kernel-development convenience rather than capacity.

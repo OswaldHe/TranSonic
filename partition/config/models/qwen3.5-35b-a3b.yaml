@@ -1,0 +1,22 @@
+# MoE rehearsal: 36 B params, ~71.9 GiB bf16. Exercises expert-group
+# partitioning and routing capture ahead of the DeepSeek target.
+name: qwen3.5-35b-a3b
+source: hf:Qwen/Qwen3.5-35B-A3B
+loader: auto
+dtype: bfloat16
+trust_remote_code: false
+
+scope:
+  vision: false
+  mtp: false
+  engram: false
+
+inputs:
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  max_short: 3
+  max_long: 2
+
+notes: |
+  Weights exceed the GPU but fit host RAM (124 GiB) and disk, so tracing runs
+  with the model resident on CPU and modules moved to the GPU as needed.

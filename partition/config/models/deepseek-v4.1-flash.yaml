@@ -1,0 +1,50 @@
+# The ultimate deployment target. Kept as a specification only: disabled until
+# the storage and quantization work lands.
+#
+# 763 B reported params, ~765 GB on disk (fp8_e4m3 204 GB + int8-packed fp4
+# experts 557 GB + bf16 2 GB), 48 shards -- more than the 465 GB local volume,
+# so it needs shard-stream-and-evict or a larger volume.
+#
+# Architecture, from config.json: 40 text layers + 3 MTP, hidden 5120, MLA-style
+# attention (q_lora_rank 1280, o_lora_rank 1024, o_groups 8, head_dim 512,
+# qk_rope_head_dim 64, num_key_value_heads 1), MoE with 384 routed fp4 experts
+# plus 1 shared at top-6 (noaux_tc / sqrtsoftplus), a second "DSpark" MoE of 128
+# experts at top-3, sparse attention driven by per-layer compress_ratios with
+# cross-layer KV reuse (kv_source_layer_ids) and a lightning indexer
+# (index_source_layer_ids, index_topk, candidate_topk_blocks), engram n-gram
+# memory layers, sliding_window 128, 1 M context via YaRN, and a 32-layer
+# vision tower.
+#
+# The cross-layer edges are why the partition graph is a DAG: a module consumes
+# tensors produced far upstream, which a linear pipeline cannot express.
+name: deepseek-v4.1-flash
+source: hf:deepseek-ai/DeepSeek-V4.1-Flash
+enabled: false
+loader: repo_code
+entry: inference/model.py
+code_paths: [inference, encoding]
+config_file: inference/config.json
+dtype: bfloat16
+trust_remote_code: true
+
+scope:
+  vision: false
+  mtp: false
+  engram: false
+
+inputs:
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  max_short: 2
+  max_long: 1
+
+overrides:
+  cache_dequant: false
+  cache_weights: false
+
+notes: |
+  Disabled on purpose. Before enabling: (1) ~765 GB exceeds local disk, so the
+  shard stream-and-evict path must be wired into tracing; (2) fp8 block and fp4
+  expert dequantization must exist; (3) encoding/tests/test_input_*.json ->
+  test_output_*.txt in the repo give free tokenizer ground truth worth checking
+  first.
