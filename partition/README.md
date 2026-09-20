@@ -29,7 +29,7 @@ something it depends on changed.
 |---|---|---|
 | `ingest` | Resolve the spec, pin a revision, read the tensor inventory, load the tokenizer and inputs, check disk | script |
 | `plan` | Group the stack into runnable modules; reconcile submodule names against the real module tree | script, agent on failure |
-| `extract` | Write one implementation per structural signature, with real source and a replay harness | script |
+| `extract` | Write one implementation per structural signature: inference code, a verifier, and the real source | script |
 | `trace` | Hook a real forward; dump per-module inputs, weights and outputs | script |
 | `verify_modules` | Replay each module from its dumps and compare against the trace | script |
 | `emulate` | Assemble the model from dumps only, generate tokens, judge them | script + LLM judge |
@@ -88,6 +88,20 @@ code, weights and inputs from the dumps. So a module of a model far too large to
 hold locally stays replayable — which is also what makes the artifacts useful to
 hand to kernel development.
 
+**Every module ships with its own verifier.** `extract` writes two runnable files
+per implementation group: `inference.py`, which runs the module on its dumped
+input feature map and dumped weights, and `verify.py`, which checks that output
+against the dumped reference and exits non-zero when it disagrees. That pairing is
+the handoff artifact — point `verify.py` at the same run directory after swapping
+in a Trainium implementation and it tells you whether the port still reproduces
+the reference.
+
+```bash
+cd <run-dir>/modules/04-decoder_layers-a5e57f50
+python inference.py --module layers.0-3          # run it
+python verify.py --all-modules --all-samples     # gate it
+```
+
 ## Layout
 
 ```
@@ -120,7 +134,11 @@ default (`MODEL_PARTITION_ARTIFACTS` or `--artifact-root`):
 run.yaml              resolved spec, pinned revision, storage estimate
 plan/                 partition_graph.yaml, valid_submodules.txt, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
-modules/              one directory per implementation group
+modules/              one directory per implementation group:
+                        inference.py  runs the module from its dumped input + weights
+                        verify.py     checks inference.py against the dumped output
+                        source.py     the real implementation's source, for reference
+                        meta.yaml     module ids, layers, shapes
 reports/              verify.json, emulate.json, summary.md, tokens.txt
 ```
 

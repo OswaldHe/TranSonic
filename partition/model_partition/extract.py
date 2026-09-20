@@ -21,7 +21,11 @@ import yaml
 from model_partition.planner.graph import PartitionGraph
 from model_partition.trace import _lookup
 
-TEMPLATE_NAME = "module_harness.py.tmpl"
+#: Each group gets an inference implementation and a verifier for it.
+TEMPLATES = {
+    "inference.py": "module_inference.py.tmpl",
+    "verify.py": "module_verify.py.tmpl",
+}
 
 SOURCE_HEADER = '''\
 """Source of the real implementation for partition group `{signature}`.
@@ -61,13 +65,13 @@ class ExtractedGroup:
         }
 
 
-def _render_template(context: dict[str, Any]) -> str:
+def _render_template(name: str, context: dict[str, Any]) -> str:
     from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
     templates = Path(__file__).resolve().parent / "templates"
     env = Environment(loader=FileSystemLoader(str(templates)), undefined=StrictUndefined,
                       keep_trailing_newline=True)
-    return env.get_template(TEMPLATE_NAME).render(**context)
+    return env.get_template(name).render(**context)
 
 
 def collect_sources(module: Any, max_classes: int = 40) -> tuple[list[str], list[str], str]:
@@ -143,7 +147,7 @@ def extract(
             SOURCE_HEADER.format(signature=signature, provenance=provenance)
             + "\n\n".join(sources)
         )
-        (directory / "module.py").write_text(_render_template({
+        context = {
             "signature": signature,
             "module_ids": list(module_ids),
             "layer_map": {m.id: list(m.layer_indices) for m in modules},
@@ -151,7 +155,9 @@ def extract(
             "sample_ids": list(sample_ids or []),
             "weight_tensors": {mid: list((weight_tensors or {}).get(mid, [])) for mid in module_ids},
             "run_root": str(run_root),
-        }))
+        }
+        for filename, template in TEMPLATES.items():
+            (directory / filename).write_text(_render_template(template, context))
         (directory / "meta.yaml").write_text(yaml.safe_dump({
             **group.to_dict(),
             "kind": representative.kind,

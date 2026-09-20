@@ -86,33 +86,83 @@ def build_structure_only(spec, device: str = "cpu") -> Any:
         return model
 
 
+@dataclass
+class ModuleCall:
+    """One submodule invocation of a module, with what inference produced."""
+
+    submodule: str
+    output: Any
+    record: Any
+
+
+def load_module(
+    run_dir: str | Path,
+    module_id: str,
+    device: str = "cpu",
+) -> tuple[LoadedRun, Any, Any]:
+    """Build a module ready to run: structure from code, weights from the dumps.
+
+    Returns ``(run, model, graph_module)``. The checkpoint is never read.
+    """
+    from model_partition.verify.modules import plan_owned_parameters, poison_parameters
+
+    run = load_run(run_dir)
+    graph_module = _module_or_raise(run.graph, module_id)
+    model = build_structure_only(run.spec, device=device)
+    poison_parameters(model, only=plan_owned_parameters(model, run.graph))
+    applied = apply_dumped_weights(model, run.bundle, module_id, graph_module, device=device)
+    if not applied:
+        raise StandaloneError(
+            f"No dumped weights were applied for {module_id!r}; the artifacts may "
+            "have been pruned by retention"
+        )
+    return run, model, graph_module
+
+
+def run_module(
+    run_dir: str | Path,
+    module_id: str,
+    sample_id: str | None = None,
+    device: str = "cpu",
+) -> list[ModuleCall]:
+    """Run a module's inference from its dumped inputs and weights.
+
+    A module spanning several layers is run as the sequence of its submodule
+    calls, each with the arguments the trace recorded for it.
+    """
+    run, model, _ = load_module(run_dir, module_id, device=device)
+    sample = sample_id or (run.bundle.sample_ids() or [None])[0]
+    records = run.bundle.select(module_id=module_id, sample_id=sample)
+    if not records:
+        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
+    return [
+        ModuleCall(submodule=record.submodule,
+                   output=replay_record(model, record, run.bundle.store, device=device),
+                   record=record)
+        for record in records
+    ]
+
+
 def replay_module(
     run_dir: str | Path,
     module_id: str,
     sample_id: str | None = None,
     device: str = "cpu",
-    model: Any = None,
+    tolerance: Any = None,
 ) -> list[Comparison]:
-    """Replay one module from artifacts and compare against its trace."""
-    run = load_run(run_dir)
-    graph_module = _module_or_raise(run.graph, module_id)
+    """Run a module's inference and compare it against the dumped output."""
+    run, model, _ = load_module(run_dir, module_id, device=device)
     sample = sample_id or (run.bundle.sample_ids() or [None])[0]
     records = run.bundle.select(module_id=module_id, sample_id=sample)
     if not records:
         raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
 
-    if model is None:
-        from model_partition.verify.modules import plan_owned_parameters, poison_parameters
-
-        model = build_structure_only(run.spec, device=device)
-        poison_parameters(model, only=plan_owned_parameters(model, run.graph))
-    apply_dumped_weights(model, run.bundle, module_id, graph_module, device=device)
-
     results: list[Comparison] = []
     for record in records:
         actual = first_tensor(replay_record(model, record, run.bundle.store, device=device))
         reference = first_tensor(expected_output(record, run.bundle.store, device=device))
-        results.append(compare(actual, reference, name=f"{module_id}@{sample}"))
+        label = f"{module_id}@{sample}" if len(records) == 1 else f"{record.submodule}@{sample}"
+        results.append(compare(actual, reference, name=label, tolerance=tolerance))
     return results
 
 

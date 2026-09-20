@@ -18,7 +18,8 @@ def test_one_directory_per_signature_group(tiny_run, tmp_path):
     assert len(groups) == len(tiny_run.graph.signature_groups())
     for group in groups:
         assert group.directory and group.directory.is_dir()
-        assert (group.directory / "module.py").is_file()
+        assert (group.directory / "inference.py").is_file()
+        assert (group.directory / "verify.py").is_file()
         assert (group.directory / "source.py").is_file()
         assert (group.directory / "meta.yaml").is_file()
 
@@ -89,38 +90,89 @@ def test_source_header_records_provenance(tiny_run, tmp_path):
     assert "tiny_llm.py" in source
 
 
-def test_harness_is_valid_python_and_names_its_modules(tiny_run, tmp_path):
-    import ast
-
-    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
-                     run_root=tiny_run.layout.root,
-                     sample_ids=tiny_run.sample_ids,
-                     weight_tensors=tiny_run.bundle.weights)
-    for group in groups:
-        text = (group.directory / "module.py").read_text()
-        ast.parse(text)  # raises on a broken template render
-        assert str(tiny_run.layout.root) in text
-        for module_id in group.module_ids:
-            assert module_id in text
+def _extract(run, tmp_path):
+    return extract(run.graph, run.build_model(), tmp_path / "modules",
+                   run_root=run.layout.root, sample_ids=run.sample_ids,
+                   weight_tensors=run.bundle.weights)
 
 
-def test_harness_runs_and_replays_a_module(tiny_run, tmp_path):
-    """The generated harness must actually work, not just parse."""
+def _script(run, tmp_path, name, *args, group_class="TinyDecoderLayer"):
     import subprocess
     import sys
 
-    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
-                     run_root=tiny_run.layout.root,
-                     sample_ids=tiny_run.sample_ids,
-                     weight_tensors=tiny_run.bundle.weights)
-    decoder = next(g for g in groups if g.class_name == "TinyDecoderLayer")
-    completed = subprocess.run(
-        [sys.executable, str(decoder.directory / "module.py"),
-         "--run", str(tiny_run.layout.root)],
+    groups = _extract(run, tmp_path)
+    group = next(g for g in groups if g.class_name == group_class)
+    return subprocess.run(
+        [sys.executable, str(group.directory / name), "--run", str(run.layout.root), *args],
         capture_output=True, text=True, timeout=300,
     )
+
+
+def test_generated_scripts_are_valid_python_and_name_their_modules(tiny_run, tmp_path):
+    import ast
+
+    for group in _extract(tiny_run, tmp_path):
+        for name in ("inference.py", "verify.py"):
+            text = (group.directory / name).read_text()
+            ast.parse(text)  # raises on a broken template render
+            assert str(tiny_run.layout.root) in text
+            for module_id in group.module_ids:
+                assert module_id in text
+
+
+def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
+    """The inference code must actually run, not just parse."""
+    completed = _script(tiny_run, tmp_path, "inference.py")
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "ok" in completed.stdout
+    assert "output shape=" in completed.stdout
+    assert "dumped tensors" in completed.stdout
+
+
+def test_inference_script_can_save_its_output(tiny_run, tmp_path):
+    out = tmp_path / "out.bin"
+    completed = _script(tiny_run, tmp_path, "inference.py", "--save", str(out))
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_verify_script_passes_against_intact_artifacts(tiny_run, tmp_path):
+    completed = _script(tiny_run, tmp_path, "verify.py")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "PASS" in completed.stdout
+    assert "match the dumped reference" in completed.stdout
+
+
+def test_verify_script_fails_when_the_reference_disagrees(tiny_run, tmp_path):
+    """The verifier is a gate: it must report a wrong result, not wave it through."""
+    store = tiny_run.bundle.store
+    target = next(m.id for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    outputs = store.find(role="output", module_id=target)
+    assert outputs
+    blob = store.blob_path(outputs[0])
+    blob.write_bytes(b"\x7f" * outputs[0].nbytes)
+
+    completed = _script(tiny_run, tmp_path, "verify.py")
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    assert "FAIL" in completed.stdout
+
+
+def test_verify_script_reports_unusable_artifacts(tiny_run, tmp_path):
+    completed = _script(tiny_run, tmp_path, "verify.py", "--sample", "no-such-sample")
+    assert completed.returncode == 2
+    assert "No trace records" in completed.stdout + completed.stderr
+
+
+def test_verify_script_covers_every_module_and_sample(tiny_run, tmp_path):
+    completed = _script(tiny_run, tmp_path, "verify.py", "--all-modules", "--all-samples")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    for sample_id in tiny_run.sample_ids:
+        assert f"@{sample_id}" in completed.stdout
+
+
+def test_verify_script_tolerance_can_be_loosened(tiny_run, tmp_path):
+    completed = _script(tiny_run, tmp_path, "verify.py", "--rtol", "0.5", "--atol", "0.5")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_group_directory_names_are_readable_and_unique(tiny_moe_run, tmp_path):

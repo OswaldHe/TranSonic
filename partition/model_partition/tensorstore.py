@@ -100,7 +100,7 @@ class TensorMeta:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def _contiguous_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
+def contiguous_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
     """Extract (raw bytes, dtype name, shape) from a torch tensor or numpy array."""
     if hasattr(tensor, "detach"):  # torch
         import torch
@@ -141,7 +141,7 @@ class TensorStore:
         slice_info: SliceInfo | None = None,
         extra: dict[str, Any] | None = None,
     ) -> TensorMeta:
-        raw, dtype, shape = _contiguous_bytes(tensor)
+        raw, dtype, shape = contiguous_bytes(tensor)
         digest = hashlib.sha256(raw).hexdigest()
         directory = self.root / subdir if subdir else self.root
         directory.mkdir(parents=True, exist_ok=True)
