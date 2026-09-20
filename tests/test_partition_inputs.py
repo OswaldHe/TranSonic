@@ -165,13 +165,27 @@ def test_summarize_describes_both_bands():
 # -- bundled sets ------------------------------------------------------------
 
 
-def test_bundled_short_set_is_valid_and_pins_lengths():
+def test_bundled_short_set_holds_complete_instructions():
+    """No target_tokens: pinning a length truncates these mid-sentence, which
+    would have the judge assess a broken instruction."""
     records = read_jsonl(INPUTS_DIR / "short.jsonl")
     assert len(records) >= 5
-    assert all(r["target_tokens"] == 128 for r in records)
+    assert not any("target_tokens" in r for r in records)
     assert len({r["id"] for r in records}) == len(records)
     # A mixture of chat-templated and raw continuation prompts.
     assert {r["role"] for r in records} >= {"user", "raw"}
+    for record in records:
+        # Each prompt is long enough to be a real instruction and ends cleanly.
+        assert 90 <= len(record["prompt"].split()) <= 200, record["id"]
+        assert record["prompt"].rstrip()[-1] in ".?\"" or record["role"] == "raw"
+
+
+def test_bundled_long_set_pins_lengths_where_the_tail_is_filler():
+    path = INPUTS_DIR / "long.jsonl"
+    if not path.is_file():
+        pytest.skip("long.jsonl not generated")
+    records = read_jsonl(path)
+    assert all(r["target_tokens"] >= 2048 for r in records)
 
 
 def test_long_generator_produces_the_requested_budgets(tmp_path):
