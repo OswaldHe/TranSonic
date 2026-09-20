@@ -48,7 +48,7 @@ examples = [
 autohelix = "autohelix.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/autohelix"]
+packages = ["src/autohelix", "partition/model_partition"]
 
 # Scope the source distribution to the package + packaging metadata only, so it
 # doesn't sweep in the whole working tree (docs, examples, assets, CI config, or
@@ -57,7 +57,7 @@ packages = ["src/autohelix"]
 # sdist stays as clean as the wheel. The PyPI readme/LICENSE/NOTICE are added
 # via force-include since they live outside the only-included paths.
 [tool.hatch.build.targets.sdist]
-only-include = ["src/autohelix"]
+only-include = ["src/autohelix", "partition/model_partition"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "assets/README-pypi.md" = "assets/README-pypi.md"
