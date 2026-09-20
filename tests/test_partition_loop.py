@@ -204,12 +204,16 @@ def test_verify_report_json_is_machine_readable(tiny_run, tmp_path):
 
 
 def test_rerunning_the_loop_reuses_cached_stages(tiny_run, tmp_path):
-    """The whole point of content-hash caching: no re-trace on a second run."""
+    """The whole point of content-hash caching: no re-trace on a second run.
+
+    Retention is off: a passed-and-pruned run short-circuits instead, which
+    test_completed_pruned_run_short_circuits covers.
+    """
     messages: list[str] = []
-    first = loop_for(tiny_run, tmp_path)
+    first = loop_for(tiny_run, tmp_path, retain=False)
     assert first.run().passed
 
-    second = loop_for(tiny_run, tmp_path)
+    second = loop_for(tiny_run, tmp_path, retain=False)
     second.report = messages.append
     assert second.run().passed
     cached = [m for m in messages if "cached" in m]
@@ -223,7 +227,7 @@ def test_rerunning_the_loop_reuses_cached_stages(tiny_run, tmp_path):
 def test_editing_the_plan_invalidates_downstream_stages(tiny_run, tmp_path):
     from model_partition.planner.graph import PartitionGraph
 
-    first = loop_for(tiny_run, tmp_path)
+    first = loop_for(tiny_run, tmp_path, retain=False)
     result = first.run()
     assert result.passed
     layout = result.context.layout
@@ -233,7 +237,7 @@ def test_editing_the_plan_invalidates_downstream_stages(tiny_run, tmp_path):
     graph.save(layout.graph_path)
 
     messages: list[str] = []
-    second = loop_for(tiny_run, tmp_path)
+    second = loop_for(tiny_run, tmp_path, retain=False)
     second.report = messages.append
     assert second.run().passed
     # Changing the plan re-runs everything downstream of it, tracing included.
@@ -273,3 +277,30 @@ def test_retention_can_be_disabled(tiny_run, tmp_path):
     result = loop_for(tiny_run, tmp_path, retain=False).run()
     assert result.passed
     assert result.state.record("retain").detail == "retention disabled"
+
+
+def test_completed_pruned_run_short_circuits(tiny_deep_run, tmp_path):
+    """Retention deletes non-representative dumps, so re-verifying a pruned run
+    would fail for a reason unrelated to correctness."""
+    first = loop_for(tiny_deep_run, tmp_path)
+    assert first.run().passed
+
+    messages: list[str] = []
+    second = loop_for(tiny_deep_run, tmp_path)
+    second.report = messages.append
+    result = second.run()
+    assert result.passed
+    text = "\n".join(messages)
+    assert "already passed" in text and "--force" in text
+    assert not any("trace" in m and "ok" in m for m in messages)
+
+
+def test_force_reruns_a_completed_run(tiny_run, tmp_path):
+    first = loop_for(tiny_run, tmp_path, retain=False)
+    assert first.run().passed
+
+    messages: list[str] = []
+    second = loop_for(tiny_run, tmp_path, retain=False, force=True)
+    second.report = messages.append
+    assert second.run().passed
+    assert not any("already passed" in m for m in messages)
