@@ -70,6 +70,14 @@ share one extracted implementation. A 64-layer hybrid stack such as Qwen3.8-27B
 (linear attention 3:1 with full attention) resolves to 35 modules but only **5
 implementations**, and no group ever mixes two kernel variants.
 
+**Two different numeric bars, for two different questions.** Replaying one module
+against its own recorded input is a single step, so it is held to a near-exact
+elementwise bar. A module *boundary* seen during end-to-end emulation is the
+product of every layer before it, where bf16 rounding accumulates — at layer 63 of
+Qwen3.8-27B a good boundary had only 64% of elements within 2e-2 yet cosine
+0.999714, while a genuine wiring error scored cosine 0.707. So boundaries are
+gated on cosine, with the pass fraction kept as a coarse floor and still reported.
+
 **Verification proves the dumps are sufficient.** Parameters the plan owns are
 NaN-poisoned before each module's dumped weights are applied, so a forgotten
 tensor fails loudly instead of quietly reusing whatever was in memory. Poisoning
@@ -234,5 +242,9 @@ generated module harness as a subprocess to confirm it actually replays.
   captured; prefill IO is.
 - Tracing and emulation need the whole model resident, so a checkpoint larger
   than the GPU is spread across GPU and host by layer placement. Most of the
-  compute still lands on the GPU, but the host-resident layers are slow. Full
+  compute still lands on the GPU, but the host-resident layers are slow: one
+  generated token of Qwen3.8-27B costs roughly a minute on a single L40S. Full
   GPU residency for such models needs sequential module streaming.
+- Because tracing and emulation may place layers differently, their bf16 results
+  diverge slightly with depth. That is why accumulated boundaries are gated on
+  cosine rather than an elementwise pass fraction.
