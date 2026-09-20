@@ -111,11 +111,25 @@ def decode_call(record: CallRecord, store: TensorStore, device: str = "cpu") -> 
 
 
 def load_dumped_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
-    """Load a module's dumped weights, keyed by their original parameter names."""
+    """Load a module's dumped weights, keyed by their filesystem-safe names."""
     load = tensor_loader(bundle.store, device)
+    return {name: load(name) for name in bundle.weights.get(module_id, [])}
+
+
+def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
+    """Load a module's dumped weights keyed by their original parameter names.
+
+    This is what an extracted implementation is handed, so its code reads
+    ``weights["model.layers.0.self_attn.q_proj.weight"]`` rather than a flattened
+    filesystem name.
+    """
+    load = tensor_loader(bundle.store, device)
+    by_name = {entry.name: entry for entry in bundle.store.entries}
     result: dict[str, Any] = {}
     for name in bundle.weights.get(module_id, []):
-        result[name] = load(name)
+        entry = by_name.get(name)
+        original = (entry.extra or {}).get("param") if entry else None
+        result[original or name] = load(name)
     return result
 
 

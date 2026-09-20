@@ -173,6 +173,7 @@ def verify_modules(
     poison: bool = True,
     model_device: str | None = None,
     module_device: str | None = None,
+    impl_dirs: dict[str, Any] | None = None,
 ) -> VerifyReport:
     """Replay every module from its dumps and compare against the trace.
 
@@ -181,6 +182,10 @@ def verify_modules(
     its replay, defaulting to ``model_device``. Setting it to a GPU verifies each
     module on the accelerator one at a time, which is exactly what the plan's
     per-module budget promises.
+
+    ``impl_dirs`` maps a module id to its extracted implementation directory. When
+    given, that implementation is what gets run — the code the loop owns and edits
+    — with this function still deciding whether the result is correct.
     """
     report = VerifyReport()
     model = build_model()
@@ -218,13 +223,24 @@ def verify_modules(
                     weights_applied=applied,
                     error=f"ran on {host}: {exc}",
                 ))
+        impl_dir = (impl_dirs or {}).get(module_id)
         try:
             for sample_id in wanted_samples:
-                for record in bundle.select(module_id=module_id, sample_id=sample_id):
+                records = bundle.select(module_id=module_id, sample_id=sample_id)
+                if not records:
+                    continue
+                # With an implementation the module is checked as a whole: its
+                # input is the first submodule's, its output the last submodule's.
+                # Without one, each submodule is replayed against its own record.
+                pairs = ([(records[0], records[-1])] if impl_dir is not None
+                         else [(r, r) for r in records])
+                for source, reference_record in pairs:
                     comparisons: list[Comparison] = []
                     try:
-                        actual = replay_record(model, record, bundle.store, device=residency)
-                        reference = expected_output(record, bundle.store, device=residency)
+                        actual = _run_once(model, source, bundle, module_id,
+                                          impl_dir, residency)
+                        reference = expected_output(reference_record, bundle.store,
+                                                   device=residency)
                         comparisons = _compare_outputs(actual, reference, module_id, tolerance)
                     except Exception as exc:
                         report.results.append(ModuleVerification(
@@ -242,6 +258,33 @@ def verify_modules(
                 move_submodules(model, graph_module, host)
                 _release(residency)
     return report
+
+
+def _run_once(model: Any, record: Any, bundle: TraceBundle, module_id: str,
+              impl_dir: Any, device: str) -> Any:
+    """Produce a module's output for one recorded call.
+
+    Prefers the extracted implementation when one exists, so verification
+    exercises the code the loop owns; falls back to replaying the original
+    submodule when extraction has not run yet.
+    """
+    if impl_dir is None:
+        return replay_record(model, record, bundle.store, device=device)
+
+    from model_partition.runtime.module_impl import ImplError, load_impl, run_impl
+    from model_partition.runtime.module_runner import decode_call, load_named_weights
+
+    try:
+        impl = load_impl(impl_dir)
+        weights = load_named_weights(bundle, module_id, device=device)
+        args, kwargs = decode_call(record, bundle.store, device)
+        return run_impl(impl, bundle.metadata.get("config") or {}, weights,
+                        args, kwargs, device=device)
+    except ImplError:
+        # A group without a usable implementation still gets checked against the
+        # original submodule, so a broken generated file is reported as a
+        # numeric failure rather than skipping the module entirely.
+        return replay_record(model, record, bundle.store, device=device)
 
 
 def _compare_outputs(actual: Any, reference: Any, label: str,

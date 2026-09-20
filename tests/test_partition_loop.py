@@ -44,7 +44,7 @@ def test_invalidation_clears_the_stage_and_everything_after_it():
     for stage in STAGES:
         state.mark(stage, OK, f"h-{stage}")
     cleared = state.invalidate_from("plan")
-    assert cleared == ["plan", "extract", "trace", "verify_modules", "emulate", "retain"]
+    assert cleared == ["plan", "trace", "extract", "verify_modules", "emulate", "retain"]
     assert state.record("ingest").status == OK
     assert state.record("ingest").input_hash == "h-ingest"
     assert state.record("trace").status == PENDING
@@ -323,6 +323,13 @@ class _RecordingPlanner:
         graph.metadata["refined_by"] = "agent"
         return AgentOutcome(ok=True), graph
 
+    def repair_modules(self, layout, context, iteration):
+        from model_partition.planner.agent import AgentOutcome
+
+        type(self).calls.append({"context": context, "iteration": iteration,
+                                 "kind": "modules"})
+        return AgentOutcome(ok=True)
+
 
 def _patch_planner(monkeypatch, planner):
     from model_partition.planner import agent as agent_module
@@ -444,3 +451,127 @@ def test_an_interrupted_run_reuses_its_trace(tiny_run, tmp_path):
     second.report = messages.append
     assert second.run().passed
     assert any("trace" in m and "cached" in m for m in messages)
+
+
+class DecliningJudge:
+    """Reproduces the model fine, but the judge is never satisfied."""
+
+    def judge(self, prompt, continuation, sample_id=""):
+        from model_partition.verify.judge import Verdict
+
+        return Verdict(fluent=False, score=2, reason="unconvincing", sample_id=sample_id)
+
+
+def test_a_declining_judge_does_not_fail_the_run(tiny_run, tmp_path):
+    """The judge is advisory: the partition reproduced the model, so the run passed."""
+    result = loop_for(tiny_run, tmp_path, retain=False,
+                      judge=DecliningJudge()).run()
+    assert result.passed
+    assert result.judge_declined == tiny_run.sample_ids
+    assert result.error == ""
+
+
+def test_a_declining_judge_keeps_the_loop_iterating(tiny_run, tmp_path, monkeypatch):
+    """With iterations left, a declined judgement continues rather than stopping."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    messages: list[str] = []
+    loop = loop_for(tiny_run, tmp_path, retain=False, judge=DecliningJudge(),
+                    max_iterations=3, use_agent_planner=True)
+    loop.report = messages.append
+    result = loop.run()
+    assert result.passed
+    text = "\n".join(messages)
+    assert "continuing to iteration 2" in text
+    assert "iteration 2/3" in text
+
+
+def test_a_declining_judge_stops_at_the_iteration_cap(tiny_run, tmp_path, monkeypatch):
+    """max_iterations bounds the quality loop so it cannot spin forever."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    messages: list[str] = []
+    loop = loop_for(tiny_run, tmp_path, retain=False, judge=DecliningJudge(),
+                    max_iterations=2, use_agent_planner=True)
+    loop.report = messages.append
+    result = loop.run()
+    assert result.passed
+    assert result.iterations == 2
+    assert "iteration 3/" not in "\n".join(messages)
+
+
+def test_a_declining_judge_with_no_agent_accepts_the_result(tiny_run, tmp_path):
+    """Nothing can change without an agent, so the run concludes immediately."""
+    messages: list[str] = []
+    loop = loop_for(tiny_run, tmp_path, retain=False, judge=DecliningJudge(),
+                    max_iterations=5, use_agent_planner=False)
+    loop.report = messages.append
+    result = loop.run()
+    assert result.passed and result.iterations == 1
+    text = "\n".join(messages)
+    assert "agent disabled" in text
+    assert "not satisfied" in text
+
+
+def test_tokens_are_printed_even_when_the_judge_declines(tiny_run, tmp_path):
+    """A human makes the final call, so the sampled tokens are always shown."""
+    messages: list[str] = []
+    loop = loop_for(tiny_run, tmp_path, retain=False, judge=DecliningJudge())
+    loop.report = messages.append
+    result = loop.run()
+    text = "\n".join(messages)
+    assert "sampled tokens (human verification)" in text
+    assert "Review the sampled tokens above" in text
+    assert result.tokens_text()
+
+
+def test_a_wrong_module_implementation_fails_the_run(tiny_run, tmp_path):
+    """Only the judge is advisory. The implementation is the loop's, and a wrong
+    one is a genuine failure the agent is asked to fix."""
+    first = loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge()).run()
+    assert first.passed, first.error
+
+    # Replace an implementation with one that returns the wrong thing.
+    impls = sorted(first.context.layout.modules_dir.glob("*/inference.py"))
+    assert impls
+    target = next(p for p in impls if "decoder" in p.parent.name)
+    target.write_text(
+        "MODULE_IDS = " + repr([m.id for m in first.context.graph.partitioned_modules
+                               if m.kind == "decoder_layers"]) + "\n"
+        "def build_module(config, weights, device='cpu'):\n"
+        "    def forward(*args, **kwargs):\n"
+        "        return args[0] * 0.5\n"
+        "    return forward\n"
+    )
+
+    result = loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge(),
+                      force=True).run()
+    assert not result.passed
+    assert "verify_modules" in result.error
+
+
+def test_an_edited_implementation_reruns_verification(tiny_run, tmp_path):
+    """Editing inference.py must invalidate verification without re-tracing."""
+    first = loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge()).run()
+    assert first.passed
+
+    impl = sorted(first.context.layout.modules_dir.glob("*/inference.py"))[0]
+    impl.write_text(impl.read_text() + "\n# touched by the agent\n")
+
+    messages: list[str] = []
+    second = loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge(), force=True)
+    second.report = messages.append
+    assert second.run().passed
+    assert any("trace" in m and "cached" in m for m in messages)
+    assert not any("verify_modules" in m and "cached" in m for m in messages)
+
+
+def test_extraction_preserves_an_edited_implementation(tiny_run, tmp_path):
+    """The implementation is the loop's editable surface; extract must not clobber it."""
+    first = loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge()).run()
+    impl = sorted(first.context.layout.modules_dir.glob("*/inference.py"))[0]
+    marker = "\n# agent edit that must survive\n"
+    impl.write_text(impl.read_text() + marker)
+
+    loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge(), force=True).run()
+    assert marker in impl.read_text()

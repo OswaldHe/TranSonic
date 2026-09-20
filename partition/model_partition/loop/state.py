@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Any
 
 #: Stage order. Invalidating a stage invalidates every later stage.
-STAGES = ("ingest", "plan", "extract", "trace", "verify_modules", "emulate", "retain")
+#: Extraction follows tracing: a module's implementation documents the parameter
+#: names it is handed, and verification runs that implementation.
+STAGES = ("ingest", "plan", "trace", "extract", "verify_modules", "emulate", "retain")
 
 PENDING, OK, FAILED, SKIPPED = "pending", "ok", "failed", "skipped"
 

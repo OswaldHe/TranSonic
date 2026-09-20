@@ -23,11 +23,30 @@ DEFAULT_TIMEOUT = 240
 DEFAULT_MIN_SCORE = 4
 
 JUDGE_PROMPT = """\
-You are judging whether a language model's continuation is coherent.
+You are checking whether a language model was reassembled correctly from
+partitioned weights. You are NOT grading the writing.
 
-The continuation was produced by a model reassembled from partitioned weights, so
-the question is whether it reads like fluent, on-topic text — not whether it is
-factually correct or complete. Truncation at the end is expected and fine.
+Apply exactly three tests. If all three hold, it PASSES.
+
+1. Human-readable — a person can read it and extract meaning.
+2. Correctly formed text — real words and sensible punctuation, not mojibake,
+   random symbols, or broken markup.
+3. Connected to the input — it is about whatever the prompt is about.
+
+None of the following lowers the verdict, because none of them indicate a broken
+partition:
+
+- terse or telegraphic style, dropped articles ("We need answer user's question.
+  Need explain two main problems") — models often emit an internal reasoning
+  stream, which is normal output
+- truncation mid-sentence at the end, which is expected
+- role or thinking markers such as "assistant" or "<think>"
+- being incomplete, unpolished, or factually wrong
+- answering at an angle, as long as it is recognisably about the same subject
+
+Fail it only on evidence of damage: degenerate repetition of a token or phrase,
+gibberish or random characters, text about an unrelated subject, or wording so
+scrambled that no meaning survives.
 
 PROMPT:
 {prompt}
@@ -38,8 +57,10 @@ CONTINUATION:
 Reply with ONLY a JSON object, no other text:
 {{"fluent": true|false, "score": 1-5, "reason": "<one sentence>"}}
 
-score 5 = fluent and clearly on-topic; 3 = readable but odd or repetitive;
-1 = gibberish, degenerate repetition, or unrelated tokens.
+Set "fluent" true when all three tests hold. Score: 5 = readable, well-formed and
+clearly on-topic; 4 = all three tests hold, style rough or terse; 3 = one test is
+marginal; 2 = one test clearly fails; 1 = gibberish, degenerate repetition, or an
+unrelated subject.
 """
 
 
@@ -59,7 +80,13 @@ class Verdict:
     error: str = ""
 
     def passed(self, min_score: int = DEFAULT_MIN_SCORE) -> bool:
-        return self.fluent and self.score >= min_score and not self.error
+        """True at or above ``min_score`` (4 by default: readable, formed, on-topic).
+
+        The score is authoritative. ``fluent`` is kept as reported metadata rather
+        than a second gate, so a verdict that scores 4 or 5 while forgetting the
+        flag still passes instead of stalling the loop on an inconsistency.
+        """
+        return self.score >= min_score and not self.error
 
     def to_dict(self) -> dict[str, Any]:
         return {

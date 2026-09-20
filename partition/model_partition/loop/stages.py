@@ -101,6 +101,9 @@ class StageResult:
     #: Set when a failure should be handed to the agent for repair.
     repairable: bool = False
     failing_modules: list[str] = field(default_factory=list)
+    #: The stage succeeded mechanically but the judge was not satisfied. Advisory:
+    #: it keeps the loop iterating without marking the run failed.
+    judge_declined: bool = False
 
 
 @dataclass
@@ -346,15 +349,49 @@ def stage_extract(ctx: LoopContext) -> StageResult:
         ctx.graph, model, ctx.layout.modules_dir, run_root=ctx.layout.root,
         sample_ids=[s.id for s in ctx.samples],
         weight_tensors=ctx.bundle.weights if ctx.bundle else None,
+        param_names=_param_names(ctx),
     )
     lines = sum(g.source_lines for g in groups)
-    return StageResult(ok=True, detail=(
-        f"{len(groups)} implementation group(s), {lines} source lines"
-    ), metrics={"n_groups": len(groups), "source_lines": lines})
+    preserved = sum(1 for g in groups if g.preserved)
+    detail = f"{len(groups)} implementation group(s), {lines} source lines"
+    if preserved:
+        detail += f"; {preserved} existing implementation(s) preserved"
+    return StageResult(ok=True, detail=detail, metrics={
+        "n_groups": len(groups), "source_lines": lines, "preserved": preserved,
+    })
+
+
+def _param_names(ctx: LoopContext) -> dict[str, list[str]]:
+    """Original parameter names per module, for the generated implementations."""
+    if ctx.bundle is None:
+        return {}
+    by_name = {entry.name: entry for entry in ctx.bundle.store.entries}
+    result: dict[str, list[str]] = {}
+    for module_id, names in ctx.bundle.weights.items():
+        originals = []
+        for name in names:
+            entry = by_name.get(name)
+            originals.append((entry.extra or {}).get("param") or name if entry else name)
+        result[module_id] = originals
+    return result
 
 
 def hash_extract(ctx: LoopContext) -> list[Any]:
-    return [_graph_fingerprint(ctx.layout.graph_path)]
+    # Not the implementation's content: an edit must re-run verification, not
+    # re-extract over the top of the edit.
+    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx)]
+
+
+def _impl_fingerprint(ctx: LoopContext) -> str:
+    """Content hash of every extracted implementation.
+
+    The agent edits these, so a change must re-run verification without
+    re-extracting over the top of the edit.
+    """
+    from model_partition.loop.state import content_hash
+
+    paths = sorted(ctx.layout.modules_dir.glob("*/inference.py"))
+    return content_hash([p.read_text() for p in paths]) if paths else ""
 
 
 # -- stage: trace ------------------------------------------------------------
@@ -476,6 +513,7 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
     report = verify_modules(
         ctx.build_model, bundle, ctx.graph,
         model_device=host, module_device=target,
+        impl_dirs=_impl_dirs(ctx),
     )
     ctx.verify_report = report
     if target != host:
@@ -505,6 +543,13 @@ def _verify_metrics(report) -> dict[str, Any]:
         "max_abs_err": report.max_abs_err(),
         "devices": sorted({r.device for r in report.results if r.device}),
     }
+
+
+def _impl_dirs(ctx: LoopContext) -> dict[str, Path]:
+    """Extracted implementation per module, so verification exercises the loop's code."""
+    from model_partition.runtime.module_impl import find_impl_dirs
+
+    return find_impl_dirs(ctx.layout.modules_dir)
 
 
 def _host_device(ctx: LoopContext) -> str:
@@ -539,7 +584,8 @@ def _accelerator(ctx: LoopContext) -> str:
 
 
 def hash_verify(ctx: LoopContext) -> list[Any]:
-    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx)]
+    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx),
+            _impl_fingerprint(ctx)]
 
 
 def _trace_fingerprint(ctx: LoopContext) -> str:
@@ -598,27 +644,37 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     (ctx.layout.reports_dir / "emulate.json").write_text(json.dumps(report.to_dict(), indent=2))
     _write_tokens(ctx, report)
 
-    if not report.passed:
-        failures = report.failures
+    if not report.mechanically_passed:
         boundary_failures = sorted({
             c.name.removeprefix("boundary:")
-            for o in failures for c in o.failed_boundaries()
+            for o in report.outcomes for c in o.failed_boundaries()
         })
+        broken = [o for o in report.outcomes if not o.mechanically_passed]
         return StageResult(
             ok=False, repairable=bool(boundary_failures), failing_modules=boundary_failures,
-            detail=(f"{len(failures)}/{len(report.outcomes)} sample(s) failed; "
-                    f"mean judge score {report.mean_score():.1f}"),
+            detail=(f"{len(broken)}/{len(report.outcomes)} sample(s) did not reproduce "
+                    f"the model; {len(boundary_failures)} boundary mismatch(es)"),
             metrics=_emulate_metrics(report),
         )
-    return StageResult(ok=True, detail=(
-        f"{len(report.outcomes)} sample(s) passed, mean judge score {report.mean_score():.1f}"
-    ), metrics=_emulate_metrics(report))
+
+    declined = report.judge_declined
+    detail = (f"{len(report.outcomes)} sample(s) reproduced the model, "
+              f"mean judge score {report.mean_score():.1f}")
+    if declined:
+        # The judge is advisory: the partition is sound, so the stage succeeds and
+        # the loop keeps iterating on quality rather than reporting a failure.
+        detail += f"; judge declined {len(declined)} sample(s)"
+        return StageResult(ok=True, detail=detail, judge_declined=True,
+                           metrics=_emulate_metrics(report))
+    return StageResult(ok=True, detail=detail, metrics=_emulate_metrics(report))
 
 
 def _emulate_metrics(report) -> dict[str, Any]:
     return {
         "n_samples": len(report.outcomes),
         "n_failed": len(report.failures),
+        "mechanically_passed": report.mechanically_passed,
+        "judge_declined": [o.sample_id for o in report.judge_declined],
         "mean_judge_score": report.mean_score(),
         "weights_filled": report.fill.applied if report.fill else 0,
     }
@@ -685,8 +741,8 @@ STAGE_FUNCTIONS: dict[str, tuple[Callable[[LoopContext], StageResult],
                                  Callable[[LoopContext], list[Any]]]] = {
     "ingest": (stage_ingest, hash_ingest),
     "plan": (stage_plan, hash_plan),
-    "extract": (stage_extract, hash_extract),
     "trace": (stage_trace, hash_trace),
+    "extract": (stage_extract, hash_extract),
     "verify_modules": (stage_verify_modules, hash_verify),
     "emulate": (stage_emulate, hash_emulate),
     "retain": (stage_retain, hash_retain),

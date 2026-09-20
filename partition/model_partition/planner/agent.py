@@ -126,6 +126,28 @@ class AgentPlanner:
         prompt = render_prompt("repair.md", graph=graph, **context)
         return self._edit_plan(layout, graph, prompt, iteration, "repair")
 
+    def repair_modules(
+        self,
+        layout,
+        context: dict[str, Any],
+        iteration: int,
+    ) -> AgentOutcome:
+        """Ask the agent to fix a module's inference code.
+
+        The editable surface here is ``modules/*/inference.py`` — not the plan and
+        not the verifier. Implementations are snapshotted so a proposal that makes
+        things worse can be rolled back.
+        """
+        prompt = render_prompt("repair_module.md", **context)
+        snapshot = snapshot_impls(layout, iteration)
+        outcome = self.invoke(
+            workdir=layout.root, prompt=prompt, iteration=iteration,
+            log_path=layout.root / "logs" / f"agent-module-{iteration}.log",
+        )
+        if not outcome.ok:
+            restore_impls(layout, snapshot)
+        return outcome
+
     def _edit_plan(
         self, layout, graph: PartitionGraph, prompt: str, iteration: int, tag: str,
     ) -> tuple[AgentOutcome, PartitionGraph]:
@@ -144,6 +166,35 @@ class AgentPlanner:
                 error=f"agent produced an invalid plan, rolled back: {exc}",
             ), graph
         return outcome, revised
+
+
+def snapshot_impls(layout, iteration: int) -> Path | None:
+    """Copy every extracted implementation aside before the agent edits them."""
+    import shutil
+
+    sources = sorted(layout.modules_dir.glob("*/inference.py"))
+    if not sources:
+        return None
+    target = layout.modules_dir / "history" / f"iter-{iteration}"
+    target.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        shutil.copy2(source, target / f"{source.parent.name}.py")
+    return target
+
+
+def restore_impls(layout, snapshot: Path | None) -> int:
+    """Put snapshotted implementations back; returns how many were restored."""
+    import shutil
+
+    if snapshot is None or not snapshot.is_dir():
+        return 0
+    restored = 0
+    for saved in snapshot.glob("*.py"):
+        destination = layout.modules_dir / saved.stem / "inference.py"
+        if destination.parent.is_dir():
+            shutil.copy2(saved, destination)
+            restored += 1
+    return restored
 
 
 def snapshot_plan(layout, iteration: int) -> Path | None:

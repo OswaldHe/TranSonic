@@ -227,3 +227,84 @@ def test_build_judge_selects_backend():
     assert isinstance(build_judge("stub"), StubJudge)
     with pytest.raises(JudgeError, match="Unknown judge kind"):
         build_judge("oracle")
+
+
+# -- the passing bar ---------------------------------------------------------
+#
+# The bar is deliberately low: readable, correctly formed, and connected to the
+# input. Rough style must not fail a run, because rough style is not evidence of a
+# broken partition. These check the prompt states that bar and the parser applies
+# it; the prompt's behaviour against a real model is exercised by the slow test.
+
+
+def test_prompt_states_the_three_tests():
+    from model_partition.verify.judge import JUDGE_PROMPT
+
+    lowered = JUDGE_PROMPT.lower()
+    assert "human-readable" in lowered
+    assert "correctly formed" in lowered
+    assert "connected to the input" in lowered
+
+
+def test_prompt_excuses_terse_reasoning_style():
+    from model_partition.verify.judge import JUDGE_PROMPT
+
+    assert "telegraphic" in JUDGE_PROMPT
+    assert "truncation" in JUDGE_PROMPT
+    assert "<think>" in JUDGE_PROMPT
+
+
+def test_prompt_names_the_failure_modes():
+    from model_partition.verify.judge import JUDGE_PROMPT
+
+    for failure in ("degenerate repetition", "gibberish", "unrelated"):
+        assert failure in JUDGE_PROMPT
+
+
+def test_rough_but_on_topic_output_passes():
+    """A 4 means all three tests held with rough style; it must pass."""
+    verdict = parse_verdict(json.dumps({
+        "fluent": True, "score": 4,
+        "reason": "Telegraphic style but clearly addresses the question",
+    }))
+    assert verdict.passed()
+
+
+def test_one_failing_test_does_not_pass():
+    verdict = parse_verdict(json.dumps({"fluent": False, "score": 2, "reason": "unrelated"}))
+    assert not verdict.passed()
+
+
+def test_missing_fields_do_not_pass():
+    assert not parse_verdict("{}").passed()
+
+
+@pytest.mark.slow
+def test_real_judge_applies_the_stated_bar():
+    """Terse on-topic output passes; damage does not."""
+    judge = ClaudeJudge()
+    if not judge.available():
+        pytest.skip("claude CLI not available")
+    prompt = "Explain why reading a 12 GB CSV with read().splitlines() exhausts memory."
+    rough = ("We need answer user's question. Need explain problem: read().splitlines() "
+             "loads entire file into memory plus list of lines, huge memory")
+    assert judge.judge(prompt, rough).passed()
+    assert not judge.judge(prompt, "the the the the the the the the").passed()
+    assert not judge.judge(prompt, "Bananas ripen best at room temperature.").passed()
+
+
+def test_score_four_or_five_passes_and_ends_the_loop():
+    """4 and 5 are the passing scores; the loop exits on them."""
+    for score in (4, 5):
+        assert parse_verdict(json.dumps({"fluent": True, "score": score})).passed()
+        # The score is authoritative even if the flag disagrees with it.
+        assert parse_verdict(json.dumps({"fluent": False, "score": score})).passed()
+
+
+def test_score_below_four_does_not_pass():
+    for score in (0, 1, 2, 3):
+        assert not parse_verdict(json.dumps({"fluent": True, "score": score})).passed()
+
+
+def test_an_errored_verdict_never_passes_whatever_the_score():
+    assert not Verdict(fluent=True, score=5, error="timed out").passed()

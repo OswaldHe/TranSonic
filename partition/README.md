@@ -33,10 +33,40 @@ something it depends on changed.
 | `trace` | Hook a real forward; dump per-module inputs, weights and outputs | script |
 | `verify_modules` | Replay each module from its dumps and compare against the trace | script |
 | `emulate` | Assemble the model from dumps only, generate tokens, judge them | script + LLM judge |
+| | The judge is **advisory**: it never fails a run. A score of 4 or 5 (readable, correctly formed, connected to the input) ends the loop; below that the loop keeps iterating while `--iterations` allows, then reports and prints the tokens anyway | |
 | `retain` | Prune tensors to a representative layer set, keeping deduplicated code | script |
 
 The loop exits as soon as every module verifies and every sample's continuation
-is judged sound, printing the sampled tokens for human review.
+scores 4 or 5, printing the sampled tokens for human review. `--iterations/-n`
+caps how many iterations it may take (default 5).
+
+A judge that stays unconvinced never fails the run: the partition either
+reproduced the model or it did not, and that is decided by the module checks and
+boundary comparisons. An unconvinced judge keeps the loop iterating on the module
+implementations while iterations remain, then the run concludes as passed with the
+judge's reservation reported and the tokens printed for a human to settle.
+
+### What the loop owns, and what the harness owns
+
+The split is deliberate. The loop iterates on the two things that are genuinely
+judgement calls:
+
+- **`plan/partition_graph.yaml`** — where module boundaries fall: whether each
+  module is convenient to write a kernel for and loadable on the device for
+  tracing.
+- **`modules/<group>/inference.py`** — each module's inference code, which is what
+  gets fixed when a module does not reproduce its reference numerically.
+
+Everything that decides *whether* a module is correct belongs to the harness and
+the agent does not edit it: the tolerances, the comparison, the boundary checks,
+the verifier scripts, and the dumped artifacts they compare against. An agent that
+could relax its own acceptance test would make the loop worthless.
+
+| Failure | Editable surface the agent is pointed at |
+|---|---|
+| a plan submodule does not exist, or a module will not load | `plan/partition_graph.yaml` |
+| a module's output does not match its reference | `modules/<group>/inference.py` |
+| the judge is unconvinced by the generated text | `modules/<group>/inference.py` (advisory) |
 
 ### Why a separate loop
 
@@ -96,13 +126,15 @@ code, weights and inputs from the dumps. So a module of a model far too large to
 hold locally stays replayable — which is also what makes the artifacts useful to
 hand to kernel development.
 
-**Every module ships with its own verifier.** `extract` writes two runnable files
-per implementation group: `inference.py`, which runs the module on its dumped
-input feature map and dumped weights, and `verify.py`, which checks that output
-against the dumped reference and exits non-zero when it disagrees. That pairing is
-the handoff artifact — point `verify.py` at the same run directory after swapping
-in a Trainium implementation and it tells you whether the port still reproduces
-the reference.
+**Every module ships with its own verifier.** `extract` writes two files per
+implementation group. `inference.py` is the module's inference code and the loop's
+to edit; it is written once and never overwritten, so the agent's fixes survive.
+`verify.py` belongs to the harness: it builds that implementation, runs it on the
+dumped input feature map and dumped weights, and exits non-zero when the output
+disagrees with the dumped reference. So verification exercises the code the loop
+owns, and the same pairing is the handoff artifact — swap in a Trainium
+implementation and `verify.py` tells you whether the port still reproduces the
+reference.
 
 ```bash
 cd <run-dir>/modules/04-decoder_layers-a5e57f50

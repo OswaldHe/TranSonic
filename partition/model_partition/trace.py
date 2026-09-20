@@ -212,6 +212,7 @@ class Tracer:
                         meta = self.store.write(
                             _safe_name(full), tensor, role="weight",
                             module_id=module.id, subdir=f"weights/{module.id}",
+                            extra={"param": full},
                         )
                         self._account(meta.nbytes)
                         names.append(meta.name)
@@ -219,6 +220,7 @@ class Tracer:
                     meta = self.store.write(
                         _safe_name(submodule_name), submodule, role="weight",
                         module_id=module.id, subdir=f"weights/{module.id}",
+                        extra={"param": submodule_name},
                     )
                     self._account(meta.nbytes)
                     names.append(meta.name)

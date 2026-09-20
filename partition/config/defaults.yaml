@@ -27,7 +27,7 @@ loop:
   min_judge_score: 4
 
   # --- loop ------------------------------------------------------------------
-  max_iterations: 5
+  max_iterations: 5          # hard cap on loop iterations (--iterations/-n)
   use_agent_planner: true
   refine_plan: false        # true asks the agent to improve the seed plan first
   # agent_model: <id>

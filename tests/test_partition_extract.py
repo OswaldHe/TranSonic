@@ -149,8 +149,9 @@ def test_verify_script_fails_when_the_reference_disagrees(tiny_run, tmp_path):
                   if m.kind == "decoder_layers")
     outputs = store.find(role="output", module_id=target)
     assert outputs
-    blob = store.blob_path(outputs[0])
-    blob.write_bytes(b"\x7f" * outputs[0].nbytes)
+    # The module's reference is its *last* submodule's output.
+    for entry in outputs:
+        store.blob_path(entry).write_bytes(b"\x7f" * entry.nbytes)
 
     completed = _script(tiny_run, tmp_path, "verify.py")
     assert completed.returncode == 1, completed.stdout + completed.stderr

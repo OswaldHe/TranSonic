@@ -48,10 +48,19 @@ class EmulationOutcome:
     def boundaries_passed(self) -> bool:
         return all(c.passed for c in self.boundary_checks)
 
+    @property
+    def mechanically_passed(self) -> bool:
+        """True when the partition reproduced the model, judge aside.
+
+        This is the objective part: tokens were produced and every module
+        boundary matched. The judge's opinion of the text is tracked separately
+        because it is a heuristic and must not be the thing that fails a run.
+        """
+        return bool(self.token_ids) and not self.error and self.boundaries_passed
+
     def passed(self, min_score: int = 4) -> bool:
-        if self.error or not self.token_ids:
-            return False
-        if not self.boundaries_passed:
+        """Mechanically sound *and* judged sound — the bar for an early exit."""
+        if not self.mechanically_passed:
             return False
         return self.verdict is not None and self.verdict.passed(min_score)
 
@@ -87,6 +96,17 @@ class EmulationReport:
     def failures(self) -> list[EmulationOutcome]:
         return [o for o in self.outcomes if not o.passed(self.min_score)]
 
+    @property
+    def mechanically_passed(self) -> bool:
+        """True when every sample reproduced the model, judge aside."""
+        return bool(self.outcomes) and all(o.mechanically_passed for o in self.outcomes)
+
+    @property
+    def judge_declined(self) -> list[EmulationOutcome]:
+        """Samples that reproduced the model but whose text the judge rejected."""
+        return [o for o in self.outcomes
+                if o.mechanically_passed and not o.passed(self.min_score)]
+
     def mean_score(self) -> float:
         scores = [o.verdict.score for o in self.outcomes if o.verdict]
         return sum(scores) / len(scores) if scores else 0.0
@@ -112,6 +132,8 @@ class EmulationReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
+            "mechanically_passed": self.mechanically_passed,
+            "judge_declined": [o.sample_id for o in self.judge_declined],
             "mean_score": self.mean_score(),
             "n_samples": len(self.outcomes),
             "n_failed": len(self.failures),

@@ -21,11 +21,10 @@ import yaml
 from model_partition.planner.graph import PartitionGraph
 from model_partition.trace import _lookup
 
-#: Each group gets an inference implementation and a verifier for it.
-TEMPLATES = {
-    "inference.py": "module_inference.py.tmpl",
-    "verify.py": "module_verify.py.tmpl",
-}
+#: The implementation is the loop's to edit, so it is written once and then left
+#: alone. Everything else belongs to the harness and is regenerated every run.
+EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
+HARNESS_TEMPLATES = {"verify.py": "module_verify.py.tmpl"}
 
 SOURCE_HEADER = '''\
 """Source of the real implementation for partition group `{signature}`.
@@ -52,6 +51,8 @@ class ExtractedGroup:
     source_files: list[str] = field(default_factory=list)
     directory: Path | None = None
     source_lines: int = 0
+    #: True when an existing implementation was left in place.
+    preserved: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +63,7 @@ class ExtractedGroup:
             "classes": list(self.classes),
             "source_files": list(self.source_files),
             "source_lines": self.source_lines,
+            "preserved": self.preserved,
         }
 
 
@@ -114,8 +116,18 @@ def extract(
     run_root: str | Path = ".",
     sample_ids: list[str] | None = None,
     weight_tensors: dict[str, list[str]] | None = None,
+    param_names: dict[str, list[str]] | None = None,
+    regenerate: bool = False,
 ) -> list[ExtractedGroup]:
-    """Write one implementation directory per signature group."""
+    """Write one implementation directory per signature group.
+
+    ``param_names`` maps a module id to the original parameter names its
+    implementation will be handed, so the generated file can document them.
+
+    An existing ``inference.py`` is preserved: it is the loop's editable surface
+    and may carry the agent's numerical fixes. ``regenerate=True`` overwrites it.
+    """
+    param_names = param_names or {}
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     groups: list[ExtractedGroup] = []
@@ -154,10 +166,18 @@ def extract(
             "class_name": group.class_name,
             "sample_ids": list(sample_ids or []),
             "weight_tensors": {mid: list((weight_tensors or {}).get(mid, [])) for mid in module_ids},
+            "submodules": list(representative.submodules),
+            "weight_names": list(param_names.get(representative.id, [])),
             "run_root": str(run_root),
         }
-        for filename, template in TEMPLATES.items():
+        for filename, template in HARNESS_TEMPLATES.items():
             (directory / filename).write_text(_render_template(template, context))
+        for filename, template in EDITABLE_TEMPLATES.items():
+            target = directory / filename
+            if target.is_file() and not regenerate:
+                group.preserved = True
+                continue
+            target.write_text(_render_template(template, context))
         (directory / "meta.yaml").write_text(yaml.safe_dump({
             **group.to_dict(),
             "kind": representative.kind,

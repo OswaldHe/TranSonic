@@ -186,7 +186,8 @@ def plan_only(target: str, config: Path | None, **kwargs: Any) -> None:
 @partition.command("run")
 @click.argument("target")
 @loop_options
-@click.option("--iterations", "-n", type=int, default=None, help="Maximum loop iterations")
+@click.option("--iterations", "--max-iterations", "-n", "iterations", type=int, default=None,
+              help="Maximum loop iterations before the run stops (default 5)")
 @click.option("--max-new-tokens", type=int, default=None, help="Tokens to generate when emulating")
 @click.option("--judge", "judge_kind", type=click.Choice(["claude", "stub"]), default=None,
               help="Judge backend (stub is offline)")

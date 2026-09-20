@@ -6,11 +6,16 @@
 Specialized rather than reusing AutoHelix's harness, because the verification and
 invalidation model differ: stages are content-hash cached so a failure re-runs
 only what it must, and the expensive artifacts live outside any worktree so a
-rejected iteration never forces a re-trace. The agent's editable surface is the
-partition plan alone.
+rejected iteration never forces a re-trace.
+
+The agent's editable surface is the partition plan and the extracted module
+implementations — where boundaries fall, and whether the arithmetic is right.
+Everything that decides *whether* a module is correct stays with the harness.
 
 The loop exits as soon as every module verifies and every sample's emulated
-continuation is judged sound, printing the sampled tokens for human review.
+continuation is judged sound, printing the sampled tokens for human review. A
+judge that stays unconvinced is advisory: it keeps the loop iterating while
+iterations remain, and is reported rather than failing the run.
 """
 
 from __future__ import annotations
@@ -44,6 +49,8 @@ class LoopResult:
     iterations: int = 0
     summary_path: Path | None = None
     error: str = ""
+    #: Samples the partition reproduced but whose text the judge rejected.
+    judge_declined: list[str] = field(default_factory=list)
 
     def tokens_text(self) -> str:
         path = self.context.layout.tokens_file
@@ -157,15 +164,20 @@ class PartitionLoop:
             state.save(ctx.layout.state_file)
 
             if failure is None:
-                state.passed = True
-                state.finished = True
-                state.log_iteration({"result": "passed"})
-                state.save(ctx.layout.state_file)
-                summary = write_summary(ctx, state)
-                self._print_tokens(ctx)
-                self.report(f"\nAll stages passed. Summary: {summary}")
-                return LoopResult(passed=True, state=state, context=ctx,
-                                  iterations=iteration, summary_path=summary)
+                declined = state.record("emulate").metrics.get("judge_declined") or []
+                if declined and iteration < self.options.max_iterations:
+                    # The partition reproduced the model, so nothing failed — the
+                    # judge is just not satisfied with the text. Keep iterating on
+                    # quality rather than stopping or declaring a failure.
+                    state.log_iteration({"result": "judge_declined", "samples": list(declined)})
+                    state.save(ctx.layout.state_file)
+                    self.report(f"\njudge declined {len(declined)} sample(s); "
+                                f"continuing to iteration {iteration + 1}")
+                    if not self._improve_quality(ctx, state, iteration):
+                        return self._finish_passed(ctx, state, iteration, declined)
+                    continue
+
+                return self._finish_passed(ctx, state, iteration, declined)
 
             stage_name, result = failure
             last_failure = failure
@@ -186,6 +198,62 @@ class PartitionLoop:
         return LoopResult(passed=False, state=state, context=ctx,
                           iterations=state.iteration, error=f"{stage}: {detail}",
                           summary_path=ctx.layout.summary_file)
+
+    def _finish_passed(self, ctx: LoopContext, state: LoopState, iteration: int,
+                       declined: list) -> LoopResult:
+        """Conclude a run whose partition reproduced the model.
+
+        A judge that stayed unconvinced is reported, not treated as a failure: the
+        sampled tokens are printed either way so a human makes the final call.
+        """
+        state.passed = True
+        state.finished = True
+        state.log_iteration({"result": "passed", "judge_declined": list(declined)})
+        state.save(ctx.layout.state_file)
+        summary = write_summary(ctx, state)
+        self._print_tokens(ctx)
+        if declined:
+            self.report(f"\nEvery module verified and every boundary matched, but the judge "
+                        f"was not satisfied with {len(declined)} sample(s): {', '.join(declined)}.")
+            self.report("Review the sampled tokens above and decide.")
+        else:
+            self.report("\nAll stages passed.")
+        self.report(f"Summary: {summary}")
+        return LoopResult(passed=True, state=state, context=ctx,
+                          iterations=iteration, summary_path=summary,
+                          judge_declined=list(declined))
+
+    def _improve_quality(self, ctx: LoopContext, state: LoopState, iteration: int) -> bool:
+        """Give the agent a chance to improve output the judge rejected.
+
+        The partition is numerically sound, so the plausible remaining cause is
+        arithmetic too subtle for the boundary check. False when no further
+        progress is possible, which ends the run as passed-with-reservation.
+        """
+        if not self.options.use_agent_planner:
+            self.report("  agent disabled; accepting the result as is")
+            return False
+
+        from model_partition.planner.agent import AgentPlanner
+
+        self.report("  asking the agent to improve the module implementations...")
+        planner = AgentPlanner(model=self.options.agent_model,
+                               timeout_seconds=self.options.agent_timeout_seconds)
+        result = StageResult(
+            ok=False,
+            detail=("Every module verified and every boundary matched, but the judge "
+                    "found the generated continuation unconvincing. Look for arithmetic "
+                    "that is close enough to pass a per-module check yet degrades the "
+                    "output over the whole stack."),
+        )
+        outcome = planner.repair_modules(ctx.layout, dump_agent_context(ctx, "emulate", result),
+                                        iteration)
+        if not outcome.ok:
+            self.report(f"  no improvement made: {outcome.error}")
+            return False
+        cleared = state.invalidate_from("verify_modules")
+        self.report(f"  implementations revised; invalidated: {', '.join(cleared) or 'nothing'}")
+        return True
 
     def _already_complete(self, ctx: LoopContext, state: LoopState) -> LoopResult | None:
         """Short-circuit a run that already passed and had its artifacts pruned.
@@ -330,6 +398,9 @@ class PartitionLoop:
 
         from model_partition.planner.agent import AgentPlanner
 
+        if stage_name == "verify_modules":
+            return self._repair_modules(ctx, state, result, iteration)
+
         self.report("  asking the agent to revise the plan...")
         planner = AgentPlanner(model=self.options.agent_model,
                                timeout_seconds=self.options.agent_timeout_seconds)
@@ -349,6 +420,32 @@ class PartitionLoop:
         cleared = state.invalidate_from("plan")
         ctx.bundle = None
         self.report(f"  plan revised; invalidated: {', '.join(cleared) or 'nothing'}")
+        return True
+
+    def _repair_modules(
+        self, ctx: LoopContext, state: LoopState,
+        result: StageResult, iteration: int,
+    ) -> bool:
+        """Numeric failure: the module's inference code is what needs fixing.
+
+        The plan decides *where* boundaries fall; the implementation decides
+        whether the arithmetic is right. A verification mismatch is the second
+        kind of problem, so the agent is pointed at inference.py rather than at
+        the partition.
+        """
+        from model_partition.planner.agent import AgentPlanner
+
+        self.report("  asking the agent to fix the failing module implementation(s)...")
+        planner = AgentPlanner(model=self.options.agent_model,
+                               timeout_seconds=self.options.agent_timeout_seconds)
+        context = dump_agent_context(ctx, "verify_modules", result)
+        outcome = planner.repair_modules(ctx.layout, context, iteration)
+        if not outcome.ok:
+            self.report(f"  module repair failed: {outcome.error}")
+            ctx.notes.append(f"iteration {iteration}: module repair failed: {outcome.error}")
+            return False
+        cleared = state.invalidate_from("verify_modules")
+        self.report(f"  implementations revised; invalidated: {', '.join(cleared) or 'nothing'}")
         return True
 
     def _print_tokens(self, ctx: LoopContext) -> None:

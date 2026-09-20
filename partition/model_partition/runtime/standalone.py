@@ -166,6 +166,43 @@ def replay_module(
     return results
 
 
+def verify_impl(
+    run_dir: str | Path,
+    impl_dir: str | Path,
+    module_id: str,
+    sample_id: str | None = None,
+    device: str = "cpu",
+    tolerance: Any = None,
+) -> list[Comparison]:
+    """Run a module's *extracted implementation* and compare against the dump.
+
+    This is the check that matters: it exercises the code the loop owns, not the
+    original model. The comparison itself stays here, out of the agent's reach.
+    """
+    from model_partition.runtime.module_impl import load_impl, run_impl
+    from model_partition.runtime.module_runner import decode_call, load_named_weights
+
+    run = load_run(run_dir)
+    _module_or_raise(run.graph, module_id)
+    sample = sample_id or (run.bundle.sample_ids() or [None])[0]
+    records = run.bundle.select(module_id=module_id, sample_id=sample)
+    if not records:
+        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
+
+    impl = load_impl(impl_dir)
+    weights = load_named_weights(run.bundle, module_id, device=device)
+    config = run.manifest.get("config") or (run.spec.overrides or {})
+
+    results: list[Comparison] = []
+    for record in records[:1] if len(records) > 1 else records:
+        args, kwargs = decode_call(record, run.bundle.store, device)
+        actual = first_tensor(run_impl(impl, config, weights, args, kwargs, device=device))
+        reference = first_tensor(expected_output(records[-1], run.bundle.store, device=device))
+        results.append(compare(actual, reference, name=f"impl:{module_id}@{sample}",
+                               tolerance=tolerance))
+    return results
+
+
 def _module_or_raise(graph: PartitionGraph, module_id: str):
     try:
         return graph.by_id(module_id)
