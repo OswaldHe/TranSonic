@@ -194,13 +194,16 @@ def plan_only(target: str, config: Path | None, **kwargs: Any) -> None:
 @click.option("--min-judge-score", type=int, default=None, help="Passing judge score (1-5)")
 @click.option("--agent-model", default=None, help="Model id for the planning/repair agent")
 @click.option("--no-agent", is_flag=True, default=False, help="Disable agent plan repair")
+@click.option("--refine-plan", is_flag=True, default=False,
+              help="Ask the agent to improve the seed plan for kernel development")
 @click.option("--no-retain", is_flag=True, default=False, help="Keep all traced layers")
 @click.option("--allow-overflow", is_flag=True, default=False,
               help="Warn instead of failing when projected artifacts exceed disk")
 @click.option("--force", is_flag=True, default=False,
               help="Re-run even if this run already passed and was pruned")
 def run_loop(target: str, config: Path | None, iterations: int | None, no_agent: bool,
-             no_retain: bool, allow_overflow: bool, force: bool, **kwargs: Any) -> None:
+             no_retain: bool, allow_overflow: bool, force: bool, refine_plan: bool,
+             **kwargs: Any) -> None:
     """Run the partition loop until verification passes."""
     from model_partition.loop.driver import PartitionLoop
 
@@ -216,6 +219,7 @@ def run_loop(target: str, config: Path | None, iterations: int | None, no_agent:
         retain=False if no_retain else None,
         strict_storage=False if allow_overflow else None,
         force=True if force else None,
+        refine_plan=True if refine_plan else None,
         **kwargs,
     )
     result = PartitionLoop(spec=spec, options=options).run()

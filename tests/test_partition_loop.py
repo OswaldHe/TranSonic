@@ -149,12 +149,14 @@ def loop_for(run, tmp_path, judge=None, **overrides):
     from model_partition.loop.driver import PartitionLoop
     from model_partition.loop.stages import LoopOptions
 
-    options = LoopOptions(
+    settings = dict(
         artifact_root=str(tmp_path / "loop-artifacts"),
         device="cpu", trace_device="cpu", judge_kind="stub",
         max_new_tokens=3, max_iterations=1, use_agent_planner=False,
-        gpu_memory_gib=1.0, **overrides,
+        gpu_memory_gib=1.0,
     )
+    settings.update(overrides)
+    options = LoopOptions(**settings)
     return PartitionLoop(spec=run.spec, options=options, report=lambda _msg: None,
                          judge=judge or AcceptingJudge())
 
@@ -304,3 +306,85 @@ def test_force_reruns_a_completed_run(tiny_run, tmp_path):
     second.report = messages.append
     assert second.run().passed
     assert not any("already passed" in m for m in messages)
+
+
+class _RecordingPlanner:
+    """Stands in for AgentPlanner, recording each refine_plan call."""
+
+    calls: list[dict] = []
+
+    def __init__(self, **kwargs):
+        pass
+
+    def refine_plan(self, layout, graph, context, iteration):
+        from model_partition.planner.agent import AgentOutcome
+
+        type(self).calls.append({"context": context, "iteration": iteration})
+        graph.metadata["refined_by"] = "agent"
+        return AgentOutcome(ok=True), graph
+
+
+def _patch_planner(monkeypatch, planner):
+    from model_partition.planner import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "AgentPlanner", planner)
+
+
+def test_plan_refinement_is_off_by_default(tiny_run, tmp_path, monkeypatch):
+    """Refinement costs an agent call, so it must be opt-in."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    loop = loop_for(tiny_run, tmp_path, retain=False, use_agent_planner=True)
+    assert loop.options.refine_plan is False
+    assert loop.run().passed
+    assert _RecordingPlanner.calls == []
+
+
+def test_refinement_is_skipped_when_the_agent_is_disabled(tiny_run, tmp_path, monkeypatch):
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    loop = loop_for(tiny_run, tmp_path, retain=False, refine_plan=True,
+                    use_agent_planner=False)
+    assert loop.run().passed
+    assert _RecordingPlanner.calls == []
+
+
+def test_plan_refinement_invokes_the_agent_when_enabled(tiny_run, tmp_path, monkeypatch):
+    """The agent gets a chance to improve the seed plan for kernel development."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    result = loop_for(tiny_run, tmp_path, retain=False, refine_plan=True,
+                      use_agent_planner=True).run()
+    assert result.passed
+    assert len(_RecordingPlanner.calls) == 1
+    context = _RecordingPlanner.calls[0]["context"]
+    assert context["model"] == tiny_run.spec.source
+    assert context["budget_bytes"] > 0
+    assert context["module_table"]
+    assert result.context.graph.metadata["refined_by"] == "agent"
+
+
+def test_refinement_runs_once_not_per_iteration(tiny_run, tmp_path, monkeypatch):
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    loop = loop_for(tiny_run, tmp_path, retain=False, refine_plan=True,
+                    use_agent_planner=True, max_iterations=3)
+    assert loop.run().passed
+    assert len(_RecordingPlanner.calls) == 1
+
+
+def test_failed_refinement_keeps_the_seed_plan(tiny_run, tmp_path, monkeypatch):
+    from model_partition.planner.agent import AgentOutcome
+
+    class FailingPlanner:
+        def __init__(self, **kwargs):
+            pass
+
+        def refine_plan(self, layout, graph, context, iteration):
+            return AgentOutcome(ok=False, error="rolled back"), graph
+
+    _patch_planner(monkeypatch, FailingPlanner)
+    result = loop_for(tiny_run, tmp_path, retain=False, refine_plan=True,
+                      use_agent_planner=True).run()
+    assert result.passed
+    assert any("refinement failed" in note for note in result.context.notes)

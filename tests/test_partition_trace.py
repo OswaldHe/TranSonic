@@ -218,3 +218,25 @@ def test_call_record_dict_round_trip():
                         args=[{TENSOR_KEY: "a"}], kwargs={"flag": True},
                         output={TENSOR_KEY: "b"}, order=7)
     assert CallRecord.from_dict(record.to_dict()) == record
+
+
+def test_dump_budget_is_enforced_not_just_declared(tiny_run):
+    """Regression: max_total_bytes was documented as a hard abort but ignored."""
+    from model_partition.tensorstore import TensorStore
+    from model_partition.trace import DumpBudgetExceeded
+
+    store = TensorStore(tiny_run.root / "capped")
+    tracer = Tracer(tiny_run.build_model(), tiny_run.graph, store,
+                    policy=DumpPolicy(max_total_bytes=1024))
+    with pytest.raises(DumpBudgetExceeded, match="max_total_bytes"):
+        tracer.dump_weights()
+    assert tracer.bytes_written > 1024
+
+
+def test_bytes_written_is_tracked_without_a_ceiling(tiny_run):
+    from model_partition.tensorstore import TensorStore
+
+    store = TensorStore(tiny_run.root / "counted")
+    tracer = Tracer(tiny_run.build_model(), tiny_run.graph, store)
+    tracer.dump_weights()
+    assert tracer.bytes_written == sum(e.nbytes for e in store.entries)

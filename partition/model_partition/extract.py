@@ -36,10 +36,6 @@ helpers from the original package are not inlined.
 '''
 
 
-class ExtractError(RuntimeError):
-    """Raised when a module's code cannot be collected."""
-
-
 @dataclass
 class ExtractedGroup:
     """One deduplicated implementation."""

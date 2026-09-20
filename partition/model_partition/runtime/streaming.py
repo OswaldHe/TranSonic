@@ -97,14 +97,6 @@ def fill_from_dumps(
     return report
 
 
-@dataclass
-class BoundaryCheck:
-    """A module boundary observed during emulation."""
-
-    module_id: str
-    tensor: Any
-
-
 def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[str, Any]]:
     """Hook every partitioned module to record its output on the *first* forward.
 

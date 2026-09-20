@@ -29,6 +29,7 @@ loop:
   # --- loop ------------------------------------------------------------------
   max_iterations: 5
   use_agent_planner: true
+  refine_plan: false        # true asks the agent to improve the seed plan first
   # agent_model: <id>
   agent_timeout_seconds: 1800
   strict_storage: true      # fail rather than run out of disk mid-trace

@@ -255,3 +255,12 @@ def test_run_manifest_records_the_resolved_spec(tiny_run):
     payload = json.loads(json.dumps(tiny_run.layout.read_run()))
     assert payload["spec"]["source"] == str(tiny_run.repo)
     assert payload["loader"] == "repo_code"
+
+
+def test_evict_shards_is_a_no_op_for_local_weights(repo):
+    """A local model's weights are the user's own files and must not be deleted."""
+    from model_partition.ingest import evict_shards
+
+    result = ingest(local_spec(repo))
+    assert evict_shards(result, ["model.safetensors"]) == 0
+    assert (repo / "model.safetensors").is_file()

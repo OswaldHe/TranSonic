@@ -66,6 +66,8 @@ class PartitionLoop:
     report: Reporter = _print
     #: Overrides ``options.judge_kind``. Lets callers and tests supply their own.
     judge: Any = None
+    #: Plan refinement happens once per run, not once per iteration.
+    _refined: bool = field(default=False, repr=False)
 
     def build_context(self) -> LoopContext:
         layout = RunLayout.create(self.spec.slug, self.options.artifact_root).ensure()
@@ -214,6 +216,8 @@ class PartitionLoop:
 
             if state.is_fresh(name, stage_hash) and self._rehydrate(ctx, name):
                 self.report(f"  {name:<15} cached")
+                if name == "plan":
+                    self._maybe_refine(ctx, state)
                 continue
 
             started = time.time()
@@ -233,7 +237,46 @@ class PartitionLoop:
             self.report(f"  {name:<15} {marker:<5} {result.detail}  ({elapsed:.1f}s)")
             if not result.ok:
                 return name, result
+            if name == "plan":
+                self._maybe_refine(ctx, state)
         return None
+
+    def _maybe_refine(self, ctx: LoopContext, state: LoopState) -> None:
+        """Let the agent improve the seed plan for kernel-development convenience.
+
+        Runs once, right after planning. Even a model that fits whole on the GPU
+        benefits from boundaries chosen for how a kernel gets written and tested,
+        which is a judgement call the deterministic planner cannot make.
+        """
+        if self._refined or not self.options.refine_plan or not self.options.use_agent_planner:
+            return
+        if ctx.graph is None:
+            return
+        self._refined = True
+
+        from model_partition.planner.agent import AgentPlanner
+
+        self.report("  asking the agent to refine the plan for kernel development...")
+        planner = AgentPlanner(model=self.options.agent_model,
+                               timeout_seconds=self.options.agent_timeout_seconds)
+        before = ctx.graph.to_dict()
+        outcome, revised = planner.refine_plan(
+            ctx.layout, ctx.graph, dump_agent_context(ctx, "plan", StageResult(ok=True)),
+            state.iteration,
+        )
+        if not outcome.ok:
+            self.report(f"  refinement failed, keeping the seed plan: {outcome.error}")
+            ctx.notes.append(f"plan refinement failed: {outcome.error}")
+            return
+        if revised.to_dict() == before:
+            self.report("  agent kept the seed plan unchanged")
+            return
+        ctx.graph = revised
+        cleared = state.invalidate_from("extract")
+        ctx.bundle = None
+        self.report(f"  plan refined: {len(revised.partitioned_modules)} modules in "
+                    f"{len(revised.signature_groups())} groups; "
+                    f"invalidated: {', '.join(cleared) or 'nothing'}")
 
     def _rehydrate(self, ctx: LoopContext, name: str) -> bool:
         """Reload what a cached stage would have produced. False forces a re-run.
@@ -304,9 +347,3 @@ class PartitionLoop:
             self.report(f"  tokens : {outcome.token_ids}")
             self.report(f"  text   : {outcome.text[:600]}")
         self.report(f"\nFull transcript: {ctx.layout.tokens_file}")
-
-
-def run_partition_loop(spec: ModelSpec, options: LoopOptions | None = None,
-                       report: Reporter = _print) -> LoopResult:
-    """Convenience entry point."""
-    return PartitionLoop(spec=spec, options=options or LoopOptions(), report=report).run()

@@ -33,6 +33,10 @@ class TraceError(RuntimeError):
     """Raised when tracing cannot produce a usable record."""
 
 
+class DumpBudgetExceeded(TraceError):
+    """Raised when tracing would write past ``DumpPolicy.max_total_bytes``."""
+
+
 @dataclass
 class CallRecord:
     """One submodule invocation: its arguments and its output."""
@@ -153,7 +157,19 @@ class Tracer:
         self.store = store
         self.policy = policy or DumpPolicy()
         self.records: list[CallRecord] = []
+        self.bytes_written = 0
         self._targets = self._resolve_targets()
+
+    def _account(self, nbytes: int) -> None:
+        """Track dumped bytes and stop at the policy ceiling."""
+        self.bytes_written += nbytes
+        ceiling = self.policy.max_total_bytes
+        if ceiling is not None and self.bytes_written > ceiling:
+            raise DumpBudgetExceeded(
+                f"tracing has written {self.bytes_written} bytes, past the "
+                f"{ceiling}-byte max_total_bytes ceiling; raise it, reduce the "
+                "input set, or disable cache_weights"
+            )
 
     def _resolve_targets(self) -> dict[str, list[str]]:
         """Map submodule qualified name -> module ids that own it."""
@@ -197,12 +213,14 @@ class Tracer:
                             _safe_name(full), tensor, role="weight",
                             module_id=module.id, subdir=f"weights/{module.id}",
                         )
+                        self._account(meta.nbytes)
                         names.append(meta.name)
                 else:
                     meta = self.store.write(
                         _safe_name(submodule_name), submodule, role="weight",
                         module_id=module.id, subdir=f"weights/{module.id}",
                     )
+                    self._account(meta.nbytes)
                     names.append(meta.name)
             dumped[module.id] = names
         return dumped
@@ -264,6 +282,7 @@ class Tracer:
                 sample_id=sample_id, step=step, subdir=f"activations/{module_id}",
                 slice_info=slice_info,
             )
+            self._account(meta.nbytes)
             return {TENSOR_KEY: meta.name}
         if value is None or isinstance(value, (bool, int, float, str)):
             return value

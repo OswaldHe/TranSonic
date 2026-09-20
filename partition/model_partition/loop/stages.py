@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
-
 from model_partition.hardware import MemoryBudget, format_bytes, move_to_device
 from model_partition.inputs import SampleInput, load_input_set, summarize
 from model_partition.ingest import IngestResult, ingest
@@ -58,6 +56,10 @@ class LoopOptions:
     judge_model: str | None = None
     min_judge_score: int = 4
     use_agent_planner: bool = True
+    #: Ask the agent to improve the seed plan for kernel-development convenience
+    #: before tracing. Off by default: it costs an agent call even when the
+    #: deterministic plan is already fine.
+    refine_plan: bool = False
     agent_model: str | None = None
     agent_timeout_seconds: int = 1800
     retain: bool = True
@@ -679,13 +681,3 @@ def _summarize_types(layer_types: list[str]) -> str:
         counts[name] = counts.get(name, 0) + 1
     return ", ".join(f"{name} x{count}" for name, count in counts.items())
 
-
-def load_graph_if_present(layout: RunLayout) -> PartitionGraph | None:
-    try:
-        return PartitionGraph.load(layout.graph_path)
-    except Exception:
-        return None
-
-
-def read_yaml(path: Path) -> dict[str, Any]:
-    return yaml.safe_load(path.read_text()) or {} if path.is_file() else {}

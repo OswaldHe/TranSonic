@@ -33,10 +33,6 @@ class GPUInfo:
     free_bytes: int
     capability: tuple[int, int] | None = None
 
-    @property
-    def total_gib(self) -> float:
-        return self.total_bytes / GIB
-
     def supports_fp8(self) -> bool:
         """True on sm_89+ (L40S, H100). Hardware fp8 is not the same as a usable
         block-scaled fp8 GEMM — see :mod:`model_partition.quant.fp8_block`."""
@@ -64,10 +60,6 @@ class MemoryBudget:
     usable_bytes: int
     #: Set when no GPU was found and the budget is a caller-supplied fallback.
     synthetic: bool = False
-
-    @property
-    def usable_gib(self) -> float:
-        return self.usable_bytes / GIB
 
     def fits(self, nbytes: int) -> bool:
         return nbytes <= self.usable_bytes
