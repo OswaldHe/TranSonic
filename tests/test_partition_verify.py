@@ -709,3 +709,108 @@ def test_an_allocation_failure_is_told_apart_from_a_real_error():
 
     assert _is_out_of_memory(RuntimeError("CUDA out of memory. Tried to allocate 16 GiB"))
     assert not _is_out_of_memory(RuntimeError("shape mismatch"))
+
+
+# -- accumulated error through the chained implementations --------------------
+
+
+def _chain(run, tmp_path, **kwargs):
+    from model_partition.runtime import baseline
+    from model_partition.verify.chain import verify_chain
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _extract_impls(run, tmp_path)
+        return verify_chain(run.bundle, run.graph, impl_dirs, **kwargs)
+    finally:
+        baseline.clear_structure_cache()
+
+
+def test_the_chain_carries_each_output_into_the_next_module(tiny_run, tmp_path):
+    """Per-module checks restart from the recording, so nothing accumulates there."""
+    suite = _chain(tiny_run, tmp_path)
+    assert suite.reports
+    report = suite.reports[0]
+    assert report.chained_steps, report.render()
+    assert suite.passed, suite.render()
+    assert suite.worst_cosine() > 0.99
+
+
+def test_the_chain_reports_drift_in_dependency_order(tiny_run, tmp_path):
+    suite = _chain(tiny_run, tmp_path)
+    curve = suite.reports[0].drift_curve()
+    order = tiny_run.graph.topological_order()
+    positions = [order.index(module_id) for module_id, _ in curve]
+    assert positions == sorted(positions)
+
+
+def test_an_unbroken_chain_predicts_the_same_tokens(tiny_run, tmp_path):
+    report = _chain(tiny_run, tmp_path).reports[0]
+    assert report.unbroken, report.render()
+    assert report.tokens and report.tokens == report.reference_tokens
+    assert report.top1 == 1.0
+
+
+def test_a_broken_implementation_shows_up_as_drift_downstream(tiny_run, tmp_path):
+    """The point of chaining: an error in one module reaches the ones after it."""
+    from model_partition.runtime import baseline
+    from model_partition.verify.chain import verify_chain
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _extract_impls(tiny_run, tmp_path)
+        target = next(m.id for m in tiny_run.graph.partitioned_modules
+                      if m.kind == "decoder_layers")
+        # Reversing the hidden dimension is wrong in a way cosine can see. A uniform
+        # scale would not do: cosine ignores it, and the next norm removes it.
+        (impl_dirs[target] / "inference.py").write_text(
+            "def build_module(config, weights, device='cpu', submodule=None):\n"
+            "    from model_partition.runtime.baseline import build_from_dumps\n"
+            f"    inner = build_from_dumps(config, weights, device=device,\n"
+            f"                             run_dir={str(tiny_run.layout.root)!r},\n"
+            f"                             module_ids={[target]!r}, submodule=submodule)\n"
+            "    def run(*args, **kwargs):\n"
+            "        out = inner(*args, **kwargs)\n"
+            "        first = out[0] if isinstance(out, tuple) else out\n"
+            "        broken = first.flip(-1)\n"
+            "        return (broken,) + tuple(out[1:]) if isinstance(out, tuple) else broken\n"
+            "    return run\n"
+        )
+        suite = verify_chain(tiny_run.bundle, tiny_run.graph, impl_dirs)
+    finally:
+        baseline.clear_structure_cache()
+
+    assert not suite.passed, suite.render()
+    report = suite.reports[0]
+    diverged = report.first_divergence()
+    assert diverged is not None
+    # The broken module is where it starts, and later modules carry it.
+    assert diverged.module_id == target
+    assert target in suite.diverging_modules()
+    downstream = [s for s in report.steps
+                  if s.chained and s.module_id != target and not s.passed]
+    assert downstream, "the error should reach the modules after it"
+    assert not report.tokens_agree
+
+
+def test_an_edge_the_recording_contradicts_is_not_carried(tiny_split_run, tmp_path):
+    """A split layer puts the residual add in neither half, so that edge is not real.
+
+    Carrying it would feed the next module a tensor the model never gave it, and the
+    drift measurement would be reporting the plan's mistake as an implementation's.
+    """
+    suite = _chain(tiny_split_run, tmp_path)
+    report = suite.reports[0]
+    assert report.unchained, report.render()
+    assert not report.unbroken
+    reason = report.unchained[0].unchained_reason
+    assert "belongs to" in reason or "shape" in reason
+    # Not a failure: nothing an implementation did.
+    assert suite.passed, suite.render()
+
+
+def test_tokens_are_only_credited_when_the_chain_is_unbroken(tiny_split_run, tmp_path):
+    """Otherwise a broken chain would claim credit for the recording's tokens."""
+    report = _chain(tiny_split_run, tmp_path).reports[0]
+    assert not report.unbroken
+    assert report.passed  # held, because nothing carried drifted

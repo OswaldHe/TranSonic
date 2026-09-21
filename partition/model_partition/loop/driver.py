@@ -35,7 +35,13 @@ from model_partition.loop.stages import (
     dump_agent_context,
     write_summary,
 )
-from model_partition.loop.state import FAILED, OK, STAGES, LoopState, content_hash
+from model_partition.loop.state import (
+    FAILED,
+    ITERATION_STAGES,
+    OK,
+    LoopState,
+    content_hash,
+)
 from model_partition.spec import ModelSpec
 
 
@@ -234,6 +240,7 @@ class PartitionLoop:
         sampled tokens are printed either way so a human makes the final call.
         """
         state.passed = True
+        self._retain(ctx, state)
         state.finished = True
         state.log_iteration({"result": "passed", "judge_declined": list(declined)})
         state.save(ctx.layout.state_file)
@@ -249,6 +256,23 @@ class PartitionLoop:
         return LoopResult(passed=True, state=state, context=ctx,
                           iterations=iteration, summary_path=summary,
                           judge_declined=list(declined))
+
+    def _retain(self, ctx: LoopContext, state: LoopState) -> None:
+        """Prune the artifacts, now that no further iteration will read them."""
+        from model_partition.loop.stages import STAGE_FUNCTIONS
+
+        runner, hasher = STAGE_FUNCTIONS["retain"]
+        started = time.time()
+        try:
+            result = runner(ctx)
+            stage_hash = content_hash(*hasher(ctx))
+        except Exception as exc:
+            state.mark("retain", FAILED, detail=f"{type(exc).__name__}: {exc}")
+            self.report(f"  {'retain':<15} FAIL  {exc}")
+            return
+        state.mark("retain", OK if result.ok else FAILED, stage_hash, result.detail,
+                   result.metrics, time.time() - started)
+        self.report(f"  {'retain':<15} {'ok' if result.ok else 'FAIL':<5} {result.detail}")
 
     def _improve_quality(self, ctx: LoopContext, state: LoopState, iteration: int) -> bool:
         """Give the agent a chance to improve output the judge rejected.
@@ -315,7 +339,7 @@ class PartitionLoop:
         State is persisted after each stage, not just at the end: tracing is
         expensive enough that an interrupted run must not have to redo it.
         """
-        for name in STAGES:
+        for name in ITERATION_STAGES:
             runner, hasher = STAGE_FUNCTIONS[name]
             try:
                 stage_hash = content_hash(*hasher(ctx))
@@ -418,7 +442,7 @@ class PartitionLoop:
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)
-            if name in ("trace", "verify_modules", "emulate", "retain"):
+            if name in ("trace", "verify_modules", "verify_chain", "emulate", "retain"):
                 load_bundle(ctx)
         except Exception:
             return False

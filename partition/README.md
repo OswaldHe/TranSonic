@@ -26,7 +26,7 @@ bundled ones and how to write another.
 
 ## The loop
 
-Seven stages. Each declares a hash of its inputs, so a stage re-runs only when
+Eight stages. Each declares a hash of its inputs, so a stage re-runs only when
 something it depends on changed.
 
 | Stage | What it does | Who does it |
@@ -36,7 +36,8 @@ something it depends on changed.
 | `extract` | Write one implementation per structural signature: inference code, a verifier, a README, and the real source | script |
 | `trace` | Hook a real forward; dump per-module inputs, weights and outputs | script |
 | `verify_modules` | Run each module's extracted implementation from its dumps and compare against the trace | script |
-| `emulate` | Assemble the model from dumps only, generate tokens, judge them | script + LLM judge |
+| `verify_chain` | Chain the implementations, carrying each output into the next, and measure how the error compounds | script |
+| `emulate` | Assemble the model from dumps, install the implementations, generate tokens, judge them | script + LLM judge |
 | `retain` | Prune tensors to a representative layer set, keeping deduplicated code | script |
 
 The loop exits as soon as every module verifies and every sample's continuation
@@ -80,6 +81,8 @@ iteration outright, since it cannot be put back.
 |---|---|
 | a plan submodule does not exist, or a module will not load | `plan/partition_graph.yaml` |
 | a module's output does not match its reference | `modules/<group>/inference.py` |
+| a module will not fit the device the plan sized it for | `plan/partition_graph.yaml` |
+| drift through the chained implementations moves a token | `modules/<group>/inference.py` |
 | the judge is unconvinced by the generated text | `modules/<group>/inference.py` (advisory) |
 
 ### Why a separate loop
@@ -158,6 +161,22 @@ projection it feeds have to run in the model's order, and no ordering of names c
 say which that is, so the baseline orders a group's submodules by when they were
 actually observed.
 
+**Three checks, because one question is really three.** Per-module verification
+starts every module from its *recorded* input, so an error in one module cannot show
+up in another — the checks are independent by construction, which is what lets them
+hold a near-exact bar. That says nothing about what happens when the modules are
+chained, so `verify_chain` feeds each computed output into the next and reports the
+drift as a curve, the first boundary outside tolerance, and whether the logits still
+predict the same tokens. Emulation then generates through those same implementations
+at a sequence length no recording covers.
+
+An edge is only carried while the module that produced it is still reproducing its
+reference. A plan that splits a layer puts the residual add between two modules and
+inside neither, so that edge is not real dataflow and the chain says so instead of
+blaming an implementation for it. Once a module *has* drifted, the same mismatch means
+the opposite thing and the value is carried regardless — watching the error travel is
+the point.
+
 **Two different numeric bars, for two different questions.** Replaying one module
 against its own recorded input is a single step, so it is held to a near-exact
 elementwise bar. A module *boundary* seen during end-to-end emulation is the product
@@ -192,6 +211,14 @@ host by layer placement rather than abandoning the GPU.
 weights and inputs from the dumps. So a module of a model far too large to hold
 locally stays replayable — which is what makes the artifacts useful to hand to
 kernel development.
+
+**What gets checked is what gets shipped.** The implementations are the deliverable,
+so they are what runs: `verify_modules` and `verify_chain` execute them, and emulation
+replaces every partitioned submodule with its implementation before generating, so the
+tokens printed for human review are the shipped code's tokens. The model's own modules
+appear in exactly two places — `trace`, where they *are* the reference, and
+`autohelix partition replay`, which runs them deliberately to prove the artifacts are
+self-sufficient.
 
 **Every module ships with its own verifier and README.** `extract` writes four files
 per implementation group. `inference.py` is the module's inference code and the
@@ -246,7 +273,7 @@ modules/              one directory per implementation group:
                         README.md     what it does, pre-conditions, post-conditions
                         source.py     the real implementation's source, for reference
                         meta.yaml     module ids, layers, shapes
-reports/              verify.json, emulate.json, summary.md, tokens.txt,
+reports/              verify.json, chain.json, emulate.json, summary.md, tokens.txt,
                       review.md, reviews/
 ```
 

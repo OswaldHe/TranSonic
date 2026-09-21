@@ -37,6 +37,22 @@ def clear_structure_cache() -> None:
     _RUN_CACHE.clear()
 
 
+def seed_structure(run_dir: str | Path, device: str, model: Any) -> None:
+    """Offer ``model`` as the structure for this run, instead of building another.
+
+    Used when the implementations are installed into a model that already exists: a
+    second copy of the architecture would double the memory for no benefit. Paired
+    with :func:`forget_structure`, because the model gets mutated once the wrappers
+    are in it and a later stage must not find that version in the cache.
+    """
+    _STRUCTURE_CACHE[(str(Path(run_dir).resolve()), device)] = model
+
+
+def forget_structure(run_dir: str | Path, device: str) -> None:
+    """Drop one cached structure, leaving the rest of the cache alone."""
+    _STRUCTURE_CACHE.pop((str(Path(run_dir).resolve()), device), None)
+
+
 def _run_for(run_dir: str | Path) -> Any:
     from model_partition.runtime.standalone import load_run
 
@@ -51,7 +67,7 @@ def _run_for(run_dir: str | Path) -> Any:
 def _structure(run: Any, device: str) -> Any:
     from model_partition.runtime.standalone import build_structure_only
 
-    key = (str(run.layout.root), device)
+    key = (str(Path(run.layout.root).resolve()), device)
     model = _STRUCTURE_CACHE.get(key)
     if model is None:
         model = build_structure_only(run.spec, device=device)
@@ -113,11 +129,11 @@ def build_from_dumps(
             f"{next(iter(weights), '(none supplied)')}"
         )
 
-    # Only a parallel group has branches to choose between. A sequential group runs
-    # all of its submodules however the caller names them, or it would silently
-    # compute a prefix of the module and compare it against the whole.
-    names = ([submodule] if submodule and graph_module.is_parallel
-             and submodule in graph_module.submodules
+    # Naming a submodule asks for that one alone — which branch of a parallel group,
+    # or which piece of a span when the implementation is being installed into a
+    # model. Callers that want the whole span pass nothing, because computing a
+    # prefix and comparing it against the whole would look like a numeric failure.
+    names = ([submodule] if submodule in graph_module.submodules
              else _execution_order(run, module_id, graph_module.submodules))
     targets = [_lookup(model, name) for name in names]
     targets = [t for t in targets if t is not None and callable(t)]

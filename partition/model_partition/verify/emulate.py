@@ -1,11 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Emulated end-to-end inference from partition artifacts.
+"""Emulated end-to-end inference from the partition's own implementations.
 
-Assembles the model from dumped per-module weights only, checks every module
-boundary against the trace during the first forward, then generates tokens from
-the final module's logits and has them judged.
+Assembles the model from dumped per-module weights only, replaces every
+partitioned submodule with the implementation the loop extracted for it, checks
+every module boundary against the trace during the first forward, then generates
+tokens from the final module's logits and has them judged.
+
+Running the model's own modules here would check the reference against itself and
+print tokens the shipped code never produced. The implementations are what gets
+handed over, so they are what generates.
 """
 
 from __future__ import annotations
@@ -86,6 +91,8 @@ class EmulationReport:
 
     outcomes: list[EmulationOutcome] = field(default_factory=list)
     fill: FillReport | None = None
+    #: Which submodules were running the loop's own code during generation.
+    install: Any = None
     min_score: int = 4
 
     @property
@@ -115,6 +122,8 @@ class EmulationReport:
         lines: list[str] = []
         if self.fill:
             lines.append(self.fill.summary())
+        if self.install:
+            lines.append(self.install.summary())
         for outcome in self.outcomes:
             status = "ok" if outcome.passed(self.min_score) else "FAIL"
             score = outcome.verdict.score if outcome.verdict else 0
@@ -142,6 +151,7 @@ class EmulationReport:
                 "missing": self.fill.missing[:32],
                 "complete": self.fill.complete,
             } if self.fill else None,
+            "install": self.install.to_dict() if self.install else None,
             "outcomes": [o.to_dict() for o in self.outcomes],
         }
 
@@ -172,8 +182,10 @@ def emulate(
     strict_fill: bool = True,
     check_boundaries: bool = True,
     place_max_memory: dict | None = None,
+    impl_dirs: dict[str, Any] | None = None,
+    run_dir: Any = None,
 ) -> EmulationReport:
-    """Assemble from dumps, generate, and judge.
+    """Assemble from dumps, install the implementations, generate, and judge.
 
     ``place_max_memory`` spreads the assembled model across GPU and host for the
     generation pass, for a model too large to hold on the GPU whole.
@@ -184,6 +196,12 @@ def emulate(
     model, device = move_to_device(build_model(), device)
     poison_parameters(model, only=plan_owned_parameters(model, graph))
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
+    if impl_dirs and run_dir is not None:
+        from model_partition.runtime.assemble import install_implementations
+
+        report.install = install_implementations(
+            model, graph, bundle, impl_dirs, run_dir=run_dir, device=device,
+        )
     if place_max_memory:
         model, device = place_across_devices(model, place_max_memory)
 

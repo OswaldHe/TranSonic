@@ -44,7 +44,8 @@ def test_invalidation_clears_the_stage_and_everything_after_it():
     for stage in STAGES:
         state.mark(stage, OK, f"h-{stage}")
     cleared = state.invalidate_from("plan")
-    assert cleared == ["plan", "trace", "extract", "verify_modules", "emulate", "retain"]
+    assert cleared == ["plan", "trace", "extract", "verify_modules", "verify_chain",
+                       "emulate", "retain"]
     assert state.record("ingest").status == OK
     assert state.record("ingest").input_hash == "h-ingest"
     assert state.record("trace").status == PENDING
@@ -824,3 +825,46 @@ def test_the_planner_prompt_states_the_granularity_trade_off():
     assert "Too coarse" in text and "Too fine" in text
     assert "fusion" in text or "fused" in text
     assert "Trainium" not in text
+
+
+# -- retention runs after the loop, not inside it ----------------------------
+
+
+def test_retention_is_not_an_iteration_stage():
+    """Pruning the reference tensors mid-loop would make a later pass verify less."""
+    from model_partition.loop.state import ITERATION_STAGES, STAGES
+
+    assert "retain" in STAGES
+    assert "retain" not in ITERATION_STAGES
+    assert list(ITERATION_STAGES) == [s for s in STAGES if s != "retain"]
+
+
+def test_a_declining_judge_does_not_prune_before_the_next_iteration(tiny_run, tmp_path,
+                                                                   monkeypatch):
+    """The loop keeps iterating on quality, so the trace has to survive."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    from model_partition.loop import stages as stages_module
+
+    real_retain, hasher = stages_module.STAGE_FUNCTIONS["retain"]
+    pruned: list[str] = []
+
+    def counting_retain(ctx):
+        pruned.append(ctx.spec.name)
+        return real_retain(ctx)
+
+    monkeypatch.setitem(stages_module.STAGE_FUNCTIONS, "retain",
+                        (counting_retain, hasher))
+
+    result = loop_for(tiny_run, tmp_path, judge=DecliningJudge(), max_iterations=2,
+                      use_agent_planner=True).run()
+    assert result.passed
+    # Once, at the end — not once per iteration.
+    assert len(pruned) == 1
+
+
+def test_retention_still_runs_when_the_run_passes(tiny_run, tmp_path):
+    result = loop_for(tiny_run, tmp_path).run()
+    assert result.passed
+    assert result.state.record("retain").status == "ok"
+    assert result.state.record("retain").metrics.get("kept_layers")

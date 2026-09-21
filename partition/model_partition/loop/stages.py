@@ -27,6 +27,7 @@ from model_partition.storage import DumpPolicy, TraceShape, estimate_storage, pr
 from model_partition.tensorstore import TensorStore
 from model_partition.trace import Tracer
 from model_partition.runtime.module_runner import TraceBundle
+from model_partition.verify.chain import verify_chain
 from model_partition.verify.emulate import EmulationInput, emulate
 from model_partition.verify.judge import Judge, StubJudge
 from model_partition.verify.modules import verify_modules
@@ -135,6 +136,7 @@ class LoopContext:
     build_model: Callable[..., Any] | None = None
     build_meta_model: Callable[[], Any] | None = None
     verify_report: Any = None
+    chain_report: Any = None
     emulate_report: Any = None
     retention: Any = None
     notes: list[str] = field(default_factory=list)
@@ -737,6 +739,57 @@ def input_device(model: Any) -> str:
 
 
 
+# -- stage: verify_chain -----------------------------------------------------
+
+
+def stage_verify_chain(ctx: LoopContext) -> StageResult:
+    """Chain the implementations together and measure how the error compounds.
+
+    Per-module verification starts each module from its recorded input, so it cannot
+    see one module's error reaching the next. This feeds each computed output forward
+    and reports where the drift first leaves tolerance, and whether the logits still
+    predict the same tokens.
+    """
+    assert ctx.graph is not None
+    bundle = load_bundle(ctx)
+    impl_dirs = _impl_dirs(ctx)
+    if not impl_dirs:
+        return StageResult(ok=True, detail="no extracted implementations to chain")
+
+    suite = verify_chain(bundle, ctx.graph, impl_dirs, device=_accelerator(ctx))
+    ctx.chain_report = suite
+    (ctx.layout.reports_dir / "chain.json").write_text(json.dumps(suite.to_dict(), indent=2))
+
+    metrics = {
+        "n_samples": len(suite.reports),
+        "n_failed": len(suite.failures),
+        "worst_cosine": suite.worst_cosine(),
+        "mean_top1_agreement": suite.mean_top1(),
+        "diverging_modules": suite.diverging_modules(),
+    }
+    if not suite.passed:
+        diverging = suite.diverging_modules()
+        kept = sum(1 for r in suite.reports if r.tokens_agree)
+        return StageResult(
+            ok=False, repairable=True, repair_surface="modules",
+            failing_modules=diverging,
+            detail=(f"{len(suite.failures)}/{len(suite.reports)} chain(s) drifted past "
+                    f"tolerance; {kept}/{len(suite.reports)} kept every token"
+                    + (f"; first divergence at {', '.join(diverging[:4])}"
+                       if diverging else "")),
+            metrics=metrics,
+        )
+    return StageResult(ok=True, detail=(
+        f"{len(suite.reports)} chain(s) held, worst cosine {suite.worst_cosine():.6f}, "
+        f"top-1 agreement {suite.mean_top1():.4f}"
+    ), metrics=metrics)
+
+
+def hash_verify_chain(ctx: LoopContext) -> list[Any]:
+    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx),
+            _impl_fingerprint(ctx)]
+
+
 # -- stage: emulate ----------------------------------------------------------
 
 
@@ -761,6 +814,9 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
         temperature=ctx.options.temperature, seed=ctx.options.seed,
         eos_token_id=eos, device=device, min_score=ctx.options.min_judge_score,
         strict_fill=True, place_max_memory=place_max_memory,
+        # Generation runs the loop's own implementations, not the model's modules:
+        # these tokens are the deliverable's tokens or they are worth nothing.
+        impl_dirs=_impl_dirs(ctx), run_dir=ctx.layout.root,
     )
     ctx.emulate_report = report
     (ctx.layout.reports_dir / "emulate.json").write_text(json.dumps(report.to_dict(), indent=2))
@@ -799,6 +855,7 @@ def _emulate_metrics(report) -> dict[str, Any]:
         "judge_declined": [o.sample_id for o in report.judge_declined],
         "mean_judge_score": report.mean_score(),
         "weights_filled": report.fill.applied if report.fill else 0,
+        "implementations_installed": len(report.install.installed) if report.install else 0,
     }
 
 
@@ -866,6 +923,7 @@ STAGE_FUNCTIONS: dict[str, tuple[Callable[[LoopContext], StageResult],
     "trace": (stage_trace, hash_trace),
     "extract": (stage_extract, hash_extract),
     "verify_modules": (stage_verify_modules, hash_verify),
+    "verify_chain": (stage_verify_chain, hash_verify_chain),
     "emulate": (stage_emulate, hash_emulate),
     "retain": (stage_retain, hash_retain),
 }
@@ -896,6 +954,9 @@ def write_summary(ctx: LoopContext, state: Any) -> Path:
         lines.append("")
     if ctx.verify_report:
         lines += ["## Module verification", "", "```", ctx.verify_report.render(), "```", ""]
+    if ctx.chain_report:
+        lines += ["## Accumulated error through the chained implementations", "",
+                  "```", ctx.chain_report.render(), "```", ""]
     if ctx.emulate_report:
         lines += ["## Emulated inference", "", "```", ctx.emulate_report.render(), "```", ""]
     if ctx.retention:

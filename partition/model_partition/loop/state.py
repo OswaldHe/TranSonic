@@ -21,7 +21,14 @@ from typing import Any
 #: Stage order. Invalidating a stage invalidates every later stage.
 #: Extraction follows tracing: a module's implementation documents the parameter
 #: names it is handed, and verification runs that implementation.
-STAGES = ("ingest", "plan", "trace", "extract", "verify_modules", "emulate", "retain")
+STAGES = ("ingest", "plan", "trace", "extract", "verify_modules", "verify_chain",
+          "emulate", "retain")
+
+#: Stages the loop runs each iteration. Retention deletes the reference tensors for
+#: every layer outside the representative set, so it runs once the loop is done
+#: rather than at the end of each pass — otherwise a later iteration would verify
+#: against a pruned trace and report partial coverage as a pass.
+ITERATION_STAGES = tuple(name for name in STAGES if name != "retain")
 
 PENDING, OK, FAILED, SKIPPED = "pending", "ok", "failed", "skipped"
 

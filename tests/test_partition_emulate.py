@@ -238,3 +238,121 @@ def test_stub_judge_flags_degenerate_repetition():
     judge = StubJudge()
     assert not judge.judge("p", "the the the the the the the the").passed()
     assert judge.judge("p", "a clearly varied continuation of text").passed()
+
+
+# -- generation runs the loop's own code -------------------------------------
+#
+# The implementations are the deliverable. Generating through the model's own
+# modules would check the reference against itself and print tokens the shipped
+# code never produced.
+
+
+def _impls(run, tmp_path):
+    from model_partition.extract import extract
+    from model_partition.runtime.module_impl import find_impl_dirs
+
+    extract(run.graph, run.build_model(), tmp_path / "modules",
+            run_root=run.layout.root, sample_ids=run.sample_ids,
+            weight_tensors=run.bundle.weights, param_names=run.bundle.weight_params)
+    return find_impl_dirs(tmp_path / "modules")
+
+
+def test_installing_the_implementations_replaces_every_submodule(tiny_run, tmp_path):
+    from model_partition.runtime import baseline
+    from model_partition.runtime.assemble import install_implementations
+    from model_partition.trace import _lookup
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _impls(tiny_run, tmp_path)
+        model = tiny_run.build_model()
+        report = install_implementations(model, tiny_run.graph, tiny_run.bundle,
+                                         impl_dirs, run_dir=tiny_run.layout.root)
+        assert report.installed, report.summary()
+        for name in report.installed:
+            assert type(_lookup(model, name)).__name__ == "Implemented"
+    finally:
+        baseline.clear_structure_cache()
+
+
+def test_installation_reuses_the_model_rather_than_building_a_second(tiny_run, tmp_path):
+    """A second copy of the architecture would double the memory for nothing."""
+    from model_partition.runtime import baseline
+    from model_partition.runtime.assemble import install_implementations
+
+    baseline.clear_structure_cache()
+    seen: list = []
+    real = baseline._structure
+
+    def watching(run, device):
+        model = real(run, device)
+        seen.append(model)
+        return model
+
+    try:
+        impl_dirs = _impls(tiny_run, tmp_path)
+        model = tiny_run.build_model()
+        baseline._structure = watching
+        install_implementations(model, tiny_run.graph, tiny_run.bundle, impl_dirs,
+                                run_dir=tiny_run.layout.root)
+    finally:
+        baseline._structure = real
+        baseline.clear_structure_cache()
+
+    # Every build resolved to the model passed in, never to a fresh one.
+    assert seen and all(m is model for m in seen)
+
+
+def test_installation_leaves_no_wrapped_model_in_the_cache(tiny_run, tmp_path):
+    """A later stage finding this model would look up a submodule and get a wrapper."""
+    from model_partition.runtime import baseline
+    from model_partition.runtime.assemble import install_implementations
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _impls(tiny_run, tmp_path)
+        install_implementations(tiny_run.build_model(), tiny_run.graph, tiny_run.bundle,
+                                impl_dirs, run_dir=tiny_run.layout.root)
+        assert baseline._STRUCTURE_CACHE == {}
+    finally:
+        baseline.clear_structure_cache()
+
+
+def test_emulation_generates_through_the_extracted_implementations(tiny_run, tmp_path):
+    from model_partition.runtime import baseline
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _impls(tiny_run, tmp_path)
+        report = emulate(
+            tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+            inputs=inputs_for(tiny_run), judge=AcceptAll(), max_new_tokens=3,
+            impl_dirs=impl_dirs, run_dir=tiny_run.layout.root,
+        )
+    finally:
+        baseline.clear_structure_cache()
+
+    assert report.install is not None and report.install.installed
+    assert report.mechanically_passed, report.render()
+    assert "extracted implementation" in report.render()
+
+
+def test_emulation_says_when_a_submodule_kept_the_model_s_own_code(tiny_run, tmp_path):
+    """Partial installation has to be visible, not assumed away."""
+    from model_partition.runtime import baseline
+    from model_partition.runtime.assemble import install_implementations
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _impls(tiny_run, tmp_path)
+        dropped = sorted(impl_dirs)[0]
+        del impl_dirs[dropped]
+        report = install_implementations(tiny_run.build_model(), tiny_run.graph,
+                                         tiny_run.bundle, impl_dirs,
+                                         run_dir=tiny_run.layout.root)
+    finally:
+        baseline.clear_structure_cache()
+
+    assert dropped in report.skipped
+    assert not report.complete
+    assert "left as the model's own" in report.summary()
