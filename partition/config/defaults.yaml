@@ -3,7 +3,7 @@
 loop:
   # --- placement -------------------------------------------------------------
   device: cuda              # device used for tracing; falls back to cpu if it fails
-  headroom: 0.60            # fraction of GPU memory one module may occupy
+  headroom: 0.80            # fraction of GPU memory one module may occupy
   # gpu_memory_gib: 46      # plan for a GPU of this size without one attached
 
   # --- partitioning ----------------------------------------------------------

@@ -37,9 +37,34 @@ checkpoint:
     - ['e_score_correction_bias', 'bias']
 
 scope:
+  # The n-gram memory writes into the residual stream at layers 1 and 14
+  # (model.py:1262), so a partition without it does not reproduce the model. Its two
+  # tables are 94.4 GiB each: streamed for the trace and verified on the host, since
+  # no partition of one embedding table fits a 44 GiB card.
+  #
+  # The draft stack is the deployed decoding path, so it gets modules too: the seed
+  # planner cuts `mtp.*` as a second repeating stack hanging off the backbone's last
+  # hidden state, and `trace.extra_passes` below drives it, since the model's own
+  # `forward` runs the backbone alone.
+  #
+  # Vision stays out: these runs are text-only and the tower is another 32 layers
+  # nothing in them exercises.
   vision: false
-  mtp: false
-  engram: false
+  mtp: true
+  engram: true
+
+trace:
+  # `Transformer.forward` runs the backbone alone, so hooks never fire inside the
+  # draft stack and nothing in `mtp.*` would have a reference. `forward_spec`
+  # (model.py:1275) is what drives it, taking the ids, the `main_hidden` the forward
+  # returns third, and the position. It needs a decode step: at start_pos 0 a
+  # DSparkBlock only seeds its window KV cache and returns its input (model.py:1124).
+  # Inert while `scope.mtp` is false — no module is unreached, so no pass runs.
+  returns: [output_ids, logits, main_hidden]
+  extra_passes:
+    - entry: forward_spec
+      args: [input_ids, main_hidden, start_pos]
+      decode: true
 
 partition:
   # Attention and the FFN/MoE of a layer are separate pieces of work: different
@@ -55,11 +80,25 @@ partition:
     per-module budget, or when two computations inside it would genuinely be
     developed and tuned separately.
 
-    Two things about this model in particular. Attention is sparse and reads KV
-    from other layers, with a lightning indexer fed from elsewhere again: express
-    those as tensor edges in the graph rather than duplicating the computation. And
-    the FFN side has two independent MoEs plus a shared expert, which are three
-    separate pieces of work, not one.
+    These are the pieces of this model a kernel author tunes separately, and each
+    wants its own module:
+
+    - the sparse attention (CSA v2): sparse, reading KV from other layers, with a
+      lightning indexer fed from elsewhere again. Express those as tensor edges in
+      the graph rather than duplicating the computation.
+    - the MoE FFN: two independent MoEs plus a shared expert, which are three
+      separate pieces of work, not one.
+    - the hyper-connections (mHC): the per-layer hc_* mix before and after each
+      layer. It is small but it is its own arithmetic, and it sits on every
+      layer boundary.
+    - the engram n-gram memory at layers 1 and 14: a hash lookup into a 94.4 GiB
+      fp8 table, gated against the residual stream. Nothing else in the model looks
+      like it.
+    - the draft stack (mtp.*): the speculative decoding path, which is attention and
+      FFN again at a different shape.
+
+    If you find another computation that would be developed and tuned on its own,
+    give it a module too and say why in the rationale.
 
 inputs:
   # max_short / max_long cap how many prompts of each set this run uses. Cost is
@@ -75,9 +114,8 @@ overrides:
   cache_weights: false      # nor would a second copy; read them from the shards
 
 notes: |
-  `inspect` and `plan` work from metadata alone and need no weights, and the rest now
-  works on a machine far smaller than the checkpoint — with one exception that is the
-  GPU's, not the loop's.
+  `inspect` and `plan` work from metadata alone and need no weights, and the rest runs
+  on a machine far smaller than the checkpoint.
 
   What it takes, all of it verified here on one 44 GiB L40S with 119 GiB of host RAM:
 
@@ -95,12 +133,12 @@ notes: |
     runtime headers. Both the fp8 and the fp4 GEMM compile and run on sm_89.
   - The tokenizer at construction: an n-gram layer builds its token map from the
     vocabulary, so no config can stand in for it.
-
-  What stops a forward here is `sparse_attn`, which asks for 141 312 bytes of dynamic
-  shared memory per block. An L40S (sm_89) allows 101 376; Hopper allows 232 448. The
-  kernel is written for Hopper and there is no reference path beside it, so `trace` and
-  everything after it needs an H100/H200-class GPU — where all of the above still
-  applies, since the checkpoint is larger than those cards too.
+  - A ported `sparse_attn`. The vendor's kernel asks for 141 312 bytes of dynamic
+    shared memory per block and this card allows 101 376, so the launch fails before
+    the kernel runs. The loop hands that to the agent, which writes a replacement
+    under `compat/` computing the same thing at the same precision — bf16 operands,
+    fp32 accumulation — and the trace is taken again with it in place. `compat/` is
+    part of the artifacts, so a reader sees exactly what ran.
 
   encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
   tokenizer ground truth and are worth checking before anything else.

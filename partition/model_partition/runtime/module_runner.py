@@ -52,17 +52,18 @@ class TraceBundle:
         return dict(self.metadata.get("config") or {})
 
     def sample_ids(self) -> list[str]:
-        seen: list[str] = []
-        for record in self.records:
-            if record.sample_id not in seen:
-                seen.append(record.sample_id)
-        return seen
+        return self._distinct("sample_id")
 
     def module_ids(self) -> list[str]:
+        return self._distinct("module_id")
+
+    def _distinct(self, field_name: str) -> list[str]:
+        """Values of one record field, in the order the trace first saw them."""
         seen: list[str] = []
         for record in self.records:
-            if record.module_id not in seen:
-                seen.append(record.module_id)
+            value = getattr(record, field_name)
+            if value not in seen:
+                seen.append(value)
         return seen
 
     def select(self, module_id: str | None = None, sample_id: str | None = None,

@@ -1,6 +1,11 @@
 A partition module's inference code does not reproduce its reference output. Fix
 the implementation.
 
+This is the `"modules"` repair surface of the loop: it runs after `verify_modules` or
+`verify_chain` fails and the reviewer has written its diagnosis. See the loop diagram
+in `partition/README.md` for where that sits and which other prompts handle the
+other failures.
+
 ## Model
 
 - id: {{ model }}

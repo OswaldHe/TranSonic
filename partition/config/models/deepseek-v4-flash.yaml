@@ -16,9 +16,22 @@ dtype: bfloat16
 trust_remote_code: true     # required: importing inference/model.py runs repo code
 
 scope:
+  # `n_mtp_layers` defaults to 1 and this config does not override it, so the model
+  # builds one MTP block and the checkpoint carries its weights. It is not part of
+  # `Transformer.forward` — `trace.extra_passes` below drives it. This model has no
+  # engram layers and no vision tower.
   vision: false
-  mtp: false
+  mtp: true
   engram: false
+
+trace:
+  # The MTP block takes the backbone's last hidden state, the position, and the ids.
+  # Nothing in the repo calls it in anger — `generate.py` decodes one token at a time
+  # — so the convention is the one the model file's own demo uses (model.py:825-827).
+  extra_passes:
+    - entry: mtp.0
+      args: [hidden, start_pos, input_ids]
+      decode: true
 
 partition:
   # Attention and the FFN/MoE of a layer are separate pieces of work: different

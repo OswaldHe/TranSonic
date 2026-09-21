@@ -287,3 +287,152 @@ def test_a_derived_buffer_is_recorded_as_the_forward_saw_it(tiny_run):
     recorded = store.read_torch(entry)
     assert recorded.dtype is torch.float32
     assert recorded[0].item() == pytest.approx(0.6042963862, abs=1e-9)
+
+
+# -- entry points the main forward does not reach -----------------------------
+
+
+def _drafting_model():
+    """A backbone plus a draft stack its own ``forward`` never calls.
+
+    Both DeepSeek V4 models are shaped this way: the MTP/DSpark blocks are in the
+    checkpoint and in the module tree, and `Transformer.forward` runs the backbone
+    alone. One is driven by a second method on the model, the other by calling the
+    block with the backbone's last hidden state, so both conventions are here.
+    """
+    import torch
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+
+        def forward(self, hidden, start_pos, input_ids):
+            return self.proj(hidden) + start_pos + input_ids.sum()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 4)
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(3)])
+            self.mtp = torch.nn.ModuleList([Draft()])
+
+        def forward(self, input_ids, start_pos=0):
+            hidden = self.embed(input_ids)
+            for layer in self.layers:
+                hidden = layer(hidden)
+            return hidden.sum(-1), hidden
+
+        def forward_spec(self, input_ids, last_hidden, start_pos):
+            return self.mtp[0](last_hidden, start_pos, input_ids)
+
+    return Model()
+
+
+def _drafting_graph():
+    from model_partition.planner.graph import ModuleNode, PartitionGraph
+
+    return PartitionGraph(model="drafting", modules=[
+        ModuleNode(id="00-backbone", kind="decoder_layers",
+                   submodules=[f"layers.{i}" for i in range(3)]),
+        ModuleNode(id="01-draft", kind="mtp", submodules=["mtp.0"]),
+    ])
+
+
+def _trace_spec(**kwargs):
+    from model_partition.spec import parse_spec
+
+    return parse_spec({"source": "/tmp/x", "name": "t", "trace": kwargs}).trace
+
+
+def test_a_module_the_forward_never_calls_records_nothing(tiny_run):
+    """The gap the extra passes exist to close, stated as a fact about hooks."""
+    from model_partition.tensorstore import TensorStore
+
+    tracer = Tracer(_drafting_model(), _drafting_graph(),
+                    TensorStore(tiny_run.root / "unreached"))
+    tracer.trace_sample("s", torch.zeros(1, 5, dtype=torch.long))
+    assert {r.module_id for r in tracer.records} == {"00-backbone"}
+
+
+def test_an_extra_pass_reaches_the_draft_stack(tiny_run):
+    """A second entry point, driven with what the first returned."""
+    from model_partition.tensorstore import TensorStore
+
+    store = TensorStore(tiny_run.root / "extra")
+    tracer = Tracer(_drafting_model(), _drafting_graph(), store)
+    spec = _trace_spec(returns=["logits", "last_hidden"], extra_passes=[
+        {"entry": "forward_spec", "args": ["input_ids", "last_hidden", "start_pos"],
+         "decode": True},
+    ])
+    input_ids = torch.zeros(1, 5, dtype=torch.long)
+    tracer.trace_sample("s", input_ids)
+    produced = tracer.trace_extra_passes("s", input_ids, spec, only={"mtp.0"})
+
+    assert [r.module_id for r in produced] == ["01-draft"]
+    # A decode step: one position, at the one after the prompt, and its own step
+    # number so nothing confuses it with the prefill's records.
+    assert produced[0].step == 1
+    recorded = store.read_torch(next(e for e in store.entries
+                                     if e.name == produced[0].output[TENSOR_KEY]))
+    assert recorded.shape == (1, 1, 4)
+
+
+def test_an_extra_pass_records_only_what_it_was_asked_for(tiny_run):
+    """The backbone runs again to reach the draft stack; it is already traced."""
+    from model_partition.tensorstore import TensorStore
+
+    tracer = Tracer(_drafting_model(), _drafting_graph(),
+                   TensorStore(tiny_run.root / "only"))
+    spec = _trace_spec(returns=["logits", "last_hidden"], extra_passes=[
+        {"entry": "forward_spec", "args": ["input_ids", "last_hidden", "start_pos"],
+         "decode": True},
+    ])
+    input_ids = torch.zeros(1, 5, dtype=torch.long)
+    tracer.trace_sample("s", input_ids)
+    before = len(tracer.records)
+    tracer.trace_extra_passes("s", input_ids, spec, only={"mtp.0"})
+    assert len(tracer.records) == before + 1
+
+
+def test_an_extra_pass_can_take_the_stack_hidden_state(tiny_run):
+    """What no forward returns: the hidden state the last layer produced."""
+    from model_partition.tensorstore import TensorStore
+
+    tracer = Tracer(_drafting_model(), _drafting_graph(),
+                    TensorStore(tiny_run.root / "hidden"))
+    spec = _trace_spec(extra_passes=[
+        {"entry": "mtp.0", "args": ["hidden", "start_pos", "input_ids"], "decode": True},
+    ])
+    input_ids = torch.zeros(1, 5, dtype=torch.long)
+    tracer.trace_sample("s", input_ids)
+    produced = tracer.trace_extra_passes("s", input_ids, spec, only={"mtp.0"})
+    assert [r.module_id for r in produced] == ["01-draft"]
+
+
+def test_an_extra_pass_naming_nothing_on_the_model_says_so(tiny_run):
+    from model_partition.tensorstore import TensorStore
+
+    from model_partition.trace import TraceError
+
+    tracer = Tracer(_drafting_model(), _drafting_graph(),
+                    TensorStore(tiny_run.root / "absent"))
+    spec = _trace_spec(extra_passes=[{"entry": "forward_draft", "args": ["input_ids"]}])
+    with pytest.raises(TraceError, match="no callable"):
+        tracer.trace_extra_passes("s", torch.zeros(1, 5, dtype=torch.long), spec)
+
+
+def test_an_argument_the_forward_does_not_produce_is_reported(tiny_run):
+    """Naming the returns wrongly is a spec mistake, and it says which name."""
+    from model_partition.tensorstore import TensorStore
+
+    from model_partition.trace import TraceError
+
+    tracer = Tracer(_drafting_model(), _drafting_graph(),
+                    TensorStore(tiny_run.root / "wrong"))
+    # The forward returns two values, so a third name binds to nothing.
+    spec = _trace_spec(returns=["logits", "last_hidden", "draft_hidden"], extra_passes=[
+        {"entry": "forward_spec", "args": ["input_ids", "draft_hidden", "start_pos"]},
+    ])
+    with pytest.raises(TraceError, match="draft_hidden"):
+        tracer.trace_extra_passes("s", torch.zeros(1, 5, dtype=torch.long), spec)

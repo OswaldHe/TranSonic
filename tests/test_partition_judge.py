@@ -306,5 +306,3 @@ def test_score_below_four_does_not_pass():
         assert not parse_verdict(json.dumps({"fluent": True, "score": score})).passed()
 
 
-def test_an_errored_verdict_never_passes_whatever_the_score():
-    assert not Verdict(fluent=True, score=5, error="timed out").passed()

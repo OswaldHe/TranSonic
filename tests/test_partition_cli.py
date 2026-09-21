@@ -145,7 +145,7 @@ def test_defaults_file_populates_options():
     assert options.judge_kind == "claude"
     assert options.min_judge_score == 4
     assert options.retention_layers == (1, 5)
-    assert options.headroom == 0.60
+    assert options.headroom == 0.80
 
 
 def test_cli_overrides_beat_defaults():

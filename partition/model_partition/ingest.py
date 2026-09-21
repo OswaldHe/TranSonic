@@ -63,9 +63,6 @@ class IngestResult:
     def missing_shards(self) -> list[str]:
         return sorted(s for s in self.index.shard_bytes if not self.shard_path(s).is_file())
 
-    def entry_path(self) -> Path | None:
-        return self.root / self.spec.entry if self.spec.entry else None
-
 
 def _hf_api(token: str | None = None):
     try:

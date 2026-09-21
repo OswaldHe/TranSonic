@@ -123,6 +123,46 @@ class ScopeSpec:
 
 
 @dataclass
+class ExtraPass:
+    """One entry point the model's own ``forward`` does not reach.
+
+    A speculative-decoding stack is part of the model and no part of ``forward``: it
+    runs after it, on what it produced. Hooks only fire for code that runs, so those
+    modules cannot be traced from ``forward`` alone — the entry point that does call
+    them has to be driven, and how to call it is knowledge about this model.
+
+    ``entry`` is a dotted path to a callable on the model and ``args`` the values to
+    hand it, by name: ``input_ids``, ``start_pos``, ``hidden`` (the decoder stack's
+    last output) or any of :attr:`TraceSpec.returns`. ``decode`` runs the pass against
+    a single-token step after the prefill rather than the prefill itself, which a
+    draft stack needs — at ``start_pos`` 0 it has no drafting to do.
+    """
+
+    entry: str
+    args: tuple[str, ...] = ()
+    decode: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"entry": self.entry, "args": list(self.args), "decode": self.decode}
+
+
+@dataclass
+class TraceSpec:
+    """How to drive this model for a trace, beyond ``model(input_ids)``.
+
+    ``returns`` names the model forward's return tuple positionally, so an extra pass
+    can ask for one of its elements by name.
+    """
+
+    returns: tuple[str, ...] = ()
+    extra_passes: tuple[ExtraPass, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"returns": list(self.returns),
+                "extra_passes": [p.to_dict() for p in self.extra_passes]}
+
+
+@dataclass
 class ModelSpec:
     """A resolved, validated model specification."""
 
@@ -139,6 +179,7 @@ class ModelSpec:
     checkpoint: CheckpointSpec = field(default_factory=CheckpointSpec)
     inputs: InputSpec = field(default_factory=InputSpec)
     partition: PartitionSpec = field(default_factory=PartitionSpec)
+    trace: TraceSpec = field(default_factory=TraceSpec)
     overrides: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     notes: str = ""
@@ -192,6 +233,7 @@ class ModelSpec:
             "scope": {"vision": self.scope.vision, "mtp": self.scope.mtp, "engram": self.scope.engram},
             "checkpoint": self.checkpoint.to_dict(),
             "partition": self.partition.to_dict(),
+            "trace": self.trace.to_dict(),
             "inputs": {
                 "short": self.inputs.short,
                 "long": self.inputs.long,
@@ -221,7 +263,7 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
     unknown = set(data) - {
         "name", "source", "revision", "loader", "code_paths", "entry", "config_file",
         "trust_remote_code", "dtype", "scope", "checkpoint", "inputs", "partition",
-        "overrides", "enabled", "notes",
+        "trace", "overrides", "enabled", "notes",
     }
     if unknown:
         raise SpecError(f"Unknown spec key(s): {', '.join(sorted(unknown))}")
@@ -274,6 +316,8 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         split_attention_ffn=bool(raw_partition.get("split_attention_ffn", False)),
     )
 
+    trace = _parse_trace(data.get("trace") or {})
+
     raw_checkpoint = data.get("checkpoint") or {}
     if not isinstance(raw_checkpoint, dict):
         raise SpecError("checkpoint must be a mapping")
@@ -314,11 +358,50 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         checkpoint=checkpoint,
         inputs=inputs,
         partition=partition,
+        trace=trace,
         overrides=dict(overrides),
         enabled=bool(data.get("enabled", True)),
         notes=str(data.get("notes", "")),
         spec_path=spec_path,
     )
+
+
+def _parse_trace(raw: dict[str, Any]) -> TraceSpec:
+    """Validate the ``trace`` block, including every argument name it uses."""
+    if not isinstance(raw, dict):
+        raise SpecError("trace must be a mapping")
+    unknown = set(raw) - {"returns", "extra_passes"}
+    if unknown:
+        raise SpecError(f"Unknown trace key(s): {', '.join(sorted(unknown))}")
+    returns = raw.get("returns") or []
+    if not isinstance(returns, list) or not all(isinstance(name, str) for name in returns):
+        raise SpecError("trace.returns must be a list of names for the forward's return tuple")
+    # Names an extra pass may ask for. A typo here would otherwise surface as a
+    # failed trace after the model is loaded, which for a large one is an hour away.
+    available = set(returns) | {"input_ids", "start_pos", "hidden"}
+    passes = []
+    for entry in raw.get("extra_passes") or []:
+        if not isinstance(entry, dict):
+            raise SpecError("each trace.extra_passes entry must be a mapping")
+        pass_unknown = set(entry) - {"entry", "args", "decode"}
+        if pass_unknown:
+            raise SpecError(f"Unknown trace.extra_passes key(s): {', '.join(sorted(pass_unknown))}")
+        target = entry.get("entry")
+        if not target or not isinstance(target, str):
+            raise SpecError("trace.extra_passes entry requires 'entry', a callable on the model")
+        args = entry.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise SpecError(f"trace.extra_passes[{target}].args must be a list of names")
+        missing = [a for a in args if a not in available]
+        if missing:
+            raise SpecError(
+                f"trace.extra_passes[{target}] asks for {', '.join(missing)}, which is "
+                f"not available; name it in trace.returns or use one of "
+                f"{', '.join(sorted(available))}"
+            )
+        passes.append(ExtraPass(entry=target, args=tuple(args),
+                                decode=bool(entry.get("decode", False))))
+    return TraceSpec(returns=tuple(returns), extra_passes=tuple(passes))
 
 
 def load_spec(path: str | Path) -> ModelSpec:

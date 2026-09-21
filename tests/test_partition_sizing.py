@@ -166,35 +166,8 @@ def test_layer_types_surface_hybrid_stacks():
     assert inventory.layer_types == ["linear_attention", "full_attention"]
 
 
-# -- representative layer selection (post-loop retention) --------------------
-
-
-def build_inventory(n_layers: int, signature_of=lambda i: "same") -> ModelInventory:
-    entries = [
-        entry(f"model.layers.{i}.{signature_of(i)}.weight", nbytes=100)
-        for i in range(n_layers)
-    ]
-    return ModelInventory.build(WeightIndex(entries=entries),
-                                {"hidden_size": 8, "num_hidden_layers": n_layers})
-
-
-def test_representative_layers_keep_requested_plus_mid_and_last():
-    keep = build_inventory(64).representative_layers()
-    assert keep == [0, 1, 5, 32, 63]
-
-
-def test_representative_layers_cover_every_distinct_signature():
-    """A hybrid stack must not lose the only copy of a kernel variant."""
-    inventory = build_inventory(24, lambda i: "full_attn" if i % 4 == 3 else "linear_attn")
-    keep = inventory.representative_layers()
-    kept_signatures = {inventory.layers[i].signature for i in keep}
-    assert kept_signatures == set(inventory.signature_groups())
-
-
-def test_representative_layers_handles_short_stacks():
-    assert build_inventory(2).representative_layers() == [0, 1]
-    assert build_inventory(1).representative_layers() == [0]
-    assert build_inventory(0).representative_layers() == []
+# Which layers a run keeps is one rule with one implementation,
+# `RetentionPolicy.layers_to_keep`, and it is covered in test_partition_retention.py.
 
 
 # -- cost model --------------------------------------------------------------

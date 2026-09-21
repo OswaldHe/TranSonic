@@ -60,6 +60,12 @@ def test_local_source_detection(tmp_path):
     ({"source": "hf:x/y", "inputs": {"nope": 1}}, "Unknown inputs key"),
     ({"source": "hf:x/y", "inputs": {"long_token_budgets": [0]}}, "positive ints"),
     ({"source": "hf:x/y", "code_paths": "inference/"}, "list of strings"),
+    ({"source": "hf:x/y", "trace": {"passes": []}}, "Unknown trace key"),
+    ({"source": "hf:x/y", "trace": {"extra_passes": [{"args": ["input_ids"]}]}},
+     "requires 'entry'"),
+    # Caught here rather than an hour into loading a 475 GiB model.
+    ({"source": "hf:x/y", "trace": {"extra_passes": [{"entry": "f", "args": ["hidde"]}]}},
+     "asks for hidde"),
 ])
 def test_invalid_specs_rejected(payload, match):
     with pytest.raises(SpecError, match=match):
@@ -71,6 +77,10 @@ def test_round_trip_through_yaml(tmp_path):
         "source": "hf:Qwen/Qwen3.5-0.8B",
         "revision": "abc123",
         "scope": {"mtp": True},
+        "trace": {"returns": ["logits", "hidden_states"],
+                  "extra_passes": [{"entry": "forward_spec",
+                                    "args": ["input_ids", "hidden_states"],
+                                    "decode": True}]},
         "inputs": {"short": "short.jsonl", "long_token_budgets": [2048]},
         "overrides": {"max_new_tokens": 8},
     })
@@ -79,6 +89,8 @@ def test_round_trip_through_yaml(tmp_path):
     reloaded = load_spec(path)
     assert reloaded.revision == "abc123"
     assert reloaded.scope.mtp is True
+    assert reloaded.trace.extra_passes[0].entry == "forward_spec"
+    assert reloaded.trace.extra_passes[0].decode is True
     assert reloaded.inputs.long_token_budgets == [2048]
     assert reloaded.overrides == {"max_new_tokens": 8}
 

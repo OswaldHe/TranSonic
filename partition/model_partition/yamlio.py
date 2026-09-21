@@ -40,8 +40,3 @@ def dumps(payload: Any, sort_keys: bool = False, **options: Any) -> str:
                      default_flow_style=False, **options)
 
 
-def dump_path(path: str | Path, payload: Any, **options: Any) -> Path:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(dumps(payload, **options))
-    return target

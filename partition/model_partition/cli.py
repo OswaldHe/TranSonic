@@ -163,6 +163,7 @@ def inspect_model(target: str, artifact_root: str | None) -> None:
     from model_partition.hardware import detect_host, format_bytes, resolve_budget
     from model_partition.ingest import ingest
     from model_partition.layout import RunLayout
+    from model_partition.retention import RetentionPolicy
     from model_partition.sizing import ModelInventory
 
     spec = resolve_spec(target)
@@ -183,7 +184,9 @@ def inspect_model(target: str, artifact_root: str | None) -> None:
     click.echo(f"layers     : {len(inventory.layers)}  hidden {inventory.hidden_size}  "
                f"vocab {inventory.vocab_size}")
     click.echo(f"signatures : {len(inventory.signature_groups())} distinct layer structure(s)")
-    click.echo(f"representative layers: {inventory.representative_layers()}")
+    # The same selection retention applies, so `inspect` reports what a run would keep
+    # rather than a second opinion about it.
+    click.echo(f"representative layers: {RetentionPolicy().layers_to_keep(inventory)}")
     if inventory.subtree_bytes:
         click.echo("excluded   : " + ", ".join(
             f"{name} {format_bytes(size)}" for name, size in sorted(inventory.subtree_bytes.items())))

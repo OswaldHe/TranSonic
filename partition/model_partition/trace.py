@@ -16,6 +16,7 @@ instead of silently substituting a default.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -170,6 +171,10 @@ class Tracer:
         self.policy = policy or DumpPolicy()
         self.records: list[CallRecord] = []
         self.bytes_written = 0
+        #: What the last traced forward returned, and the hidden state its decoder
+        #: stack produced — which is what an extra pass continues from.
+        self.last_output: Any = None
+        self.last_hidden: Any = None
         #: Set while encoding one record, read back onto it afterwards.
         self._sliced = False
         #: Non-persistent buffers as the traced forward saw them, by original name.
@@ -294,13 +299,17 @@ class Tracer:
         return dumped
 
     def index_weights(self) -> dict[str, list[str]]:
-        """Which parameters each module owns, writing nothing.
+        """Which checkpoint tensors each module owns, writing nothing.
 
         What ``cache_weights=false`` leaves behind: the mapping is all a run needs
         to read those tensors back out of the checkpoint on demand, so
         verification still has real weights without a second copy on disk.
+
+        Non-persistent buffers are left out because no checkpoint holds them — a rotary
+        table and a KV cache are built at construction, and asking a checkpoint for one
+        fails on a model that has them. :meth:`dump_derived` is where they come from.
         """
-        return {module.id: [name for name, _ in self._module_tensors(module)]
+        return {module.id: [name for name, _ in self._module_tensors(module, weights_only=True)]
                 for module in self.graph.partitioned_modules}
 
     # -- activations -----------------------------------------------------------
@@ -310,8 +319,109 @@ class Tracer:
         import torch
 
         produced: list[CallRecord] = []
+        hidden, handle = self._capture_stack_output()
+        try:
+            with self._recording(sample_id, step, int(input_ids.shape[-1]), produced):
+                with torch.no_grad():
+                    self.last_output = forward_no_cache(self.model, input_ids)
+        finally:
+            handle.remove()
+        self.last_hidden = hidden.get("value")
+
+        self.records.extend(produced)
+        return produced
+
+    def trace_extra_passes(
+        self, sample_id: str, input_ids: Any, spec: Any,
+        only: set[str] | None = None, step: int = 1,
+    ) -> list[CallRecord]:
+        """Drive the entry points ``forward`` does not reach, recording what they call.
+
+        Must follow :meth:`trace_sample` for the same input: a pass reads what the main
+        forward returned, and a decode pass continues from the KV state it left.
+
+        Only the submodules in ``only`` are recorded. A decode pass runs the whole model
+        again to reach its second entry point, and those layers already have their
+        reference from the prefill; recording them again would double the artifacts and
+        give the chain two unrelated steps to reconcile.
+        """
+        import torch
+
+        produced: list[CallRecord] = []
+        for offset, extra in enumerate(spec.extra_passes):
+            target = _lookup(self.model, extra.entry)
+            if target is None or not callable(target):
+                raise TraceError(
+                    f"trace.extra_passes names {extra.entry!r}, which this model has no "
+                    f"callable for"
+                )
+            with torch.no_grad():
+                pool, ids = self._pass_pool(input_ids, extra, tuple(spec.returns))
+                missing = [name for name in extra.args if pool.get(name) is None]
+                if missing:
+                    raise TraceError(
+                        f"{extra.entry} needs {', '.join(missing)}, which this forward did "
+                        f"not produce; check trace.returns against what it returns"
+                    )
+                with self._recording(sample_id, step + offset, int(ids.shape[-1]),
+                                     produced, only=only):
+                    target(*[pool[name] for name in extra.args])
+
+        self.records.extend(produced)
+        return produced
+
+    def _pass_pool(self, input_ids: Any, extra: Any,
+                   returns: tuple[str, ...]) -> tuple[dict[str, Any], Any]:
+        """The values an extra pass can ask for, and the ids it runs on."""
+        ids, start_pos, output = input_ids, 0, self.last_output
+        hidden_state = self.last_hidden
+        if extra.decode:
+            # The prefill above filled the cache through the last prompt position, so a
+            # step at the next one is a real decode. The token fed there is the prompt's
+            # last one again: a draft stack's reference call does not depend on which
+            # token it is, and reusing a prompt token keeps the trace independent of
+            # what the model sampled.
+            ids = input_ids[..., -1:]
+            start_pos = int(input_ids.shape[-1])
+            hidden, handle = self._capture_stack_output()
+            try:
+                output = self.model(ids, start_pos)
+            except TypeError as exc:
+                raise TraceError(
+                    f"a decode pass calls model(ids, start_pos) and this model's forward "
+                    f"does not take that: {exc}"
+                ) from exc
+            finally:
+                handle.remove()
+            hidden_state = hidden.get("value")
+        pool: dict[str, Any] = {"input_ids": ids, "start_pos": start_pos,
+                                "hidden": hidden_state}
+        if returns:
+            values = output if isinstance(output, (tuple, list)) else (output,)
+            pool.update(dict(zip(returns, values)))
+        return pool, ids
+
+    def _capture_stack_output(self) -> tuple[dict[str, Any], Any]:
+        """Hook the decoder stack's last layer to keep what it produced.
+
+        An extra pass that continues the backbone rather than reading its return value
+        needs the hidden state entering the head, which no forward returns.
+        """
+        stack = _decoder_stack(self.model)
+        captured: dict[str, Any] = {}
+
+        def hook(_module, _args, output):
+            captured["value"] = output
+
+        if stack is None:
+            return captured, _NullHandle()
+        return captured, stack[-1].register_forward_hook(hook)
+
+    @contextmanager
+    def _recording(self, sample_id: str, step: int, seq_len: int,
+                   produced: list[CallRecord], only: set[str] | None = None):
+        """Install per-submodule hooks for the duration of one pass."""
         counter = {"n": 0}
-        seq_len = int(input_ids.shape[-1])
 
         def make_hook(submodule_name: str, module_ids: list[str]):
             def hook(_module, args, kwargs, output):
@@ -335,6 +445,8 @@ class Tracer:
 
         handles = []
         for submodule_name, module_ids in self._targets.items():
+            if only is not None and submodule_name not in only:
+                continue
             submodule = _lookup(self.model, submodule_name)
             if submodule is None:
                 continue
@@ -342,14 +454,10 @@ class Tracer:
                 make_hook(submodule_name, module_ids), with_kwargs=True,
             ))
         try:
-            with torch.no_grad():
-                forward_no_cache(self.model, input_ids)
+            yield
         finally:
             for handle in handles:
                 handle.remove()
-
-        self.records.extend(produced)
-        return produced
 
     def _encode(
         self, value: Any, path: str, seq_len: int,
@@ -396,6 +504,25 @@ def decode_value(value: Any, load: Any) -> Any:
             return [decode_value(item, load) for item in value[LIST_KEY]]
         return {key: decode_value(item, load) for key, item in value.items()}
     return value
+
+
+class _NullHandle:
+    """Stands in for a hook handle when there was nothing to hook."""
+
+    def remove(self) -> None:
+        pass
+
+
+def _decoder_stack(model: Any) -> Any | None:
+    """The repeating decoder stack: the longest ``ModuleList`` in the model."""
+    import torch
+
+    best = None
+    for _name, module in model.named_modules():
+        if isinstance(module, torch.nn.ModuleList) and len(module) > 1:
+            if best is None or len(module) > len(best):
+                best = module
+    return best
 
 
 def _lookup(model: Any, qualified_name: str) -> Any | None:

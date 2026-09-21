@@ -34,6 +34,14 @@ CONFIG_FILENAME = "config.json"
 #: module of a group asks for the same one.
 _SOURCE_CACHE: dict[str, Any] = {}
 
+#: Total weight bytes above which a module is constructed on the meta device and handed
+#: its recorded tensors by reference instead of copying into freshly allocated ones.
+#: Constructing for real allocates every parameter, and copying then holds the module
+#: twice — which DeepSeek V4.1's 94.4 GiB n-gram tables do not allow on any machine that
+#: holds them once. Below it construction stays real, because a class computes its
+#: derived buffers there and on the meta device those would come out empty.
+ASSIGN_THRESHOLD = 32 << 30
+
 
 def clear_source_cache() -> None:
     """Forget imported sources. Call when a ``source.py`` has been edited."""
@@ -292,32 +300,25 @@ def build(
     cls = _resolve_class(module, class_name)
 
     settings = _config_object(module, config, config_class)
-    instance = _construct(cls, settings, layer_index, weights, config)
+    by_reference = weights_bytes(weights) > ASSIGN_THRESHOLD
+    if by_reference:
+        with torch.device("meta"):
+            instance = _construct(cls, settings, layer_index, weights, config)
+    else:
+        instance = _construct(cls, settings, layer_index, weights, config)
     # The recorded weights decide the module's precision. A class constructs itself in
     # torch's default dtype, which is float32, and a bf16 checkpoint's feature maps
     # would then meet float32 parameters — the same matmul, refusing to run.
     dtype = _weights_dtype(weights)
     if dtype is not None:
         _cast_weights(instance, dtype)
-    loaded, missing = load_weights(instance, weights)
+    loaded, missing = (assign_weights(instance, weights) if by_reference
+                       else load_weights(instance, weights))
     instance = instance.to(device)
     instance.eval()
     torch.set_grad_enabled(False)
     return Launched(callable=instance, class_name=class_name,
                     weights_loaded=loaded, missing=missing)
-
-
-def _derived_buffers(instance: Any) -> set[str]:
-    """Dotted names of the non-persistent buffers, which no checkpoint holds.
-
-    A class marks a buffer non-persistent precisely because it is derived: it computes
-    the value at construction and it is not part of the weights.
-    """
-    names: set[str] = set()
-    for prefix, module in instance.named_modules():
-        for leaf in getattr(module, "_non_persistent_buffers_set", set()) or set():
-            names.add(f"{prefix}.{leaf}" if prefix else leaf)
-    return names
 
 
 def _cast_weights(instance: Any, dtype: Any) -> None:
@@ -396,6 +397,55 @@ def load_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[str]
                     buffer.copy_(candidate.reshape(buffer.shape).to(buffer.dtype))
             loaded += 1
     return loaded, missing
+
+
+def assign_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[str]]:
+    """Install ``weights`` into ``instance`` by reference, not by copy.
+
+    For a module whose parameters are too large to hold twice. The instance was built on
+    the meta device, so there is nothing to copy into: the recorded tensor becomes the
+    parameter. Anything left on meta afterwards is reported as missing rather than
+    handed back as a module that raises on its first read.
+    """
+    import torch
+
+    loaded, missing = 0, []
+    for prefix, module in instance.named_modules():
+        for leaf, parameter in list(module._parameters.items()):
+            if parameter is None:
+                continue
+            name = f"{prefix}.{leaf}" if prefix else leaf
+            candidate = _recorded(weights, name)
+            if candidate is None:
+                missing.append(name)
+                continue
+            module._parameters[leaf] = torch.nn.Parameter(
+                candidate.reshape(parameter.shape), requires_grad=False)
+            loaded += 1
+        for leaf, buffer in list(module._buffers.items()):
+            if buffer is None:
+                continue
+            name = f"{prefix}.{leaf}" if prefix else leaf
+            candidate = _recorded(weights, name)
+            if candidate is None:
+                # A class computes a derived buffer at construction, which on the meta
+                # device produces no value. Nothing here can recover it.
+                missing.append(name)
+                continue
+            module._buffers[leaf] = candidate.reshape(buffer.shape)
+            loaded += 1
+    return loaded, missing
+
+
+def weights_bytes(weights: dict[str, Any]) -> int:
+    """Bytes the recorded weights occupy."""
+    total = 0
+    for tensor in weights.values():
+        try:
+            total += tensor.numel() * tensor.element_size()
+        except AttributeError:  # pragma: no cover - a non-tensor in the dump
+            continue
+    return total
 
 
 def _recorded(weights: dict[str, Any], name: str) -> Any:

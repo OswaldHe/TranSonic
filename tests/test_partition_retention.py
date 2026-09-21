@@ -59,12 +59,12 @@ def test_signature_coverage_can_be_disabled():
     assert len(with_coverage) > len(without)
 
 
-def test_empty_stack_keeps_nothing():
-    assert RetentionPolicy().layers_to_keep(inventory_for(0)) == []
-
-
-def test_single_layer_stack():
-    assert RetentionPolicy().layers_to_keep(inventory_for(1)) == [0]
+def test_short_stacks_keep_what_there_is():
+    """First, mid and last collapse onto the same layers; none is invented."""
+    keep = RetentionPolicy().layers_to_keep
+    assert keep(inventory_for(2)) == [0, 1]
+    assert keep(inventory_for(1)) == [0]
+    assert keep(inventory_for(0)) == []
 
 
 # -- planning ----------------------------------------------------------------

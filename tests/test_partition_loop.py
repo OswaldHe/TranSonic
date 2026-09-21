@@ -294,6 +294,84 @@ def test_loop_reports_a_failure_without_an_agent(tiny_run, tmp_path):
     assert "do not exist" in result.error
 
 
+def _traced_context(run, tmp_path, spec=None):
+    """A context planned and ready to trace, optionally with a different spec."""
+    from model_partition.loop.stages import stage_ingest, stage_plan
+
+    loop = loop_for(run, tmp_path)
+    if spec is not None:
+        loop.spec = spec
+    ctx = loop.build_context()
+    stage_ingest(ctx)
+    stage_plan(ctx)
+    return ctx
+
+
+def _with_unreached_module(ctx):
+    """Give the model a submodule its forward never calls, and plan it in.
+
+    Both DeepSeek V4 models are shaped this way: the MTP blocks are in the checkpoint
+    and in the module tree, and the backbone's forward does not touch them.
+    """
+    import torch
+
+    from model_partition.planner.graph import ModuleNode, PartitionGraph
+
+    build, build_meta = ctx.build_model, ctx.build_meta_model
+
+    class Draft(torch.nn.Module):
+        def forward(self, input_ids):
+            return input_ids.float().sum()
+
+    def with_draft(placed=False):
+        model = build(placed=placed)
+        model.draft = Draft()
+        return model
+
+    def meta_with_draft():
+        model = build_meta()
+        model.draft = Draft()
+        return model
+
+    ctx.build_model = with_draft
+    ctx.build_meta_model = meta_with_draft
+    graph = PartitionGraph.load(ctx.layout.graph_path)
+    graph.modules.append(ModuleNode(id="99-draft", kind="mtp", submodules=["draft"]))
+    graph.save(ctx.layout.graph_path)
+    ctx.graph = graph
+    return graph
+
+
+def test_a_module_the_forward_never_calls_fails_the_trace_with_the_remedy(tiny_run, tmp_path):
+    """Hooks only fire for code that runs, so this module has no reference at all."""
+    from model_partition.loop.stages import stage_trace
+
+    ctx = _traced_context(tiny_run, tmp_path)
+    _with_unreached_module(ctx)
+    result = stage_trace(ctx)
+    assert not result.ok and result.failing_modules == ["99-draft"]
+    assert "trace.extra_passes" in result.detail
+
+
+def test_a_declared_extra_pass_gives_that_module_its_reference(tiny_run, tmp_path):
+    """Naming the entry point that does call it is enough to trace it."""
+    from model_partition.loop.stages import stage_trace
+    from model_partition.spec import parse_spec
+
+    payload = tiny_run.spec.to_dict()
+    payload["source"] = str(tiny_run.repo)
+    payload["trace"] = {"extra_passes": [{"entry": "draft", "args": ["input_ids"]}]}
+    payload["inputs"]["short"] = str(tiny_run.spec.inputs.short)
+    ctx = _traced_context(tiny_run, tmp_path, spec=parse_spec(payload))
+    _with_unreached_module(ctx)
+
+    result = stage_trace(ctx)
+    assert result.ok, result.detail
+    traced = {r.module_id for r in ctx.bundle.records}
+    assert "99-draft" in traced
+    assert any("does not call" in note for note in ctx.notes)
+
+
 def test_retention_runs_as_the_final_stage(tiny_run, tmp_path):
     result = loop_for(tiny_run, tmp_path).run()
     retention = result.state.record("retain")

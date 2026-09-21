@@ -257,8 +257,13 @@ def test_long_prompts_embed_a_verifiable_needle(tmp_path):
 # -- tokenizer loading -------------------------------------------------------
 
 
-def test_as_ids_handles_a_flat_list():
-    assert _as_ids([1, 2, 3]) == [1, 2, 3]
+@pytest.mark.parametrize("encoded,expected", [
+    ([1, 2, 3], [1, 2, 3]),                                   # a flat list
+    ([[1, 2, 3]], [1, 2, 3]),                                 # a batch of one
+    ({"input_ids": [4, 5], "attention_mask": [1, 1]}, [4, 5]),  # a plain mapping
+])
+def test_as_ids_reads_every_shape_a_tokenizer_returns(encoded, expected):
+    assert _as_ids(encoded) == expected
 
 
 def test_as_ids_unwraps_a_batch_encoding():
@@ -270,14 +275,6 @@ def test_as_ids_unwraps_a_batch_encoding():
             return [[7, 8, 9]]
 
     assert _as_ids(BatchEncoding({"input_ids": [[7, 8, 9]], "attention_mask": [[1, 1, 1]]})) == [7, 8, 9]
-
-
-def test_as_ids_unwraps_a_plain_mapping():
-    assert _as_ids({"input_ids": [4, 5], "attention_mask": [1, 1]}) == [4, 5]
-
-
-def test_as_ids_flattens_a_nested_batch():
-    assert _as_ids([[1, 2, 3]]) == [1, 2, 3]
 
 
 def test_as_ids_rejects_a_mapping_without_input_ids():

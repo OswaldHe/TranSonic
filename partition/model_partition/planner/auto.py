@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from model_partition.planner.graph import ModuleNode, PartitionGraph, TensorRef
-from model_partition.sizing import CostModel, ModelInventory, config_get
+from model_partition.sizing import CostModel, LayerProfile, ModelInventory, config_get
 
 #: Module path used for a head whose weights are tied to the embedding, so the
 #: checkpoint holds no tensor naming it. Reconciliation remaps it if the model
@@ -87,13 +87,43 @@ def module_path_of(tensor_name: str) -> str:
     return head if head and tail in PARAM_SUFFIXES else tensor_name
 
 
-def _group_layers(inventory: ModelInventory, per_module: int, options: PlanOptions) -> list[list[int]]:
+@dataclass
+class Stack:
+    """A repeating stack of layers: the backbone, or a draft stack beside it.
+
+    Both hold decoder layers and both need modules — a model that ships a draft stack
+    runs it in deployment, so a partition without it is a partition of part of the
+    model. What differs is the name the layers live under and the names their
+    boundaries get, so those are the only two things this carries.
+    """
+
+    prefix: str
+    layers: list[LayerProfile]
+
+    @property
+    def label(self) -> str:
+        """Leaf of the container name: ``layers`` for a backbone, ``mtp`` for a draft."""
+        return self.prefix.rstrip(".").rsplit(".", 1)[-1] or "layers"
+
+    def path(self, index: int) -> str:
+        """Module path of one layer, e.g. ``model.layers.3``."""
+        return f"{self.prefix}{index}"
+
+    def module_id(self, index: int, part: str = "") -> str:
+        return f"{self.label}.{index}.{part}" if part else f"{self.label}.{index}"
+
+    def boundary(self, index: int) -> str:
+        """Name for the tensor flowing out of layer ``index - 1`` into ``index``."""
+        return f"h.{index}" if self.label == "layers" else f"{self.label}.h.{index}"
+
+
+def _group_layers(stack: Stack, per_module: int, options: PlanOptions) -> list[list[int]]:
     """Split layer indices into consecutive, signature-homogeneous groups."""
-    indices = [layer.index for layer in inventory.layers]
+    indices = [layer.index for layer in stack.layers]
     if not indices:
         return []
     size = 1 if options.one_layer_per_module else max(per_module, 1)
-    signature = {layer.index: layer.signature for layer in inventory.layers}
+    signature = {layer.index: layer.signature for layer in stack.layers}
 
     groups: list[list[int]] = []
     current: list[int] = []
@@ -157,8 +187,9 @@ def plan(
         if path not in global_names.setdefault(key, []):
             global_names[key].append(path)
 
+    backbone = Stack(prefix=inventory.stack_prefix or "", layers=inventory.layers)
     layer_groups = _group_layers(
-        inventory,
+        backbone,
         options.max_layers_per_module or cost.max_layers_per_module(
             max((layer.param_bytes for layer in inventory.layers), default=0),
             budget_bytes, options.seq_len,
@@ -178,7 +209,9 @@ def plan(
     # -- the repeating stack ---------------------------------------------------
     cursor = first_hidden
     for group in layer_groups:
-        cursor = _add_layer_group(graph, inventory, cost, options, group, cursor, budget_bytes, declare)
+        cursor = _add_layer_group(graph, inventory, backbone, cost, options, group,
+                                  cursor, budget_bytes, declare)
+    backbone_out = cursor
 
     # -- tail ------------------------------------------------------------------
     if "final_norm" in global_bytes:
@@ -207,6 +240,29 @@ def plan(
         notes="weights tied to the embedding" if tied_head else "",
     ))
     graph.output_tensors = [logits]
+
+    # -- stacks beside the backbone --------------------------------------------
+    # A draft stack reads what the backbone produced and drafts the tokens after it.
+    # It is a chain of decoder layers, so it is cut the same way, and it hangs off the
+    # backbone's last hidden state — which is what makes the plan a DAG rather than a
+    # line. `trace.extra_passes` in the spec is what drives it during a trace, since
+    # the model's own `forward` does not.
+    for prefix, layers in sorted(inventory.aux_layers.items()):
+        if not layers:
+            continue
+        stack = Stack(prefix=prefix, layers=layers)
+        groups = _group_layers(
+            stack,
+            options.max_layers_per_module or cost.max_layers_per_module(
+                max((layer.param_bytes for layer in layers), default=0),
+                budget_bytes, options.seq_len,
+            ),
+            options,
+        )
+        cursor = backbone_out
+        for group in groups:
+            cursor = _add_layer_group(graph, inventory, stack, cost, options, group,
+                                      cursor, budget_bytes, declare)
 
     for key, names in global_names.items():
         if key == "other_globals":
@@ -283,16 +339,18 @@ class LayerParts:
         return next((p for p in self.ffn if not _is_norm(p)), None)
 
 
-def layer_parts(inventory: ModelInventory, index: int) -> LayerParts:
+def layer_parts(inventory: ModelInventory, index: int,
+                stack: Stack | None = None) -> LayerParts:
     """Split one layer's tensors across its direct child modules."""
-    prefix = f"{inventory.stack_prefix or ''}{index}."
+    stack_prefix = stack.prefix if stack is not None else (inventory.stack_prefix or "")
+    prefix = f"{stack_prefix}{index}."
     parts = LayerParts()
     buckets = {"attention": parts.attention, "ffn": parts.ffn, "other": parts.other}
     seen: set[str] = set()
     # In-scope tensors only: an excluded subtree can live inside a layer, and giving
     # it a module would put 100 GiB of n-gram memory in the budget.
     for entry in inventory.entries:
-        if entry.layer_index != index or entry.layer_prefix != inventory.stack_prefix:
+        if entry.layer_index != index or (entry.layer_prefix or "") != stack_prefix:
             continue
         if not entry.name.startswith(prefix):
             continue
@@ -362,6 +420,7 @@ def _logits_bytes(inventory: ModelInventory, seq_len: int, dtype_bytes: int) -> 
 def _add_layer_group(
     graph: PartitionGraph,
     inventory: ModelInventory,
+    stack: Stack,
     cost: CostModel,
     options: PlanOptions,
     group: list[int],
@@ -370,32 +429,32 @@ def _add_layer_group(
     declare,
 ) -> str:
     """Append one group of layers, splitting further if it cannot fit."""
-    profiles = {layer.index: layer for layer in inventory.layers}
+    profiles = {layer.index: layer for layer in stack.layers}
     group_bytes = sum(profiles[i].param_bytes for i in group)
     resident = cost.resident_bytes(group_bytes, len(group), options.seq_len)
 
     if options.split_attention_ffn or (resident > budget_bytes and len(group) > 1):
         cursor = input_tensor
         for index in group:
-            cursor = (_split_layer(graph, inventory, cost, options, index, cursor,
+            cursor = (_split_layer(graph, inventory, stack, cost, options, index, cursor,
                                    budget_bytes, declare)
                       if options.split_attention_ffn
-                      else _add_layer_group(graph, inventory, cost, options, [index],
+                      else _add_layer_group(graph, inventory, stack, cost, options, [index],
                                             cursor, budget_bytes, declare))
         return cursor
 
     if resident > budget_bytes:
-        return _split_layer(graph, inventory, cost, options, group[0],
+        return _split_layer(graph, inventory, stack, cost, options, group[0],
                             input_tensor, budget_bytes, declare)
 
-    output = declare(f"h.{group[-1] + 1}")
+    output = declare(stack.boundary(group[-1] + 1))
     first, last = group[0], group[-1]
     graph.modules.append(ModuleNode(
-        id=f"layers.{first}" if first == last else f"layers.{first}-{last}",
+        id=stack.module_id(first) if first == last else f"{stack.label}.{first}-{last}",
         kind="decoder_layers",
         inputs=[input_tensor], outputs=[output],
         layer_indices=list(group),
-        submodules=[f"{inventory.stack_prefix or ''}{i}" for i in group],
+        submodules=[stack.path(i) for i in group],
         param_bytes=group_bytes,
         activation_bytes=cost.activation_bytes(options.seq_len),
         kv_bytes=cost.kv_bytes(len(group), options.seq_len),
@@ -407,6 +466,7 @@ def _add_layer_group(
 def _split_layer(
     graph: PartitionGraph,
     inventory: ModelInventory,
+    stack: Stack,
     cost: CostModel,
     options: PlanOptions,
     index: int,
@@ -419,9 +479,9 @@ def _split_layer(
     The FFN side stays one module while it fits the budget; when it does not it
     becomes router, expert groups, and the combine step.
     """
-    profile = next(layer for layer in inventory.layers if layer.index == index)
+    profile = next(layer for layer in stack.layers if layer.index == index)
     signature = _signature_key(profile.signature)
-    parts = layer_parts(inventory, index)
+    parts = layer_parts(inventory, index, stack)
     activation = cost.activation_bytes(options.seq_len)
     if parts.own_params:
         # Tensors the layer module holds itself (DeepSeek's Hyper-Connections
@@ -432,9 +492,9 @@ def _split_layer(
 
     cursor = input_tensor
     if parts.attention:
-        cursor = declare(f"h.{index}.attn")
+        cursor = declare(f"{stack.boundary(index)}.attn")
         graph.modules.append(ModuleNode(
-            id=f"layers.{index}.attention", kind="attention",
+            id=stack.module_id(index, "attention"), kind="attention",
             inputs=[input_tensor], outputs=[cursor], layer_indices=[index],
             submodules=list(parts.attention),
             param_bytes=parts.bytes_for("attention"),
@@ -445,14 +505,21 @@ def _split_layer(
 
     for path in parts.other:
         component = path.rsplit(".", 1)[-1]
-        output = declare(f"h.{index}.{component}")
-        graph.modules.append(ModuleNode(
-            id=f"layers.{index}.{component}", kind="other",
+        output = declare(f"{stack.boundary(index)}.{component}")
+        node = ModuleNode(
+            id=stack.module_id(index, component), kind="other",
             inputs=[cursor], outputs=[output], layer_indices=[index],
             submodules=[path], param_bytes=parts.path_bytes.get(path, 0),
             activation_bytes=activation,
             code_signature=f"{signature}:{component}",
-        ))
+        )
+        # One subtree, so there is nothing here for the planner to cut. An n-gram
+        # memory table is 94.4 GiB and no partition of it fits a 44 GiB card, so the
+        # plan says it runs on the host rather than promising a fit it cannot deliver.
+        if node.resident_bytes > budget_bytes:
+            node.host_only = True
+            node.notes = "larger than the per-module budget and indivisible: runs on the host"
+        graph.modules.append(node)
         cursor = output
 
     if not parts.ffn:
@@ -465,9 +532,9 @@ def _split_layer(
     ffn_bytes = parts.bytes_for("ffn")
     fits = cost.resident_bytes(ffn_bytes, 1, options.seq_len) <= budget_bytes
     if fits or not profile.has_experts:
-        output = declare(f"h.{index + 1}")
+        output = declare(stack.boundary(index + 1))
         graph.modules.append(ModuleNode(
-            id=f"layers.{index}.ffn", kind="mlp",
+            id=stack.module_id(index, "ffn"), kind="mlp",
             inputs=[cursor], outputs=[output], layer_indices=[index],
             submodules=list(parts.ffn), param_bytes=ffn_bytes,
             activation_bytes=activation,
@@ -477,13 +544,14 @@ def _split_layer(
         ))
         return output
 
-    return _split_ffn(graph, inventory, cost, options, index, parts, cursor,
+    return _split_ffn(graph, inventory, stack, cost, options, index, parts, cursor,
                       budget_bytes, declare, signature)
 
 
 def _split_ffn(
     graph: PartitionGraph,
     inventory: ModelInventory,
+    stack: Stack,
     cost: CostModel,
     options: PlanOptions,
     index: int,
@@ -503,9 +571,9 @@ def _split_ffn(
     # module rather than becoming a module of its own.
     norms = [path for path in parts.ffn if _is_norm(path)]
 
-    route = declare(f"h.{index}.route", kind="routing")
+    route = declare(f"{stack.boundary(index)}.route", kind="routing")
     graph.modules.append(ModuleNode(
-        id=f"layers.{index}.router", kind="moe_router",
+        id=stack.module_id(index, "router"), kind="moe_router",
         inputs=[input_tensor], outputs=[route], layer_indices=[index],
         submodules=norms + router,
         param_bytes=parts.bytes_of(norms) + nbytes.get("router", 0),
@@ -517,10 +585,10 @@ def _split_ffn(
     # work from the routed experts, and separate work from the router.
     partials: list[str] = []
     if shared:
-        shared_out = declare(f"h.{index}.shared")
+        shared_out = declare(f"{stack.boundary(index)}.shared")
         partials.append(shared_out)
         graph.modules.append(ModuleNode(
-            id=f"layers.{index}.shared_experts", kind="mlp",
+            id=stack.module_id(index, "shared_experts"), kind="mlp",
             inputs=[input_tensor], outputs=[shared_out], layer_indices=[index],
             submodules=shared, param_bytes=nbytes.get("shared", 0),
             activation_bytes=activation,
@@ -534,10 +602,10 @@ def _split_ffn(
     )
     for start in range(0, len(ordered), group_size):
         end = min(start + group_size, len(ordered))
-        partial = declare(f"h.{index}.moe.{start}")
+        partial = declare(f"{stack.boundary(index)}.moe.{start}")
         partials.append(partial)
         graph.modules.append(ModuleNode(
-            id=f"layers.{index}.experts.{start}-{end - 1}", kind="moe_experts",
+            id=stack.module_id(index, f"experts.{start}-{end - 1}"), kind="moe_experts",
             inputs=[input_tensor, route], outputs=[partial], layer_indices=[index],
             submodules=ordered[start:end],
             param_bytes=per_expert * (end - start),
@@ -549,9 +617,9 @@ def _split_ffn(
             composition="parallel",
         ))
 
-    output = declare(f"h.{index + 1}")
+    output = declare(stack.boundary(index + 1))
     graph.modules.append(ModuleNode(
-        id=f"layers.{index}.combine", kind="mlp",
+        id=stack.module_id(index, "combine"), kind="mlp",
         inputs=[input_tensor, *partials], outputs=[output], layer_indices=[index],
         activation_bytes=activation,
         code_signature=f"{signature}:combine",

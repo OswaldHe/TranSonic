@@ -149,6 +149,9 @@ class ModelInventory:
     subtree_bytes: dict[str, int] = field(default_factory=dict)
     #: Bytes in repeating stacks other than the main one, keyed by prefix.
     aux_stack_bytes: dict[str, int] = field(default_factory=dict)
+    #: Those stacks layer by layer, so a planner can cut them the way it cuts the main
+    #: one. A draft stack is a stack of decoder layers; only its name differs.
+    aux_layers: dict[str, list[LayerProfile]] = field(default_factory=dict)
     stack_prefix: str | None = None
     dequant_bytes: int = 0
 
@@ -185,26 +188,6 @@ class ModelInventory:
             groups[layer.signature].append(layer.index)
         return dict(groups)
 
-    def representative_layers(self, preferred: tuple[int, ...] = (1, 5)) -> list[int]:
-        """Layers whose tensors are kept after pruning.
-
-        The union of ``preferred``, a midpoint, the last layer, and one
-        representative per distinct signature. The signature term is what stops a
-        hybrid stack (Qwen3.5 alternates linear and full attention) from losing
-        the only copy of a kernel variant.
-        """
-        if not self.layers:
-            return []
-        indices = sorted(layer.index for layer in self.layers)
-        keep = {i for i in preferred if i in set(indices)}
-        keep.add(indices[len(indices) // 2])
-        keep.add(indices[-1])
-        keep.add(indices[0])
-        for layer_indices in self.signature_groups().values():
-            if not keep & set(layer_indices):
-                keep.add(min(layer_indices))
-        return sorted(keep)
-
     @classmethod
     def build(
         cls,
@@ -232,6 +215,8 @@ class ModelInventory:
         subtree_bytes: dict[str, int] = defaultdict(int)
         aux_stack_bytes: dict[str, int] = defaultdict(int)
         layer_entries: dict[int, list[TensorEntry]] = defaultdict(list)
+        aux_entries: dict[str, dict[int, list[TensorEntry]]] = defaultdict(
+            lambda: defaultdict(list))
         globals_: list[TensorEntry] = []
         dequant_total = 0
 
@@ -250,27 +235,14 @@ class ModelInventory:
             elif entry.layer_prefix == main_stack:
                 layer_entries[layer_index].append(entry)
             else:
-                # A second repeating stack (e.g. an in-scope vision tower) keeps
-                # its own index space rather than colliding with the main one.
-                aux_stack_bytes[entry.layer_prefix or "?"] += entry.nbytes
+                # A second repeating stack — an in-scope vision tower, or the draft
+                # stack of a model that ships one — keeps its own index space rather
+                # than colliding with the main one.
+                prefix = entry.layer_prefix or "?"
+                aux_stack_bytes[prefix] += entry.nbytes
+                aux_entries[prefix][layer_index].append(entry)
 
-        layers: list[LayerProfile] = []
-        for layer_index in sorted(layer_entries):
-            entries = layer_entries[layer_index]
-            expert_entries = [e for e in entries if e.expert_index is not None or ".experts" in e.name]
-            signature = "|".join(sorted(
-                f"{e.normalized()}:{e.dtype}:{','.join(str(d) for d in e.shape)}" for e in entries
-            ))
-            layers.append(LayerProfile(
-                index=layer_index,
-                signature=signature,
-                param_bytes=sum(e.nbytes for e in entries),
-                tensor_names=[e.name for e in entries],
-                shards=sorted({e.shard for e in entries}),
-                expert_bytes=sum(e.nbytes for e in expert_entries),
-                n_experts=len({e.expert_index for e in expert_entries if e.expert_index is not None}),
-                dequant_bytes=sum(quant.dequant_bytes(e) for e in entries),
-            ))
+        layers = _profiles(layer_entries, quant)
 
         return cls(
             index=index,
@@ -282,9 +254,33 @@ class ModelInventory:
             global_tensor_names=[e.name for e in globals_],
             subtree_bytes=dict(subtree_bytes),
             aux_stack_bytes=dict(aux_stack_bytes),
+            aux_layers={prefix: _profiles(by_index, quant)
+                        for prefix, by_index in sorted(aux_entries.items())},
             stack_prefix=main_stack,
             dequant_bytes=dequant_total,
         )
+
+
+def _profiles(by_index: dict[int, list[TensorEntry]], quant: QuantProfile) -> list[LayerProfile]:
+    """One profile per layer of a stack, in index order."""
+    profiles: list[LayerProfile] = []
+    for layer_index in sorted(by_index):
+        entries = by_index[layer_index]
+        expert_entries = [e for e in entries if e.expert_index is not None or ".experts" in e.name]
+        signature = "|".join(sorted(
+            f"{e.normalized()}:{e.dtype}:{','.join(str(d) for d in e.shape)}" for e in entries
+        ))
+        profiles.append(LayerProfile(
+            index=layer_index,
+            signature=signature,
+            param_bytes=sum(e.nbytes for e in entries),
+            tensor_names=[e.name for e in entries],
+            shards=sorted({e.shard for e in entries}),
+            expert_bytes=sum(e.nbytes for e in expert_entries),
+            n_experts=len({e.expert_index for e in expert_entries if e.expert_index is not None}),
+            dequant_bytes=sum(quant.dequant_bytes(e) for e in entries),
+        ))
+    return profiles
 
 
 @dataclass

@@ -3,9 +3,10 @@
 
 """Verify each module reproduces its traced output from its dumped artifacts.
 
-The model is poisoned with NaN before each module's dumped weights are applied,
-so a parameter the dump forgot shows up as a non-finite result rather than
-passing on whatever happened to be in memory.
+A parameter the dump forgot must not pass on whatever happened to be in memory, so
+the model's own weights are made unusable first: poisoned with NaN, or — for a model
+too large to hold, whose weights are placeholders to begin with — left as
+placeholders, which raise on any read.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import Any, Callable
 
 from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
+from model_partition.runtime.launcher import weights_bytes
 from model_partition.runtime.module_runner import (
     TraceBundle,
     apply_named_weights,
@@ -135,6 +137,9 @@ class VerifyReport:
     """All module verifications for a run."""
 
     results: list[ModuleVerification] = field(default_factory=list)
+    #: What the run had to do differently, per module — where a check ran when it could
+    #: not run where it was asked to.
+    notes: list[str] = field(default_factory=list)
 
     @property
     def checked(self) -> list[ModuleVerification]:
@@ -170,7 +175,7 @@ class VerifyReport:
         return max(values) if values else 0.0
 
     def render(self) -> str:
-        lines = [r.summary() for r in self.results]
+        lines = [r.summary() for r in self.results] + list(self.notes)
         checked = len(self.checked)
         lines.append(f"{checked - len(self.failures)}/{checked} module checks passed")
         if self.skipped:
@@ -186,6 +191,7 @@ class VerifyReport:
             "n_oversized": len(self.oversized),
             "worst_cosine": self.worst_cosine(),
             "max_abs_err": self.max_abs_err(),
+            "notes": list(self.notes),
             "results": [r.to_dict() for r in self.results],
         }
 
@@ -218,10 +224,21 @@ def verify_modules(
     report = VerifyReport()
     model = build_model()
     host = model_device or device
-    model = model.to(host)
     target = module_device or host
-    if poison:
-        poison_parameters(model, only=plan_owned_parameters(model, graph))
+    # A streamed model's weights are placeholders until each module reads its own, so
+    # there is nothing to move and nothing to poison — and a placeholder is the stronger
+    # guarantee anyway: reading one raises rather than returning a number. Each module
+    # under test still gets its real weights from the recording below.
+    placeholders = _has_placeholders(model)
+    if not placeholders:
+        model = model.to(host)
+        if poison:
+            poison_parameters(model, only=plan_owned_parameters(model, graph))
+    else:
+        report.notes.append(
+            "the model's weights are placeholders, so each module was checked on the "
+            "weights the trace recorded for it and nothing could fall back to the model"
+        )
 
     # Every module of the plan, not only the ones the trace has records for. A module
     # with no records — a functional node, or one whose submodule was never called — is
@@ -263,9 +280,23 @@ def verify_modules(
             continue
 
         weights = load_named_weights(bundle, module_id, device=host)
-        applied = apply_named_weights(model, weights, graph_module)
+        # How many recorded tensors this check ran on. Against a resident model they go
+        # into it; against placeholders there is nothing to put them in — `copy_` onto a
+        # placeholder succeeds and changes nothing — so they go to the implementation
+        # alone, which is what is being verified either way.
+        applied = (len(weights) if placeholders
+                   else apply_named_weights(model, weights, graph_module))
         residency = target
-        if target != host:
+        if target != host and not _weights_fit(target, weights):
+            # Not a broken promise and not something partitioning fixes: a single 94.4
+            # GiB embedding table is one piece of work whatever it is cut into, and no
+            # card here holds it. Checked on the host, and the report says where.
+            residency = host
+            report.notes.append(
+                f"{module_id}: weights are {format_bytes(weights_bytes(weights))}, more "
+                f"than {target} holds; verified on {host}"
+            )
+        elif target != host and not placeholders:
             try:
                 move_submodules(model, graph_module, target)
             except RuntimeError as exc:
@@ -347,10 +378,40 @@ def verify_modules(
                         weights_applied=applied, comparisons=comparisons, device=residency,
                     ))
         finally:
-            if residency != host:
+            if residency != host and not placeholders:
                 move_submodules(model, graph_module, host)
+            del weights
             _release(target)
     return report
+
+
+def _has_placeholders(model: Any) -> bool:
+    """True when the model's weights are placeholders rather than values.
+
+    Which is how a model larger than this machine gets built at all: each module reads
+    its own for its forward and releases them after.
+    """
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if getattr(tensor, "is_meta", False):
+            return True
+    return False
+
+
+def _weights_fit(device: str, weights: dict[str, Any]) -> bool:
+    """Whether one module's weights have room on ``device`` as things stand."""
+    if not device.startswith("cuda"):
+        return True
+    try:
+        import torch
+
+        free, _total = torch.cuda.mem_get_info(torch.device(device))
+    except Exception:  # pragma: no cover - no CUDA on the machine running the tests
+        return True
+    # The module also needs its recorded inputs, its output and whatever it allocates
+    # between them, so the weights alone do not get the whole card.
+    return weights_bytes(weights) < free * 0.8
+
+
 
 
 def _check_bytes(records: list[Any], bundle: TraceBundle) -> int:

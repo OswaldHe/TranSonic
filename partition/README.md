@@ -26,8 +26,58 @@ bundled ones and how to write another.
 
 ## The loop
 
-Eight stages. Each declares a hash of its inputs, so a stage re-runs only when
-something it depends on changed.
+Eight stages, driven by `loop/driver.py` with one function per stage in
+`loop/stages.py` and per-stage state in `loop/state.py`. Each stage declares a hash
+of its inputs, so it re-runs only when something it depends on changed.
+
+```
+                        loop/driver.py — PartitionLoop.run()
+                                      │
+      ┌───────────────────────────────┴───────────────────────────────┐
+      │  per iteration, in order; a stage is skipped when its hash is  │
+      │  unchanged (loop/state.py)                                    │
+      ▼                                                               │
+  ingest ─► plan ─► trace ─► extract ─► verify_modules ─► verify_chain ─► emulate
+      │       │       │        │              │                │           │
+      │       │       │        │              │                │           └─ judge
+      │       │       │        │              │                │              (LLM,
+      │       │       │        │              │                │              advisory)
+      └───────┴───────┴────────┴──────────────┴────────────────┴──────────────┐
+                                     all pass?                                │
+                                       │  yes ──► retain ──► done             │
+                                       │  no                                  │
+                                       ▼                                      │
+                          reviewer agent: prompts/reviewer.md                 │
+                          writes reports/review.md, changes nothing           │
+                                       │                                      │
+                  repair surface chosen by the failing stage                  │
+      ┌────────────────┬───────────────┴────────────┬───────────────────┐     │
+      ▼                ▼                            ▼                   ▼     │
+  "plan"           "modules"                    "compat"            (advisory)│
+ prompts/        prompts/                    prompts/                         │
+ planner.md      repair_module.md            port_kernels.md                  │
+      │                │                            │                         │
+ edits plan/     edits modules/<group>/       writes compat/*.py              │
+ partition_      inference.py                 (vendor code this GPU           │
+ graph.yaml                                    will not run)                  │
+      │                │                            │                         │
+      └────────────────┴────────────────────────────┴─────────────────────────┘
+                     next iteration re-runs only what changed
+```
+
+Which prompt runs is decided by the failing stage's `repair_surface`
+(`loop/stages.py`), and the agent's edits are confined to that surface by
+`loop/guard.py`:
+
+| `repair_surface` | Prompt | What the agent may edit |
+|---|---|---|
+| `plan` | `prompts/planner.md` | `plan/partition_graph.yaml` |
+| `modules` | `prompts/repair_module.md` | `modules/<group>/inference.py` |
+| `compat` | `prompts/port_kernels.md` | `compat/*.py` |
+| — | `prompts/reviewer.md` | nothing; writes `reports/review.md` |
+
+So `prompts/repair_module.md` is what runs when `verify_modules` or `verify_chain`
+finds a module whose output does not match its reference — the `"modules"` row above.
 
 | Stage | What it does | Who does it |
 |---|---|---|

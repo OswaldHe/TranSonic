@@ -39,8 +39,12 @@ class GPUInfo:
     multiprocessors: int = 0
 
     def supports_fp8(self) -> bool:
-        """True on sm_89+ (L40S, H100). Hardware fp8 is not the same as a usable
-        block-scaled fp8 GEMM — see :mod:`model_partition.quant.fp8_block`."""
+        """True on sm_89+ (L40S, H100).
+
+        Hardware fp8 is not the same as a usable block-scaled fp8 GEMM: the kernel
+        still has to fit the card. DeepSeek V4.1's does on sm_89, and its sparse
+        attention does not — which is what ``runtime/compat.py`` exists for.
+        """
         return self.capability is not None and self.capability >= (8, 9)
 
     def supports_fp4(self) -> bool:

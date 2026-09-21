@@ -29,9 +29,11 @@ ST_DTYPES: dict[str, tuple[str, int]] = {
 
 #: Matches the repeating-stack index in a parameter name, e.g. ``...layers.12.``.
 #: The prefix is optional: a vendor checkpoint may name its stack ``layers.0.attn``
-#: with nothing in front of it.
+#: with nothing in front of it. ``mtp`` is in the alternation because a draft stack is
+#: indexed off the container itself (``mtp.0.attn.…``) rather than a ``layers`` beneath
+#: it, and without it every draft tensor looks like a one-off global.
 LAYER_RE = re.compile(
-    r"^(?P<prefix>(?:.*\.)?(?:layers|blocks|h)\.)(?P<index>\d+)(?P<suffix>\..*)$"
+    r"^(?P<prefix>(?:.*\.)?(?:layers|blocks|h|mtp)\.)(?P<index>\d+)(?P<suffix>\..*)$"
 )
 
 #: Matches a per-expert parameter, e.g. ``...experts.37.gate_proj.weight``

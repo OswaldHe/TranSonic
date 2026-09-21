@@ -97,6 +97,11 @@ class ModuleNode:
     expert_range: list[int] = field(default_factory=list)
     #: One of :data:`COMPOSITIONS`.
     composition: str = "sequential"
+    #: Over the per-module budget with nothing to split. One embedding table is one
+    #: piece of work however it is cut: DeepSeek V4.1's n-gram tables are 94.4 GiB
+    #: each, and no partition of them fits a 44 GiB card. Such a module runs on the
+    #: host, and the budget check reports it instead of refusing the plan.
+    host_only: bool = False
     notes: str = ""
 
     @property
@@ -141,6 +146,8 @@ class ModuleNode:
             data["kv_bytes"] = self.kv_bytes
         if self.code_signature:
             data["code_signature"] = self.code_signature
+        if self.host_only:
+            data["host_only"] = True
         if self.notes:
             data["notes"] = self.notes
         return data
@@ -177,6 +184,7 @@ class ModuleNode:
             partitioned=bool(data.get("partitioned", True)),
             expert_range=list(data.get("expert_range") or []),
             composition=composition,
+            host_only=bool(data.get("host_only", False)),
             notes=str(data.get("notes") or ""),
         )
 
@@ -308,11 +316,19 @@ class PartitionGraph:
         ceiling = budget_bytes if budget_bytes is not None else self.budget_bytes
         if ceiling:
             for module in self.partitioned_modules:
-                if module.resident_bytes > ceiling:
-                    raise GraphError(
-                        f"Module {module.id!r} needs {module.resident_bytes} bytes, "
-                        f"over the {ceiling}-byte budget"
+                if module.resident_bytes <= ceiling:
+                    continue
+                if module.host_only:
+                    warnings.append(
+                        f"Module {module.id!r} needs {module.resident_bytes} bytes, over "
+                        f"the {ceiling}-byte budget, and cannot be split further: it runs "
+                        f"on the host"
                     )
+                    continue
+                raise GraphError(
+                    f"Module {module.id!r} needs {module.resident_bytes} bytes, "
+                    f"over the {ceiling}-byte budget"
+                )
 
         if self.num_layers:
             covered: dict[int, list[str]] = defaultdict(list)

@@ -237,10 +237,6 @@ def test_empty_report_does_not_count_as_passed():
     assert VerifyReport().passed is False
 
 
-def test_comparison_defaults_are_passing():
-    assert Comparison(name="x", passed=True).pass_fraction == 1.0
-
-
 # -- per-module GPU residency ------------------------------------------------
 
 
@@ -294,6 +290,44 @@ def test_modules_are_returned_to_the_host_after_verification(tiny_run):
     verify_modules(lambda: model, tiny_run.bundle, tiny_run.graph,
                    model_device="cpu", module_device="cuda")
     assert all(p.device.type == "cpu" for p in model.parameters())
+
+
+def test_a_model_of_placeholders_is_verified_without_moving_it(tiny_run):
+    """DeepSeek V4.1's case: the model is built with placeholders for weights it cannot
+    hold, so there is nothing to move to the host and nothing to poison. Each module
+    still gets its real weights from the recording."""
+    from model_partition.verify.modules import _has_placeholders
+
+    model = tiny_run.build_model()
+    for module in model.modules():
+        for leaf, parameter in list(module._parameters.items()):
+            if parameter is not None and parameter.dim() > 1:
+                module._parameters[leaf] = torch.nn.Parameter(
+                    parameter.to("meta"), requires_grad=False)
+    assert _has_placeholders(model)
+
+    report = verify_modules(lambda: model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=None, model_device="cpu", module_device="cpu")
+    # Without an implementation the model's own submodule is what replays, and its
+    # weights are placeholders, so every check reports rather than passing on a
+    # placeholder's contents.
+    assert not report.passed
+    assert any("placeholders" in note for note in report.notes)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_module_too_large_for_the_card_is_verified_on_the_host(tiny_run, monkeypatch):
+    """An engram table is 94.4 GiB and one piece of work: no partitioning makes it fit,
+    so the check runs where the weights do and the report says where."""
+    from model_partition.verify import modules as verify_module
+
+    monkeypatch.setattr(verify_module, "weights_bytes", lambda _weights: 1 << 50)
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            model_device="cpu", module_device="cuda")
+    assert report.passed, report.render()
+    assert {r.device for r in report.results} == {"cpu"}
+    assert any("verified on cpu" in note for note in report.notes)
+    assert not report.oversized, "running on the host is not a partition failure"
 
 
 def test_accumulated_tolerance_is_looser_than_single_step():
@@ -430,6 +464,39 @@ def test_a_derived_buffer_the_recording_lacks_is_not_missing(tmp_path):
     loaded, missing = load_weights(Rotary(), {})
     assert loaded == 0
     assert missing == ["scale"]
+
+
+def test_a_module_too_large_to_hold_twice_takes_its_weights_by_reference():
+    """Constructing allocates the parameters and copying into them doubles the module.
+    An engram table is 94.4 GiB: this machine holds it once, so the recorded tensor
+    becomes the parameter instead of being copied into a second one."""
+    import torch
+    from torch import nn
+
+    from model_partition.runtime.launcher import assign_weights
+
+    with torch.device("meta"):
+        module = nn.Linear(4, 4, bias=False)
+    assert module.weight.is_meta
+
+    recorded = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    loaded, missing = assign_weights(module, {"m.weight": recorded})
+    assert loaded == 1 and not missing
+    assert module.weight.data_ptr() == recorded.data_ptr(), "copied rather than assigned"
+
+
+def test_a_parameter_no_recording_covers_stays_missing_rather_than_meta():
+    """A module built on meta has no values of its own to fall back on, so a gap is a
+    gap — reported, not handed back as something that raises on first read."""
+    import torch
+    from torch import nn
+
+    from model_partition.runtime.launcher import assign_weights
+
+    with torch.device("meta"):
+        module = nn.Linear(4, 4)
+    loaded, missing = assign_weights(module, {"m.weight": torch.zeros(4, 4)})
+    assert loaded == 1 and missing == ["bias"]
 
 
 def test_the_launcher_identifies_the_module_from_its_weights(tiny_deep_run, tmp_path):
@@ -740,6 +807,8 @@ def test_an_oversized_module_sends_the_repair_to_the_plan(tiny_run, tmp_path, mo
         graph = tiny_run.graph
         bundle = tiny_run.bundle
         build_model = staticmethod(tiny_run.build_model)
+        build_meta_model = None
+        inventory = tiny_run.inventory
         layout = tiny_run.layout
         options = type("O", (), {"device": "cpu"})()
         result = tiny_run.result

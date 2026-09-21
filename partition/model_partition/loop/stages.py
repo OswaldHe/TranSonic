@@ -19,7 +19,7 @@ from model_partition.inputs import SampleInput, load_input_set, summarize
 from model_partition.ingest import IngestResult, ingest
 from model_partition.layout import RunLayout
 from model_partition.planner import auto
-from model_partition.planner.graph import PartitionGraph
+from model_partition.planner.graph import GraphError, PartitionGraph
 from model_partition.retention import RetentionPolicy, apply_retention, plan_retention, write_retention_report
 from model_partition.runtime.compat import is_hardware_limit
 from model_partition.sizing import CostModel, ModelInventory
@@ -247,6 +247,28 @@ def _included_subtrees(spec: ModelSpec) -> tuple[str, ...]:
     ) if on)
 
 
+def _scope_mismatch(spec: ModelSpec, graph: PartitionGraph) -> str:
+    """Why an existing plan no longer answers the spec's scope, or "".
+
+    A plan is kept across iterations on purpose — the agent refines it, and that work
+    must survive a re-run. Which means a change to the spec has to be able to reject
+    it: a plan that leaves the n-gram memory unpartitioned cannot reproduce a model
+    whose forward writes it into the residual stream, however good the rest of it is.
+    """
+    from model_partition.sizing import SUBTREE_MARKERS
+
+    included = set(_included_subtrees(spec))
+    for node in graph.modules:
+        if node.kind not in SUBTREE_MARKERS:
+            continue
+        if node.kind in included and not node.partitioned:
+            return (f"{node.kind} is in scope for this run and the plan leaves it "
+                    f"unpartitioned")
+        if node.kind not in included and node.partitioned:
+            return f"{node.kind} is out of scope for this run and the plan partitions it"
+    return ""
+
+
 def _excluded_markers(spec: ModelSpec) -> tuple[str, ...]:
     """Name fragments of the subtrees this run does not partition.
 
@@ -316,6 +338,9 @@ def stage_plan(ctx: LoopContext) -> StageResult:
         try:
             graph = PartitionGraph.load(ctx.layout.graph_path)
             graph.validate(ctx.budget.usable_bytes)
+            stale = _scope_mismatch(ctx.spec, graph)
+            if stale:
+                raise GraphError(stale)
             reused = True
         except Exception as exc:
             ctx.notes.append(f"existing plan rejected, regenerating: {exc}")
@@ -380,6 +405,10 @@ def hash_plan(ctx: LoopContext) -> list[Any]:
         ctx.budget.usable_bytes, ctx.seq_len, options.max_layers_per_module,
         options.one_layer_per_module, options.experts_per_group,
         options.split_attention_ffn, options.partition_prompt,
+        # What the run is partitioning at all. Taking a subtree into scope changes
+        # which modules exist, so a cached plan from before is a plan of a different
+        # model — the n-gram memory being the case that showed it.
+        ctx.spec.scope.excluded(),
         _graph_fingerprint(ctx.layout.graph_path),
     ]
 
@@ -426,7 +455,11 @@ def stage_extract(ctx: LoopContext) -> StageResult:
     from model_partition.extract import extract
 
     assert ctx.graph is not None and ctx.build_model is not None
-    model = ctx.build_model()
+    # Structure, not values: what extraction reads off the model is each module's
+    # class and the config it was constructed with. Building it for real would
+    # allocate the weights, and one of DeepSeek V4.1's n-gram tables is 91.5 GiB on
+    # its own — more than the card, for a stage that never looks at a number.
+    model = (ctx.build_meta_model or ctx.build_model)()
     groups = extract(
         ctx.graph, model, ctx.layout.modules_dir, run_root=ctx.layout.root,
         sample_ids=[s.id for s in ctx.samples],
@@ -578,7 +611,7 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         weights = weight_tracer.dump_weights()
         weight_params = weight_params or weight_tracer.index_weights()
         del host_model, weight_tracer
-        _collect()
+        release_memory()
 
     model = ctx.build_model(placed=True)
     if ctx.last_placement == "auto":
@@ -597,7 +630,24 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         return _unresolved_result(ctx, unresolved)
     try:
         for sample in ctx.samples:
-            tracer.trace_sample(sample.id, sample.tensor(device))
+            input_ids = sample.tensor(device)
+            main = tracer.trace_sample(sample.id, input_ids)
+            # A module the main forward never calls has no reference and cannot be
+            # verified. Where the spec says which entry point does call it — a
+            # speculative-decoding stack is the case — drive that too, on this sample,
+            # while the state its prefill left behind is still current. Asked per
+            # sample, from that sample's own forward, so every sample covers the same
+            # modules rather than only the first.
+            unreached = _unreached_submodules(ctx.graph, {r.module_id for r in main})
+            if unreached and ctx.spec.trace.extra_passes:
+                extra = tracer.trace_extra_passes(
+                    sample.id, input_ids, ctx.spec.trace, only=unreached,
+                )
+                ctx.notes.append(
+                    f"{len(ctx.spec.trace.extra_passes)} extra pass(es) reached "
+                    f"{len({r.module_id for r in extra})} module(s) that "
+                    f"{type(model).__name__}.forward does not call"
+                )
     except Exception as exc:
         if not is_hardware_limit(exc):
             raise
@@ -614,11 +664,23 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     # The buffers a class computes for itself, taken from the copy that just ran: the
     # host copy above holds its own, and they are not always the same — a rotary
     # inv_freq built in bf16 there and float32 here.
-    if policy.cache_weights:
-        for module_id, names in tracer.dump_derived().items():
-            weights.setdefault(module_id, []).extend(names)
+    #
+    # Dumped whatever `cache_weights` says. That option is about not writing a second
+    # copy of the checkpoint; these are not in the checkpoint, so leaving them out
+    # leaves nothing to read them from. Identical ones across layers — a window KV
+    # cache is zeros in every layer — land on one blob, the store deduplicating by
+    # digest.
+    for module_id, names in tracer.dump_derived().items():
+        weights.setdefault(module_id, []).extend(names)
 
-    bundle = TraceBundle(store=store, records=tracer.records, weights=weights,
+    records = tracer.records
+    # The traced model and what its last forward returned are the largest things this
+    # process holds; the stage after this builds its own. Released here rather than at
+    # the end of the function so the allocator gives the pages back before then.
+    del model, tracer
+    release_memory()
+
+    bundle = TraceBundle(store=store, records=records, weights=weights,
                          weight_params=weight_params, metadata={
         "model": ctx.spec.source, "revision": ctx.result.revision if ctx.result else None,
         "device": device, "samples": [s.to_dict() for s in ctx.samples],
@@ -636,9 +698,13 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     missing = [m.id for m in ctx.graph.partitioned_modules
                if m.id not in traced and not m.functional]
     if missing:
+        why = (". Nothing this run drives calls them: name the entry point that does "
+               "in the spec's trace.extra_passes, or take them out of scope"
+               if not ctx.spec.trace.extra_passes else "")
         return StageResult(
             ok=False, repairable=True, failing_modules=missing,
-            detail=f"{len(missing)} module(s) produced no trace records: {', '.join(missing[:8])}",
+            detail=(f"{len(missing)} module(s) produced no trace records: "
+                    f"{', '.join(missing[:8])}{why}"),
         )
     sliced = sum(1 for r in bundle.records if r.sliced)
     if sliced:
@@ -657,6 +723,16 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     })
 
 
+def _unreached_submodules(graph: Any, reached: set[str]) -> set[str]:
+    """Submodules of the partitioned modules this pass did not call.
+
+    Functional nodes own no submodule and are left out: there is nothing to hook.
+    """
+    return {submodule for module in graph.partitioned_modules
+            if module.id not in reached and not module.functional
+            for submodule in module.submodules}
+
+
 def _index_weights(ctx: LoopContext, store: TensorStore) -> tuple[dict[str, list[str]], list[str]]:
     """Enumerate each module's parameter names from the model's structure alone."""
     if ctx.build_meta_model is None:
@@ -670,7 +746,7 @@ def _index_weights(ctx: LoopContext, store: TensorStore) -> tuple[dict[str, list
     unresolved = probe.unresolved_submodules()
     params = {} if unresolved else probe.index_weights()
     del structure, probe
-    _collect()
+    release_memory()
     return params, unresolved
 
 
@@ -720,8 +796,8 @@ def _unresolved_result(ctx: LoopContext, unresolved: list[str]) -> StageResult:
     )
 
 
-def _collect() -> None:
-    """Release a freed model's memory before the next one is built."""
+def release_memory() -> None:
+    """Return a freed model's cached blocks so the next stage sees a full card."""
     import gc
 
     gc.collect()
@@ -743,6 +819,8 @@ def hash_trace(ctx: LoopContext) -> list[Any]:
         _graph_fingerprint(ctx.layout.graph_path),
         [[s.id, s.token_ids] for s in ctx.samples],
         options.slice_long, options.cache_weights, options.decode_steps,
+        # Which entry points get driven decides which modules have a reference at all.
+        ctx.spec.trace.to_dict(),
     ]
 
 
@@ -761,8 +839,16 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
         )
     host = _host_device(ctx)
     target = _accelerator(ctx)
+    # What gets verified is each module's own implementation, built from its source and
+    # the weights the trace recorded for it. The model is only the structure those are
+    # checked against — so when it cannot be resident anywhere, the structure is all
+    # this stage builds. A resident build would allocate a 94.4 GiB n-gram table that
+    # no check here reads.
+    build = ctx.build_model
+    if memory_shortfall(ctx) and ctx.build_meta_model is not None:
+        build = ctx.build_meta_model
     report = verify_modules(
-        ctx.build_model, bundle, ctx.graph,
+        build, bundle, ctx.graph,
         model_device=host, module_device=target,
         impl_dirs=_impl_dirs(ctx),
     )
@@ -771,6 +857,7 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
         ctx.notes.append(
             f"modules verified one at a time on {target} with the model resident on {host}"
         )
+    ctx.notes.extend(report.notes)
     (ctx.layout.reports_dir / "verify.json").write_text(json.dumps(report.to_dict(), indent=2))
 
     if not report.passed:

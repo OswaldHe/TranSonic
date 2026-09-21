@@ -33,6 +33,7 @@ from model_partition.loop.stages import (
     LoopOptions,
     StageResult,
     dump_agent_context,
+    release_memory,
     write_summary,
 )
 from model_partition.loop.state import (
@@ -115,20 +116,6 @@ def _stream_device(ctx: Any) -> str:
     if ctx.budget and ctx.budget.gpu and ctx.options.device.startswith("cuda"):
         return ctx.options.trace_device or ctx.options.device
     return "cpu"
-
-
-def _release_accelerator() -> None:
-    """Return cached blocks to the driver so the next stage sees a full card."""
-    import gc
-
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 @dataclass
@@ -427,7 +414,7 @@ class PartitionLoop:
             # holds on to freed blocks, and a stage that traced a 16k-token forward
             # can leave tens of GB reserved — enough to make the next stage fall off
             # the GPU for no reason.
-            _release_accelerator()
+            release_memory()
             try:
                 result = runner(ctx)
             except Exception as exc:
