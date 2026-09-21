@@ -917,6 +917,7 @@ def test_a_model_too_large_for_the_machine_is_refused_before_allocating(tiny_run
     class Ctx:
         layout = tiny_run.layout
         result = tiny_run.result
+        spec = tiny_run.spec
         budget = None
 
         class inventory:

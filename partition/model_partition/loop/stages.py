@@ -464,11 +464,15 @@ def _memory_shortfall(ctx: LoopContext) -> str:
     # What the loader will hold: a quantized checkpoint read through vendor code is
     # cast to the spec's dtype, so the bf16 mirror is the resident size, not the fp8
     # bytes on disk.
-    needed = ctx.inventory.total_param_bytes(include_excluded=False)
+    on_disk = ctx.inventory.total_param_bytes(include_excluded=False)
+    needed, why = on_disk, ""
     if ctx.inventory.dequant_bytes and ctx.result and ctx.result.loader == "repo_code":
         # Vendor code casts the checkpoint to the spec's dtype as it loads, so the
         # bf16 mirror is what has to fit, not the fp8 bytes on disk.
         needed = max(needed, ctx.inventory.dequant_bytes)
+        if needed > on_disk:
+            why = (f" ({format_bytes(on_disk)} of quantized weights, cast to "
+                   f"{ctx.spec.dtype} as the vendor code loads them)")
     host = detect_host(ctx.layout.root)
     gpu_bytes = ctx.budget.gpu.total_bytes if ctx.budget and ctx.budget.gpu else 0
     capacity = host.ram_available_bytes + gpu_bytes
@@ -478,9 +482,9 @@ def _memory_shortfall(ctx: LoopContext) -> str:
     if gpu_bytes:
         where += f" + {format_bytes(gpu_bytes)} on {ctx.budget.gpu.name}"
     return (
-        f"the model needs about {format_bytes(needed)} resident for one forward and "
-        f"this machine has {format_bytes(capacity)} ({where}). Tracing needs the whole "
-        "model, which partitioning cannot change: run it on a larger machine, or "
+        f"the model needs about {format_bytes(needed)} resident for one forward{why} "
+        f"and this machine has {format_bytes(capacity)} ({where}). Tracing needs the "
+        "whole model, which partitioning cannot change: run it on a larger machine, or "
         "narrow the scope in the spec."
     )
 
