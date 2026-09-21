@@ -36,6 +36,11 @@ ARGS_CLASS_NAMES = ("ModelArgs", "Args", "ModelConfig", "Config", "TransformerCo
 #: bfloat16 they would be cast to, and the vendor's kernels take them as they are.
 NATIVE_DTYPES = ("checkpoint", "native", "auto", "")
 
+#: What a quantized model computes in. Its weights are fp8 or fp4 and its kernels take
+#: them as stored, but the activations flowing between them are bfloat16 — so that is the
+#: default dtype its code is written against, and the dtype its own entry script sets.
+DEFAULT_COMPUTE_DTYPE = "bfloat16"
+
 
 @dataclass
 class RepoCodeLoader:
@@ -60,6 +65,11 @@ class RepoCodeLoader:
     device_info: Any = None
     #: Set once the patches have run, for the run manifest to record.
     compat_report: Any = None
+
+    @property
+    def compute_dtype(self) -> str:
+        """The dtype activations flow in, which is not always the weights'."""
+        return (DEFAULT_COMPUTE_DTYPE if self.dtype in NATIVE_DTYPES else self.dtype)
 
     def _entry_path(self) -> Path:
         path = self.root / self.entry
@@ -280,6 +290,10 @@ class RepoCodeLoader:
         # would reject them. Set before construction and left set, because every forward
         # needs it too.
         torch.set_default_device(device)
+        # And the dtype, for the same reason: the vendor's kernels take fp8 and fp4
+        # weights as stored but pass bfloat16 between them, so a float32 default makes the
+        # first activation the wrong type for the first kernel that sees it.
+        torch.set_default_dtype(torch_dtype(self.compute_dtype))
         shards = sorted(self.root.glob("*.safetensors"))
         if not shards:
             raise LoaderError(f"No safetensors shards under {self.root} to stream from")

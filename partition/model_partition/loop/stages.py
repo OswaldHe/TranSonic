@@ -583,6 +583,10 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     model = ctx.build_model(placed=True)
     if ctx.last_placement == "auto":
         device = input_device(model)
+    elif ctx.last_placement == "streamed":
+        # Already placed, and deliberately incomplete: its weights are placeholders until
+        # each module reads its own. Moving it would try to copy out of them.
+        device = ctx.options.trace_device or _accelerator(ctx)
     else:
         device = ctx.options.trace_device or _accelerator(ctx)
         model, device = move_to_device(model, device)

@@ -558,3 +558,12 @@ def test_a_module_too_large_for_the_device_runs_on_the_host(repo):
     report = install_streaming(model, index, device="cuda", keep_bytes=0, module_budget=0)
     assert report.host_modules, report.summary()
     assert "on the host" in report.summary()
+
+
+def test_a_quantized_model_computes_in_bfloat16(repo):
+    """Weights as stored, activations in what the kernels take between them."""
+    from model_partition.loaders import build_loader
+
+    result = ingest(local_spec(repo, dtype="checkpoint"))
+    assert build_loader(result).compute_dtype == "bfloat16"
+    assert build_loader(ingest(local_spec(repo, dtype="float16"))).compute_dtype == "float16"

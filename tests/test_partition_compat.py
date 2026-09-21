@@ -176,3 +176,26 @@ def test_importing_a_patch_leaves_no_bytecode_beside_it(tmp_path):
     (tmp_path / "compat" / "p.py").write_text("def apply(vendor, device):\n    return []\n")
     apply_patches(types.SimpleNamespace(), patch_paths(tmp_path), None)
     assert not (tmp_path / "compat" / "__pycache__").exists()
+
+
+def test_a_streamed_model_is_not_moved_after_building(tiny_run, tmp_path, monkeypatch):
+    """Its weights are placeholders until each module reads its own, and `.to()` on a
+    placeholder is an error rather than a move."""
+    from model_partition.hardware import move_to_device
+    from model_partition.loop.stages import stage_trace
+
+    ctx = _context(tiny_run, tmp_path)
+    build = ctx.build_model
+
+    def streamed(placed=False):
+        model = build(placed=placed)
+        ctx.last_placement = "streamed"
+        return model
+
+    ctx.build_model = streamed
+    moved = []
+    monkeypatch.setattr("model_partition.loop.stages.move_to_device",
+                        lambda model, device: moved.append(device) or (model, device))
+    stage_trace(ctx)
+    assert not moved, "a streamed model must be left where the loader placed it"
+    del move_to_device
