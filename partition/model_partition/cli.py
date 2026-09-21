@@ -35,6 +35,8 @@ def _resource_dir(name: str) -> Path:
     return installed if installed.is_dir() else here.parent / name
 
 
+GIB = 1024 ** 3
+
 CONFIG_DIR = _resource_dir("config")
 DEFAULTS_FILE = CONFIG_DIR / "defaults.yaml"
 MODELS_DIR = CONFIG_DIR / "models"
@@ -312,6 +314,29 @@ def report(run_dir: str, as_json: bool) -> None:
         click.echo(f"\nsummary: {layout.summary_file}")
     if layout.tokens_file.is_file():
         click.echo(f"tokens : {layout.tokens_file}")
+
+
+@partition.command("upload")
+@click.argument("run_dir", type=click.Path(exists=True))
+@click.argument("repo_id")
+@click.option("--private/--public", default=False, help="Repository visibility")
+@click.option("--max-gib", type=float, default=2048.0,
+              help="Refuse to upload more than this (default 2048 GiB = 2 TB)")
+@click.option("--exclude", multiple=True, default=("logs/**",),
+              help="Glob of paths to leave out; repeatable")
+@click.option("--dry-run", is_flag=True, help="Report what would be uploaded and stop")
+def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
+           exclude: tuple[str, ...], dry_run: bool) -> None:
+    """Upload a run's artifacts to a HuggingFace dataset repo."""
+    from model_partition.publish import PublishError, publish_run
+
+    try:
+        result = publish_run(run_dir, repo_id, private=private,
+                             max_bytes=int(max_gib * GIB), exclude=exclude,
+                             dry_run=dry_run, report=click.echo)
+    except PublishError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(result.summary())
 
 
 @partition.command("tokens")

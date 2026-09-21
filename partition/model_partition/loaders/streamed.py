@@ -53,11 +53,13 @@ SCALE_SUFFIX = ".scale"
 MODULE_BUDGET = 8 << 30
 
 #: Allocations larger than this are placeholders during construction; smaller ones are
-#: made for real. A weight matrix comes from the checkpoint, so allocating it would be
-#: waste. Everything a model *computes* at construction — rotary frequencies, an n-gram
-#: hash table's primes, a token map built from the vocabulary — is small, is in no
-#: checkpoint, and is wrong if left as a placeholder.
-PLACEHOLDER_THRESHOLD = 16 << 20
+#: made for real. Above a gigabyte a single tensor is a weight, and weights come from the
+#: checkpoint. Below it a tensor is either small enough not to matter or something the
+#: model *computes* — and a computed table is not always small: this model's rotary
+#: frequencies are a 256 MiB table that every layer keeps a 1 MiB slice of, so a lower
+#: line left 43 buffers as placeholders that no checkpoint could fill. Anything the
+#: checkpoint does supply is released again the moment the streaming hooks go on.
+PLACEHOLDER_THRESHOLD = 1 << 30
 
 #: Dtypes that only ever come out of a checkpoint. A model computes a rotary table or a
 #: hash map in float or int; it does not compute an fp4 weight or an e8m0 block scale, so
@@ -223,6 +225,43 @@ def build_index(shards: list[Path],
     return entries
 
 
+def clear_caches(module: Any) -> list[str]:
+    """Empty any memoized function in a vendor module; returns what was cleared.
+
+    Vendor code memoizes what it computes once — rotary frequencies, window index
+    tables — and a tensor cached during one build is handed to the next. Build a probe on
+    the meta device and the real model afterwards receives that probe's placeholders,
+    which is how 43 rotary buffers came out empty in a model that computes them
+    correctly.
+    """
+    cleared: list[str] = []
+    for name, value in list(vars(module).items()):
+        clear = getattr(value, "cache_clear", None)
+        if callable(clear):
+            clear()
+            cleared.append(name)
+    return cleared
+
+
+def derived_bytes(model: Any, index: dict[str, ShardEntry]) -> int:
+    """The largest tensor this model computes for itself rather than being given.
+
+    Sizes the placeholder threshold: a derived tensor has to be allocated for real
+    whatever its size, because no checkpoint can restore it, and rotary frequencies for
+    a million-token context are not small.
+    """
+    return max((tensor.numel() * tensor.element_size()
+                for name, tensor in _all_tensors(model) if name not in index), default=0)
+
+
+def _all_tensors(model: Any):
+    for prefix, module in model.named_modules():
+        for leaf in list(module._parameters) + list(module._buffers):
+            tensor = _tensor_of(module, leaf)
+            if tensor is not None:
+                yield (f"{prefix}.{leaf}" if prefix else leaf), tensor
+
+
 def install_streaming(model: Any, index: dict[str, ShardEntry], device: str = "cuda",
                       keep_bytes: int = RESIDENT_LIMIT,
                       resident_budget: int = RESIDENT_BUDGET,
@@ -259,6 +298,12 @@ def install_streaming(model: Any, index: dict[str, ShardEntry], device: str = "c
                 report.resident_tensors += 1
                 report.resident_bytes += nbytes
                 continue
+            # Released now rather than at the first forward: a tensor the checkpoint
+            # supplies may have been allocated during construction, and holding it until
+            # something calls this module defeats the point of streaming.
+            if not tensor.is_meta:
+                _set(module, leaf, torch.empty(tensor.shape, dtype=tensor.dtype,
+                                               device="meta"))
             streamed.append((leaf, full))
         _rebind(module, aliases)
         if not streamed:

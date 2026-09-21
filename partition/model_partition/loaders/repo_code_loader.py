@@ -265,7 +265,13 @@ class RepoCodeLoader:
         import torch
 
         from model_partition.loaders.streamed import (
-            MODULE_BUDGET, build_index, install_streaming, sparse_allocation,
+            MODULE_BUDGET,
+            PLACEHOLDER_THRESHOLD,
+            build_index,
+            clear_caches,
+            derived_bytes,
+            install_streaming,
+            sparse_allocation,
         )
 
         # Vendor inference code is written to run with the default device set — its own
@@ -274,16 +280,26 @@ class RepoCodeLoader:
         # would reject them. Set before construction and left set, because every forward
         # needs it too.
         torch.set_default_device(device)
-        # Big tensors are placeholders to be streamed; the small ones the model computes
-        # for itself are made for real, because no checkpoint can restore them.
-        with sparse_allocation():
-            model = self._instantiate(None)
-        model.eval()
-        torch.set_grad_enabled(False)
         shards = sorted(self.root.glob("*.safetensors"))
         if not shards:
             raise LoaderError(f"No safetensors shards under {self.root} to stream from")
-        report = install_streaming(model, build_index(shards, self.rename), device=device,
+        index = build_index(shards, self.rename)
+        # Which tensors the checkpoint supplies is known before anything is built, so the
+        # threshold is set from the largest one it does *not*: a derived tensor has to be
+        # real whatever its size — rotary frequencies for a million-token context are
+        # 44 MiB — while everything the checkpoint holds is a placeholder to be streamed.
+        with torch.device("meta"):
+            probe = self._instantiate(None)
+        threshold = max(PLACEHOLDER_THRESHOLD, derived_bytes(probe, index))
+        del probe
+        # The probe's placeholders must not outlive it: vendor code memoizes what it
+        # computes, and a cached meta tensor would be handed to the real model.
+        clear_caches(self._import_entry())
+        with sparse_allocation(threshold):
+            model = self._instantiate(None)
+        model.eval()
+        torch.set_grad_enabled(False)
+        report = install_streaming(model, index, device=device,
                                    module_budget=module_budget or MODULE_BUDGET)
         if report.unresolved:
             raise LoaderError(
