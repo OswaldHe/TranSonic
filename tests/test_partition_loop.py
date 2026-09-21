@@ -932,3 +932,23 @@ def test_a_model_too_large_for_the_machine_is_refused_before_allocating(tiny_run
 
     Ctx.inventory.total_param_bytes = staticmethod(lambda include_excluded=True: 1024)
     assert _memory_shortfall(Ctx()) == ""
+
+
+def test_a_forced_rerun_after_retention_retraces(tiny_deep_run, tmp_path):
+    """Retention keeps a few layers, so the trace it leaves is not a cached stage.
+
+    Reusing it verified the layers that survived and then could not assemble the model
+    at all, which is how a re-run reported 251 parameters with no dumped value.
+    """
+    # One module per layer, so retention has something to drop.
+    first = loop_for(tiny_deep_run, tmp_path, retain=True, one_layer_per_module=True)
+    result = first.run()
+    assert result.passed, result.error
+    assert result.context.retention.removed_files, result.context.retention.summary()
+
+    messages: list[str] = []
+    second = loop_for(tiny_deep_run, tmp_path, retain=False, force=True,
+                      one_layer_per_module=True)
+    second.report = messages.append
+    assert second.run().passed, messages
+    assert not any("trace" in m and "cached" in m for m in messages), messages

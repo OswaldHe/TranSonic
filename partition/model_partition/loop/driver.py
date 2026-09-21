@@ -76,11 +76,30 @@ def _print(message: str) -> None:
 STAGE_OUTPUTS: dict[str, Callable[[RunLayout], bool]] = {
     "plan": lambda layout: layout.graph_path.is_file(),
     "extract": lambda layout: (layout.modules_dir / "index.yaml").is_file(),
-    "trace": lambda layout: (layout.trace_dir / "records.yaml").is_file(),
+    "trace": lambda layout: _trace_is_whole(layout),
     "verify_modules": lambda layout: (layout.reports_dir / "verify.json").is_file(),
     "verify_chain": lambda layout: (layout.reports_dir / "chain.json").is_file(),
     "emulate": lambda layout: (layout.reports_dir / "emulate.json").is_file(),
 }
+
+
+def _trace_is_whole(layout: RunLayout) -> bool:
+    """Whether the trace on disk still covers every module.
+
+    Retention keeps a few representative layers and drops the rest, so a pruned trace
+    is a record of a finished run rather than a cached stage: reusing it verifies the
+    layers that survived and cannot assemble the model at all. Re-running after
+    retention re-traces.
+    """
+    if not (layout.trace_dir / "records.yaml").is_file():
+        return False
+    manifest = layout.trace_dir / "manifest.yaml"
+    if not manifest.is_file():
+        return False
+    from model_partition import yamlio
+
+    payload = yamlio.load_path(manifest) or {}
+    return not (payload.get("metadata") or {}).get("retention")
 
 
 def _release_accelerator() -> None:
