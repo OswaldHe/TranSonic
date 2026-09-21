@@ -908,3 +908,27 @@ def test_a_cached_stage_whose_output_is_gone_runs_again(tiny_run, tmp_path):
     shutil.rmtree(layout.modules_dir)
     assert loop_for(tiny_run, tmp_path, retain=False).run().passed
     assert index.is_file(), "extract should have run again"
+
+
+def test_a_model_too_large_for_the_machine_is_refused_before_allocating(tiny_run, tmp_path):
+    """Discovering it by allocating means the kernel kills the run's terminal."""
+    from model_partition.loop.stages import _memory_shortfall
+
+    class Ctx:
+        layout = tiny_run.layout
+        result = tiny_run.result
+        budget = None
+
+        class inventory:
+            dequant_bytes = 0
+
+            @staticmethod
+            def total_param_bytes(include_excluded=True):
+                return 1 << 50  # a petabyte
+
+    detail = _memory_shortfall(Ctx())
+    assert "resident for one forward" in detail
+    assert "larger machine" in detail
+
+    Ctx.inventory.total_param_bytes = staticmethod(lambda include_excluded=True: 1024)
+    assert _memory_shortfall(Ctx()) == ""

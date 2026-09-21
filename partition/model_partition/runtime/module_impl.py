@@ -88,11 +88,17 @@ def load_impl(directory: str | Path) -> ExtractedImpl:
         raise ImplError(f"Could not import {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
+    # No `__pycache__` beside it: the directory is a deliverable, and the file is one
+    # the agent edits between runs.
+    written = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
         sys.modules.pop(name, None)
         raise ImplError(f"{path} failed to import: {exc}") from exc
+    finally:
+        sys.dont_write_bytecode = written
     return ExtractedImpl(path=path, module=module,
                          module_ids=list(getattr(module, "MODULE_IDS", [])))
 

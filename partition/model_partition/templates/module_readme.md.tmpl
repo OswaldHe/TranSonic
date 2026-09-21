@@ -42,8 +42,10 @@ What must hold before this module can run:
    `trace/activations/<module id>/`. That includes whatever this architecture
    passes alongside the hidden state — rotary embeddings, attention masks,
    sliding-window state — so the implementation needs no special handling for them.
-3. **Config.** The model's resolved config, as `config`. Read hidden size, head
-   counts, epsilons and RoPE settings from here rather than hard-coding them.
+3. **Config.** `config.json` beside this file: the config this module's subtree was
+   built from{% if config_class %}, a `{{ config_class }}`{% endif %}. It is what the launcher constructs the module with, in
+   preference to the run-wide config, and where hidden size, head counts, epsilons
+   and RoPE settings come from rather than being hard-coded.
 4. **Device.** The module must fit the per-module budget the plan was built
    against; `device` says where to put it.
 {% if not verifiable %}

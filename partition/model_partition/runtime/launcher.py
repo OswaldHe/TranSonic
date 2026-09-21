@@ -4,9 +4,10 @@
 """Construct a module from the source sitting next to it, plus config and weights.
 
 This is what makes a module directory the deliverable rather than a description of
-one. ``source.py`` is the implementation — the verbatim file the class is defined in
-— and this launches it: import that file, construct the class from the model's
-config, load the recorded weights into it, hand back something callable.
+one. ``source.py`` is the implementation — the module's own classes, taken verbatim out
+of the file that defines them — and this launches it: import that file, construct the
+classes from the config recorded beside them, load the dumped weights in, hand back
+something callable.
 
 Nothing here reads the checkpoint or instantiates the whole model. The one thing not
 vendored is the framework: ``source.py`` is loaded under its original package name so
@@ -91,11 +92,17 @@ def load_source(directory: str | Path, source_module: str | None = None) -> Any:
         raise LauncherError(f"Could not import {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
+    # No `__pycache__` in the module directory: it is a deliverable someone reads and
+    # copies, and a stale cache of a file they are editing is worse than no cache.
+    written = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
         sys.modules.pop(name, None)
         raise LauncherError(f"{path} failed to import: {exc}") from exc
+    finally:
+        sys.dont_write_bytecode = written
     _SOURCE_CACHE[key] = module
     return module
 

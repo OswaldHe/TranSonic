@@ -449,6 +449,42 @@ def _impl_fingerprint(ctx: LoopContext) -> str:
 # -- stage: trace ------------------------------------------------------------
 
 
+def _memory_shortfall(ctx: LoopContext) -> str:
+    """Why this machine cannot hold the model for a forward, or "" if it can.
+
+    Unlike every later stage, tracing needs the *whole* model resident: it runs a real
+    forward and records what each module saw. Partitioning cannot make that smaller.
+    Checked up front because the alternative is discovering it by allocating until the
+    kernel kills the process, which takes the run's terminal with it.
+    """
+    if ctx.inventory is None:
+        return ""
+    from model_partition.hardware import detect_host
+
+    # What the loader will hold: a quantized checkpoint read through vendor code is
+    # cast to the spec's dtype, so the bf16 mirror is the resident size, not the fp8
+    # bytes on disk.
+    needed = ctx.inventory.total_param_bytes(include_excluded=False)
+    if ctx.inventory.dequant_bytes and ctx.result and ctx.result.loader == "repo_code":
+        # Vendor code casts the checkpoint to the spec's dtype as it loads, so the
+        # bf16 mirror is what has to fit, not the fp8 bytes on disk.
+        needed = max(needed, ctx.inventory.dequant_bytes)
+    host = detect_host(ctx.layout.root)
+    gpu_bytes = ctx.budget.gpu.total_bytes if ctx.budget and ctx.budget.gpu else 0
+    capacity = host.ram_available_bytes + gpu_bytes
+    if not capacity or needed <= capacity:
+        return ""
+    where = f"{format_bytes(host.ram_available_bytes)} host RAM available"
+    if gpu_bytes:
+        where += f" + {format_bytes(gpu_bytes)} on {ctx.budget.gpu.name}"
+    return (
+        f"the model needs about {format_bytes(needed)} resident for one forward and "
+        f"this machine has {format_bytes(capacity)} ({where}). Tracing needs the whole "
+        "model, which partitioning cannot change: run it on a larger machine, or "
+        "narrow the scope in the spec."
+    )
+
+
 def stage_trace(ctx: LoopContext) -> StageResult:
     """Capture real per-module IO and weights for every sample."""
     assert ctx.graph is not None and ctx.build_model is not None
@@ -456,6 +492,9 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         return StageResult(ok=False, detail=(
             "no sample inputs: set inputs.short (and optionally inputs.long) in the spec"
         ))
+    shortfall = _memory_shortfall(ctx)
+    if shortfall:
+        return StageResult(ok=False, detail=shortfall)
     # A re-trace replaces the previous one entirely. Leaving the old blobs behind
     # would grow the run by a whole trace per iteration, and retention only ever
     # sees what the new manifest lists.
