@@ -225,23 +225,29 @@ what:
 
 - **`source.py` is the implementation** — the file the module's class is defined in,
   copied verbatim. This is what you edit to optimize the module.
-- **`inference.py` is the launcher.** It imports `source.py`, constructs the class
-  from the recorded config, loads the dumped weights into it, and returns the module.
-  It does not read the checkpoint and does not instantiate the rest of the model, so
+- **`inference.py` is the launcher, and the benchmark.** It imports `source.py`,
+  constructs the class from the recorded config, loads the dumped weights into it, and
+  returns the module. Run directly it times the module and compares it against the
+  dumped reference, printing `##autohelix[latency_ms=…]`, `##autohelix[cosine=…]`,
+  `##autohelix[max_abs_err=…]`, `##autohelix[max_rel_err=…]` and
+  `##autohelix[passed=…]` — so a module directory is something `autohelix run` can
+  optimize as it stands, and a faster module that stopped matching exits non-zero
+  instead of scoring well. It reads no checkpoint and instantiates no model, so
   nothing outside the directory has to be present.
-- **`verify.py` is the gate.** It runs the launcher on the dumped input feature map
-  and exits non-zero when the output disagrees with the dumped reference.
+- **`verify.py` is the gate.** Same check, every module of the group and every
+  traced sample, at a tolerance the agent cannot loosen.
 - **`README.md`** states what the module does, its pre-conditions and its
   post-conditions.
 
-That is also what `verify_modules`, `verify_chain` and `emulate` run, so optimizing
-one module and re-running the gate tells you whether it is still correct — on its own,
-and chained with the others.
+`source.py` and `inference.py` are written once and then left alone, so work done on
+them survives the next run of the loop. They are also what `verify_modules`,
+`verify_chain` and `emulate` run, so optimizing one module and re-running the loop
+tells you whether it is still correct — on its own, and chained with the others.
 
 ```bash
 cd <run-dir>/modules/<group>
 cat README.md                                    # what it does, what it needs
-python inference.py --module <module-id>         # run it
+python inference.py --device cuda --repeat 50    # time it, check it, report metrics
 python verify.py --all-modules --all-samples     # gate it
 ```
 

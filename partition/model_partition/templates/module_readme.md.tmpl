@@ -71,21 +71,41 @@ on cosine.
 ## Running it
 
 ```bash
-python inference.py --module {{ module_ids[0] }}       # run it, print output shapes
-python verify.py --all-modules --all-samples          # gate it
+python inference.py --module {{ module_ids[0] }}       # run it: error + latency
+python verify.py --all-modules --all-samples          # gate every module and sample
 ```
 
+`inference.py` launches `source.py` on the dumped weights and input, times it, and
+compares the result against the dumped output. It prints the metrics in autohelix's
+capturable form and exits non-zero when the output no longer matches, so it works
+as the benchmark command of an optimization loop over this directory:
+
+```
+##autohelix[latency_ms=...]    median of the timed forward passes
+##autohelix[cosine=...]        worst cosine against the dumped reference
+##autohelix[max_abs_err=...]   worst absolute error
+##autohelix[max_rel_err=...]   worst relative error
+##autohelix[passed=1]          1 only when every tensor is within tolerance
+```
+
+`--repeat`/`--warmup` set how many passes are timed, `--device cuda` runs it on the
+accelerator, and `--rtol`/`--atol` loosen the bar when you mean to trade accuracy.
+
 `verify.py` exits 0 when every tensor matches, 1 when one does not, 2 when the
-artifacts are unusable. That makes it the acceptance test for a port: swap
-`inference.py` for another backend's implementation, point `--run` at these same
-artifacts, and it tells you whether the port still reproduces the reference.
+artifacts are unusable. That makes it the acceptance test for optimizing this module:
+rewrite a kernel in `source.py`, or swap `inference.py` for another backend's
+implementation, point `--run` at these same artifacts, and it tells you whether the
+result still reproduces the reference.
 
 ## Files
 
 | file | owner | what it is |
 |---|---|---|
-| `inference.py` | the loop | the module's inference code; written once, then only ever edited |
-| `verify.py` | the harness | decides whether `inference.py` is correct; regenerated every run |
-| `source.py` | reference | the real implementation's source, for reading and porting |
+| `source.py` | yours | **the implementation** — this module's classes, copied verbatim; edit this to optimize it |
+| `inference.py` | yours | the launcher: imports `source.py`, builds the class from the recorded config, loads the dumped weights |
+| `verify.py` | the harness | decides whether the implementation is correct; regenerated every run |
 | `meta.yaml` | the harness | module ids, layers, shapes, byte counts |
 | `README.md` | the harness | this file |
+
+`source.py` and `inference.py` are written once and then left alone, so an edit here
+survives the next run of the loop.

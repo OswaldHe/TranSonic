@@ -145,6 +145,36 @@ def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
     assert "dumped tensors" in completed.stdout
 
 
+def test_inference_reports_error_and_latency_as_autohelix_metrics(tiny_run, tmp_path):
+    """The module directory is an optimization target, so it has to report a score."""
+    from autohelix.checks import parse_structured_metrics
+
+    completed = _script(tiny_run, tmp_path, "inference.py", "--repeat", "3")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    metrics = parse_structured_metrics(completed.stdout)
+    assert set(metrics) == {"latency_ms", "cosine", "max_abs_err", "max_rel_err", "passed"}
+    assert metrics["passed"] == 1
+    assert metrics["latency_ms"] > 0
+    assert metrics["cosine"] > 0.99
+
+
+def test_inference_exits_nonzero_when_the_output_no_longer_matches(tiny_run, tmp_path):
+    """A faster module that is wrong must not read as an improvement."""
+    from autohelix.checks import parse_structured_metrics
+
+    store = tiny_run.bundle.store
+    target = next(m.id for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    for entry in store.find(role="output", module_id=target):
+        store.blob_path(entry).write_bytes(b"\x7f" * entry.nbytes)
+
+    completed = _script(tiny_run, tmp_path, "inference.py", "--repeat", "2")
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    assert parse_structured_metrics(completed.stdout)["passed"] == 0
+    # The latency is still reported: it is the reason someone made the change.
+    assert "latency_ms" in parse_structured_metrics(completed.stdout)
+
+
 def test_inference_script_can_save_its_output(tiny_run, tmp_path):
     out = tmp_path / "out.bin"
     completed = _script(tiny_run, tmp_path, "inference.py", "--save", str(out))
@@ -321,6 +351,27 @@ def test_the_readme_explains_a_parallel_group(tiny_split_run, tmp_path):
     _, readmes = _readme(tiny_split_run, tmp_path)
     text = readmes[parallel[0].code_signature]
     assert "parallel" in text and "submodule=" in text
+
+
+def test_an_optimized_source_survives_the_next_extraction(tiny_run, tmp_path):
+    """source.py is what someone optimizes, so re-extracting must not discard it."""
+    from model_partition.extract import extract
+
+    groups = _extract(tiny_run, tmp_path)
+    directory = next(g.directory for g in groups if g.class_name == "TinyDecoderLayer")
+    optimized = (directory / "source.py").read_text() + "\n# hand-tuned kernel here\n"
+    (directory / "source.py").write_text(optimized)
+
+    again = _extract(tiny_run, tmp_path)
+    assert (directory / "source.py").read_text() == optimized
+    assert next(g for g in again if g.directory == directory).preserved
+    # Still launchable: the preserved file is the implementation, as recorded.
+    assert next(g for g in again if g.directory == directory).launchable
+
+    extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+            run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
+            weight_tensors=tiny_run.bundle.weights, regenerate=True)
+    assert (directory / "source.py").read_text() != optimized
 
 
 def test_the_readme_is_regenerated_unlike_inference_py(tiny_run, tmp_path):

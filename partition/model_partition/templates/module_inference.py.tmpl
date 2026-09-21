@@ -32,8 +32,23 @@ its own.
 
 Optimize `source.py`. Then:
 
-    python inference.py                              # run it
+    python inference.py                              # run it: error + latency
     python verify.py --all-modules --all-samples     # is it still correct?
+
+## Running this file
+
+It launches `source.py`, times it, and compares the result against the dumped
+reference. The metrics are printed in autohelix's capturable form:
+
+    ##autohelix[latency_ms=...]     median of the timed forward passes
+    ##autohelix[cosine=...]         worst cosine against the dumped reference
+    ##autohelix[max_abs_err=...]    worst absolute error
+    ##autohelix[max_rel_err=...]    worst relative error
+    ##autohelix[passed=1]           1 only when every tensor is within tolerance
+
+The exit code is 0 only when the output still matches, so a faster module that is
+wrong cannot read as an improvement. That makes this file usable directly as the
+benchmark command of an optimization loop over this one module.
 """
 
 from __future__ import annotations
@@ -77,28 +92,38 @@ def build_module(config, weights, device="cpu", submodule=None):
 
 
 def main(argv=None):
-    """Run this module once and report its output shapes.
+    """Launch this module, measure its error and its latency, report both.
 
-    A convenience for inspecting the implementation; `verify.py` is what decides
-    whether it is correct.
+    Exits 0 when every tensor is still within tolerance of the dumped reference, 1
+    when one is not, 2 when the artifacts cannot be read. `verify.py` is the harness's
+    gate and covers every module and sample; this is the same check on one module,
+    with a timing, so it can drive an optimization loop over this directory.
     """
     import argparse
+    import math
     import sys
+    import time
 
-    parser = argparse.ArgumentParser(description="Run this module's inference once.")
+    parser = argparse.ArgumentParser(
+        description="Launch this module's implementation, then time it and check it.")
     parser.add_argument("--run", default=DEFAULT_RUN, help="Run directory")
     parser.add_argument("--module", default=MODULE_IDS[0], choices=MODULE_IDS)
     parser.add_argument("--sample", default=None)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--repeat", type=int, default=10, help="Timed forward passes")
+    parser.add_argument("--warmup", type=int, default=2, help="Untimed passes first")
+    parser.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
+    parser.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     parser.add_argument("--save", default=None, help="Write the output as a raw .bin")
     args = parser.parse_args(argv)
 
-    from model_partition.runtime.module_impl import ExtractedImpl, run_impl
     from model_partition.runtime.module_runner import (
-        decode_group_call, first_tensor, load_named_weights,
+        decode_group_call, expected_output, first_tensor, load_named_weights,
     )
     from model_partition.runtime.standalone import StandaloneError, load_run
+    from model_partition.verify.numerics import Tolerance, compare_outputs
 
+    parallel = COMPOSITION == "parallel"
     try:
         run = load_run(args.run)
         sample = args.sample or (run.bundle.sample_ids() or [None])[0]
@@ -107,6 +132,11 @@ def main(argv=None):
             raise StandaloneError(f"No records for {args.module} sample {sample}")
         weights = load_named_weights(run.bundle, args.module, device=args.device)
         args_, kwargs_ = decode_group_call(records, run.bundle.store, args.device)
+        # A parallel group's calls are independent — one expert each — so the first
+        # call's own output is the reference. A sequential group is one computation
+        # from the first submodule's input to the last submodule's output.
+        reference = expected_output(records[0] if parallel else records[-1],
+                                    run.bundle.store, device=args.device)
     except StandaloneError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -115,13 +145,62 @@ def main(argv=None):
     print(f"module   : {args.module}  layers={LAYER_MAP.get(args.module) or '-'}")
     print(f"weights  : {len(weights)} dumped tensors")
 
-    impl = ExtractedImpl(path=__file__, module=sys.modules[__name__],
-                         module_ids=MODULE_IDS)
-    output = run_impl(impl, run.bundle.config, weights, args_, kwargs_,
-                      device=args.device, submodule=records[0].submodule)
+    import torch
+
+    module = build_module(run.bundle.config, weights, device=args.device,
+                          submodule=records[0].submodule if parallel else None)
+
+    def once():
+        with torch.no_grad():
+            return module(*args_, **kwargs_)
+
+    def settle():
+        # An accelerator call queues rather than completes, so nothing timed around
+        # it means anything until the device has caught up.
+        if args.device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+    for _ in range(max(args.warmup, 0)):
+        once()
+    settle()
+    timings = []
+    for _ in range(max(args.repeat, 1)):
+        start = time.perf_counter()
+        output = once()
+        settle()
+        timings.append((time.perf_counter() - start) * 1e3)
+    timings.sort()
+    latency = timings[len(timings) // 2]
+
     tensor = first_tensor(output)
     print(f"  output shape={tuple(tensor.shape) if tensor is not None else None} "
           f"dtype={getattr(tensor, 'dtype', None)}")
+    print(f"  latency {latency:.3f} ms  (median of {len(timings)}, "
+          f"{timings[0]:.3f}-{timings[-1]:.3f} ms on {args.device})")
+
+    tolerance = None
+    if args.rtol is not None or args.atol is not None:
+        base = Tolerance.for_dtype("bfloat16")
+        tolerance = Tolerance(rtol=args.rtol if args.rtol is not None else base.rtol,
+                              atol=args.atol if args.atol is not None else base.atol)
+    comparisons = compare_outputs(output, reference, args.module, tolerance)
+    for comparison in comparisons:
+        print("  " + comparison.summary())
+    passed = bool(comparisons) and all(c.passed for c in comparisons)
+
+    def metric(name, value):
+        # A non-finite metric is not a number autohelix can track, and inventing one
+        # would hide the failure. The human line above it still shows what happened.
+        if isinstance(value, float) and not math.isfinite(value):
+            print(f"  {name} is {value}; not reported as a metric")
+            return
+        print(f"##autohelix[{name}={value:.6g}]")
+
+    metric("latency_ms", latency)
+    metric("cosine", min((c.cosine for c in comparisons), default=0.0))
+    metric("max_abs_err", max((c.max_abs_err for c in comparisons), default=0.0))
+    metric("max_rel_err", max((c.max_rel_err for c in comparisons), default=0.0))
+    print(f"##autohelix[passed={1 if passed else 0}]")
 
     if args.save and tensor is not None:
         from model_partition.tensorstore import contiguous_bytes
@@ -130,7 +209,11 @@ def main(argv=None):
         with open(args.save, "wb") as handle:
             handle.write(raw)
         print(f"wrote {args.save}  ({dtype} {tuple(shape)}, {len(raw)} bytes)")
-    return 0
+
+    verdict = "PASS" if passed else "FAIL"
+    print(f"{verdict}: {args.module} in {latency:.3f} ms, "
+          f"{sum(1 for c in comparisons if c.passed)}/{len(comparisons)} tensor(s) match")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

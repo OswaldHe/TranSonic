@@ -22,9 +22,11 @@ from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
 from model_partition.trace import _lookup
 
-#: The implementation is the loop's to edit, so it is written once and then left
-#: alone. Everything else belongs to the harness and is regenerated every run.
+#: The implementation and its launcher are the loop's to edit, so they are written
+#: once and then left alone — an optimization made to a module has to survive the
+#: next extraction. Everything else belongs to the harness and is regenerated.
 EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
+SOURCE_FILENAME = "source.py"
 HARNESS_TEMPLATES = {
     "verify.py": "module_verify.py.tmpl",
     "README.md": "module_readme.md.tmpl",
@@ -225,8 +227,9 @@ def extract(
     ``param_names`` maps a module id to the original parameter names its
     implementation will be handed, so the generated file can document them.
 
-    An existing ``inference.py`` is preserved: it is the loop's editable surface
-    and may carry the agent's numerical fixes. ``regenerate=True`` overwrites it.
+    An existing ``source.py`` and ``inference.py`` are preserved: they are the loop's
+    editable surface and may carry the agent's numerical fixes, or someone's kernel
+    work. ``regenerate=True`` overwrites them.
     """
     param_names = param_names or {}
     # The class the model's own config is, rather than whichever name in the source
@@ -263,7 +266,10 @@ def extract(
 
         principal = _principal(targets) if targets else None
         group.source_module = type(principal).__module__ if principal is not None else ""
-        group.launchable = _write_source(directory, principal, sources, signature, files)
+        if (directory / SOURCE_FILENAME).is_file() and not regenerate:
+            group.preserved = True
+        group.launchable = _write_source(directory, principal, sources, signature, files,
+                                         regenerate=regenerate)
         weight_names = list(param_names.get(representative.id, []))
         # One class name per submodule, positionally. Groups are signature-homogeneous,
         # so submodule i of any module in the group has submodule i's class.
@@ -326,14 +332,21 @@ def extract(
 
 
 def _write_source(directory: Path, principal: Any, sources: list[str],
-                  signature: str, files: list[str]) -> bool:
+                  signature: str, files: list[str], regenerate: bool = False) -> bool:
     """Write ``source.py``: the implementation if there is one, else an excerpt.
 
     Returns whether the result is importable. Copying the defining file verbatim is
     what makes the module directory a unit you can optimize on its own — the code that
-    runs is the code in front of you, not whatever happens to be installed.
+    runs is the code in front of you, not whatever happens to be installed. An
+    existing one is left alone for the same reason ``inference.py`` is: it is the file
+    being optimized, and re-extracting must not throw that away.
     """
     import inspect
+
+    destination = directory / SOURCE_FILENAME
+    if destination.is_file() and not regenerate:
+        previous = yamlio.load_path(directory / "meta.yaml") or {}
+        return bool(previous.get("launchable", True))
 
     origin = None
     if principal is not None:
@@ -344,7 +357,7 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
             origin = None
 
     if origin is not None:
-        (directory / "source.py").write_text(
+        destination.write_text(
             SOURCE_BANNER.format(signature=signature, origin=origin,
                                  class_name=type(principal).__name__)
             + origin.read_text()
@@ -353,7 +366,7 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
 
     provenance = ("\n".join(f"  {path}" for path in sorted(files))
                   or "  (not present in the loaded model)")
-    (directory / "source.py").write_text(
+    destination.write_text(
         EXCERPT_HEADER.format(signature=signature, provenance=provenance)
         + "\n\n".join(sources)
     )
@@ -363,9 +376,10 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
 def _copy_source_files(groups: list[ExtractedGroup], root: Path) -> int:
     """Copy each implementation's originating file verbatim; returns how many.
 
-    The extracted ``source.py`` is a readable subset and does not import. A porter
-    wants the real file, and the files are shared between groups, so they are written
-    once beside them.
+    A group's ``source.py`` is the file its *principal* class comes from, and a group
+    can span classes defined elsewhere — a framework primitive alongside the model's
+    own block. Those files are collected here so the whole group can be read, written
+    once beside the groups since several of them come from the same file.
     """
     import shutil
 

@@ -26,9 +26,16 @@ A reviewer has already diagnosed this. Work from it.
 {% endif %}
 ## What you can change
 
-Only the `inference.py` of a failing module's group, under `modules/<group>/`.
-Each group's `meta.yaml` lists which module ids it covers, so map a failing module
-id to its directory there.
+Only `source.py` and `inference.py` of a failing module's group, under
+`modules/<group>/`. Each group's `meta.yaml` lists which module ids it covers, so map
+a failing module id to its directory there.
+
+- `source.py` **is** the implementation: the module's classes, copied out of the
+  model's own code. This is where the arithmetic lives, and editing it is what
+  changes what runs.
+- `inference.py` launches it: it imports `source.py`, constructs the class from the
+  recorded config, loads the dumped weights into it and returns it. Fix it here when
+  the module is built or wired wrongly rather than computed wrongly.
 
 Do **not** touch:
 
@@ -59,7 +66,8 @@ signature if the module has a single submodule.
 
 - `reports/verify.json` — per-module metrics: max absolute and relative error,
   cosine similarity, pass fraction, and the index of the worst element
-- `modules/<group>/source.py` — the real implementation's source, to work from
+- `modules/<group>/source.py` — the implementation itself; add a print or an
+  assertion to it and `verify.py` will run that code
 - `modules/<group>/verify.py` — run it directly to iterate:
   `python verify.py --all-modules --all-samples`
 
