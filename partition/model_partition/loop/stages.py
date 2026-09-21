@@ -260,6 +260,18 @@ def _excluded_markers(spec: ModelSpec) -> tuple[str, ...]:
                  if name not in included for marker in markers)
 
 
+def _checkpoint_to_fetch(ctx: LoopContext) -> int:
+    """Bytes of checkpoint this run still has to write to disk."""
+    if not ctx.result:
+        return 0
+    missing = set(ctx.result.missing_shards())
+    if not missing:
+        return 0
+    shard_bytes = ctx.result.index.shard_bytes
+    return sum(size for shard, size in shard_bytes.items() if shard in missing) or \
+        ctx.result.index.total_bytes
+
+
 def _storage_estimate(ctx: LoopContext):
     inventory = ctx.inventory
     assert inventory is not None
@@ -270,7 +282,9 @@ def _storage_estimate(ctx: LoopContext):
     per_layer = 2 if ctx.options.split_attention_ffn else 1
     n_modules = max(len(inventory.layers), 1) * per_layer + 3
     return estimate_storage(
-        checkpoint_bytes=ctx.result.index.total_bytes if ctx.result else 0,
+        # Only what still has to be fetched: shards already in the snapshot are on this
+        # disk and counting them again asks for room for a second copy of the model.
+        checkpoint_bytes=_checkpoint_to_fetch(ctx),
         module_weight_bytes=inventory.total_param_bytes(include_excluded=False),
         dequant_bytes=inventory.dequant_bytes,
         trace=TraceShape(

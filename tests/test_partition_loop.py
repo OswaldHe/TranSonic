@@ -953,3 +953,16 @@ def test_a_forced_rerun_after_retention_retraces(tiny_deep_run, tmp_path):
     second.report = messages.append
     assert second.run().passed, messages
     assert not any("trace" in m and "cached" in m for m in messages), messages
+
+
+def test_a_checkpoint_already_on_disk_is_not_counted_again(tiny_run):
+    """Counting it twice asks for room for a second copy of the model."""
+    from model_partition.loop.stages import _checkpoint_to_fetch
+
+    class Ctx:
+        result = tiny_run.result
+
+    assert _checkpoint_to_fetch(Ctx()) == 0
+
+    (tiny_run.repo / "model.safetensors").unlink()
+    assert _checkpoint_to_fetch(Ctx()) > 0
