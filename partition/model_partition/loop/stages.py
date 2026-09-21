@@ -21,6 +21,7 @@ from model_partition.layout import RunLayout
 from model_partition.planner import auto
 from model_partition.planner.graph import PartitionGraph
 from model_partition.retention import RetentionPolicy, apply_retention, plan_retention, write_retention_report
+from model_partition.runtime.compat import is_hardware_limit
 from model_partition.sizing import CostModel, ModelInventory
 from model_partition.spec import ModelSpec
 from model_partition.storage import DumpPolicy, TraceShape, estimate_storage, preflight
@@ -139,6 +140,9 @@ class LoopContext:
     chain_report: Any = None
     emulate_report: Any = None
     retention: Any = None
+    #: Compatibility patches in effect, when the model's own code needed porting to
+    #: this hardware. Recorded because the trace they produce is the reference.
+    compat: Any = None
     notes: list[str] = field(default_factory=list)
     #: Placement the last built model actually got: "single" or "auto".
     last_placement: str = "single"
@@ -211,6 +215,7 @@ def stage_ingest(ctx: LoopContext) -> StageResult:
         # run rather than being re-read from a snapshot that may be gone.
         "config": ctx.result.config,
         "partition_prompt": ctx.options.partition_prompt,
+        "compat": ctx.compat.to_dict() if ctx.compat else None,
         "inputs": [s.to_dict() for s in ctx.samples],
         "storage_estimate": {
             "total_bytes": estimate.total_bytes,
@@ -572,8 +577,21 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     unresolved = tracer.unresolved_submodules()
     if unresolved:
         return _unresolved_result(ctx, unresolved)
-    for sample in ctx.samples:
-        tracer.trace_sample(sample.id, sample.tensor(device))
+    try:
+        for sample in ctx.samples:
+            tracer.trace_sample(sample.id, sample.tensor(device))
+    except Exception as exc:
+        if not is_hardware_limit(exc):
+            raise
+        # The model's own code will not run on this card. That is a porting job, not a
+        # partitioning one: the agent writes a replacement under compat/ for the parts
+        # this hardware refuses, and the trace is taken again.
+        where = ctx.budget.gpu.describe() if ctx.budget.gpu else "no GPU"
+        return StageResult(
+            ok=False, repairable=True, repair_surface="compat",
+            detail=(f"the model's own code does not run on this GPU: {type(exc).__name__}: "
+                    f"{exc}. This card is {where}."),
+        )
 
     # The buffers a class computes for itself, taken from the copy that just ran: the
     # host copy above holds its own, and they are not always the same — a rotary
@@ -1127,6 +1145,9 @@ def dump_agent_context(ctx: LoopContext, failed_stage: str, result: StageResult)
         "failed_stage": failed_stage,
         "failure_detail": result.detail,
         "failing_modules": result.failing_modules,
+        # What a port has to target, and what it is porting from.
+        "device": ctx.budget.gpu.describe() if ctx.budget.gpu else "no GPU",
+        "snapshot": str(ctx.result.root) if ctx.result else "",
     }
 
 

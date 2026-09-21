@@ -98,9 +98,9 @@ notes: |
 
   What stops a forward here is `sparse_attn`, which asks for 141 312 bytes of dynamic
   shared memory per block. An L40S (sm_89) allows 101 376; Hopper allows 232 448. The
-  kernel is written for Hopper and there is no reference path beside it, so tracing this
-  model needs an H100/H200-class GPU — where everything above still applies, since the
-  checkpoint is larger than those cards too.
+  kernel is written for Hopper and there is no reference path beside it, so `trace` and
+  everything after it needs an H100/H200-class GPU — where all of the above still
+  applies, since the checkpoint is larger than those cards too.
 
   encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
   tokenizer ground truth and are worth checking before anything else.

@@ -42,6 +42,7 @@ from model_partition.loop.state import (
     LoopState,
     content_hash,
 )
+from model_partition.runtime.compat import patch_paths
 from model_partition.spec import ModelSpec
 
 
@@ -177,7 +178,9 @@ class PartitionLoop:
 
             result = ctx.result or ingest(ctx.spec)
             ctx.result = result
-            return build_loader(result).build_meta().model
+            return build_loader(result, tokenizer=ctx.tokenizer,
+                                compat_paths=patch_paths(ctx.layout.root),
+                                device_info=ctx.budget.gpu).build_meta().model
 
         return build
 
@@ -215,7 +218,9 @@ class PartitionLoop:
 
             device_map, max_memory = ctx.placement() if placed else (None, None)
             loader = build_loader(result, device_map=device_map, max_memory=max_memory,
-                                 tokenizer=ctx.tokenizer)
+                                 tokenizer=ctx.tokenizer,
+                                 compat_paths=patch_paths(ctx.layout.root),
+                                 device_info=ctx.budget.gpu)
             if placed and _must_stream(ctx) and hasattr(loader, "build_streamed"):
                 # Too large to be resident anywhere: hold one module's weights at a
                 # time instead. Slower per forward, and the alternative is no forward.
@@ -224,6 +229,15 @@ class PartitionLoop:
             else:
                 loaded = loader.build()
             ctx.last_placement = loaded.placement
+            report = getattr(loader, "compat_report", None)
+            if report is not None and report.files:
+                # The reference every later stage is measured against was produced by
+                # patched code, so the run has to say so rather than imply the vendor's.
+                ctx.compat = report
+                note = f"compatibility patches in effect: {report.summary()}"
+                if note not in ctx.notes:
+                    ctx.notes.append(note)
+                    self.report(f"  {note}")
             return loaded.model
 
         return build
@@ -525,6 +539,8 @@ class PartitionLoop:
                                timeout_seconds=self.options.agent_timeout_seconds)
         self._review(ctx, planner, stage_name, result, iteration)
 
+        if result.repair_surface == "compat":
+            return self._port_kernels(ctx, state, result, iteration)
         if stage_name == "verify_modules" and result.repair_surface == "modules":
             return self._repair_modules(ctx, state, result, iteration)
 
@@ -563,6 +579,38 @@ class PartitionLoop:
             self.report(f"  no review produced: {outcome.error}")
             return False
         self.report(f"  review written to {ctx.layout.review_file}")
+        return True
+
+    def _port_kernels(
+        self, ctx: LoopContext, state: LoopState,
+        result: StageResult, iteration: int,
+    ) -> bool:
+        """The model's own code will not run here: have the agent port what refuses.
+
+        A kernel written for a bigger card is not a partitioning problem and not an
+        arithmetic one — the arithmetic is right and the hardware says no. The agent
+        writes a replacement under ``compat/`` and the trace is taken again with it.
+        """
+        from model_partition.planner.agent import AgentPlanner
+
+        self.report("  asking the agent to port the model's code to this GPU...")
+        planner = AgentPlanner(model=self.options.agent_model,
+                               timeout_seconds=self.options.agent_timeout_seconds)
+        outcome = planner.port_kernels(
+            ctx.layout, dump_agent_context(ctx, "trace", result), iteration)
+        if not outcome.ok:
+            self.report(f"  porting failed: {outcome.error}")
+            ctx.notes.append(f"iteration {iteration}: porting failed: {outcome.error}")
+            return False
+        patches = patch_paths(ctx.layout.root)
+        if not patches:
+            self.report("  the agent wrote no compatibility patch; stopping")
+            return False
+        cleared = state.invalidate_from("trace")
+        ctx.bundle = None
+        self.report(f"  {len(patches)} compatibility patch(es) written "
+                    f"({', '.join(p.name for p in patches)}); "
+                    f"invalidated: {', '.join(cleared) or 'nothing'}")
         return True
 
     def _repair_modules(

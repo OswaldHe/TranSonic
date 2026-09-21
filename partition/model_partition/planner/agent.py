@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from model_partition.planner.graph import GraphError, PartitionGraph
+from model_partition.runtime.compat import COMPAT_DIR
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -186,6 +187,27 @@ class AgentPlanner:
         if not outcome.ok:
             restore_impls(layout, snapshot)
         return outcome
+
+    def port_kernels(
+        self,
+        layout,
+        context: dict[str, Any],
+        iteration: int,
+    ) -> AgentOutcome:
+        """Ask the agent to make the model's own code run on this GPU.
+
+        The editable surface is ``compat/*.py``: small files that replace the parts of
+        the vendor's implementation this card cannot launch. Nothing else — not the
+        plan, not the vendor's snapshot, not the verifier — so what the patch changes
+        is visible in one place, and the run records that the reference was produced
+        with it.
+        """
+        prompt = render_prompt("port_kernels.md", **context)
+        (layout.root / COMPAT_DIR).mkdir(parents=True, exist_ok=True)
+        return self.invoke(
+            workdir=layout.root, prompt=prompt, iteration=iteration,
+            log_path=layout.root / "logs" / f"agent-port-{iteration}.log",
+        )
 
     def _edit_plan(
         self, layout, graph: PartitionGraph, prompt: str, iteration: int, tag: str,

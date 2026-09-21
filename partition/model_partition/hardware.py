@@ -32,11 +32,31 @@ class GPUInfo:
     total_bytes: int
     free_bytes: int
     capability: tuple[int, int] | None = None
+    #: Dynamic shared memory one block may opt into. A kernel written for a bigger
+    #: card asks for more than this and fails to launch — the most common reason a
+    #: vendor's own kernels do not run on the GPU in front of you.
+    shared_memory_per_block: int = 0
+    multiprocessors: int = 0
 
     def supports_fp8(self) -> bool:
         """True on sm_89+ (L40S, H100). Hardware fp8 is not the same as a usable
         block-scaled fp8 GEMM — see :mod:`model_partition.quant.fp8_block`."""
         return self.capability is not None and self.capability >= (8, 9)
+
+    def supports_fp4(self) -> bool:
+        """True on sm_100+ (Blackwell). Below that, fp4 has to be widened to compute."""
+        return self.capability is not None and self.capability >= (10, 0)
+
+    def architecture(self) -> str:
+        return f"sm_{self.capability[0]}{self.capability[1]}" if self.capability else "?"
+
+    def describe(self) -> str:
+        """What a kernel author needs to know about this card, in one line."""
+        return (f"{self.name} ({self.architecture()}), {format_bytes(self.total_bytes)}, "
+                f"{self.multiprocessors} SMs, {self.shared_memory_per_block} bytes of "
+                f"dynamic shared memory per block, fp8 "
+                f"{'yes' if self.supports_fp8() else 'no'}, fp4 "
+                f"{'yes' if self.supports_fp4() else 'no'}")
 
 
 @dataclass(frozen=True)
@@ -86,6 +106,10 @@ def _detect_gpus_torch() -> list[GPUInfo]:
                 total_bytes=int(total),
                 free_bytes=int(free),
                 capability=(props.major, props.minor),
+                shared_memory_per_block=int(getattr(
+                    props, "shared_memory_per_block_optin",
+                    getattr(props, "shared_memory_per_block", 0))),
+                multiprocessors=int(getattr(props, "multi_processor_count", 0)),
             )
         )
     return gpus

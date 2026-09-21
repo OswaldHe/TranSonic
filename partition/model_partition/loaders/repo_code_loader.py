@@ -53,6 +53,13 @@ class RepoCodeLoader:
     #: implementation may need it at construction — an n-gram memory layer builds its
     #: token map from the tokenizer's vocabulary — and then no config can stand in.
     tokenizer: Any = None
+    #: Compatibility patches to apply to the vendor module after importing it, for the
+    #: parts of it that will not run on this hardware. See ``runtime/compat.py``.
+    compat_paths: tuple[Path, ...] = ()
+    #: The GPU the patches are adapting to, handed to them so they need not guess.
+    device_info: Any = None
+    #: Set once the patches have run, for the run manifest to record.
+    compat_report: Any = None
 
     def _entry_path(self) -> Path:
         path = self.root / self.entry
@@ -69,7 +76,11 @@ class RepoCodeLoader:
         path = self._entry_path()
         module_name = f"_model_partition_repo_{abs(hash(str(path)))}"
         if module_name in sys.modules:
-            return sys.modules[module_name]
+            # Patches are re-applied: the set can change between iterations, and what
+            # runs must be what the run directory currently says.
+            module = sys.modules[module_name]
+            self._apply_compat(module)
+            return module
 
         search_paths = [str(self.root)] + [str(self.root / p) for p in self.code_paths]
         added = [p for p in search_paths if p not in sys.path]
@@ -81,6 +92,7 @@ class RepoCodeLoader:
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
+            self._apply_compat(module)
             return module
         except Exception as exc:
             sys.modules.pop(module_name, None)
@@ -89,6 +101,24 @@ class RepoCodeLoader:
             for p in added:
                 if p in sys.path:
                     sys.path.remove(p)
+
+    def _apply_compat(self, module) -> None:
+        """Replace the parts of the vendor's code that will not run on this GPU.
+
+        Applied at import, before anything is constructed or traced, so the model that
+        runs is the patched one — which is why the report travels into the run manifest.
+        """
+        if not self.compat_paths:
+            return
+        from model_partition.runtime.compat import apply_patches
+
+        report = apply_patches(module, list(self.compat_paths), self.device_info)
+        self.compat_report = report
+        if report.errors:
+            raise LoaderError(
+                "compatibility patch(es) failed: "
+                + "; ".join(f"{name}: {why}" for name, why in report.errors.items())
+            )
 
     def _find_factory(self, module):
         for name in BUILDER_NAMES:

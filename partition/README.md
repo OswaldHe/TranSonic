@@ -161,6 +161,19 @@ projection it feeds have to run in the model's order, and no ordering of names c
 say which that is, so a group's submodules are ordered by when the trace actually
 observed them.
 
+**A kernel this card will not launch is work, not a wall.** A vendor's reference
+implementation is written for the vendor's hardware, and its kernels can ask for more
+shared memory than this GPU allows or a dtype whose tensor cores arrive a generation
+later. Then the model does not run at all: no trace, no reference, nothing to partition.
+So `trace` tells a hardware refusal apart from a bug — the former names a limit, the
+latter names a shape — and hands the first to the agent as a porting job. The agent
+writes a patch under `compat/` that replaces the offending function on the imported
+vendor module, keeping the original's precision where the card has it and moving to the
+closest it does where it does not. The patch runs before anything is constructed, so the
+trace it produces is the reference every later stage is measured against, and `run.yaml`
+and the summary say which parts were ported rather than letting "reproduces the model"
+quietly mean "reproduces the adaptation".
+
 **Three checks, because one question is really three.** Per-module verification
 starts every module from its *recorded* input, so an error in one module cannot show
 up in another — the checks are independent by construction, which is what lets them
@@ -288,6 +301,7 @@ Artifacts live **outside** the repo, at `~/transonic_artifacts/<slug>/` by defau
 
 ```
 run.yaml              resolved spec, pinned revision, model config, storage estimate
+compat/               agent-written patches for vendor code this GPU will not run
 plan/                 partition_graph.yaml, valid_submodules.txt, rationale.md, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
 modules/              one directory per implementation group:

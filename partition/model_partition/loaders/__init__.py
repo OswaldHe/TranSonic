@@ -15,7 +15,8 @@ __all__ = [
 ]
 
 
-def build_loader(result, device_map=None, max_memory=None, tokenizer=None) -> ModelLoader:
+def build_loader(result, device_map=None, max_memory=None, tokenizer=None,
+                 compat_paths=(), device_info=None) -> ModelLoader:
     """Construct the loader named by an :class:`~model_partition.ingest.IngestResult`.
 
     ``device_map``/``max_memory`` request layer placement across GPU and host, so
@@ -35,6 +36,8 @@ def build_loader(result, device_map=None, max_memory=None, tokenizer=None) -> Mo
             trust_remote_code=spec.trust_remote_code,
             rename=spec.checkpoint.rename,
             tokenizer=tokenizer,
+            compat_paths=tuple(compat_paths),
+            device_info=device_info,
         )
     if result.loader == "transformers":
         return TransformersLoader(
