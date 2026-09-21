@@ -224,7 +224,8 @@ class RepoCodeLoader:
             state_dict = self.load_checkpoint()
         return self._finalize(self._instantiate(state_dict), device)
 
-    def build_streamed(self, device: str = "cuda") -> LoadedModel:
+    def build_streamed(self, device: str = "cuda",
+                       module_budget: int | None = None) -> LoadedModel:
         """Build on meta and read each module's weights only while it runs.
 
         For a checkpoint that cannot be resident. The dtypes are the model's own, which
@@ -234,9 +235,15 @@ class RepoCodeLoader:
         import torch
 
         from model_partition.loaders.streamed import (
-            build_index, install_streaming, sparse_allocation,
+            MODULE_BUDGET, build_index, install_streaming, sparse_allocation,
         )
 
+        # Vendor inference code is written to run with the default device set — its own
+        # entry script sets it — so helpers that build index tensors without naming a
+        # device land them beside the weights instead of on the host, where a kernel
+        # would reject them. Set before construction and left set, because every forward
+        # needs it too.
+        torch.set_default_device(device)
         # Big tensors are placeholders to be streamed; the small ones the model computes
         # for itself are made for real, because no checkpoint can restore them.
         with sparse_allocation():
@@ -246,7 +253,8 @@ class RepoCodeLoader:
         shards = sorted(self.root.glob("*.safetensors"))
         if not shards:
             raise LoaderError(f"No safetensors shards under {self.root} to stream from")
-        report = install_streaming(model, build_index(shards, self.rename), device=device)
+        report = install_streaming(model, build_index(shards, self.rename), device=device,
+                                   module_budget=module_budget or MODULE_BUDGET)
         if report.unresolved:
             raise LoaderError(
                 f"{len(report.unresolved)} parameter(s) have no tensor in the checkpoint "

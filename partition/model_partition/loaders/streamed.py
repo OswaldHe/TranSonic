@@ -47,6 +47,11 @@ RESIDENT_BUDGET = 1 << 30
 #: Suffix of the block-scale tensor that sits beside a quantized weight.
 SCALE_SUFFIX = ".scale"
 
+#: Bytes one module may materialize on the accelerator. A module over this runs on the
+#: host instead: this model's n-gram memory holds a 94 GiB table, which no card here
+#: takes, and the alternative to running it slowly is not running the model at all.
+MODULE_BUDGET = 8 << 30
+
 #: Allocations larger than this are placeholders during construction; smaller ones are
 #: made for real. A weight matrix comes from the checkpoint, so allocating it would be
 #: waste. Everything a model *computes* at construction — rotary frequencies, an n-gram
@@ -54,14 +59,28 @@ SCALE_SUFFIX = ".scale"
 #: checkpoint, and is wrong if left as a placeholder.
 PLACEHOLDER_THRESHOLD = 16 << 20
 
+#: Dtypes that only ever come out of a checkpoint. A model computes a rotary table or a
+#: hash map in float or int; it does not compute an fp4 weight or an e8m0 block scale, so
+#: a request for one is a request for something the checkpoint will supply. This matters
+#: because size alone does not separate the two: this model's expert weights are 5.9 MB
+#: each and its block scales 0.35 MB, all of them from the checkpoint, and 94 000 of them
+#: fill a card that a 0.07 GiB set of derived tables would not notice.
+QUANTIZED_DTYPES = frozenset({
+    "torch.float8_e4m3fn", "torch.float8_e5m2", "torch.float8_e8m0fnu",
+    "torch.float4_e2m1fn_x2", "torch.uint8", "torch.int8",
+})
+
 
 def sparse_allocation(threshold: int = PLACEHOLDER_THRESHOLD):
-    """Context manager: build big tensors as placeholders, small ones for real.
+    """Context manager: allocate what a model computes, placehold what it will be given.
 
     ``torch.device("meta")`` would make everything a placeholder, including the tables a
-    model derives from its config or tokenizer, which no checkpoint can restore. This
-    draws the line at size instead, which is the line between "comes from the
-    checkpoint" and "computed here".
+    model derives from its config or its tokenizer — rotary frequencies, an n-gram hash
+    map, a zeroed cache — which no checkpoint can restore and which are then silently
+    garbage. This draws the line twice, and the dtype is the sharper of the two: a
+    quantized tensor comes from a quantized checkpoint, because nothing computes an fp4
+    weight or an e8m0 block scale at construction. Size catches the rest, since a
+    derived table is small where a weight matrix is not.
     """
     import torch
     from torch.overrides import TorchFunctionMode
@@ -75,11 +94,24 @@ def sparse_allocation(threshold: int = PLACEHOLDER_THRESHOLD):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = dict(kwargs or {})
             if func in factories and kwargs.get("device") is None:
-                if _requested_bytes(args, kwargs) > threshold:
+                dtype = _requested_dtype(args, kwargs)
+                if (str(dtype) in QUANTIZED_DTYPES
+                        or _requested_bytes(args, kwargs) > threshold):
                     kwargs["device"] = "meta"
             return func(*args, **kwargs)
 
     return _Sparse()
+
+
+def _requested_dtype(args: tuple, kwargs: dict) -> Any:
+    """The dtype a factory call asks for, explicitly or by default."""
+    import torch
+
+    if kwargs.get("dtype") is not None:
+        return kwargs["dtype"]
+    if args and isinstance(args[0], torch.Tensor):
+        return args[0].dtype
+    return torch.get_default_dtype()
 
 
 def _requested_bytes(args: tuple, kwargs: dict) -> int:
@@ -94,10 +126,7 @@ def _requested_bytes(args: tuple, kwargs: dict) -> int:
     else:
         dimensions = [a for a in args if isinstance(a, int)]
         shape = tuple(dimensions)
-    dtype = kwargs.get("dtype") or (
-        args[0].dtype if args and isinstance(args[0], torch.Tensor)
-        else torch.get_default_dtype())
-    width = getattr(dtype, "itemsize", 4) or 4
+    width = getattr(_requested_dtype(args, kwargs), "itemsize", 4) or 4
     count = 1
     for dimension in shape:
         count *= max(int(dimension), 0)
@@ -118,6 +147,8 @@ class StreamReport:
     """What installing the streaming hooks set up."""
 
     streamed_modules: int = 0
+    #: Modules too large for the accelerator, materialized and run on the host.
+    host_modules: list[str] = field(default_factory=list)
     resident_tensors: int = 0
     streamed_tensors: int = 0
     resident_bytes: int = 0
@@ -136,6 +167,9 @@ class StreamReport:
                 f"{format_bytes(self.largest_module_bytes)}; "
                 f"{self.resident_tensors} small tensor(s) resident "
                 f"({format_bytes(self.resident_bytes)})")
+        if self.host_modules:
+            text += (f"; {len(self.host_modules)} too large for the device, on the host "
+                     f"({', '.join(self.host_modules[:3])})")
         if self.derived:
             text += f"; {len(self.derived)} computed at construction"
         if self.unresolved:
@@ -191,13 +225,22 @@ def build_index(shards: list[Path],
 
 def install_streaming(model: Any, index: dict[str, ShardEntry], device: str = "cuda",
                       keep_bytes: int = RESIDENT_LIMIT,
-                      resident_budget: int = RESIDENT_BUDGET) -> StreamReport:
-    """Make every module read its own weights when called, and release them after."""
+                      resident_budget: int = RESIDENT_BUDGET,
+                      module_budget: int = MODULE_BUDGET) -> StreamReport:
+    """Make every module read its own weights when called, and release them after.
+
+    A module whose weights exceed ``module_budget`` runs on the host: its tensors are
+    materialized there, its inputs are moved across for the call and its output moved
+    back. Slow, and the honest alternative to refusing the model outright.
+    """
     import torch
 
     report = StreamReport()
     owned = _owned_tensors(model)
     for module, prefix, names in owned:
+        # Before anything is replaced: a vendor module hangs its block scale off its
+        # weight so its kernel can reach it, and swapping either tensor breaks the link.
+        aliases = _aliases(module)
         streamed: list[tuple[str, str]] = []
         for leaf, full in names:
             entry = index.get(full)
@@ -217,42 +260,92 @@ def install_streaming(model: Any, index: dict[str, ShardEntry], device: str = "c
                 report.resident_bytes += nbytes
                 continue
             streamed.append((leaf, full))
+        _rebind(module, aliases)
         if not streamed:
             continue
         report.streamed_modules += 1
         report.streamed_tensors += len(streamed)
-        report.largest_module_bytes = max(report.largest_module_bytes, sum(
-            _tensor_of(module, leaf).numel() * _tensor_of(module, leaf).element_size()
-            for leaf, _ in streamed))
-        _install_hooks(module, streamed, index, device)
+        wanted = sum(_tensor_of(module, leaf).numel() * _tensor_of(module, leaf).element_size()
+                     for leaf, _ in streamed)
+        report.largest_module_bytes = max(report.largest_module_bytes, wanted)
+        place = device
+        if wanted > module_budget and not device.startswith("cpu"):
+            place = "cpu"
+            report.host_modules.append(prefix or "(root)")
+        _install_hooks(module, streamed, index, place, aliases,
+                       moves=place != device)
     del torch
     return report
 
 
 def _install_hooks(module: Any, streamed: list[tuple[str, str]],
-                   index: dict[str, ShardEntry], device: str) -> None:
+                   index: dict[str, ShardEntry], device: str,
+                   aliases: list[tuple[str, str, str]], moves: bool = False) -> None:
+    """Read this module's weights for its call and drop them after.
+
+    ``moves`` is for a module placed off the accelerator: its inputs are brought to
+    where its weights are and its output sent back, so the rest of the model does not
+    have to know.
+    """
     import torch
 
     shapes = {leaf: (_tensor_of(module, leaf).shape, _tensor_of(module, leaf).dtype)
               for leaf, _ in streamed}
-    aliases = _aliases(module)
+    origin: list[Any] = [None]
 
-    def materialize(*_args: Any) -> None:
+    def materialize(_module: Any, args: tuple, kwargs: dict):
         for leaf, full in streamed:
             current = _tensor_of(module, leaf)
-            if not current.is_meta:
-                continue
-            _set(module, leaf, _read(index[full], current, device))
+            if current.is_meta:
+                _set(module, leaf, _read(index[full], current, device))
         _rebind(module, aliases)
+        if not moves:
+            return None
+        origin[0] = _device_of(args) or _device_of(tuple(kwargs.values()))
+        return _moved(args, device), _moved(kwargs, device)
 
-    def release(*_args: Any) -> None:
+    def release(_module: Any, args: tuple, kwargs: dict, output: Any):
         for leaf, _ in streamed:
             shape, dtype = shapes[leaf]
             _set(module, leaf, torch.empty(shape, dtype=dtype, device="meta"))
         _rebind(module, aliases)
+        if moves and origin[0] is not None:
+            return _moved(output, origin[0])
+        return None
 
-    module.register_forward_pre_hook(lambda *args: materialize())
-    module.register_forward_hook(lambda *args: release())
+    module.register_forward_pre_hook(materialize, with_kwargs=True)
+    module.register_forward_hook(release, with_kwargs=True)
+
+
+def _device_of(value: Any) -> Any:
+    """The device of the first tensor in an argument tree."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.device
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _device_of(item)
+            if found is not None:
+                return found
+    if isinstance(value, dict):
+        return _device_of(tuple(value.values()))
+    return None
+
+
+def _moved(value: Any, device: Any) -> Any:
+    """The same argument tree with every tensor on ``device``."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_moved(item, device) for item in value)
+    if isinstance(value, list):
+        return [_moved(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _moved(item, device) for key, item in value.items()}
+    return value
 
 
 def _owned_tensors(model: Any) -> list[tuple[Any, str, list[tuple[str, str]]]]:

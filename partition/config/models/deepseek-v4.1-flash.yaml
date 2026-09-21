@@ -75,16 +75,32 @@ overrides:
   cache_weights: false      # nor would a second copy; read them from the shards
 
 notes: |
-  `inspect` and `plan` work from metadata alone and need no weights. Everything
-  from `trace` onward needs the whole model resident for one forward, and 510 GB
-  exceeds this machine (46 GiB GPU + 124 GiB host) by more than 3x; transformers
-  also does not recognize `deepseek_v41`, so the only code path is the vendor
-  implementation under inference/, which wants a checkpoint converted to one file
-  per tensor-parallel rank (inference/convert.py) before it will load anything.
+  `inspect` and `plan` work from metadata alone and need no weights, and the rest now
+  works on a machine far smaller than the checkpoint — with one exception that is the
+  GPU's, not the loop's.
 
-  So: plan it here, run it where the memory is. `autohelix partition plan
-  deepseek-v4.1-flash` produces the module graph, per-module byte budgets and the
-  deduplicated implementation groups without fetching a shard.
+  What it takes, all of it verified here on one 44 GiB L40S with 119 GiB of host RAM:
+
+  - `dtype: checkpoint`, so the fp8 weights and int8-packed fp4 experts stay as stored.
+    Casting to bfloat16 turns 278 GiB of in-scope weights into 1.0 TiB.
+  - `checkpoint.rename`, because the published weights use HuggingFace names and the
+    vendor's code its own. `inference/convert.py` reconciles them by writing a second
+    475 GiB copy, and it holds the whole state dict in memory to do it; the same
+    mapping applied on read costs nothing. All 96 042 of the model's parameters resolve.
+  - Streamed weights: the model is built with its weight tensors as placeholders and
+    each module reads its own for its forward, 1 GiB resident instead of 478. The two
+    n-gram memory tables are 94.4 GiB each, which no card here takes, so those two
+    modules run on the host.
+  - A CUDA toolkit for the vendor's TileLang kernels, self-consistent with its own
+    runtime headers. Both the fp8 and the fp4 GEMM compile and run on sm_89.
+  - The tokenizer at construction: an n-gram layer builds its token map from the
+    vocabulary, so no config can stand in for it.
+
+  What stops a forward here is `sparse_attn`, which asks for 141 312 bytes of dynamic
+  shared memory per block. An L40S (sm_89) allows 101 376; Hopper allows 232 448. The
+  kernel is written for Hopper and there is no reference path beside it, so tracing this
+  model needs an H100/H200-class GPU — where everything above still applies, since the
+  checkpoint is larger than those cards too.
 
   encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
   tokenizer ground truth and are worth checking before anything else.

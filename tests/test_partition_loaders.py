@@ -534,3 +534,27 @@ def test_renamed_checkpoint_keys_are_mapped_before_loading(repo):
     model = loader.build_config_only().model
     state = {f"published.{k}": v for k, v in load_file(str(repo / "model.safetensors")).items()}
     assert loader._load_into(model, state) is model
+
+
+def test_a_module_too_large_for_the_device_runs_on_the_host(repo):
+    """A 94 GiB embedding table fits no card here, and refusing the model is worse."""
+    import torch
+
+    from model_partition.ingest import ingest
+    from model_partition.loaders import build_loader
+    from model_partition.loaders.streamed import build_index, install_streaming
+
+    result = ingest(local_spec(repo))
+    with torch.device("meta"):
+        model = build_loader(result)._instantiate(None)
+    index = build_index(sorted(repo.glob("*.safetensors")))
+    # Pretend the device is tiny: every weight-bearing module goes to the host.
+    report = install_streaming(model, index, device="cpu", keep_bytes=0,
+                               module_budget=0)
+    assert report.host_modules == []  # "cpu" is already the host: nothing to move
+
+    with torch.device("meta"):
+        model = build_loader(result)._instantiate(None)
+    report = install_streaming(model, index, device="cuda", keep_bytes=0, module_budget=0)
+    assert report.host_modules, report.summary()
+    assert "on the host" in report.summary()
