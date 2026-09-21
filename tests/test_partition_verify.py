@@ -850,24 +850,57 @@ def test_a_broken_implementation_shows_up_as_drift_downstream(tiny_run, tmp_path
     assert not report.tokens_agree
 
 
-def test_an_edge_the_recording_contradicts_is_not_carried(tiny_split_run, tmp_path):
-    """A split layer puts the residual add in neither half, so that edge is not real.
+def test_a_split_layers_residual_add_is_reconstructed_from_the_recording(tiny_split_run,
+                                                                        tmp_path):
+    """Splitting attention from the FFN leaves the residual add in neither half.
 
-    Carrying it would feed the next module a tensor the model never gave it, and the
-    drift measurement would be reporting the plan's mistake as an implementation's.
+    The recording identifies it — the gap between one module's output and the next
+    one's input is exactly a tensor the chain already holds — so the arithmetic is
+    known and drift keeps travelling. Refusing the edge instead would measure each
+    half against a fresh recording and see no propagation at all, which is the thing
+    the chain exists to measure.
     """
     suite = _chain(tiny_split_run, tmp_path)
     report = suite.reports[0]
-    assert report.unchained, report.render()
-    assert not report.unbroken
-    reason = report.unchained[0].unchained_reason
-    assert "belongs to" in reason or "shape" in reason
-    # Not a failure: nothing an implementation did.
     assert suite.passed, suite.render()
+    assert report.unbroken, report.render()
+    assert not report.unchained, report.render()
+    residual = [s for s in report.steps if "residual add" in s.via]
+    assert len(residual) >= 2, report.render()
+    assert report.tokens_agree
 
 
-def test_tokens_are_only_credited_when_the_chain_is_unbroken(tiny_split_run, tmp_path):
-    """Otherwise a broken chain would claim credit for the recording's tokens."""
-    report = _chain(tiny_split_run, tmp_path).reports[0]
+def test_an_edge_the_recording_contradicts_is_not_carried(tiny_run, tmp_path):
+    """A plan can claim dataflow that does not exist, and that is not drift.
+
+    Carrying such an edge would feed a module a tensor the model never gave it and
+    report the plan's mistake as an implementation's.
+    """
+    graph = tiny_run.graph
+    last = graph.partitioned_modules[-1]
+    first_hidden = graph.partitioned_modules[0].outputs[0]
+    # Claim the head reads the embedding: nothing between them is a single tensor.
+    last.inputs = [first_hidden]
+
+    suite = _chain(tiny_run, tmp_path)
+    report = suite.reports[0]
+    broken = next(s for s in report.steps if s.module_id == last.id)
+    assert not broken.chained
+    assert "belongs to no module" in broken.unchained_reason
     assert not report.unbroken
+
+
+def test_tokens_are_only_credited_when_the_chain_is_unbroken(tiny_run, tmp_path):
+    """Otherwise a broken chain would claim credit for the recording's tokens."""
+    graph = tiny_run.graph
+    last = graph.partitioned_modules[-1]
+    last.inputs = [graph.partitioned_modules[0].outputs[0]]
+
+    suite = _chain(tiny_run, tmp_path)
+    report = suite.reports[0]
+    assert not report.unbroken
+    # The head restarted from the recording, so its tokens are the recording's own.
+    assert report.tokens_agree and not report.credited_tokens
+    assert suite.kept_tokens() == 0
+    assert suite.mean_top1() == 0.0
     assert report.passed  # held, because nothing carried drifted

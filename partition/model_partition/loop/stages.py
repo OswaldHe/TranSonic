@@ -835,7 +835,7 @@ def stage_verify_chain(ctx: LoopContext) -> StageResult:
     }
     if not suite.passed:
         diverging = suite.diverging_modules()
-        kept = sum(1 for r in suite.reports if r.tokens_agree)
+        kept = suite.kept_tokens()
         return StageResult(
             ok=False, repairable=True, repair_surface="modules",
             failing_modules=diverging,

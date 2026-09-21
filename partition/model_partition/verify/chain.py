@@ -21,13 +21,16 @@ extras come from the recording, because they are inputs to the model rather than
 products of it: carrying them would measure the trace's own consistency instead of
 the implementations' drift.
 
-An edge is trusted only after the recording confirms it — but only while the module
-that produced it is still reproducing its own reference. A plan that splits a layer
-puts the residual add between two modules and inside neither: the attention module's
-output is pre-residual while the FFN's recorded input is post-residual, so carrying
-that edge would feed the next module a tensor the model never gave it. Once a module
-*has* drifted, the same mismatch means the opposite thing and the value is carried
-regardless, because watching the error travel is the whole purpose.
+A plan edge is a claim about dataflow, and the recording settles it: both ends are
+dumps of the same forward, so if this module's input really is that module's output
+they are the same numbers. A plan that splits a layer puts the residual add between two
+modules and inside neither — the attention module's output is pre-residual while the
+FFN's recorded input is post-residual — and there the recording settles something
+better than "not an edge": the gap is *exactly* another tensor the chain holds, which
+identifies the missing arithmetic. So the add is reconstructed, the drift keeps
+flowing, and a split layer measures the same thing an unsplit one does. When the gap
+explains nothing, the edge is not dataflow, the module restarts from the recording and
+the report says so.
 """
 
 from __future__ import annotations
@@ -49,10 +52,17 @@ from model_partition.verify.numerics import Comparison, Tolerance, compare, top1
 #: would actually emit — which is the thing drift either changes or does not.
 DEFAULT_TOKEN_POSITIONS = 8
 
-#: How closely a carried tensor must match the module's recorded input for the edge
-#: to be a real dataflow edge. Loose on purpose: this is asking "is this the same
-#: tensor", not "is it numerically perfect", and by this point it carries drift.
-EDGE_COSINE = 0.99
+#: Recorded tensors kept alive beyond the plan's own dataflow, so a residual add can
+#: be recognized from the tensors around it. A residual is always a recent one, and a
+#: feature map is tens of megabytes where the logits are gigabytes.
+RESIDUAL_WINDOW = 4
+
+#: The bar for "these two recordings are the same numbers". Both ends come out of the
+#: same store in the same dtype, so a true edge is exact; this leaves room only for a
+#: dtype round-trip, not for a residual add, whose magnitude is that of the residual
+#: stream itself.
+EDGE_TOLERANCE = Tolerance(rtol=1e-3, atol=1e-3, min_pass_fraction=0.999,
+                           min_cosine=0.99999)
 
 
 @dataclass
@@ -68,6 +78,9 @@ class ChainStep:
     chained: bool = False
     #: Why an edge the plan declares was not carried.
     unchained_reason: str = ""
+    #: How the input was assembled when it took more than the upstream output alone —
+    #: the residual add a split layer leaves between two modules.
+    via: str = ""
 
     @property
     def cosine(self) -> float:
@@ -80,7 +93,8 @@ class ChainStep:
     def summary(self) -> str:
         if self.error:
             return f"{self.module_id}: ERROR {self.error}"
-        source = "chained" if self.chained else f"from trace: {self.unchained_reason}"
+        source = (f"chained{f' via {self.via}' if self.via else ''}" if self.chained
+                  else f"from trace: {self.unchained_reason}")
         return (f"{self.module_id} ({source}): "
                 f"{self.comparison.summary() if self.comparison else 'not compared'}")
 
@@ -88,7 +102,7 @@ class ChainStep:
         return {
             "module_id": self.module_id, "tensor": self.tensor,
             "chained": self.chained, "unchained_reason": self.unchained_reason,
-            "error": self.error,
+            "via": self.via, "error": self.error,
             "comparison": self.comparison.to_dict() if self.comparison else None,
         }
 
@@ -134,6 +148,16 @@ class ChainReport:
     @property
     def tokens_agree(self) -> bool:
         return bool(self.tokens) and self.tokens == self.reference_tokens
+
+    @property
+    def credited_tokens(self) -> bool:
+        """Token agreement that the chain actually earned.
+
+        A chain interrupted before the logits produces them from a fresh recording, so
+        they say nothing about drift; counting those would report coverage the run does
+        not have.
+        """
+        return self.tokens_agree and self.unbroken
 
     @property
     def passed(self) -> bool:
@@ -227,12 +251,21 @@ class ChainSuite:
         return min(values) if values else 1.0
 
     def mean_top1(self) -> float:
-        values = [r.top1 for r in self.reports if r.tokens]
+        """Mean agreement over the chains that reached the logits unbroken.
+
+        A chain that restarted at the head would otherwise contribute the recording's
+        own agreement with itself.
+        """
+        values = [r.top1 for r in self.reports if r.tokens and r.unbroken]
         return sum(values) / len(values) if values else 0.0
+
+    def kept_tokens(self) -> int:
+        """Chains that carried the drift all the way and still predicted the same."""
+        return sum(1 for r in self.reports if r.credited_tokens)
 
     def render(self) -> str:
         lines = [r.render() for r in self.reports]
-        agreed = sum(1 for r in self.reports if r.tokens_agree)
+        agreed = self.kept_tokens()
         lines.append(f"{len(self.reports) - len(self.failures)}/{len(self.reports)} "
                      f"chain(s) held; {agreed} kept every token")
         return "\n".join(lines)
@@ -244,6 +277,7 @@ class ChainSuite:
             "n_failed": len(self.failures),
             "worst_cosine": self.worst_cosine(),
             "mean_top1_agreement": self.mean_top1(),
+            "n_kept_tokens": self.kept_tokens(),
             "diverging_modules": self.diverging_modules(),
             "reports": [r.to_dict() for r in self.reports],
         }
@@ -291,8 +325,12 @@ def _chain_sample(
     by_id = {module.id: module for module in graph.partitioned_modules}
     #: Graph tensor name -> the value this chain computed for it.
     carried: dict[str, Any] = {}
-    #: Graph tensor name -> whether the module that produced it held its reference.
-    sound: dict[str, bool] = {}
+    #: Graph tensor name -> what the trace recorded for it. What makes an edge check a
+    #: question about the recording rather than about how far the chain has drifted.
+    recorded: dict[str, Any] = {}
+    #: The order tensors were produced in, so the recent ones stay available as
+    #: candidates for a residual add the plan leaves between two modules.
+    recent: list[str] = []
     #: How many modules still ahead of us consume each tensor, so a feature map can
     #: be released the moment nothing wants it. One per module is gigabytes at long
     #: context, and holding them all to the end reserves memory for nothing.
@@ -318,16 +356,23 @@ def _chain_sample(
         step = ChainStep(module_id=module_id, tensor=produced)
         try:
             args, kwargs = decode_group_call(records, bundle.store, device)
+            # What the trace gave this module, before anything is substituted for it.
+            entering = args[0] if args else None
             if upstream is not None and args:
-                if sound.get(upstream, True):
-                    step.chained, step.unchained_reason = _edge_holds(
-                        carried[upstream], args[0])
-                else:
-                    # The producer already drifted, so a mismatch here is that drift
-                    # arriving rather than a plan edge that was never real.
-                    step.chained = True
-                if step.chained:
-                    args = (carried[upstream],) + tuple(args[1:])
+                value, step.via, step.unchained_reason = _carry(
+                    upstream, entering, recorded, carried)
+                step.chained = value is not None
+                if value is not None:
+                    args = (value,) + tuple(args[1:])
+            if entering is not None:
+                # A module's input is itself a residual-stream tensor, and a split layer
+                # adds it back after the half that follows: layer n+1 reads
+                # `mlp_out + the FFN's own input`, a sum the plan names nowhere. Keeping
+                # it under this module's name leaves that arithmetic identifiable.
+                name = f"the input of {module_id}"
+                recorded[name] = entering
+                carried[name] = args[0]
+                recent.append(name)
             impl = load_impl(impl_dir)
             weights = _weights_for(bundle, module_id, device)
             built = impl.build(bundle.config, weights, device)
@@ -337,11 +382,14 @@ def _chain_sample(
             reference = first_tensor(expected_output(records[-1], bundle.store, device=device))
             step.comparison = compare(actual, reference, module_id, tolerance)
             carried[produced] = actual
-            sound[produced] = step.passed and sound.get(upstream, True)
+            recorded[produced] = reference
+            recent.append(produced)
             if upstream is not None:
                 waiting[upstream] = waiting.get(upstream, 1) - 1
-                if waiting[upstream] <= 0 and upstream != logits_tensor:
-                    carried.pop(upstream, None)
+            for name in _releasable(recent, waiting, logits_tensor):
+                carried.pop(name, None)
+                recorded.pop(name, None)
+                recent.remove(name)
             if produced == logits_tensor:
                 reference_logits = reference
         except Exception as exc:
@@ -383,27 +431,63 @@ def _consumer_counts(graph: PartitionGraph, order: list[str],
     return counts
 
 
-def _edge_holds(carried: Any, recorded: Any) -> tuple[bool, str]:
-    """Whether the carried value is the tensor this module was actually given.
+def _carry(upstream: str, consumed: Any, recorded: dict[str, Any],
+           carried: dict[str, Any]) -> tuple[Any, str, str]:
+    """The value to feed this module — computed, not recorded — or None with a reason.
 
-    A plan's edges are a claim about dataflow, and a split layer's residual add lives
-    in the parent module rather than in either half — so the claim can be wrong in a
-    way that has nothing to do with any implementation. Checking it here is what lets
-    the drift measurement mean something.
+    Returns ``(value, how, why not)``. The question is about the *recording*: this
+    module's recorded input either is the upstream module's recorded output or it is
+    not, and both are dumps of the same forward, so the answer is exact. Asking the
+    computed value instead conflates a false edge with accumulated drift, and gets it
+    wrong in both directions — the same split-layer residual was 12% of the signal on
+    one model, where a real edge looked broken, and 0.3% on another, where a false edge
+    looked real and the chain carried a tensor the model never produced.
+
+    When the gap is exactly another tensor the chain holds, the missing arithmetic is
+    identified rather than merely detected: a split layer's residual add belongs to the
+    parent layer and so to neither half, and adding it back is what lets drift travel
+    through a plan that splits attention from the FFN.
     """
-    if carried is None or recorded is None:
-        return False, "nothing recorded to compare the edge against"
-    if tuple(carried.shape) != tuple(recorded.shape):
-        return False, (f"shape {tuple(carried.shape)} != the recorded input's "
-                       f"{tuple(recorded.shape)}")
-    match = compare(carried, recorded, "edge", Tolerance(rtol=1.0, atol=1.0,
-                                                        min_pass_fraction=0.0,
-                                                        min_cosine=EDGE_COSINE))
-    if match.passed:
-        return True, ""
-    return False, (f"the module's recorded input is not this tensor "
-                   f"(cosine {match.cosine:.4f}); something between them belongs to "
-                   "no module — a residual add, most likely")
+    import torch
+
+    produced = recorded.get(upstream)
+    if produced is None or consumed is None:
+        return None, "", "the trace does not record both ends of this edge"
+    if tuple(produced.shape) != tuple(consumed.shape):
+        return None, "", (f"the upstream output is {tuple(produced.shape)} and this "
+                          f"module's recorded input is {tuple(consumed.shape)}")
+    if _same(produced, consumed):
+        return carried[upstream], "", ""
+
+    for name, value in recorded.items():
+        if name == upstream or tuple(value.shape) != tuple(consumed.shape):
+            continue
+        with torch.no_grad():
+            if _same(produced + value, consumed):
+                return (carried[upstream] + carried[name],
+                        f"a residual add of `{name}`", "")
+
+    gap = compare(produced, consumed, "edge")
+    return None, "", (
+        f"this module's recorded input is not the upstream output (cosine "
+        f"{gap.cosine:.6f}, max_abs {gap.max_abs_err:.3e}) and the difference is none "
+        "of the tensors around it: something between them belongs to no module"
+    )
+
+
+def _same(left: Any, right: Any) -> bool:
+    """Whether two recordings are the same numbers, allowing a dtype round-trip."""
+    return compare(left, right, "edge", EDGE_TOLERANCE).passed
+
+
+def _releasable(recent: list[str], waiting: dict[str, int], keep: str | None) -> list[str]:
+    """Tensors nothing ahead consumes and nothing behind could still explain.
+
+    The plan's own dataflow says when a feature map is finished with; a residual add
+    needs the few before it as well, which is why the window exists.
+    """
+    stale = recent[:-RESIDUAL_WINDOW] if len(recent) > RESIDUAL_WINDOW else []
+    return [name for name in stale if waiting.get(name, 0) <= 0 and name != keep]
 
 
 def _weights_for(bundle: TraceBundle, module_id: str, device: str) -> dict[str, Any]:
