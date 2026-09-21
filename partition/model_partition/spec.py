@@ -187,6 +187,11 @@ class ModelSpec:
     inputs: InputSpec = field(default_factory=InputSpec)
     partition: PartitionSpec = field(default_factory=PartitionSpec)
     trace: TraceSpec = field(default_factory=TraceSpec)
+    #: Values to set on the model's own config before building it. The config a vendor
+    #: ships is not the config a deployment runs: DeepSeek V4.1's names a 4096-token
+    #: limit and its entry script raises that to 64K before loading the weights, so a run
+    #: tracing a longer prompt has to say so or the model's caches are sized too small.
+    config_overrides: dict[str, Any] = field(default_factory=dict)
     overrides: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     notes: str = ""
@@ -241,6 +246,7 @@ class ModelSpec:
             "checkpoint": self.checkpoint.to_dict(),
             "partition": self.partition.to_dict(),
             "trace": self.trace.to_dict(),
+            "config_overrides": dict(self.config_overrides),
             "inputs": {
                 "short": self.inputs.short,
                 "long": self.inputs.long,
@@ -270,7 +276,7 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
     unknown = set(data) - {
         "name", "source", "revision", "loader", "code_paths", "entry", "config_file",
         "trust_remote_code", "dtype", "scope", "checkpoint", "inputs", "partition",
-        "trace", "overrides", "enabled", "notes",
+        "trace", "config_overrides", "overrides", "enabled", "notes",
     }
     if unknown:
         raise SpecError(f"Unknown spec key(s): {', '.join(sorted(unknown))}")
@@ -349,6 +355,10 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
     if not isinstance(overrides, dict):
         raise SpecError("overrides must be a mapping")
 
+    config_overrides = data.get("config_overrides") or {}
+    if not isinstance(config_overrides, dict):
+        raise SpecError("config_overrides must be a mapping")
+
     name = data.get("name") or slugify(str(source).removeprefix("hf:").replace("/", "-"))
 
     return ModelSpec(
@@ -366,6 +376,7 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         inputs=inputs,
         partition=partition,
         trace=trace,
+        config_overrides=dict(config_overrides),
         overrides=dict(overrides),
         enabled=bool(data.get("enabled", True)),
         notes=str(data.get("notes", "")),

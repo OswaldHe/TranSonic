@@ -466,6 +466,20 @@ def test_an_optimized_source_survives_the_next_extraction(tiny_run, tmp_path):
     assert (directory / "source.py").read_text() != optimized
 
 
+def test_a_launcher_beside_no_implementation_is_not_preserved(tiny_run, tmp_path):
+    """What an agent leaves in a directory the harness has not written yet. Preserving it
+    would let a file written against nothing survive every later extraction."""
+    groups = _extract(tiny_run, tmp_path)
+    directory = next(g.directory for g in groups if g.class_name == "TinyDecoderLayer")
+    generated = (directory / "inference.py").read_text()
+    (directory / "inference.py").write_text("# an agent's, written from nothing\n")
+    (directory / "source.py").unlink()
+
+    again = _extract(tiny_run, tmp_path)
+    assert (directory / "inference.py").read_text() == generated
+    assert not next(g for g in again if g.directory == directory).preserved
+
+
 def test_the_readme_is_regenerated_unlike_inference_py(tiny_run, tmp_path):
     """It belongs to the harness, so a stale copy must not survive."""
     groups, _ = _readme(tiny_run, tmp_path)

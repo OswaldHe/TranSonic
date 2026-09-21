@@ -126,6 +126,9 @@ def ingest(spec: ModelSpec, token: str | None = None, with_index: bool = True) -
                  if with_index else WeightIndex(source=f"hf:{spec.repo_id}"))
 
     config = load_config(root, spec.config_file)
+    # Applied here so there is one config: the planner sizes from it, extraction records
+    # it beside each module, and the launcher builds from it.
+    config.update(spec.config_overrides)
     entry = spec.entry
     code_paths = list(spec.code_paths)
     if loader == "repo_code":

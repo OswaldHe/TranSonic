@@ -53,6 +53,15 @@ scope:
   mtp: true
   engram: true
 
+config_overrides:
+  # `ModelArgs.max_seq_len` defaults to 4096 and this checkpoint's config does not set
+  # it, while the vendor's own entry script raises it to 64K before loading the weights
+  # (generate.py:126). Every cache is sized from it — the n-gram hash cache, the
+  # compressed KV, the rotary table — so an 8192-token prompt against the default
+  # overruns them. 16384 covers this run's longest prompt and its generated tokens; the
+  # caches it sizes come to a few hundred megabytes, none of it on the critical path.
+  max_seq_len: 16384
+
 trace:
   # `Transformer.forward` runs the backbone alone, so hooks never fire inside the
   # draft stack and nothing in `mtp.*` would have a reference. `forward_spec`

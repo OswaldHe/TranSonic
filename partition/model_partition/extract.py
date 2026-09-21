@@ -294,7 +294,10 @@ def extract(
         group.config_class = config_class
         (directory / CONFIG_FILENAME).write_text(
             json.dumps(settings, indent=2, sort_keys=True, default=str) + "\n")
-        if (directory / SOURCE_FILENAME).is_file() and not regenerate:
+        # Whether a previous extraction has been here, asked before this one writes
+        # anything. It decides what counts as somebody's work to keep.
+        had_source = (directory / SOURCE_FILENAME).is_file()
+        if had_source and not regenerate:
             group.preserved = True
         group.launchable = _write_source(directory, principal, sources, signature, files,
                                          classes=names, regenerate=regenerate)
@@ -338,7 +341,11 @@ def extract(
             (directory / filename).write_text(_render_template(template, context))
         for filename, template in EDITABLE_TEMPLATES.items():
             path = directory / filename
-            if path.is_file() and not regenerate:
+            # Kept only when there is an implementation for it to launch. A launcher
+            # beside no `source.py` is not somebody's work to preserve: it is what an
+            # agent left in a directory the harness had not written yet, and preserving
+            # it would let that survive every later extraction.
+            if path.is_file() and not regenerate and had_source:
                 group.preserved = True
                 continue
             path.write_text(_render_template(template, context))
