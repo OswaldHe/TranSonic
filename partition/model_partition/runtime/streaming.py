@@ -165,6 +165,22 @@ def greedy_step(logits: Any, temperature: float = 0.0, seed: int | None = None) 
     return int(torch.multinomial(probs, num_samples=1, generator=generator))
 
 
+#: Names a causal LM uses for "apply the head to only the last N positions".
+#: ``logits_to_keep`` in transformers 5, ``num_logits_to_keep`` before it.
+LAST_LOGITS_ARGUMENTS = ("logits_to_keep", "num_logits_to_keep")
+
+
+def _last_logits_argument(model: Any) -> str | None:
+    """The keyword this model takes to skip computing logits it will not be asked for."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(model.forward).parameters
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return next((name for name in LAST_LOGITS_ARGUMENTS if name in parameters), None)
+
+
 def generate(
     model: Any,
     input_ids: Any,
@@ -181,23 +197,26 @@ def generate(
     ``model(input_ids) -> logits``, which is what keeps emulation independent of
     each architecture's cache implementation.
 
-    Only the last position is kept. A full ``[1, seq, vocab]`` tensor is 8 GB at 16k
-    tokens with a large vocabulary, it grows by a row every step, and the allocator
-    cannot reuse a cached block of the previous step's size — so holding them turns a
-    1.6 GiB model into tens of gigabytes of cached blocks and constant allocation
-    failures. Sampling only ever reads the final row.
+    Sampling reads only the final row, so the model is asked for only that row. A
+    full ``[1, seq, vocab]`` tensor is 8 GB at 16k tokens with a large vocabulary and
+    grows by a row every step, which the allocator cannot serve from the previous
+    step's cached block — measured on a 1.6 GiB model, reserved memory climbed 10 →
+    25 → 44 GiB and then started failing allocations. Keeping one row holds it flat
+    at 3 GiB.
     """
     import torch
 
     from model_partition.trace import forward_no_cache
 
     extract = logits_of or (lambda out: out.logits if hasattr(out, "logits") else out)
+    keep_last = _last_logits_argument(model)
     sequence = input_ids
     produced: list[int] = []
     last = None
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            output = forward_no_cache(model, sequence)
+            output = (model(sequence, use_cache=False, **{keep_last: 1}) if keep_last
+                      else forward_no_cache(model, sequence))
             logits = extract(output)
             last = logits[:, -1:].clone() if logits.dim() == 3 else logits[-1:].clone()
             del output, logits

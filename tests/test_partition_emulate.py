@@ -445,3 +445,43 @@ def test_boundaries_are_still_checked_on_their_own_forward(tiny_run):
 
 def _first_input_ids(run):
     return inputs_for(run)[0].input_ids
+
+
+def test_generation_asks_the_model_for_only_the_last_row(tiny_run):
+    """A full-sequence logits tensor is 8 GB at long context, and unused but for one row."""
+    from model_partition.runtime.streaming import _last_logits_argument
+
+    model = tiny_run.build_model()
+    keyword = _last_logits_argument(model)
+    if keyword is None:
+        pytest.skip("this model's forward takes no such argument")
+
+    seen = {}
+    original = type(model).forward
+
+    def recording(self, *args, **kwargs):
+        seen.update(kwargs)
+        return original(self, *args, **kwargs)
+
+    type(model).forward = recording
+    try:
+        generate(model, _first_input_ids(tiny_run), max_new_tokens=2)
+    finally:
+        type(model).forward = original
+    assert seen.get(keyword) == 1
+
+
+def test_generation_still_works_when_the_model_takes_no_such_argument(tiny_run):
+    from model_partition.runtime import streaming
+
+    model = tiny_run.build_model()
+    ids = _first_input_ids(tiny_run)
+    with_flag, _ = streaming.generate(model, ids, max_new_tokens=3)
+
+    real = streaming._last_logits_argument
+    streaming._last_logits_argument = lambda _model: None
+    try:
+        without, _ = streaming.generate(model, ids, max_new_tokens=3)
+    finally:
+        streaming._last_logits_argument = real
+    assert with_flag == without

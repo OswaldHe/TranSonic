@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -13,6 +14,14 @@ from typing import Any
 
 import click
 import yaml
+
+# Set before anything touches CUDA. The work here allocates a few large, unequal
+# tensors in sequence — a logits tensor that grows by a row per generated token, a
+# feature map per module — and the default allocator caches each freed block at its
+# exact size, so it reserves memory it can never reuse. Expandable segments give it
+# back. An operator who has set this already keeps their setting.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def _resource_dir(name: str) -> Path:
     """Locate a bundled resource directory.

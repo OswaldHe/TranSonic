@@ -293,6 +293,10 @@ def _chain_sample(
     carried: dict[str, Any] = {}
     #: Graph tensor name -> whether the module that produced it held its reference.
     sound: dict[str, bool] = {}
+    #: How many modules still ahead of us consume each tensor, so a feature map can
+    #: be released the moment nothing wants it. One per module is gigabytes at long
+    #: context, and holding them all to the end reserves memory for nothing.
+    waiting = _consumer_counts(graph, order, by_id)
     logits_tensor = graph.output_tensors[0] if graph.output_tensors else None
     reference_logits = None
 
@@ -334,6 +338,10 @@ def _chain_sample(
             step.comparison = compare(actual, reference, module_id, tolerance)
             carried[produced] = actual
             sound[produced] = step.passed and sound.get(upstream, True)
+            if upstream is not None:
+                waiting[upstream] = waiting.get(upstream, 1) - 1
+                if waiting[upstream] <= 0 and upstream != logits_tensor:
+                    carried.pop(upstream, None)
             if produced == logits_tensor:
                 reference_logits = reference
         except Exception as exc:
@@ -346,7 +354,33 @@ def _chain_sample(
         _score_tokens(report, carried[logits_tensor], reference_logits, token_positions)
     elif not report.error and not report.failures:
         report.error = "the chain never reached the logits, so no token was predicted"
+    carried.clear()
+    _release(device)
     return report
+
+
+def _release(device: str) -> None:
+    """Hand cached blocks back, so one sample's feature maps do not outlive it."""
+    if str(device).startswith("cuda"):
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _consumer_counts(graph: PartitionGraph, order: list[str],
+                     by_id: dict[str, Any]) -> dict[str, int]:
+    """How many modules consume each tensor, so it can be freed once none remain."""
+    counts: dict[str, int] = {}
+    for module_id in order:
+        module = by_id.get(module_id)
+        if module is None:
+            continue
+        for tensor in module.inputs:
+            counts[tensor] = counts.get(tensor, 0) + 1
+    return counts
 
 
 def _edge_holds(carried: Any, recorded: Any) -> tuple[bool, str]:
