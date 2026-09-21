@@ -138,7 +138,14 @@ def test_corrupt_header_json_raises(tmp_path):
 @pytest.mark.slow
 def test_index_from_hub_without_downloading_weights():
     """Metadata-only inventory of a real repo."""
-    index = WeightIndex.from_hub("Qwen/Qwen3.5-0.8B")
+    try:
+        index = WeightIndex.from_hub("Qwen/Qwen3.5-0.8B")
+    except WeightIndexError as exc:
+        # This one test really does talk to the Hub, so a Hub that is down says
+        # nothing about the code. Everything else about indexing is covered locally.
+        if any(code in str(exc) for code in ("503", "502", "504", "Connection")):
+            pytest.skip(f"the Hub is unavailable: {exc}")
+        raise
     assert index.num_layers == 24
     assert index.total_bytes > 1_500_000_000
     assert "bfloat16" in index.bytes_by_dtype()

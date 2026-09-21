@@ -212,44 +212,77 @@ class Tracer:
     def _capture_derived(self, submodule_name: str, submodule: Any) -> None:
         """Keep the non-persistent buffers as this forward saw them.
 
-        No checkpoint holds them — the class computes them at construction — and the
-        copy a module hands out afterwards is not always the one that ran: an offloaded
-        model returns a bfloat16 view of a rotary ``inv_freq`` that executed in float32,
-        and a module rebuilt from that view drifts a tenth of a radian by position 2000.
-        Recorded here, at the moment of the call the output is also recorded from.
+        No checkpoint holds them: the class computes them at construction. Which means
+        the values depend on how the model was built, and the weights are dumped from a
+        second, single-device copy — whose rotary ``inv_freq`` was bfloat16 while the
+        placed copy that actually ran kept float32. A module rebuilt from the wrong one
+        drifts a tenth of a radian by position 2000: right on short samples, wrong on
+        long ones. So they are captured here, during the call whose output is the
+        reference they will be checked against.
         """
-        for prefix, child in submodule.named_modules():
-            for leaf in getattr(child, "_non_persistent_buffers_set", set()) or set():
-                buffer = child._buffers.get(leaf)
-                if buffer is None or getattr(buffer, "is_meta", False):
-                    continue
-                inner = f"{prefix}.{leaf}" if prefix else leaf
-                full = f"{submodule_name}.{inner}" if inner else submodule_name
-                self._derived.setdefault(full, buffer.detach().clone())
+        for name, buffer in _non_persistent(submodule).items():
+            if getattr(buffer, "is_meta", False):
+                continue
+            full = f"{submodule_name}.{name}" if name else submodule_name
+            self._derived.setdefault(full, buffer.detach().clone())
 
-    def _module_tensors(self, module: Any):
-        """Yield ``(original name, tensor)`` for everything a module owns."""
+    def _module_tensors(self, module: Any, weights_only: bool = False):
+        """Yield ``(original name, tensor)`` for everything a module owns.
+
+        ``weights_only`` leaves out the non-persistent buffers, which are dumped from
+        the traced model by :meth:`dump_derived` rather than from this one.
+        """
         for submodule_name in module.submodules:
             submodule = _lookup(self.model, submodule_name)
             if submodule is None:
                 continue
             if hasattr(submodule, "named_parameters"):
+                skip = set(_non_persistent(submodule)) if weights_only else set()
                 items = list(submodule.named_parameters()) + list(submodule.named_buffers())
                 for param_name, tensor in items:
-                    full = f"{submodule_name}.{param_name}" if param_name else submodule_name
-                    yield full, self._derived.get(full, tensor)
+                    if param_name in skip:
+                        continue
+                    yield (f"{submodule_name}.{param_name}" if param_name else submodule_name), tensor
             else:
                 yield submodule_name, submodule
 
-    def dump_weights(self, module_ids: list[str] | None = None) -> dict[str, list[str]]:
-        """Dump each module's real parameters; returns module id -> tensor names."""
+    def dump_derived(self) -> dict[str, list[str]]:
+        """Dump the buffers captured during tracing; returns module id -> names.
+
+        Separate from :meth:`dump_weights` because these are not weights, and the copy
+        of the model that ran is the only one that can be asked for them.
+        """
+        dumped: dict[str, list[str]] = {}
+        for module in self.graph.partitioned_modules:
+            names: list[str] = []
+            for full, tensor in self._derived.items():
+                if not any(full == s or full.startswith(f"{s}.") for s in module.submodules):
+                    continue
+                meta = self.store.write(
+                    _safe_name(full), tensor.detach().cpu(), role="weight",
+                    module_id=module.id, subdir=f"weights/{module.id}",
+                    extra={"param": full},
+                )
+                self._account(meta.nbytes)
+                names.append(meta.name)
+            if names:
+                dumped[module.id] = names
+        return dumped
+
+    def dump_weights(self, module_ids: list[str] | None = None,
+                     weights_only: bool = True) -> dict[str, list[str]]:
+        """Dump each module's real parameters; returns module id -> tensor names.
+
+        Non-persistent buffers are left to :meth:`dump_derived`, which takes them from
+        the model that traced rather than from this one.
+        """
         wanted = set(module_ids) if module_ids else None
         dumped: dict[str, list[str]] = {}
         for module in self.graph.partitioned_modules:
             if wanted is not None and module.id not in wanted:
                 continue
             names: list[str] = []
-            for full, tensor in self._module_tensors(module):
+            for full, tensor in self._module_tensors(module, weights_only=weights_only):
                 meta = self.store.write(
                     _safe_name(full), tensor, role="weight",
                     module_id=module.id, subdir=f"weights/{module.id}",
@@ -378,6 +411,17 @@ def _lookup(model: Any, qualified_name: str) -> Any | None:
             return None
         current = getattr(current, part)
     return current
+
+
+def _non_persistent(root: Any) -> dict[str, Any]:
+    """Non-persistent buffers under ``root``, keyed relative to it."""
+    found: dict[str, Any] = {}
+    for prefix, module in root.named_modules():
+        for leaf in getattr(module, "_non_persistent_buffers_set", set()) or set():
+            buffer = module._buffers.get(leaf)
+            if buffer is not None:
+                found[f"{prefix}.{leaf}" if prefix else leaf] = buffer
+    return found
 
 
 def _safe_name(name: str) -> str:

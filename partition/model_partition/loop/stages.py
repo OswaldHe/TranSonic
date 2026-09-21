@@ -502,6 +502,13 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     for sample in ctx.samples:
         tracer.trace_sample(sample.id, sample.tensor(device))
 
+    # The buffers a class computes for itself, taken from the copy that just ran: the
+    # host copy above holds its own, and they are not always the same — a rotary
+    # inv_freq built in bf16 there and float32 here.
+    if policy.cache_weights:
+        for module_id, names in tracer.dump_derived().items():
+            weights.setdefault(module_id, []).extend(names)
+
     bundle = TraceBundle(store=store, records=tracer.records, weights=weights,
                          weight_params=weight_params, metadata={
         "model": ctx.spec.source, "revision": ctx.result.revision if ctx.result else None,

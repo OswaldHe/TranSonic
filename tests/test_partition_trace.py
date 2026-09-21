@@ -278,7 +278,10 @@ def test_a_derived_buffer_is_recorded_as_the_forward_saw_it(tiny_run):
     # Whatever the module hands out now is a different, coarser copy.
     owner.derived_probe = executed.to(torch.bfloat16).float()
 
-    names = tracer.dump_weights(module_ids=[target.id])[target.id]
+    # dump_weights leaves derived buffers alone; dump_derived takes the captured ones.
+    assert not any("derived_probe" in n
+                   for n in tracer.dump_weights(module_ids=[target.id])[target.id])
+    names = tracer.dump_derived()[target.id]
     probe = next(n for n in names if n.endswith("derived_probe"))
     entry = next(e for e in store.entries if e.name == probe)
     recorded = store.read_torch(entry)
