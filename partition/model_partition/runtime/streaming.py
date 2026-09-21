@@ -8,8 +8,9 @@ partition artifacts (never from the original checkpoint), then generate. If the
 dumps are incomplete the fill reports exactly which parameters were left
 unsatisfied instead of quietly falling back.
 
-Module boundaries are checked during the same forward, so one run answers both
-"do the modules chain correctly" and "do the final logits sample sensibly".
+Module boundaries are captured on their own forward, then released before
+generation: leaving the hooks installed would hold one output per module for every
+step, and at long context the logits alone are gigabytes.
 """
 
 from __future__ import annotations
@@ -179,6 +180,12 @@ def generate(
     Quadratic, but architecture-agnostic — it needs nothing from the model beyond
     ``model(input_ids) -> logits``, which is what keeps emulation independent of
     each architecture's cache implementation.
+
+    Only the last position is kept. A full ``[1, seq, vocab]`` tensor is 8 GB at 16k
+    tokens with a large vocabulary, it grows by a row every step, and the allocator
+    cannot reuse a cached block of the previous step's size — so holding them turns a
+    1.6 GiB model into tens of gigabytes of cached blocks and constant allocation
+    failures. Sampling only ever reads the final row.
     """
     import torch
 
@@ -187,11 +194,14 @@ def generate(
     extract = logits_of or (lambda out: out.logits if hasattr(out, "logits") else out)
     sequence = input_ids
     produced: list[int] = []
-    logits = None
+    last = None
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = extract(forward_no_cache(model, sequence))
-            token = greedy_step(logits, temperature=temperature, seed=seed)
+            output = forward_no_cache(model, sequence)
+            logits = extract(output)
+            last = logits[:, -1:].clone() if logits.dim() == 3 else logits[-1:].clone()
+            del output, logits
+            token = greedy_step(last, temperature=temperature, seed=seed)
             produced.append(token)
             if eos_token_id is not None and token == eos_token_id:
                 break
@@ -199,4 +209,4 @@ def generate(
                 [sequence, torch.tensor([[token]], device=sequence.device, dtype=sequence.dtype)],
                 dim=-1,
             )
-    return produced, logits
+    return produced, last

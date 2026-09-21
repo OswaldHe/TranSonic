@@ -222,31 +222,72 @@ def emulate(
 
     for item in inputs:
         outcome = EmulationOutcome(sample_id=item.sample_id, prompt=item.prompt)
-        handles, sink = capture_boundaries(model, graph) if check_boundaries else ([], {})
-        try:
-            token_ids, _ = generate(
-                model, item.input_ids.to(device) if hasattr(item.input_ids, "to") else item.input_ids,
-                max_new_tokens=max_new_tokens, temperature=temperature, seed=seed,
-                eos_token_id=eos_token_id,
-            )
-            outcome.token_ids = token_ids
-        except Exception as exc:
-            outcome.error = f"generation failed: {exc}"
-        finally:
-            for handle in handles:
-                handle.remove()
+        ids = item.input_ids.to(device) if hasattr(item.input_ids, "to") else item.input_ids
 
-        if check_boundaries and not outcome.error:
-            outcome.boundary_checks = _check_boundaries(
-                sink, bundle, graph, item.sample_id, device,
+        # The boundaries get their own forward, and the captured tensors are released
+        # before generation starts. Leaving the hooks installed across every step
+        # would hold one output per module — including a vocabulary-wide logits tensor
+        # — for the whole generation, which is most of a GPU at long context.
+        if check_boundaries:
+            outcome.boundary_checks = _capture_and_check(
+                model, bundle, graph, item.sample_id, ids, device,
                 tolerance or Tolerance.accumulated(),
             )
+
+        try:
+            outcome.token_ids, _ = generate(
+                model, ids, max_new_tokens=max_new_tokens, temperature=temperature,
+                seed=seed, eos_token_id=eos_token_id,
+            )
+        except Exception as exc:
+            outcome.error = f"generation failed: {exc}"
 
         if outcome.token_ids:
             outcome.text = decode(outcome.token_ids) if decode else " ".join(map(str, outcome.token_ids))
             outcome.verdict = judge.judge(item.prompt or "(token ids)", outcome.text, item.sample_id)
         report.outcomes.append(outcome)
+        _release(device)
     return report
+
+
+def _capture_and_check(
+    model: Any,
+    bundle: TraceBundle,
+    graph: PartitionGraph,
+    sample_id: str,
+    input_ids: Any,
+    device: str,
+    tolerance: Tolerance,
+) -> list[Comparison]:
+    """Run one forward with every module hooked, compare, and let the tensors go."""
+    import torch
+
+    from model_partition.trace import forward_no_cache
+
+    handles, sink = capture_boundaries(model, graph)
+    try:
+        with torch.no_grad():
+            forward_no_cache(model, input_ids)
+    except Exception:
+        return []
+    finally:
+        for handle in handles:
+            handle.remove()
+    try:
+        return _check_boundaries(sink, bundle, graph, sample_id, device, tolerance)
+    finally:
+        sink.clear()
+        _release(device)
+
+
+def _release(device: str) -> None:
+    if str(device).startswith("cuda"):
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _check_boundaries(

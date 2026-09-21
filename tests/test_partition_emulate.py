@@ -401,3 +401,47 @@ def test_the_mean_score_ignores_samples_the_judge_could_not_assess(tiny_run):
     report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
                      inputs=inputs_for(tiny_run), judge=Mixed(), max_new_tokens=2)
     assert report.mean_score() == 5.0
+
+
+# -- memory during generation ------------------------------------------------
+#
+# A 1.6 GiB model reached tens of gigabytes of cached allocator blocks because a
+# vocabulary-wide logits tensor was held per step, at a different size each step.
+
+
+def test_generate_keeps_only_the_last_position(tiny_run):
+    """The returned logits must not be the whole [1, seq, vocab] tensor."""
+    ids = _first_input_ids(tiny_run)
+    tokens, logits = generate(tiny_run.build_model(), ids, max_new_tokens=3)
+    assert len(tokens) == 3
+    assert logits.shape[-2] == 1, f"kept {logits.shape[-2]} positions, expected 1"
+
+
+def test_boundary_hooks_are_gone_before_generation_starts(tiny_run, monkeypatch):
+    """Otherwise every module's output is held for the whole generation."""
+    from model_partition.runtime import streaming
+
+    hooked_during_generate = {"any": False}
+    real_generate = streaming.generate
+
+    def checking(model, *args, **kwargs):
+        for module in model.modules():
+            if getattr(module, "_forward_hooks", None):
+                hooked_during_generate["any"] = True
+        return real_generate(model, *args, **kwargs)
+
+    monkeypatch.setattr("model_partition.verify.emulate.generate", checking)
+    emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+            inputs=inputs_for(tiny_run), judge=AcceptAll(), max_new_tokens=2)
+    assert not hooked_during_generate["any"]
+
+
+def test_boundaries_are_still_checked_on_their_own_forward(tiny_run):
+    report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                     inputs=inputs_for(tiny_run), judge=AcceptAll(), max_new_tokens=2)
+    assert all(o.boundary_checks for o in report.outcomes)
+    assert all(o.boundaries_passed for o in report.outcomes)
+
+
+def _first_input_ids(run):
+    return inputs_for(run)[0].input_ids
