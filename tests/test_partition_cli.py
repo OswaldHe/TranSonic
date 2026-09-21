@@ -262,9 +262,15 @@ def test_replay_reports_a_bad_module_id(runner, tiny_run):
 
 
 def test_replay_verifies_a_module_from_artifacts_alone(runner, tiny_run):
-    """No checkpoint is read: structure from config, weights from the dumps."""
+    """No checkpoint and no model: the module directory and the dumps are the input."""
+    from model_partition.extract import extract
+
     module_id = next(m.id for m in tiny_run.graph.partitioned_modules
                      if m.kind == "decoder_layers")
+    extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
+            run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
+            weight_tensors=tiny_run.bundle.weights)
+    (tiny_run.repo / "model.safetensors").unlink()
     result = runner.invoke(partition, ["replay", str(tiny_run.layout.root), module_id])
     assert result.exit_code == 0, result.output + str(result.exception)
     assert ": ok" in result.output

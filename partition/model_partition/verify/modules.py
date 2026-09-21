@@ -244,6 +244,18 @@ def verify_modules(
             ))
             continue
 
+        # Once extraction has run, the implementation is the thing under test. A
+        # module extraction missed has to be reported as unverified: replaying the
+        # model's own submodule instead would compare the model against itself.
+        impl_dir = (impl_dirs or {}).get(module_id)
+        if impl_dirs is not None and impl_dir is None:
+            report.results.append(ModuleVerification(
+                module_id=module_id, sample_id="-", passed=False,
+                error="extraction produced no implementation for this module, so "
+                      "there is nothing of the loop's own to run",
+            ))
+            continue
+
         weights = load_named_weights(bundle, module_id, device=host)
         applied = apply_named_weights(model, weights, graph_module)
         residency = target
@@ -262,9 +274,8 @@ def verify_modules(
                     error=f"will not load on {target}: {exc}. Partition it further.",
                 ))
                 continue
-        impl_dir = (impl_dirs or {}).get(module_id)
-        # Built once per (module, branch): the baseline instantiates the model's
-        # structure, too expensive to repeat for every recorded call.
+        # Built once per (module, branch): constructing a module from its source and
+        # loading its weights is too expensive to repeat for every recorded call.
         builder = (_impl_builder(impl_dir, weights, bundle, module_id, residency)
                    if impl_dir else None)
         # Only a parallel group has a branch to select; naming one for a sequential

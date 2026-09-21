@@ -17,7 +17,7 @@ autohelix partition plan <spec>             # produce the partition plan and sto
 autohelix partition run <spec>              # the full loop
 autohelix partition report <run-dir>        # stage status
 autohelix partition tokens <run-dir>        # sampled continuations
-autohelix partition replay <run-dir> <mod>  # replay one module, no checkpoint needed
+autohelix partition replay <run-dir> <mod>  # run one module's implementation alone
 ```
 
 A spec is a bundled name, a path to a YAML file, a HuggingFace repo id, or a local
@@ -158,8 +158,8 @@ parallel group is checked call by call.
 
 **Submodule order comes from the trace, not from the plan.** A norm and the
 projection it feeds have to run in the model's order, and no ordering of names can
-say which that is, so the baseline orders a group's submodules by when they were
-actually observed.
+say which that is, so a group's submodules are ordered by when the trace actually
+observed them.
 
 **Three checks, because one question is really three.** Per-module verification
 starts every module from its *recorded* input, so an error in one module cannot show
@@ -207,27 +207,36 @@ moved back — the whole model never needs to be resident. Tracing and emulation
 need the whole model, so a checkpoint larger than the GPU is spread across GPU and
 host by layer placement rather than abandoning the GPU.
 
-**A module replays without the checkpoint.** Structure comes from config and code,
-weights and inputs from the dumps. So a module of a model far too large to hold
-locally stays replayable — which is what makes the artifacts useful to hand to
-kernel development.
+**A module replays without the checkpoint, and without the model.** The code comes
+from the module directory, the weights and inputs from the dumps. So a module of a
+model far too large to hold locally stays replayable — which is what makes the
+artifacts useful to hand to kernel development.
 
 **What gets checked is what gets shipped.** The implementations are the deliverable,
-so they are what runs: `verify_modules` and `verify_chain` execute them, and emulation
-replaces every partitioned submodule with its implementation before generating, so the
-tokens printed for human review are the shipped code's tokens. The model's own modules
-appear in exactly two places — `trace`, where they *are* the reference, and
-`autohelix partition replay`, which runs them deliberately to prove the artifacts are
-self-sufficient.
+so they are what runs: `verify_modules`, `verify_chain` and `autohelix partition
+replay` execute them, and emulation replaces every partitioned submodule with its
+implementation before generating, so the tokens printed for human review are the
+shipped code's tokens. The model's own modules appear in exactly one place — `trace`,
+where they *are* the reference every later stage is measured against.
 
-**Every module ships with its own verifier and README.** `extract` writes four files
-per implementation group. `inference.py` is the module's inference code and the
-loop's to edit; it is written once and never overwritten, so the agent's fixes
-survive. `verify.py` belongs to the harness: it builds that implementation, runs it
-on the dumped input feature map and dumped weights, and exits non-zero when the
-output disagrees with the dumped reference. `README.md` states what the module does,
-its pre-conditions and its post-conditions. `source.py` is the real
-implementation's source, for reading and porting.
+**A module directory is a unit you can optimize on its own.** `extract` writes four
+files per implementation group, and the important thing about them is what depends on
+what:
+
+- **`source.py` is the implementation** — the file the module's class is defined in,
+  copied verbatim. This is what you edit to optimize the module.
+- **`inference.py` is the launcher.** It imports `source.py`, constructs the class
+  from the recorded config, loads the dumped weights into it, and returns the module.
+  It does not read the checkpoint and does not instantiate the rest of the model, so
+  nothing outside the directory has to be present.
+- **`verify.py` is the gate.** It runs the launcher on the dumped input feature map
+  and exits non-zero when the output disagrees with the dumped reference.
+- **`README.md`** states what the module does, its pre-conditions and its
+  post-conditions.
+
+That is also what `verify_modules`, `verify_chain` and `emulate` run, so optimizing
+one module and re-running the gate tells you whether it is still correct — on its own,
+and chained with the others.
 
 ```bash
 cd <run-dir>/modules/<group>
@@ -254,7 +263,7 @@ partition/
     ├── planner/                 # graph, seed planner, agent planner, reconcile
     ├── loaders/                 # vendor code preferred, transformers fallback
     ├── trace.py tensorstore.py  # IO capture; binary dump format
-    ├── runtime/                 # module replay, assembly from dumps, standalone
+    ├── runtime/                 # launching source.py, assembly, standalone replay
     ├── verify/                  # numerics, module checks, emulation, judge
     ├── retention.py             # post-loop pruning
     └── loop/                    # the specialized loop, and the harness guard
@@ -268,10 +277,10 @@ run.yaml              resolved spec, pinned revision, model config, storage esti
 plan/                 partition_graph.yaml, valid_submodules.txt, rationale.md, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
 modules/              one directory per implementation group:
-                        inference.py  runs the module from its recorded input + weights
+                        source.py     the implementation, copied verbatim
+                        inference.py  launches source.py on the recorded config+weights
                         verify.py     checks inference.py against the dumped output
                         README.md     what it does, pre-conditions, post-conditions
-                        source.py     the real implementation's source, for reference
                         meta.yaml     module ids, layers, shapes
 reports/              verify.json, chain.json, emulate.json, summary.md, tokens.txt,
                       review.md, reviews/

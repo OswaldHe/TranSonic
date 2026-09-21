@@ -868,3 +868,18 @@ def test_retention_still_runs_when_the_run_passes(tiny_run, tmp_path):
     assert result.passed
     assert result.state.record("retain").status == "ok"
     assert result.state.record("retain").metrics.get("kept_layers")
+
+
+def test_a_cached_stage_whose_output_is_gone_runs_again(tiny_run, tmp_path):
+    """Otherwise deleting an artifact yields a run that reports success with nothing."""
+    result = loop_for(tiny_run, tmp_path, retain=False).run()
+    assert result.passed
+    layout = result.context.layout
+    index = layout.modules_dir / "index.yaml"
+    assert index.is_file()
+
+    import shutil
+
+    shutil.rmtree(layout.modules_dir)
+    assert loop_for(tiny_run, tmp_path, retain=False).run().passed
+    assert index.is_file(), "extract should have run again"

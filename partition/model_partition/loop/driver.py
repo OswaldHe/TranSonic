@@ -70,6 +70,19 @@ def _print(message: str) -> None:
     print(message, flush=True)
 
 
+#: What a cached stage must have left behind. A stage whose inputs are unchanged but
+#: whose output is gone has to run again — otherwise deleting an artifact yields a run
+#: that reports success with nothing to show for it.
+STAGE_OUTPUTS: dict[str, Callable[[RunLayout], bool]] = {
+    "plan": lambda layout: layout.graph_path.is_file(),
+    "extract": lambda layout: (layout.modules_dir / "index.yaml").is_file(),
+    "trace": lambda layout: (layout.trace_dir / "records.yaml").is_file(),
+    "verify_modules": lambda layout: (layout.reports_dir / "verify.json").is_file(),
+    "verify_chain": lambda layout: (layout.reports_dir / "chain.json").is_file(),
+    "emulate": lambda layout: (layout.reports_dir / "emulate.json").is_file(),
+}
+
+
 def _release_accelerator() -> None:
     """Return cached blocks to the driver so the next stage sees a full card."""
     import gc
@@ -439,6 +452,9 @@ class PartitionLoop:
 
         if name == "ingest":
             return ctx.result is not None and ctx.inventory is not None and bool(ctx.samples)
+        present = STAGE_OUTPUTS.get(name)
+        if present is not None and not present(ctx.layout):
+            return False
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)

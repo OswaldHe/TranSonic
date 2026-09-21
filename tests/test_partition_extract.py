@@ -3,6 +3,8 @@
 
 """Tests for per-module code extraction and deduplication."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -68,6 +70,17 @@ def test_meta_records_module_ids_and_layers(tiny_deep_run, tmp_path):
     assert meta["submodules"]
 
 
+def test_source_imports_on_its_own(tiny_run, tmp_path):
+    """The launcher imports it, so a file that cannot import is useless."""
+    from model_partition.runtime.launcher import load_source
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+                     run_root=tiny_run.layout.root)
+    decoder = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    module = load_source(decoder.directory, decoder.source_module)
+    assert hasattr(module, decoder.class_name)
+
+
 def test_source_contains_the_real_implementation(tiny_run, tmp_path):
     groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
                      run_root=tiny_run.layout.root)
@@ -80,14 +93,18 @@ def test_source_contains_the_real_implementation(tiny_run, tmp_path):
     assert decoder.source_lines > 20
 
 
-def test_source_header_records_provenance(tiny_run, tmp_path):
-    """Each extracted group names the files its source came from."""
+def test_source_is_the_implementation_and_names_where_it_came_from(tiny_run, tmp_path):
+    """source.py is the code that runs, so it has to be the real file, importable."""
     groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
                      run_root=tiny_run.layout.root)
     decoder = next(g for g in groups if g.class_name == "TinyDecoderLayer")
     source = (decoder.directory / "source.py").read_text()
-    assert "Provenance:" in source
+    assert decoder.launchable
+    assert "copied verbatim from" in source
     assert "tiny_llm.py" in source
+    assert "class TinyDecoderLayer" in source
+    # A verbatim file keeps its imports, which is what makes it importable.
+    assert "import torch" in source
 
 
 def _extract(run, tmp_path):
@@ -197,10 +214,41 @@ def test_missing_submodule_is_recorded_not_fatal(tiny_run, tmp_path):
 
 def test_collect_sources_deduplicates_repeated_child_classes(tiny_run):
     model = tiny_run.build_model()
-    sources, names, provenance = collect_sources(model)
+    sources, names, files = collect_sources(model)
     assert len(names) == len(set(names))
-    assert "tiny_llm" in provenance
+    assert len(files) == len(set(files))
     assert any("TinyCausalLM" in name for name in names)
+    assert any(name.startswith("tests.fixtures.tiny_llm") or "tiny_llm" in name
+               for name in names), names
+
+
+def test_the_originating_files_are_copied_verbatim(tiny_run, tmp_path):
+    """The extracted source.py does not import; the real file does."""
+    from model_partition.extract import SOURCE_FILES_DIR, extract
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    copies = tmp_path / "modules" / SOURCE_FILES_DIR
+    assert copies.is_dir()
+
+    wanted = {Path(path) for group in groups for path in group.source_files}
+    assert wanted, "source_files should not be empty"
+    for origin in wanted:
+        assert (copies / origin.name).read_bytes() == origin.read_bytes()
+
+
+def test_meta_records_where_the_implementation_came_from(tiny_run, tmp_path):
+    import yaml
+
+    from model_partition.extract import extract
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    for group in groups:
+        meta = yaml.safe_load((group.directory / "meta.yaml").read_text())
+        assert meta["source_files"], f"{group.directory.name} records no provenance"
+        assert (group.directory / "source.py").read_text().count(
+            meta["source_files"][0]) >= 1
 
 
 def test_collect_sources_respects_the_class_cap(tiny_run):
@@ -285,3 +333,65 @@ def test_the_readme_is_regenerated_unlike_inference_py(tiny_run, tmp_path):
     _readme(tiny_run, tmp_path)
     assert (directory / "README.md").read_text() != "stale\n"
     assert (directory / "inference.py").read_text() == "# agent's fix\n"
+
+
+# -- the reference covers the whole group -------------------------------------
+
+
+def test_source_covers_every_submodule_of_a_group(tiny_run, tmp_path):
+    """A group spans a norm and the computation it feeds; both belong in source.py.
+
+    Taking only the first submodule's source left the attention groups documented by
+    an RMSNorm, which is no use to anyone porting them.
+    """
+    from model_partition.extract import extract
+
+    graph = tiny_run.graph
+    group_module = next((m for m in graph.partitioned_modules if len(m.submodules) > 1), None)
+    if group_module is None:
+        pytest.skip("this plan has no multi-submodule group")
+
+    groups = extract(graph, tiny_run.build_model(), tmp_path / "modules",
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    group = next(g for g in groups if group_module.id in g.module_ids)
+    source = (group.directory / "source.py").read_text()
+    assert len(group.classes) > 1, group.classes
+    for class_name in group.classes:
+        assert class_name.split(".")[-1] in source
+
+
+def test_the_group_is_named_after_what_it_computes(tiny_run, tmp_path):
+    """Not after the normalization that happens to be listed first."""
+    from model_partition.extract import extract
+    from model_partition.trace import _lookup
+
+    graph = tiny_run.graph
+    group_module = next((m for m in graph.partitioned_modules if len(m.submodules) > 1), None)
+    if group_module is None:
+        pytest.skip("this plan has no multi-submodule group")
+
+    model = tiny_run.build_model()
+    groups = extract(graph, model, tmp_path / "modules",
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    group = next(g for g in groups if group_module.id in g.module_ids)
+
+    heaviest = max((_lookup(model, name) for name in group_module.submodules),
+                   key=lambda m: sum(p.numel() for p in m.parameters()))
+    assert group.class_name == type(heaviest).__name__
+
+
+def test_the_principal_submodule_is_the_one_with_the_parameters():
+    from model_partition.extract import _principal
+
+    class Fake:
+        def __init__(self, n):
+            self._n = n
+
+        def parameters(self):
+            import torch
+
+            return [torch.zeros(self._n)]
+
+    small, large = Fake(4), Fake(400)
+    assert _principal([small, large]) is large
+    assert _principal([large, small]) is large

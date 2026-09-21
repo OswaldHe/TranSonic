@@ -10,20 +10,14 @@ wrapper that calls its group's ``inference.py``. Generation then proceeds normal
 the surrounding model still computes masks and rotary embeddings and passes them in,
 which is what lets the chain run at a sequence length no recording covers.
 
-Two details make this cheap rather than a second copy of the model:
-
-* Wrappers are built before any of them is installed, so each holds a direct
-  reference to the original submodule rather than looking it up later and finding
-  its own wrapper.
-* The baseline's structure cache is seeded with the model being assembled, so an
-  implementation that delegates to the baseline reuses these parameters instead of
-  instantiating the architecture again.
+Wrappers are built before any of them is installed, so each holds a direct reference
+to the submodule it replaces rather than looking it up later and finding its own
+wrapper.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 
@@ -62,7 +56,6 @@ def install_implementations(
     graph: Any,
     bundle: Any,
     impl_dirs: dict[str, Any],
-    run_dir: str | Path,
     device: str = "cpu",
 ) -> InstallReport:
     """Replace every partitioned submodule with its implementation.
@@ -74,19 +67,7 @@ def install_implementations(
     ``verify_modules`` and ``verify_chain``; here each of its submodules runs the
     group's code for its own part.
     """
-    from model_partition.runtime import baseline
-
-    report = InstallReport()
-    # An implementation that delegates to the baseline should reuse these very
-    # parameters. Without this the baseline would instantiate the architecture a
-    # second time, which for a checkpoint that only just fits is fatal. Dropped again
-    # before returning: from here on this model has wrappers in it, and a later stage
-    # finding that in the cache would look up a submodule and get a wrapper.
-    baseline.seed_structure(run_dir, device, model)
-    try:
-        return _install_all(model, graph, bundle, impl_dirs, device, report)
-    finally:
-        baseline.forget_structure(run_dir, device)
+    return _install_all(model, graph, bundle, impl_dirs, device, InstallReport())
 
 
 def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],

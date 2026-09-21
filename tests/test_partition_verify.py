@@ -378,21 +378,37 @@ def test_an_implementation_returning_a_non_callable_is_reported(tiny_run, tmp_pa
     assert not report.passed
 
 
-def test_the_baseline_identifies_the_module_from_its_weights(tiny_deep_run, tmp_path):
-    """One implementation serves many modules; the weights say which instance."""
-    from model_partition.runtime.baseline import _module_for_weights
-    from model_partition.runtime.module_runner import load_named_weights
+def test_a_module_with_no_implementation_is_a_failure_not_a_free_pass(tiny_run, tmp_path):
+    """Falling back to the model's own submodule would verify it against itself."""
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    dropped = next(m.id for m in tiny_run.graph.partitioned_modules
+                   if m.kind == "decoder_layers")
+    del impl_dirs[dropped]
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    assert not report.passed
+    failure = next(r for r in report.failures if r.module_id == dropped)
+    assert "no implementation" in failure.error
+
+
+def test_the_launcher_identifies_the_module_from_its_weights(tiny_deep_run, tmp_path):
+    """One implementation serves a whole group, so the weights say which instance."""
+    from model_partition.runtime.launcher import _module_paths
 
     graph = tiny_deep_run.graph
-    group = [m.id for m in graph.partitioned_modules if m.kind == "decoder_layers"]
-    assert len(group) > 1
-    for module_id in group[:3]:
-        weights = load_named_weights(tiny_deep_run.bundle, module_id)
-        assert _module_for_weights(graph, group, weights) == module_id
+    submodules = {m.id: list(m.submodules) for m in graph.partitioned_modules}
+    target = [m for m in graph.partitioned_modules if m.kind == "decoder_layers"][-1]
+    weights = {f"{target.submodules[0]}.self_attn.q_proj.weight": None}
+
+    found = _module_paths(submodules, weights)
+    assert found is not None
+    assert found[0] == target.id
+
+    assert _module_paths(submodules, {"nothing.recognisable": None}) is None
 
 
 def test_every_module_of_a_shared_group_verifies(tiny_deep_run, tmp_path):
-    """Regression: the baseline built the group's first module for all of them."""
+    """Regression: one implementation served a whole group but built only its first."""
     impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
     report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
                             tiny_deep_run.graph, impl_dirs=impl_dirs)
@@ -401,39 +417,30 @@ def test_every_module_of_a_shared_group_verifies(tiny_deep_run, tmp_path):
                 if m.kind == "decoder_layers"]
     checked = {r.module_id for r in report.results}
     assert set(decoders) <= checked
+def test_the_source_is_imported_once_per_group(tiny_deep_run, tmp_path):
+    """Executing a modeling file per module made verification far slower than it is."""
+    from model_partition.runtime import launcher
 
-
-def test_structure_is_reused_across_modules(tiny_deep_run, tmp_path):
-    """Instantiating the model per module made verification 80x slower."""
-    from model_partition.runtime import baseline
-
-    baseline.clear_structure_cache()
-    built = {"n": 0}
-    original = baseline._structure
-
-    def counting(run, device):
-        if (str(run.layout.root), device) not in baseline._STRUCTURE_CACHE:
-            built["n"] += 1
-        return original(run, device)
-
-    baseline._structure = counting
+    launcher.clear_source_cache()
     try:
         impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
         report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
                                 tiny_deep_run.graph, impl_dirs=impl_dirs)
+        imported = len(launcher._SOURCE_CACHE)
     finally:
-        baseline._structure = original
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
+
     assert report.passed, report.render()
     assert len(report.results) > 5
-    assert built["n"] == 1, f"structure built {built['n']} times"
+    # One executed source per group directory, however many modules share it.
+    assert imported == len(set(impl_dirs.values())), imported
 
 
 def test_reuse_does_not_let_one_module_cover_another_s_missing_dump(tiny_deep_run, tmp_path):
     """The shared structure is poisoned per module, so a gap still shows."""
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _extract_impls(tiny_deep_run, tmp_path)
         decoders = [m.id for m in tiny_deep_run.graph.partitioned_modules
@@ -443,7 +450,7 @@ def test_reuse_does_not_let_one_module_cover_another_s_missing_dump(tiny_deep_ru
         report = verify_modules(tiny_deep_run.build_model, tiny_deep_run.bundle,
                                 tiny_deep_run.graph, impl_dirs=impl_dirs)
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
     assert not report.passed
     assert victim in {r.module_id for r in report.failures}
 
@@ -460,20 +467,20 @@ def test_a_parallel_group_is_checked_call_by_call(tiny_split_run, tmp_path):
     reproduce no reference at all, and comparing one call's input against the last
     call's output compares two different experts.
     """
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
 
     graph = tiny_split_run.graph
     parallel = [m for m in graph.partitioned_modules if m.is_parallel]
     if not parallel:
         pytest.skip("this plan produced no parallel expert group")
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _extract_impls(tiny_split_run, tmp_path)
         report = verify_modules(tiny_split_run.build_model, tiny_split_run.bundle,
                                 graph, impl_dirs=impl_dirs)
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
 
     target = parallel[0]
     checks = [r for r in report.checked if r.module_id == target.id]
@@ -617,11 +624,9 @@ def test_the_group_call_keeps_the_entry_point_s_value_for_a_shared_keyword():
 
     _, kwargs = decode_group_call(records, TensorStore("/nonexistent"))
     assert kwargs == {"depth": 0, "shared": "first", "extra": 7}
-
-
 def test_each_submodule_gets_only_the_keywords_it_declares():
     """Passing a norm the attention's mask is a TypeError, not a wrong number."""
-    from model_partition.runtime.baseline import _accepted_kwargs
+    from model_partition.runtime.launcher import _accepted
 
     class Norm:
         def forward(self, hidden_states):
@@ -636,16 +641,13 @@ def test_each_submodule_gets_only_the_keywords_it_declares():
             return hidden_states
 
     offered = {"position_embeddings": 1, "attention_mask": 2, "hidden_states": 3}
-    assert _accepted_kwargs(Norm(), offered) == {}
-    assert _accepted_kwargs(Attention(), offered) == {
+    assert _accepted(Norm(), offered) == {}
+    assert _accepted(Attention(), offered) == {
         "position_embeddings": 1, "attention_mask": 2}
     # A decoder layer taking **kwargs wants everything except the flowing tensor,
     # which is passed positionally — the trace records it as `hidden_states=`.
-    assert _accepted_kwargs(Layer(), offered) == {
+    assert _accepted(Layer(), offered) == {
         "position_embeddings": 1, "attention_mask": 2}
-
-
-# -- running out of accelerator memory ---------------------------------------
 
 
 def test_an_out_of_memory_module_is_a_partition_failure(tiny_run, tmp_path, monkeypatch):
@@ -679,12 +681,18 @@ def test_an_out_of_memory_module_is_a_partition_failure(tiny_run, tmp_path, monk
 
 def test_an_oversized_module_sends_the_repair_to_the_plan(tiny_run, tmp_path, monkeypatch):
     """Arithmetic cannot make a module fit, so the plan is the surface to edit."""
+    from model_partition.extract import extract
     from model_partition.loop.stages import stage_verify_modules
     from model_partition.verify import modules as modules_module
 
     def out_of_memory(*args, **kwargs):
         raise RuntimeError("CUDA out of memory. Tried to allocate 16.00 GiB")
 
+    # The stage reads the implementations from the run, and every module needs one
+    # before an allocation failure is the reason a check did not pass.
+    extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
+            run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
+            weight_tensors=tiny_run.bundle.weights)
     monkeypatch.setattr(modules_module, "_run_once", out_of_memory)
 
     class Ctx:
@@ -714,16 +722,33 @@ def test_an_allocation_failure_is_told_apart_from_a_real_error():
 # -- accumulated error through the chained implementations --------------------
 
 
+#: Appended to a generated implementation to make it wrong in a way cosine can see.
+#: A uniform scale would not do: cosine ignores it and the next norm removes it.
+BREAK_THE_OUTPUT = '''
+
+def build_module(config, weights, device="cpu", submodule=None):
+    inner = _original(config, weights, device, submodule)
+
+    def run(*args, **kwargs):
+        out = inner(*args, **kwargs)
+        first = out[0] if isinstance(out, tuple) else out
+        broken = first.flip(-1)
+        return (broken,) + tuple(out[1:]) if isinstance(out, tuple) else broken
+
+    return run
+'''
+
+
 def _chain(run, tmp_path, **kwargs):
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
     from model_partition.verify.chain import verify_chain
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _extract_impls(run, tmp_path)
         return verify_chain(run.bundle, run.graph, impl_dirs, **kwargs)
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
 
 
 def test_the_chain_carries_each_output_into_the_next_module(tiny_run, tmp_path):
@@ -753,32 +778,23 @@ def test_an_unbroken_chain_predicts_the_same_tokens(tiny_run, tmp_path):
 
 def test_a_broken_implementation_shows_up_as_drift_downstream(tiny_run, tmp_path):
     """The point of chaining: an error in one module reaches the ones after it."""
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
     from model_partition.verify.chain import verify_chain
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _extract_impls(tiny_run, tmp_path)
         target = next(m.id for m in tiny_run.graph.partitioned_modules
                       if m.kind == "decoder_layers")
         # Reversing the hidden dimension is wrong in a way cosine can see. A uniform
         # scale would not do: cosine ignores it, and the next norm removes it.
-        (impl_dirs[target] / "inference.py").write_text(
-            "def build_module(config, weights, device='cpu', submodule=None):\n"
-            "    from model_partition.runtime.baseline import build_from_dumps\n"
-            f"    inner = build_from_dumps(config, weights, device=device,\n"
-            f"                             run_dir={str(tiny_run.layout.root)!r},\n"
-            f"                             module_ids={[target]!r}, submodule=submodule)\n"
-            "    def run(*args, **kwargs):\n"
-            "        out = inner(*args, **kwargs)\n"
-            "        first = out[0] if isinstance(out, tuple) else out\n"
-            "        broken = first.flip(-1)\n"
-            "        return (broken,) + tuple(out[1:]) if isinstance(out, tuple) else broken\n"
-            "    return run\n"
-        )
+        # Edited the way a porter edits it: keep the launcher, wrap what it returns.
+        path = impl_dirs[target] / "inference.py"
+        path.write_text(path.read_text().replace("def build_module(", "def _original(")
+                        + BREAK_THE_OUTPUT)
         suite = verify_chain(tiny_run.bundle, tiny_run.graph, impl_dirs)
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
 
     assert not suite.passed, suite.render()
     report = suite.reports[0]

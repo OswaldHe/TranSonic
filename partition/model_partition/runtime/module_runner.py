@@ -197,13 +197,6 @@ def apply_named_weights(model: Any, weights: dict[str, Any], graph_module: Any) 
     return applied
 
 
-def apply_dumped_weights(model: Any, bundle: TraceBundle, module_id: str, graph_module: Any,
-                         device: str = "cpu") -> int:
-    """Overwrite a module's live parameters with its recorded ones."""
-    weights = load_named_weights(bundle, module_id, device=device)
-    return apply_named_weights(model, weights, graph_module)
-
-
 def replay_record(model: Any, record: CallRecord, store: TensorStore, device: str = "cpu") -> Any:
     """Call the recorded submodule with its recorded arguments."""
     import torch

@@ -207,12 +207,21 @@ def test_transformers_loader_reports_an_unreadable_config(repo):
 # -- standalone replay -------------------------------------------------------
 
 
+def _with_modules(run):
+    """Extract into the run so replay finds an implementation to launch."""
+    from model_partition.extract import extract
+
+    extract(run.graph, run.build_model(), run.layout.modules_dir,
+            run_root=run.layout.root, sample_ids=run.sample_ids,
+            weight_tensors=run.bundle.weights)
+    return next(m.id for m in run.graph.partitioned_modules if m.kind == "decoder_layers")
+
+
 def test_standalone_replay_needs_no_checkpoint(tiny_run):
     from model_partition.runtime.standalone import replay_module
 
-    module_id = next(m.id for m in tiny_run.graph.partitioned_modules
-                     if m.kind == "decoder_layers")
-    # Remove the weights the model would otherwise be loaded from.
+    module_id = _with_modules(tiny_run)
+    # Remove the checkpoint: the module directory and the trace are the whole input.
     (tiny_run.repo / "model.safetensors").unlink()
     comparisons = replay_module(tiny_run.layout.root, module_id)
     assert comparisons and all(c.passed for c in comparisons)
@@ -228,10 +237,19 @@ def test_standalone_replay_reports_an_unknown_module(tiny_run):
 def test_standalone_replay_reports_a_missing_sample(tiny_run):
     from model_partition.runtime.standalone import StandaloneError, replay_module
 
-    module_id = next(m.id for m in tiny_run.graph.partitioned_modules
-                     if m.kind == "decoder_layers")
+    module_id = _with_modules(tiny_run)
     with pytest.raises(StandaloneError, match="No trace records"):
         replay_module(tiny_run.layout.root, module_id, sample_id="absent")
+
+
+def test_standalone_replay_says_so_when_nothing_was_extracted(tiny_run):
+    """Without a module directory there is no implementation to replay."""
+    from model_partition.runtime.standalone import StandaloneError, replay_module
+
+    module_id = next(m.id for m in tiny_run.graph.partitioned_modules
+                     if m.kind == "decoder_layers")
+    with pytest.raises(StandaloneError, match="No extracted implementation"):
+        replay_module(tiny_run.layout.root, module_id)
 
 
 def test_load_run_requires_a_plan(tiny_run):

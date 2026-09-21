@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from model_partition.runtime.standalone import StandaloneError, load_run, verify_impl
+    from model_partition.runtime.standalone import StandaloneError, load_run, replay_module
     from model_partition.verify.numerics import Tolerance
 
     tolerance = None
@@ -72,9 +72,11 @@ def main(argv: list[str] | None = None) -> int:
     for module_id in modules:
         for sample_id in samples:
             try:
-                comparisons = verify_impl(args.run, Path(__file__).resolve().parent,
-                                          module_id, sample_id,
-                                          device=args.device, tolerance=tolerance)
+                # This directory's implementation, not whichever one the run's
+                # index names: a copy taken elsewhere still checks its own code.
+                comparisons = replay_module(args.run, module_id, sample_id,
+                                            device=args.device, tolerance=tolerance,
+                                            impl_dir=Path(__file__).resolve().parent)
             except StandaloneError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2

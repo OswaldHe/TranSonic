@@ -146,8 +146,16 @@ class TinyMoE(nn.Module):
 
 
 class TinyDecoderLayer(nn.Module):
-    def __init__(self, config: TinyConfig, use_moe: bool):
+    """One layer, MoE on odd indices when the config declares experts.
+
+    Takes ``(config, layer_idx)`` as a real decoder layer does, so the layer can be
+    constructed from the config and its index alone — which is what lets an extracted
+    module be rebuilt from its artifacts without the rest of the model.
+    """
+
+    def __init__(self, config: TinyConfig, layer_idx: int = 0):
         super().__init__()
+        use_moe = bool(config.n_experts) and layer_idx % 2 == 1
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = TinyAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -163,7 +171,7 @@ class TinyModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            TinyDecoderLayer(config, use_moe=bool(config.n_experts) and i % 2 == 1)
+            TinyDecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)

@@ -258,79 +258,69 @@ def _impls(run, tmp_path):
 
 
 def test_installing_the_implementations_replaces_every_submodule(tiny_run, tmp_path):
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
     from model_partition.runtime.assemble import install_implementations
     from model_partition.trace import _lookup
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _impls(tiny_run, tmp_path)
         model = tiny_run.build_model()
         report = install_implementations(model, tiny_run.graph, tiny_run.bundle,
-                                         impl_dirs, run_dir=tiny_run.layout.root)
+                                         impl_dirs)
         assert report.installed, report.summary()
         for name in report.installed:
             assert type(_lookup(model, name)).__name__ == "Implemented"
     finally:
-        baseline.clear_structure_cache()
-
-
-def test_installation_reuses_the_model_rather_than_building_a_second(tiny_run, tmp_path):
-    """A second copy of the architecture would double the memory for nothing."""
-    from model_partition.runtime import baseline
+        launcher.clear_source_cache()
+def test_installation_does_not_instantiate_another_model(tiny_run, tmp_path):
+    """The wrappers call source.py, so nothing else gets built to serve them."""
+    from model_partition.runtime import launcher
     from model_partition.runtime.assemble import install_implementations
+    from model_partition.trace import _lookup
 
-    baseline.clear_structure_cache()
-    seen: list = []
-    real = baseline._structure
+    launcher.clear_source_cache()
+    built = {"n": 0}
+    original = launcher.load_source
 
-    def watching(run, device):
-        model = real(run, device)
-        seen.append(model)
-        return model
+    def counting(directory, source_module=None):
+        built["n"] += 1
+        return original(directory, source_module)
 
+    launcher.load_source = counting
     try:
         impl_dirs = _impls(tiny_run, tmp_path)
         model = tiny_run.build_model()
-        baseline._structure = watching
-        install_implementations(model, tiny_run.graph, tiny_run.bundle, impl_dirs,
-                                run_dir=tiny_run.layout.root)
+        report = install_implementations(model, tiny_run.graph, tiny_run.bundle, impl_dirs)
     finally:
-        baseline._structure = real
-        baseline.clear_structure_cache()
+        launcher.load_source = original
+        launcher.clear_source_cache()
 
-    # Every build resolved to the model passed in, never to a fresh one.
-    assert seen and all(m is model for m in seen)
-
-
-def test_installation_leaves_no_wrapped_model_in_the_cache(tiny_run, tmp_path):
-    """A later stage finding this model would look up a submodule and get a wrapper."""
-    from model_partition.runtime import baseline
-    from model_partition.runtime.assemble import install_implementations
-
-    baseline.clear_structure_cache()
-    try:
-        impl_dirs = _impls(tiny_run, tmp_path)
-        install_implementations(tiny_run.build_model(), tiny_run.graph, tiny_run.bundle,
-                                impl_dirs, run_dir=tiny_run.layout.root)
-        assert baseline._STRUCTURE_CACHE == {}
-    finally:
-        baseline.clear_structure_cache()
+    assert report.installed
+    # Every replacement runs code loaded from a module directory, not the model's.
+    for name in report.installed:
+        wrapper = _lookup(model, name)
+        inner = type(wrapper._built)
+        # The copy is registered under its original package so its own relative
+        # imports resolve, so the private leaf is the last component.
+        leaf = inner.__module__.rsplit(".", 1)[-1]
+        assert leaf.startswith(launcher.SOURCE_MODULE_PREFIX), inner.__module__
+    assert built["n"] >= 1
 
 
 def test_emulation_generates_through_the_extracted_implementations(tiny_run, tmp_path):
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _impls(tiny_run, tmp_path)
         report = emulate(
             tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
             inputs=inputs_for(tiny_run), judge=AcceptAll(), max_new_tokens=3,
-            impl_dirs=impl_dirs, run_dir=tiny_run.layout.root,
+            impl_dirs=impl_dirs,
         )
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
 
     assert report.install is not None and report.install.installed
     assert report.mechanically_passed, report.render()
@@ -339,19 +329,18 @@ def test_emulation_generates_through_the_extracted_implementations(tiny_run, tmp
 
 def test_emulation_says_when_a_submodule_kept_the_model_s_own_code(tiny_run, tmp_path):
     """Partial installation has to be visible, not assumed away."""
-    from model_partition.runtime import baseline
+    from model_partition.runtime import launcher
     from model_partition.runtime.assemble import install_implementations
 
-    baseline.clear_structure_cache()
+    launcher.clear_source_cache()
     try:
         impl_dirs = _impls(tiny_run, tmp_path)
         dropped = sorted(impl_dirs)[0]
         del impl_dirs[dropped]
         report = install_implementations(tiny_run.build_model(), tiny_run.graph,
-                                         tiny_run.bundle, impl_dirs,
-                                         run_dir=tiny_run.layout.root)
+                                         tiny_run.bundle, impl_dirs)
     finally:
-        baseline.clear_structure_cache()
+        launcher.clear_source_cache()
 
     assert dropped in report.skipped
     assert not report.complete

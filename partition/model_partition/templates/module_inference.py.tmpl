@@ -22,17 +22,18 @@ reference.
 set of MoE experts, where one recorded call exercises one expert. Drop it from the
 signature if this module has a single submodule.
 
-## Where to start
+## What runs
 
-The baseline below instantiates the model's own class and loads the dumped
-weights into it, so it is correct from the outset. Replace its body with an
-explicit implementation when you need one — for porting to a target accelerator, or
-because the module should be expressed in simpler operations. `source.py` beside
-this file holds the real implementation's source to work from.
+`source.py` beside this file **is** the implementation. This launcher imports it,
+constructs {{ class_names | join(' then ') }} from the recorded config, loads the
+dumped weights in, and returns the module. Nothing reads the checkpoint and nothing
+instantiates the rest of the model, so this directory is a unit you can optimize on
+its own.
 
-Whatever you write, `verify.py` must still pass:
+Optimize `source.py`. Then:
 
-    python verify.py --all-modules --all-samples
+    python inference.py                              # run it
+    python verify.py --all-modules --all-samples     # is it still correct?
 """
 
 from __future__ import annotations
@@ -41,22 +42,38 @@ MODULE_IDS = {{ module_ids | tojson }}
 LAYER_MAP = {{ layer_map | tojson }}
 SIGNATURE = {{ signature | tojson }}
 CLASS_NAME = {{ class_name | tojson }}
+#: One class per submodule of a module in this group, in order.
+CLASS_NAMES = {{ class_names | tojson }}
 SUBMODULES = {{ submodules | tojson }}
+MODULE_SUBMODULES = {{ module_submodules | tojson }}
+#: Dotted name source.py's classes were defined under, so its own imports resolve.
+SOURCE_MODULE = {{ source_module | tojson }}
+#: The config class these modules are constructed with, recorded rather than guessed.
+CONFIG_CLASS = {{ config_class | tojson }}
+LAUNCHABLE = {{ 'True' if launchable else 'False' }}
 COMPOSITION = {{ composition | tojson }}
 WEIGHT_NAMES = {{ weight_names | tojson }}
 DEFAULT_RUN = {{ run_root | tojson }}
 
 
 def build_module(config, weights, device="cpu", submodule=None):
-    """Return a callable that computes this module's forward.
+    """Launch this module's implementation from `source.py`.
 
-    Baseline: build the model's structure from its config and code, then load this
-    module's recorded weights into it.
+    Constructs one instance per submodule from the source in this directory, loads the
+    recorded weights into each, and returns the module — the chain of them when the
+    group spans more than one. `submodule` asks for a single piece: which expert of a
+    parallel group, or which submodule when these are installed into a model.
     """
-    from model_partition.runtime.baseline import build_from_dumps
+    from pathlib import Path
 
-    return build_from_dumps(config, weights, device=device, run_dir=DEFAULT_RUN,
-                            module_ids=MODULE_IDS, submodule=submodule)
+    from model_partition.runtime.launcher import build_group
+
+    return build_group(
+        Path(__file__).resolve().parent, config, weights, device=device,
+        source_module=SOURCE_MODULE, class_names=CLASS_NAMES,
+        config_class=CONFIG_CLASS, submodules=MODULE_SUBMODULES,
+        layer_map=LAYER_MAP, submodule=submodule,
+    )
 
 
 def main(argv=None):

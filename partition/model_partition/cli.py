@@ -176,7 +176,7 @@ def inspect_model(target: str, artifact_root: str | None) -> None:
     click.echo(f"loader     : {result.loader}")
     click.echo(f"checkpoint : {format_bytes(result.index.total_bytes)} "
                f"in {len(result.index.shard_bytes)} shard(s)")
-    click.echo(f"dtypes     : " + ", ".join(
+    click.echo("dtypes     : " + ", ".join(
         f"{name} {format_bytes(size)}" for name, size in sorted(inventory.index.bytes_by_dtype().items())))
     click.echo(f"layers     : {len(inventory.layers)}  hidden {inventory.hidden_size}  "
                f"vocab {inventory.vocab_size}")
@@ -279,7 +279,7 @@ def run_loop(target: str, config: Path | None, iterations: int | None, no_agent:
 @click.option("--sample", default=None, help="Sample id (default: first traced)")
 @click.option("--device", default="cpu")
 def replay(run_dir: str, module_id: str, sample: str | None, device: str) -> None:
-    """Replay one module from artifacts alone, without the checkpoint."""
+    """Run one module's extracted implementation against its dumped reference."""
     from model_partition.runtime.standalone import StandaloneError, replay_module
 
     try:

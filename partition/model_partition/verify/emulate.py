@@ -211,12 +211,11 @@ def emulate(
     model, device = move_to_device(build_model(), device)
     poison_parameters(model, only=plan_owned_parameters(model, graph))
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
-    if impl_dirs and run_dir is not None:
+    if impl_dirs:
         from model_partition.runtime.assemble import install_implementations
 
-        report.install = install_implementations(
-            model, graph, bundle, impl_dirs, run_dir=run_dir, device=device,
-        )
+        report.install = install_implementations(model, graph, bundle, impl_dirs,
+                                                 device=device)
     if place_max_memory:
         model, device = place_across_devices(model, place_max_memory)
 
