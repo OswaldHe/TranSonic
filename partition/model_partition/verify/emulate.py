@@ -105,8 +105,16 @@ class EmulationReport:
 
     @property
     def mechanically_passed(self) -> bool:
-        """True when every sample reproduced the model, judge aside."""
-        return bool(self.outcomes) and all(o.mechanically_passed for o in self.outcomes)
+        """True when every sample reproduced the model *through the loop's own code*.
+
+        A module whose implementation could not be installed leaves the model's own
+        submodule in place, and that submodule reproduces the reference by definition —
+        it *is* the reference. Counting that as a pass is the one way this check can
+        assert something it never tested, so an incomplete installation fails here.
+        """
+        if not self.outcomes or not all(o.mechanically_passed for o in self.outcomes):
+            return False
+        return self.install is None or self.install.complete
 
     @property
     def judge_declined(self) -> list[EmulationOutcome]:
@@ -131,6 +139,17 @@ class EmulationReport:
         scores = [o.verdict.score for o in self.outcomes
                   if o.verdict and not o.verdict.errored]
         return sum(scores) / len(scores) if scores else 0.0
+
+    def install_gap(self) -> str:
+        """Why the installation was incomplete, or "" when it was not."""
+        if self.install is None or self.install.complete:
+            return ""
+        if not self.install.installed:
+            return ("no module ran the extracted implementation: emulation would have "
+                    "measured the model against itself")
+        first = ", ".join(list(self.install.skipped)[:4])
+        return (f"{len(self.install.skipped)} submodule(s) kept the model's own code "
+                f"instead of the extracted implementation: {first}")
 
     def render(self) -> str:
         lines: list[str] = []
@@ -199,6 +218,7 @@ def emulate(
     place_max_memory: dict | None = None,
     impl_dirs: dict[str, Any] | None = None,
     run_dir: Any = None,
+    out_of_scope: tuple[str, ...] = (),
 ) -> EmulationReport:
     """Assemble from dumps, install the implementations, generate, and judge.
 
@@ -210,7 +230,8 @@ def emulate(
 
     model, device = move_to_device(build_model(), device)
     poison_parameters(model, only=plan_owned_parameters(model, graph))
-    report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill)
+    report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill,
+                                  out_of_scope=out_of_scope)
     if impl_dirs:
         from model_partition.runtime.assemble import install_implementations
 
@@ -267,8 +288,12 @@ def _capture_and_check(
     try:
         with torch.no_grad():
             forward_no_cache(model, input_ids)
-    except Exception:
-        return []
+    except Exception as exc:
+        # A forward that did not happen is not a set of boundaries that matched. An
+        # empty list would make `all(...)` true and report the absence of the check as
+        # the check passing.
+        return [Comparison(name="boundaries", passed=False, cosine=0.0,
+                           reason=f"the boundary forward failed: {exc}")]
     finally:
         for handle in handles:
             handle.remove()

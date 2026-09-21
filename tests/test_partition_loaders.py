@@ -436,3 +436,101 @@ def test_a_downloaded_shard_is_visible_where_the_run_looks(tmp_path, monkeypatch
     assert paths == [snapshot / "model.safetensors"]
     assert result.missing_shards() == []
     assert (snapshot / "model.safetensors").read_bytes() == b"\x01" * 16
+
+
+# -- streaming weights for a model that cannot be resident ---------------------
+
+
+def test_streaming_reproduces_the_resident_model(repo):
+    """Holding one module's weights at a time must not change what the model computes."""
+    import torch
+
+    from model_partition.ingest import ingest
+    from model_partition.loaders import build_loader
+    from tests.fixtures.tiny_llm import sample_inputs
+
+    result = ingest(local_spec(repo))
+    loader = build_loader(result)
+    resident = loader.build().model
+    streamed_loader = build_loader(result)
+    streamed = streamed_loader.build_streamed(device="cpu")
+
+    ids = sample_inputs(1, 8)
+    with torch.no_grad():
+        expected = resident(ids)
+        actual = streamed.model(ids)
+    assert torch.allclose(actual.float(), expected.float(), atol=1e-4), \
+        (actual.float() - expected.float()).abs().max()
+
+
+def test_streaming_leaves_the_big_tensors_on_meta_between_calls(repo):
+    """The point is the peak: a streamed weight is not resident when nothing is running."""
+    import torch
+
+    from model_partition.ingest import ingest
+    from model_partition.loaders import build_loader
+    from model_partition.loaders.streamed import install_streaming, build_index
+    from tests.fixtures.tiny_llm import sample_inputs
+
+    result = ingest(local_spec(repo))
+    with torch.device("meta"):
+        model = build_loader(result)._instantiate(None)
+    report = install_streaming(model, build_index(sorted(repo.glob("*.safetensors"))),
+                               device="cpu", keep_bytes=0)
+    assert report.streamed_tensors and not report.unresolved
+    assert all(p.is_meta for _, p in model.named_parameters())
+
+    with torch.no_grad():
+        model(sample_inputs(1, 8))
+    # Released again afterwards, which is what bounds the peak to one module.
+    assert all(p.is_meta for _, p in model.named_parameters())
+
+
+def test_rename_rules_map_checkpoint_keys_onto_model_names():
+    """A vendor's code and its published weights need not agree on names."""
+    from model_partition.loaders.streamed import rename
+
+    rules = ((r"^model\.", ""), ("self_attn", "attn"), (r"^(?!vision\.)(.*?)mlp", r"\1ffn"),
+             ("weight_scale_inv", "scale"))
+    assert rename("model.layers.0.self_attn.wq_b.weight", rules) == "layers.0.attn.wq_b.weight"
+    assert rename("model.layers.3.mlp.experts.7.gate.weight", rules) == \
+        "layers.3.ffn.experts.7.gate.weight"
+    assert rename("vision.blocks.1.mlp.fc1.weight", rules) == "vision.blocks.1.mlp.fc1.weight"
+    assert rename("model.layers.0.attn.wo_b.weight_scale_inv", rules) == \
+        "layers.0.attn.wo_b.scale"
+
+
+def test_a_checkpoint_missing_a_weight_is_refused_not_shrugged_off(repo):
+    """A parameter left at its initial value would be traced, dumped and 'verified'."""
+    from safetensors.torch import load_file
+
+    loader = build_loader(ingest(local_spec(repo)))
+    model = loader.build_config_only().model
+    state = load_file(str(repo / "model.safetensors"))
+    dropped = next(k for k in state if k.endswith("weight"))
+    del state[dropped]
+    with pytest.raises(LoaderError, match="not in the checkpoint"):
+        loader._load_into(model, state)
+
+
+def test_unexpected_checkpoint_keys_are_still_tolerated(repo):
+    """A checkpoint carries parts a run excludes, and those must not fail the load."""
+    from safetensors.torch import load_file
+
+    loader = build_loader(ingest(local_spec(repo)))
+    model = loader.build_config_only().model
+    state = load_file(str(repo / "model.safetensors"))
+    state["vision.blocks.0.attn.qkv.weight"] = torch.zeros(4, 4)
+    assert loader._load_into(model, state) is model
+
+
+def test_renamed_checkpoint_keys_are_mapped_before_loading(repo):
+    """The vendor's code and its published weights need not agree on names."""
+    from safetensors.torch import load_file
+
+    result = ingest(local_spec(repo))
+    loader = build_loader(result)
+    loader.rename = (("^published[.]", ""),)
+    model = loader.build_config_only().model
+    state = {f"published.{k}": v for k, v in load_file(str(repo / "model.safetensors")).items()}
+    assert loader._load_into(model, state) is model

@@ -15,12 +15,14 @@ __all__ = [
 ]
 
 
-def build_loader(result, device_map=None, max_memory=None) -> ModelLoader:
+def build_loader(result, device_map=None, max_memory=None, tokenizer=None) -> ModelLoader:
     """Construct the loader named by an :class:`~model_partition.ingest.IngestResult`.
 
     ``device_map``/``max_memory`` request layer placement across GPU and host, so
-    a checkpoint larger than the GPU still runs most of its compute there. Only
-    the transformers path supports it; vendor code is loaded on one device.
+    a checkpoint larger than the GPU still runs most of its compute there; the vendor
+    path instead streams a module's weights in for its forward and drops them after,
+    which is what a checkpoint larger than GPU *and* host needs. ``tokenizer`` is for a
+    vendor factory that builds part of the model from the vocabulary.
     """
     spec = result.spec
     if result.loader == "repo_code":
@@ -31,6 +33,8 @@ def build_loader(result, device_map=None, max_memory=None) -> ModelLoader:
             dtype=spec.dtype,
             code_paths=tuple(result.code_paths or spec.code_paths),
             trust_remote_code=spec.trust_remote_code,
+            rename=spec.checkpoint.rename,
+            tokenizer=tokenizer,
         )
     if result.loader == "transformers":
         return TransformersLoader(

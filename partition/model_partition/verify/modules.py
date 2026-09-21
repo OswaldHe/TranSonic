@@ -223,7 +223,13 @@ def verify_modules(
     if poison:
         poison_parameters(model, only=plan_owned_parameters(model, graph))
 
-    wanted_modules = module_ids or bundle.module_ids()
+    # Every module of the plan, not only the ones the trace has records for. A module
+    # with no records — a functional node, or one whose submodule was never called — is
+    # a hole in the coverage, and reporting it is the difference between "verified" and
+    # "verified the parts that happened to be recorded".
+    planned = [m.id for m in graph.partitioned_modules]
+    recorded = bundle.module_ids()
+    wanted_modules = module_ids or planned + [m for m in recorded if m not in set(planned)]
     wanted_samples = sample_ids or bundle.sample_ids()
 
     for module_id in wanted_modules:
@@ -282,6 +288,17 @@ def verify_modules(
         # group would ask for a prefix of the module.
         branch = graph_module.is_parallel
         try:
+            if not bundle.select(module_id=module_id):
+                # In the plan, absent from the trace: nothing was recorded for it, so
+                # there is nothing to check it against. Reported rather than skipped
+                # over, because a module nobody verified is not a module that passed.
+                report.results.append(ModuleVerification(
+                    module_id=module_id, sample_id="-", passed=False,
+                    weights_applied=applied, device=residency,
+                    skipped="the trace holds no record of this module, so it has no "
+                            "reference to check against",
+                ))
+                continue
             for sample_id in wanted_samples:
                 records = bundle.select(module_id=module_id, sample_id=sample_id)
                 if not records:

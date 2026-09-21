@@ -33,15 +33,29 @@ class FillReport:
 
     applied: int = 0
     missing: list[str] = field(default_factory=list)
+    #: Parameters no module of the plan claims, which the plan should have covered.
     unclaimed: list[str] = field(default_factory=list)
+    #: Parameters the spec deliberately leaves unpartitioned.
+    out_of_scope: list[str] = field(default_factory=list)
     by_module: dict[str, int] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
-        return not self.missing
+        """Every parameter the plan is responsible for came from a dump.
+
+        ``unclaimed`` counts too. A parameter no plan module lists keeps whatever the
+        checkpoint put there, so emulation would run on live weights while reporting
+        that it ran on dumps — the same hole as a missing dump, reached from the other
+        side. Parts the spec puts out of scope are filtered out before they get here.
+        """
+        return not self.missing and not self.unclaimed
 
     def summary(self) -> str:
         text = f"{self.applied} parameter(s) filled from dumps"
+        if self.unclaimed:
+            text += f"; {len(self.unclaimed)} claimed by no module of the plan"
+        if self.out_of_scope:
+            text += f"; {len(self.out_of_scope)} out of scope"
         if self.missing:
             preview = ", ".join(self.missing[:5])
             text += f"; {len(self.missing)} missing ({preview}{'...' if len(self.missing) > 5 else ''})"
@@ -54,8 +68,13 @@ def fill_from_dumps(
     graph: PartitionGraph,
     device: str = "cpu",
     strict: bool = True,
+    out_of_scope: tuple[str, ...] = (),
 ) -> FillReport:
-    """Overwrite every partitioned module's parameters with its recorded values."""
+    """Overwrite every partitioned module's parameters with its recorded values.
+
+    ``out_of_scope`` names markers for subtrees the run deliberately does not partition
+    — a vision tower, an MTP head — whose parameters are expected to be unclaimed.
+    """
     import torch
 
     report = FillReport()
@@ -86,14 +105,23 @@ def fill_from_dumps(
         report.applied += count
 
     for name, _ in list(model.named_parameters()) + list(model.named_buffers()):
-        if name not in claimed:
+        if name in claimed:
+            continue
+        if any(marker in f".{name}" for marker in out_of_scope):
+            report.out_of_scope.append(name)
+        else:
             report.unclaimed.append(name)
 
     if strict and not report.complete:
-        raise StreamingError(
-            f"Cannot assemble the model from dumps: {len(report.missing)} parameter(s) "
-            f"have no dumped value ({', '.join(report.missing[:8])})"
-        )
+        detail = []
+        if report.missing:
+            detail.append(f"{len(report.missing)} parameter(s) have no dumped value "
+                          f"({', '.join(report.missing[:6])})")
+        if report.unclaimed:
+            detail.append(f"{len(report.unclaimed)} parameter(s) belong to no module of "
+                          f"the plan and would keep their checkpoint values "
+                          f"({', '.join(report.unclaimed[:6])})")
+        raise StreamingError("Cannot assemble the model from dumps: " + "; ".join(detail))
     return report
 
 

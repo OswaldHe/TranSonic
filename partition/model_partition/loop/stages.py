@@ -242,6 +242,19 @@ def _included_subtrees(spec: ModelSpec) -> tuple[str, ...]:
     ) if on)
 
 
+def _excluded_markers(spec: ModelSpec) -> tuple[str, ...]:
+    """Name fragments of the subtrees this run does not partition.
+
+    Their parameters are expected to be claimed by no module, and assembling from dumps
+    has to tell that apart from a parameter the plan simply forgot.
+    """
+    from model_partition.sizing import SUBTREE_MARKERS
+
+    included = set(_included_subtrees(spec))
+    return tuple(marker for name, markers in SUBTREE_MARKERS.items()
+                 if name not in included for marker in markers)
+
+
 def _storage_estimate(ctx: LoopContext):
     inventory = ctx.inventory
     assert inventory is not None
@@ -449,13 +462,25 @@ def _impl_fingerprint(ctx: LoopContext) -> str:
 # -- stage: trace ------------------------------------------------------------
 
 
-def _memory_shortfall(ctx: LoopContext) -> str:
+def _can_stream(ctx: LoopContext) -> bool:
+    """Whether this model's weights can be read per module instead of held.
+
+    Needs a checkpoint of safetensors shards to read from and a loader that knows how:
+    the vendor path builds on meta and materializes each module for its own forward.
+    """
+    if not (ctx.result and ctx.result.loader == "repo_code"):
+        return False
+    return any(ctx.result.root.glob("*.safetensors"))
+
+
+def memory_shortfall(ctx: LoopContext) -> str:
     """Why this machine cannot hold the model for a forward, or "" if it can.
 
-    Unlike every later stage, tracing needs the *whole* model resident: it runs a real
-    forward and records what each module saw. Partitioning cannot make that smaller.
-    Checked up front because the alternative is discovering it by allocating until the
-    kernel kills the process, which takes the run's terminal with it.
+    Unlike every later stage, tracing needs the whole model to *run*: it records what
+    each module saw during a real forward, and partitioning cannot make a forward
+    smaller. Whether it must be *resident* is a different question — see
+    :func:`_can_stream` — but when it must be and does not fit, saying so beats
+    allocating until the kernel kills the process and takes the terminal with it.
     """
     if ctx.inventory is None:
         return ""
@@ -496,9 +521,14 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         return StageResult(ok=False, detail=(
             "no sample inputs: set inputs.short (and optionally inputs.long) in the spec"
         ))
-    shortfall = _memory_shortfall(ctx)
-    if shortfall:
+    shortfall = memory_shortfall(ctx)
+    if shortfall and not _can_stream(ctx):
         return StageResult(ok=False, detail=shortfall)
+    if shortfall:
+        ctx.notes.append(
+            f"{shortfall} Streaming the weights instead: one module's at a time, read "
+            "from the shards for its forward and released after."
+        )
     # A re-trace replaces the previous one entirely. Leaving the old blobs behind
     # would grow the run by a whole trace per iteration, and retention only ever
     # sees what the new manifest lists.
@@ -875,6 +905,14 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     # host so generation still uses the accelerator.
     device = _host_device(ctx)
     _, place_max_memory = ctx.placement() if device == "cpu" else (None, None)
+    impl_dirs = _impl_dirs(ctx)
+    if not impl_dirs:
+        # Generating through the model's own modules would print tokens the deliverable
+        # never produced and compare the reference against itself.
+        return StageResult(ok=False, detail=(
+            "no extracted implementations to emulate with: extraction produced none, so "
+            "generation would be the model's own code rather than the loop's"
+        ))
 
     report = emulate(
         ctx.build_model, bundle, ctx.graph,
@@ -886,7 +924,8 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
         strict_fill=True, place_max_memory=place_max_memory,
         # Generation runs the loop's own implementations, not the model's modules:
         # these tokens are the deliverable's tokens or they are worth nothing.
-        impl_dirs=_impl_dirs(ctx), run_dir=ctx.layout.root,
+        impl_dirs=impl_dirs, run_dir=ctx.layout.root,
+        out_of_scope=_excluded_markers(ctx.spec),
     )
     ctx.emulate_report = report
     (ctx.layout.reports_dir / "emulate.json").write_text(json.dumps(report.to_dict(), indent=2))
@@ -898,11 +937,14 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
             for o in report.outcomes for c in o.failed_boundaries()
         })
         broken = [o for o in report.outcomes if not o.mechanically_passed]
+        gap = report.install_gap()
+        detail = (f"{len(broken)}/{len(report.outcomes)} sample(s) did not reproduce "
+                  f"the model; {len(boundary_failures)} boundary mismatch(es)")
+        if gap:
+            detail = gap if not broken else f"{detail}. {gap}"
         return StageResult(
             ok=False, repairable=bool(boundary_failures), failing_modules=boundary_failures,
-            detail=(f"{len(broken)}/{len(report.outcomes)} sample(s) did not reproduce "
-                    f"the model; {len(boundary_failures)} boundary mismatch(es)"),
-            metrics=_emulate_metrics(report),
+            detail=detail, metrics=_emulate_metrics(report),
         )
 
     declined = report.judge_declined

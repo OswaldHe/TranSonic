@@ -70,7 +70,7 @@ class HarnessGuard:
 
     root: Path
     contents: dict[str, bytes] = field(default_factory=dict)
-    stamps: dict[str, tuple[int, int]] = field(default_factory=dict)
+    stamps: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
 
     @classmethod
     def capture(cls, root: str | Path) -> HarnessGuard:
@@ -86,8 +86,7 @@ class HarnessGuard:
                 continue
             for path in directory.rglob("*"):
                 if path.is_file():
-                    stat = path.stat()
-                    guard.stamps[str(path.relative_to(base))] = (stat.st_size, stat.st_mtime_ns)
+                    guard.stamps[str(path.relative_to(base))] = _stamp(path)
         return guard
 
     def restore(self) -> GuardReport:
@@ -105,7 +104,20 @@ class HarnessGuard:
             if not path.is_file():
                 report.tampered.append(name)
                 continue
-            stat = path.stat()
-            if (stat.st_size, stat.st_mtime_ns) != stamp:
+            if _stamp(path) != tuple(stamp):
                 report.tampered.append(name)
         return report
+
+
+def _stamp(path: Path) -> tuple[int, int, int, int]:
+    """A fingerprint of a reference tensor that an agent cannot reproduce at will.
+
+    Size and mtime alone are not enough: `utime()` sets mtime to anything, so a file
+    could be rewritten and its stamp restored — and these files are the reference every
+    check is measured against. Inode and *change* time close that: ctime moves on any
+    write and no unprivileged process can set it back, and a rewrite-and-replace shows
+    up as a new inode. Digesting tens of gigabytes of feature maps around every agent
+    call would cost more than the call.
+    """
+    stat = path.stat()
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)

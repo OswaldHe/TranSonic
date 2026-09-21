@@ -94,3 +94,25 @@ def test_a_new_file_is_not_the_guard_s_business(tmp_path):
 
 def test_capture_on_an_empty_directory_is_harmless(tmp_path):
     assert HarnessGuard.capture(tmp_path).restore().clean
+
+
+def test_a_rewritten_reference_is_caught_even_with_its_mtime_restored(tmp_path):
+    """The trace is the acceptance reference, and mtime is settable by anyone."""
+    import os
+
+    from model_partition.loop.guard import HarnessGuard
+
+    root = tmp_path / "run"
+    (root / "trace" / "activations").mkdir(parents=True)
+    blob = root / "trace" / "activations" / "reference.bin"
+    blob.write_bytes(b"\x01" * 64)
+    before = blob.stat()
+
+    guard = HarnessGuard.capture(root)
+    # Same length, same mtime, different numbers: what an agent would do to make its
+    # own output look correct.
+    blob.write_bytes(b"\x02" * 64)
+    os.utime(blob, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    report = guard.restore()
+    assert "trace/activations/reference.bin" in report.tampered

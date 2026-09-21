@@ -90,6 +90,23 @@ class PartitionSpec:
 
 
 @dataclass
+class CheckpointSpec:
+    """How the published checkpoint's names relate to the model's own.
+
+    A vendor's inference code and its published weights do not always agree on names —
+    ``self_attn`` against ``attn``, a block scale called ``weight_scale_inv`` — and the
+    vendor's conversion script reconciles them by rewriting the checkpoint. ``rename``
+    is that mapping as data, applied to each checkpoint key in order, so the weights
+    can be read where they are instead of being copied into a second layout.
+    """
+
+    rename: tuple[tuple[str, str], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rename": [list(rule) for rule in self.rename]}
+
+
+@dataclass
 class ScopeSpec:
     """Structural parts the loop owns.
 
@@ -119,6 +136,7 @@ class ModelSpec:
     trust_remote_code: bool = False
     dtype: str = "bfloat16"
     scope: ScopeSpec = field(default_factory=ScopeSpec)
+    checkpoint: CheckpointSpec = field(default_factory=CheckpointSpec)
     inputs: InputSpec = field(default_factory=InputSpec)
     partition: PartitionSpec = field(default_factory=PartitionSpec)
     overrides: dict[str, Any] = field(default_factory=dict)
@@ -172,6 +190,7 @@ class ModelSpec:
             "dtype": self.dtype,
             "enabled": self.enabled,
             "scope": {"vision": self.scope.vision, "mtp": self.scope.mtp, "engram": self.scope.engram},
+            "checkpoint": self.checkpoint.to_dict(),
             "partition": self.partition.to_dict(),
             "inputs": {
                 "short": self.inputs.short,
@@ -201,8 +220,8 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
 
     unknown = set(data) - {
         "name", "source", "revision", "loader", "code_paths", "entry", "config_file",
-        "trust_remote_code", "dtype", "scope", "inputs", "partition", "overrides",
-        "enabled", "notes",
+        "trust_remote_code", "dtype", "scope", "checkpoint", "inputs", "partition",
+        "overrides", "enabled", "notes",
     }
     if unknown:
         raise SpecError(f"Unknown spec key(s): {', '.join(sorted(unknown))}")
@@ -255,6 +274,19 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         split_attention_ffn=bool(raw_partition.get("split_attention_ffn", False)),
     )
 
+    raw_checkpoint = data.get("checkpoint") or {}
+    if not isinstance(raw_checkpoint, dict):
+        raise SpecError("checkpoint must be a mapping")
+    checkpoint_unknown = set(raw_checkpoint) - {"rename"}
+    if checkpoint_unknown:
+        raise SpecError(f"Unknown checkpoint key(s): {', '.join(sorted(checkpoint_unknown))}")
+    rules = raw_checkpoint.get("rename") or []
+    if not isinstance(rules, list) or not all(
+            isinstance(r, (list, tuple)) and len(r) == 2 and all(isinstance(p, str) for p in r)
+            for r in rules):
+        raise SpecError("checkpoint.rename must be a list of [pattern, replacement] pairs")
+    checkpoint = CheckpointSpec(rename=tuple((str(a), str(b)) for a, b in rules))
+
     code_paths = data.get("code_paths") or []
     if not isinstance(code_paths, list) or not all(isinstance(c, str) for c in code_paths):
         raise SpecError("code_paths must be a list of strings")
@@ -279,6 +311,7 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         trust_remote_code=bool(data.get("trust_remote_code", False)),
         dtype=str(data.get("dtype", "bfloat16")),
         scope=scope,
+        checkpoint=checkpoint,
         inputs=inputs,
         partition=partition,
         overrides=dict(overrides),

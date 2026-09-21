@@ -19,8 +19,22 @@ loader: repo_code
 entry: inference/model.py
 code_paths: [inference, encoding]
 config_file: inference/config.json
-dtype: bfloat16
+# The checkpoint's own dtypes: fp8 weights with int8-packed fp4 experts, which is what
+# the vendor's kernels take. Casting to bfloat16 would quadruple 278 GiB of in-scope
+# weights, and the fp8/fp4 GEMMs are the thing a kernel author is here to optimize.
+dtype: checkpoint
 trust_remote_code: true     # required: importing inference/model.py runs repo code
+
+checkpoint:
+  # The published weights are in HuggingFace names; the vendor's inference code uses
+  # its own. `inference/convert.py` reconciles them by rewriting the checkpoint into a
+  # second copy — 475 GiB we do not have — so the same mapping is applied on read.
+  rename:
+    - ['^model\.', '']
+    - ['self_attn', 'attn']
+    - ['^(?!vision\.)(.*?)mlp', '\1ffn']
+    - ['weight_scale_inv', 'scale']
+    - ['e_score_correction_bias', 'bias']
 
 scope:
   vision: false

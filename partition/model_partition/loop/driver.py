@@ -102,6 +102,20 @@ def _trace_is_whole(layout: RunLayout) -> bool:
     return not (payload.get("metadata") or {}).get("retention")
 
 
+def _must_stream(ctx: Any) -> bool:
+    """Whether this model is too large to be resident on GPU and host together."""
+    from model_partition.loop.stages import memory_shortfall
+
+    return bool(memory_shortfall(ctx))
+
+
+def _stream_device(ctx: Any) -> str:
+    """Where a streamed module's weights land: the accelerator, if there is one."""
+    if ctx.budget and ctx.budget.gpu and ctx.options.device.startswith("cuda"):
+        return ctx.options.trace_device or ctx.options.device
+    return "cpu"
+
+
 def _release_accelerator() -> None:
     """Return cached blocks to the driver so the next stage sees a full card."""
     import gc
@@ -200,7 +214,15 @@ class PartitionLoop:
                 fetched["done"] = True
 
             device_map, max_memory = ctx.placement() if placed else (None, None)
-            loaded = build_loader(result, device_map=device_map, max_memory=max_memory).build()
+            loader = build_loader(result, device_map=device_map, max_memory=max_memory,
+                                 tokenizer=ctx.tokenizer)
+            if placed and _must_stream(ctx) and hasattr(loader, "build_streamed"):
+                # Too large to be resident anywhere: hold one module's weights at a
+                # time instead. Slower per forward, and the alternative is no forward.
+                loaded = loader.build_streamed(device=_stream_device(ctx))
+                self.report(f"  streaming weights: {loaded.metadata.get('streaming', '')}")
+            else:
+                loaded = loader.build()
             ctx.last_placement = loaded.placement
             return loaded.model
 

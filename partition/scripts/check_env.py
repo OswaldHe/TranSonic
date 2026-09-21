@@ -14,7 +14,8 @@ def main() -> int:
     ok = True
 
     print("dependencies")
-    for name in ("torch", "safetensors", "transformers", "huggingface_hub", "yaml", "jinja2"):
+    for name in ("torch", "safetensors", "transformers", "huggingface_hub", "yaml",
+                 "jinja2", "accelerate"):
         try:
             module = __import__(name)
             version = getattr(module, "__version__", "?")
