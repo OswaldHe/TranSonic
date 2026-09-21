@@ -1,7 +1,11 @@
-# Quantization rehearsal for the DeepSeek line: text-only, fp8 weights with
-# fp4-packed experts, ~291 GB on disk (fits the 465 GB volume). Ships its own
-# reference implementation under inference/, which the loader prefers over
-# transformers -- transformers has no deepseek_v4 text+MoE path for this repo.
+# fp8 weights with fp4-packed experts, text-only: 159.6 GB across 46 shards,
+# 43 layers, 256 routed experts plus 1 shared at top-6, hidden 4096, MLA-style
+# attention with a lightning indexer and cross-layer KV reuse.
+#
+# The vendor code under inference/ is the only implementation whose module names
+# match this checkpoint: transformers recognizes `deepseek_v4` but names its modules
+# the HF way (`self_attn`, `mlp`, `q_proj`) with no conversion mapping for these
+# tensors, so it would load nothing.
 name: deepseek-v4-flash
 source: hf:deepseek-ai/DeepSeek-V4-Flash
 loader: repo_code
@@ -30,18 +34,29 @@ partition:
     per-module budget, or when two computations inside it would genuinely be
     developed and tuned separately.
 
+    This model routes across layers: attention reads KV from an earlier layer and
+    an indexer is fed from another. Express those as tensor edges rather than
+    duplicating the computation.
+
 inputs:
   # max_short / max_long cap how many prompts of each set this run uses. Cost is
   # per sample: one full traced forward, one set of dumped feature maps per module,
   # and one generation pass during emulation. Omit for no cap.
   short: ../../inputs/short.jsonl
   long: ../../inputs/long.jsonl
-  max_short: 2
-  max_long: 1
+  max_short: 1
+  max_long: 0
 
 overrides:
-  cache_dequant: false      # a bf16 mirror of 291 GB of fp8/fp4 will not fit
+  cache_dequant: false      # a bf16 mirror of 160 GB of fp8/fp4 would not fit
+  cache_weights: false      # nor would a second copy; read them from the shards
 
 notes: |
-  Not yet exercised end to end. Requires fp8 block dequantization (weight_block_size
-  32x32, ue8m0 scales) and fp4 expert unpacking to run on an L40S.
+  Larger than this machine's memory (46 GiB GPU + 124 GiB host), so `inspect` and
+  `plan` work from metadata alone while `trace` onward needs either more memory or
+  disk offload. Run `autohelix partition inspect deepseek-v4-flash` first: it
+  reports the checkpoint's shape and the projected artifact size without fetching
+  a single shard.
+
+  encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
+  tokenizer ground truth and are worth checking before anything else.

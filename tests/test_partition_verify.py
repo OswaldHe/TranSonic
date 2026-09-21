@@ -572,3 +572,114 @@ def test_identical_zero_tensors_match():
     from model_partition.verify.numerics import compare
 
     assert compare(torch.zeros(4), torch.zeros(4)).passed
+
+
+# -- heterogeneous groups ----------------------------------------------------
+
+
+def test_a_group_is_handed_every_argument_its_submodules_received(tiny_run):
+    """A norm takes only the hidden state; the attention after it needs more.
+
+    Handing the group only its first submodule's recorded call leaves the attention
+    without its rotary embeddings and mask, which fails at the call rather than in
+    the numbers.
+    """
+    from model_partition.runtime.module_runner import decode_call, decode_group_call
+
+    module_id = next(m.id for m in tiny_run.graph.partitioned_modules
+                     if len(m.submodules) > 1)
+    records = tiny_run.bundle.select(module_id=module_id,
+                                     sample_id=tiny_run.sample_ids[0])
+    assert len(records) > 1
+
+    _, first = decode_call(records[0], tiny_run.bundle.store)
+    _, merged = decode_group_call(records, tiny_run.bundle.store)
+    every = set()
+    for record in records:
+        every |= set(decode_call(record, tiny_run.bundle.store)[1])
+
+    assert set(merged) == every
+    assert set(first) <= set(merged)
+
+
+def test_the_group_call_keeps_the_entry_point_s_value_for_a_shared_keyword():
+    """First occurrence wins, so a keyword means what the group's input saw."""
+    from model_partition.runtime.module_runner import decode_group_call
+    from model_partition.trace import CallRecord
+
+    records = [
+        CallRecord(module_id="m", submodule="a", sample_id="s", order=0,
+                   args=[], kwargs={"depth": 0, "shared": "first"}),
+        CallRecord(module_id="m", submodule="b", sample_id="s", order=1,
+                   args=[], kwargs={"shared": "second", "extra": 7}),
+    ]
+    from model_partition.tensorstore import TensorStore
+
+    _, kwargs = decode_group_call(records, TensorStore("/nonexistent"))
+    assert kwargs == {"depth": 0, "shared": "first", "extra": 7}
+
+
+def test_each_submodule_gets_only_the_keywords_it_declares():
+    """Passing a norm the attention's mask is a TypeError, not a wrong number."""
+    from model_partition.runtime.baseline import _accepted_kwargs
+
+    class Norm:
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class Attention:
+        def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
+            return hidden_states
+
+    class Layer:
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    offered = {"position_embeddings": 1, "attention_mask": 2, "hidden_states": 3}
+    assert _accepted_kwargs(Norm(), offered) == {}
+    assert _accepted_kwargs(Attention(), offered) == {
+        "position_embeddings": 1, "attention_mask": 2}
+    # A decoder layer taking **kwargs wants everything except the flowing tensor,
+    # which is passed positionally — the trace records it as `hidden_states=`.
+    assert _accepted_kwargs(Layer(), offered) == {
+        "position_embeddings": 1, "attention_mask": 2}
+
+
+# -- running out of accelerator memory ---------------------------------------
+
+
+def test_an_out_of_memory_check_moves_to_the_host_and_still_counts(tiny_run, tmp_path,
+                                                                  monkeypatch):
+    """Full attention at long context is quadratic; that is capacity, not error."""
+    from model_partition.verify import modules as modules_module
+
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    target = next(m.id for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    real_run_once = modules_module._run_once
+    calls = {"n": 0}
+
+    def flaky(model, record, bundle, builder, device, branch=False, group=None):
+        if record.module_id == target and device == "cuda" and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("CUDA out of memory. Tried to allocate 16.00 GiB")
+        return real_run_once(model, record, bundle, builder, device,
+                             branch=branch, group=group)
+
+    monkeypatch.setattr(modules_module, "_run_once", flaky)
+    monkeypatch.setattr(modules_module, "move_submodules", lambda *a, **k: 0)
+
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            model_device="cpu", module_device="cuda",
+                            impl_dirs=impl_dirs)
+    assert calls["n"] == 1, "the failure should have been injected once"
+    moved = [r for r in report.checked if r.note]
+    assert moved and "not enough cuda memory" in moved[0].note
+    assert all(r.passed for r in report.checked), report.render()
+
+
+def test_an_allocation_failure_is_told_apart_from_a_real_error():
+    from model_partition.verify.modules import _is_out_of_memory
+
+    assert _is_out_of_memory(RuntimeError("CUDA out of memory. Tried to allocate 16 GiB"))
+    assert not _is_out_of_memory(RuntimeError("shape mismatch"))

@@ -27,8 +27,12 @@ ST_DTYPES: dict[str, tuple[str, int]] = {
     "BOOL": ("bool", 1),
 }
 
-#: Matches the repeating-stack index in a parameter name, e.g. ``...layers.12.``
-LAYER_RE = re.compile(r"^(?P<prefix>.*\.(?:layers|blocks|h)\.)(?P<index>\d+)(?P<suffix>\..*)$")
+#: Matches the repeating-stack index in a parameter name, e.g. ``...layers.12.``.
+#: The prefix is optional: a vendor checkpoint may name its stack ``layers.0.attn``
+#: with nothing in front of it.
+LAYER_RE = re.compile(
+    r"^(?P<prefix>(?:.*\.)?(?:layers|blocks|h)\.)(?P<index>\d+)(?P<suffix>\..*)$"
+)
 
 #: Matches a per-expert parameter, e.g. ``...experts.37.gate_proj.weight``
 EXPERT_RE = re.compile(r"^(?P<prefix>.*\.experts\.)(?P<index>\d+)(?P<suffix>\..*)$")

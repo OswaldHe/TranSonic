@@ -773,3 +773,54 @@ def test_the_reviewer_archives_each_review_and_requires_one(tiny_run, tmp_path):
     planner.invoke = lambda **kwargs: AgentOutcome(ok=True)
     outcome = planner.review(layout, context, 3)
     assert not outcome.ok and "wrote no review.md" in outcome.error
+
+
+# -- prompt rendering --------------------------------------------------------
+#
+# Prompts render with StrictUndefined, so a key the context does not supply is an
+# error at the moment the agent would have been invoked — after tracing.
+
+
+@pytest.mark.parametrize("prompt", ["planner.md", "reviewer.md", "repair_module.md"])
+def test_every_prompt_renders_from_the_real_context(tiny_run, tmp_path, prompt):
+    from model_partition.loop.stages import (
+        StageResult,
+        dump_agent_context,
+        stage_ingest,
+        stage_plan,
+    )
+    from model_partition.planner.agent import render_prompt
+
+    ctx = loop_for(tiny_run, tmp_path).build_context()
+    stage_ingest(ctx)
+    stage_plan(ctx)
+    context = dump_agent_context(ctx, "verify_modules", StageResult(
+        ok=False, detail="cosine 0.7", failing_modules=["layers.0"]))
+
+    extra = {"graph": ctx.graph} if prompt == "planner.md" else {}
+    text = render_prompt(prompt, **context, **extra)
+    assert "layers.0" in text and tiny_run.spec.source in text
+
+
+def test_the_planner_prompt_carries_the_instruction_and_the_review(tiny_run, tmp_path):
+    from model_partition.loop.stages import StageResult, dump_agent_context, stage_ingest
+    from model_partition.planner.agent import render_prompt
+
+    ctx = loop_for(tiny_run, tmp_path, partition_prompt="split the FFN off").build_context()
+    stage_ingest(ctx)
+    ctx.layout.review_file.parent.mkdir(parents=True, exist_ok=True)
+    ctx.layout.review_file.write_text("the gate is transposed\n")
+
+    context = dump_agent_context(ctx, "verify_modules", StageResult(ok=False, detail="d"))
+    text = render_prompt("planner.md", graph=ctx.graph, **context)
+    assert "split the FFN off" in text
+    assert "the gate is transposed" in text
+
+
+def test_the_planner_prompt_states_the_granularity_trade_off():
+    from model_partition.planner.agent import PROMPTS_DIR
+
+    text = (PROMPTS_DIR / "planner.md").read_text()
+    assert "Too coarse" in text and "Too fine" in text
+    assert "fusion" in text or "fused" in text
+    assert "Trainium" not in text

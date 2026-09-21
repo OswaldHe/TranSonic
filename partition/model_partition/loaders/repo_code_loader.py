@@ -25,6 +25,11 @@ BUILDER_NAMES = ("build_model", "build", "load_model", "create_model")
 #: Class names tried when no factory function is found, called as ``Cls(config)``.
 CLASS_NAMES = ("Transformer", "Model", "ModelForCausalLM", "CausalLM")
 
+#: Dataclass names a vendor module uses for its own settings object. Reference
+#: implementations usually take one of these rather than a plain dict, so the
+#: config is converted before the factory sees it.
+ARGS_CLASS_NAMES = ("ModelArgs", "Args", "ModelConfig", "Config", "TransformerConfig")
+
 
 @dataclass
 class RepoCodeLoader:
@@ -87,16 +92,44 @@ class RepoCodeLoader:
             "point 'entry' at a module with a model factory"
         )
 
+    def _settings(self, module) -> Any:
+        """The object the factory wants: the vendor's args dataclass, or the dict.
+
+        A reference implementation typically reads ``args.dim`` rather than
+        ``config["dim"]``, so the config is fed through the module's own settings
+        class — keeping only the fields it declares, since a repo's config file
+        carries more than its model code uses.
+        """
+        from dataclasses import fields, is_dataclass
+
+        for name in ARGS_CLASS_NAMES:
+            candidate = getattr(module, name, None)
+            if not (isinstance(candidate, type) and is_dataclass(candidate)):
+                continue
+            declared = {f.name: f for f in fields(candidate)}
+            known = {}
+            for key, value in self.config.items():
+                field = declared.get(key)
+                if field is None:
+                    continue
+                # JSON has no tuples, so a field declared as one arrives as a list.
+                if isinstance(value, list) and "tuple" in str(field.type).lower():
+                    value = tuple(value)
+                known[key] = value
+            return candidate(**known)
+        return self.config
+
     def _instantiate(self, state_dict: dict[str, Any] | None):
         module = self._import_entry()
         factory, kind = self._find_factory(module)
+        settings = self._settings(module)
         try:
             if kind == "function":
                 try:
-                    return factory(self.config, state_dict)
+                    return factory(settings, state_dict)
                 except TypeError:
-                    return self._load_into(factory(self.config), state_dict)
-            return self._load_into(factory(self.config), state_dict)
+                    return self._load_into(factory(settings), state_dict)
+            return self._load_into(factory(settings), state_dict)
         except Exception as exc:
             raise LoaderError(f"{self.entry} factory failed: {exc}") from exc
 

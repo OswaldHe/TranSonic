@@ -153,9 +153,21 @@ def test_yaml_round_trip_preserves_structure(tmp_path):
     assert reloaded.metadata == {"planner": "auto"}
 
 
-def test_unknown_kind_is_rejected():
-    with pytest.raises(GraphError, match="unknown kind"):
-        ModuleNode.from_dict({"id": "m", "kind": "quantum"})
+def test_a_malformed_kind_is_rejected():
+    for bad in ("Quantum Thing", "", "MLP"):
+        with pytest.raises(GraphError, match="malformed kind"):
+            ModuleNode.from_dict({"id": "m", "kind": bad})
+
+
+def test_an_unlisted_kind_is_a_warning_not_a_rejection():
+    """Rejecting a plan over an unanticipated name would throw away a good partition."""
+    node = ModuleNode.from_dict({"id": "rotary", "kind": "rope_cache"})
+    assert node.kind == "rope_cache"
+
+    graph = chain_graph()
+    graph.by_id("head").kind = "projection"
+    warnings = graph.validate()
+    assert any("outside the recommended set" in w and "projection" in w for w in warnings)
 
 
 def test_missing_required_key_is_rejected():

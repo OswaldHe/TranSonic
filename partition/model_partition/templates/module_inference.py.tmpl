@@ -78,7 +78,7 @@ def main(argv=None):
 
     from model_partition.runtime.module_impl import ExtractedImpl, run_impl
     from model_partition.runtime.module_runner import (
-        decode_call, first_tensor, load_named_weights,
+        decode_group_call, first_tensor, load_named_weights,
     )
     from model_partition.runtime.standalone import StandaloneError, load_run
 
@@ -89,7 +89,7 @@ def main(argv=None):
         if not records:
             raise StandaloneError(f"No records for {args.module} sample {sample}")
         weights = load_named_weights(run.bundle, args.module, device=args.device)
-        args_, kwargs_ = decode_call(records[0], run.bundle.store, args.device)
+        args_, kwargs_ = decode_group_call(records, run.bundle.store, args.device)
     except StandaloneError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

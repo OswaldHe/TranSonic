@@ -28,16 +28,35 @@ SUBTREE_MARKERS: dict[str, tuple[str, ...]] = {
 DEFAULT_ACTIVATION_MULTIPLIER = 6.0
 
 
-def config_get(config: dict[str, Any], key: str, default: Any = None) -> Any:
-    """Look up ``key`` at the top level, then inside ``text_config``.
+#: Canonical config key -> other spellings of the same value. A vendor config uses
+#: its own vocabulary (DeepSeek's ``dim``, ``n_layers``), and sizing needs the value
+#: rather than the spelling.
+KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "hidden_size": ("dim", "d_model", "n_embd"),
+    "num_hidden_layers": ("n_layers", "num_layers", "n_layer"),
+    "num_attention_heads": ("n_heads", "num_heads", "n_head"),
+    "num_key_value_heads": ("n_kv_heads", "num_kv_heads"),
+    "intermediate_size": ("inter_dim", "ffn_dim", "n_inner"),
+    "moe_intermediate_size": ("moe_inter_dim",),
+    "n_routed_experts": ("num_experts", "num_local_experts"),
+    "rms_norm_eps": ("norm_eps", "layer_norm_eps"),
+}
 
-    Modern multimodal configs nest the language model under ``text_config``.
+
+def config_get(config: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Look up ``key``, trying ``text_config`` and known aliases.
+
+    Modern multimodal configs nest the language model under ``text_config``, and a
+    repo's own inference config often names the same field differently.
     """
-    if key in config:
-        return config[key]
+    scopes = [config]
     text = config.get("text_config")
-    if isinstance(text, dict) and key in text:
-        return text[key]
+    if isinstance(text, dict):
+        scopes.append(text)
+    for name in (key, *KEY_ALIASES.get(key, ())):
+        for scope in scopes:
+            if name in scope:
+                return scope[name]
     return default
 
 
@@ -52,13 +71,21 @@ class QuantProfile:
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> QuantProfile:
+        """Read the scheme from ``quantization_config``, or from the config itself.
+
+        A vendor inference config states the same thing as bare ``dtype`` and
+        ``expert_dtype`` fields, and either way ``expert_dtype`` decides whether the
+        int8 expert tensors hold one value per byte or two — which is the difference
+        between a 10 GiB dequant estimate and a 500 GiB one.
+        """
         raw = config.get("quantization_config") or {}
-        block = raw.get("weight_block_size")
+        block = raw.get("weight_block_size") or config.get("weight_block_size")
+        declared = raw.get("quant_method") or config.get("dtype")
         return cls(
-            method=raw.get("quant_method"),
+            method=declared if declared in ("fp8", "fp4", "int8", "nf4") else raw.get("quant_method"),
             block_size=tuple(block) if isinstance(block, list) else None,
-            scale_fmt=raw.get("scale_fmt"),
-            expert_dtype=raw.get("expert_dtype"),
+            scale_fmt=raw.get("scale_fmt") or config.get("scale_fmt"),
+            expert_dtype=raw.get("expert_dtype") or config.get("expert_dtype"),
         )
 
     @property
@@ -112,6 +139,10 @@ class ModelInventory:
     index: WeightIndex
     config: dict[str, Any]
     quant: QuantProfile
+    #: Tensors this run owns: the full index minus every out-of-scope subtree. An
+    #: excluded subtree can be nested inside a layer (engram memory sits under
+    #: ``layers.1.engram``), so filtering by name prefix alone would miss it.
+    entries: list[TensorEntry] = field(default_factory=list)
     layers: list[LayerProfile] = field(default_factory=list)
     global_bytes: int = 0
     global_tensor_names: list[str] = field(default_factory=list)
@@ -245,6 +276,7 @@ class ModelInventory:
             index=index,
             config=config,
             quant=quant,
+            entries=kept,
             layers=layers,
             global_bytes=sum(e.nbytes for e in globals_),
             global_tensor_names=[e.name for e in globals_],

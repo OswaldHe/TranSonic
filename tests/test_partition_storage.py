@@ -116,7 +116,9 @@ def test_decode_steps_are_counted_once_not_per_sample():
         trace=trace, policy=DumpPolicy(decode_steps=0),
     )
     delta = with_decode.total_bytes - without.total_bytes
-    assert delta == 2 * trace.n_modules * 4 * trace.boundary_bytes_per_token
+    # tensors/module x n_modules x steps x bytes/token, once — not once per sample.
+    assert delta == (trace.tensors_per_module * trace.n_modules * 4
+                     * trace.boundary_bytes_per_token)
 
 
 def test_preflight_passes_with_ample_disk():
@@ -153,7 +155,7 @@ def test_preflight_non_strict_returns_warning_instead():
 
 def test_preflight_warns_near_the_limit():
     est = estimate_storage(
-        checkpoint_bytes=90 * GIB, module_weight_bytes=0, dequant_bytes=0,
+        checkpoint_bytes=85 * GIB, module_weight_bytes=0, dequant_bytes=0,
         trace=qwen27b_trace(), policy=DumpPolicy(slice_long=True), host=host(100),
     )
     warnings = preflight(est)

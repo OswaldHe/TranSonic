@@ -11,6 +11,7 @@ linear pipeline cannot express the real dataflow.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,12 +19,18 @@ from typing import Any
 
 import yaml
 
-#: Module kinds. ``decoder_layers`` is the repeating stack; the rest are either
-#: one-off (embed, lm_head) or architecture-specific.
+#: Recommended module kinds. ``decoder_layers`` is the repeating stack; the rest are
+#: either one-off (embed, lm_head) or architecture-specific. Not a closed set: an
+#: architecture the list does not anticipate should be nameable, and rejecting a
+#: whole plan over an unlisted kind would throw away a good partition. A kind
+#: outside this list is reported as a warning instead.
 KINDS = (
-    "embed", "decoder_layers", "attention", "moe_router", "moe_experts",
-    "mlp", "norm", "lm_head", "vision", "mtp", "engram", "other",
+    "embed", "decoder_layers", "attention", "rope", "moe_router", "moe_experts",
+    "moe_shared", "mlp", "norm", "lm_head", "vision", "mtp", "engram", "other",
 )
+
+#: A kind must at least look like one: lowercase, no spaces.
+KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 #: How a module's submodules relate to each other. ``sequential`` chains them —
 #: a stack of like decoder layers. ``parallel`` gives each the same position in
@@ -143,8 +150,11 @@ class ModuleNode:
         missing = {"id", "kind"} - set(data)
         if missing:
             raise GraphError(f"Module missing required key(s): {', '.join(sorted(missing))}")
-        if data["kind"] not in KINDS:
-            raise GraphError(f"Module {data['id']!r} has unknown kind {data['kind']!r}; expected one of {KINDS}")
+        if not KIND_RE.match(str(data["kind"])):
+            raise GraphError(
+                f"Module {data['id']!r} has a malformed kind {data['kind']!r}; "
+                f"use a lowercase name, ideally one of {KINDS}"
+            )
         composition = str(data.get("composition", "sequential"))
         if composition not in COMPOSITIONS:
             raise GraphError(
@@ -273,6 +283,12 @@ class PartitionGraph:
         for name in self.output_tensors:
             if name not in produced and name not in self.entry_tensors:
                 raise GraphError(f"Declared output tensor {name!r} is never produced")
+
+        unusual = sorted({m.kind for m in self.modules if m.kind not in KINDS})
+        if unusual:
+            warnings.append(
+                f"Module kind(s) outside the recommended set: {', '.join(unusual)}"
+            )
 
         functional = [m.id for m in self.functional_modules]
         if functional:

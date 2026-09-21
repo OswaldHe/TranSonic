@@ -241,7 +241,10 @@ def _storage_estimate(ctx: LoopContext):
     assert inventory is not None
     hidden = inventory.hidden_size or 1
     dtype_bytes = 2
-    n_modules = max(len(inventory.layers), 1) + 3
+    # The plan does not exist yet, so the module count is projected from the one
+    # knob that changes it structurally: splitting every layer in two.
+    per_layer = 2 if ctx.options.split_attention_ffn else 1
+    n_modules = max(len(inventory.layers), 1) * per_layer + 3
     return estimate_storage(
         checkpoint_bytes=ctx.result.index.total_bytes if ctx.result else 0,
         module_weight_bytes=inventory.total_param_bytes(include_excluded=False),
@@ -287,6 +290,15 @@ def stage_plan(ctx: LoopContext) -> StageResult:
             cost=cost, model_name=ctx.spec.source, revision=ctx.result.revision,
         )
         ctx.notes.extend(graph.validate(ctx.budget.usable_bytes))
+
+    unassigned = graph.metadata.get("layer_owned_params") or []
+    if unassigned:
+        ctx.notes.append(
+            f"{len(unassigned)} tensor(s) are held by a layer module itself rather than "
+            f"by a child, so no partition module owns them "
+            f"(e.g. {', '.join(unassigned[:3])}); they show up as unclaimed when the "
+            "model is assembled from dumps"
+        )
 
     detail = f"{'reused' if reused else 'planned'} {len(graph.partitioned_modules)} modules"
     reconcile = _reconcile(ctx, graph)
@@ -427,18 +439,28 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     store = TensorStore(ctx.layout.trace_dir)
     policy = ctx.options.dump_policy()
 
-    # Weights are read straight off the parameters, and layer placement leaves
-    # host-assigned layers on the meta device between forwards, so dump from a
-    # single-device copy and release it before placing the model for the forward.
-    host_model = ctx.build_model()
-    unresolved = Tracer(host_model, ctx.graph, store).unresolved_submodules()
+    # Which parameters each module owns is a question about structure, so it is
+    # answered on the meta device — no weights, no second full load of a checkpoint
+    # that may be larger than this machine.
+    weight_params, unresolved = _index_weights(ctx, store)
     if unresolved:
         return _unresolved_result(ctx, unresolved)
-    weight_tracer = Tracer(host_model, ctx.graph, store, policy=policy)
-    weight_params = weight_tracer.index_weights()
-    weights = weight_tracer.dump_weights() if policy.cache_weights else {}
-    del host_model, weight_tracer
-    _collect()
+
+    # Their values are another matter: they are read straight off the parameters,
+    # and layer placement leaves host-assigned layers on the meta device between
+    # forwards, so dump from a single-device copy and release it before placing the
+    # model for the forward.
+    weights: dict[str, list[str]] = {}
+    if policy.cache_weights:
+        host_model = ctx.build_model()
+        weight_tracer = Tracer(host_model, ctx.graph, store, policy=policy)
+        unresolved = weight_tracer.unresolved_submodules()
+        if unresolved:
+            return _unresolved_result(ctx, unresolved)
+        weights = weight_tracer.dump_weights()
+        weight_params = weight_params or weight_tracer.index_weights()
+        del host_model, weight_tracer
+        _collect()
 
     model = ctx.build_model(placed=True)
     if ctx.last_placement == "auto":
@@ -491,6 +513,23 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         "n_sliced_records": sliced,
         "device": device,
     })
+
+
+def _index_weights(ctx: LoopContext, store: TensorStore) -> tuple[dict[str, list[str]], list[str]]:
+    """Enumerate each module's parameter names from the model's structure alone."""
+    if ctx.build_meta_model is None:
+        return {}, []
+    try:
+        structure = ctx.build_meta_model()
+    except Exception as exc:
+        ctx.notes.append(f"could not enumerate parameters on the meta device: {exc}")
+        return {}, []
+    probe = Tracer(structure, ctx.graph, store)
+    unresolved = probe.unresolved_submodules()
+    params = {} if unresolved else probe.index_weights()
+    del structure, probe
+    _collect()
+    return params, unresolved
 
 
 def clear_trace(trace_dir: Path) -> int:

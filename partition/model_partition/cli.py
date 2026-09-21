@@ -39,8 +39,13 @@ def _load_defaults(path: Path | None = None) -> dict[str, Any]:
     return payload.get("loop", payload) if isinstance(payload, dict) else {}
 
 
-def build_options(config: Path | None = None, **overrides: Any):
-    """Build LoopOptions from defaults.yaml plus non-None CLI overrides."""
+def build_options(config: Path | None = None, spec: Any = None, **overrides: Any):
+    """Build LoopOptions, layering defaults, the spec, then the command line.
+
+    A spec's ``overrides`` are loop settings a particular model needs — no bf16
+    dequant mirror of a 500 GB fp8 checkpoint, for instance — so they sit above the
+    shared defaults and below anything asked for explicitly.
+    """
     from model_partition.loop.stages import LoopOptions
 
     prompt_file = overrides.pop("partition_prompt_file", None)
@@ -49,6 +54,14 @@ def build_options(config: Path | None = None, **overrides: Any):
 
     known = {f.name for f in fields(LoopOptions)}
     values = {k: v for k, v in _load_defaults(config).items() if k in known}
+    if spec is not None:
+        unknown = set(getattr(spec, "overrides", {})) - known
+        if unknown:
+            raise click.ClickException(
+                f"Spec {spec.name!r} overrides unknown loop option(s): "
+                f"{', '.join(sorted(unknown))}"
+            )
+        values.update({k: v for k, v in spec.overrides.items() if k in known})
     values.update({k: v for k, v in overrides.items() if v is not None and k in known})
     if "retention_layers" in values and not isinstance(values["retention_layers"], tuple):
         values["retention_layers"] = tuple(values["retention_layers"])
@@ -186,7 +199,7 @@ def plan_only(target: str, config: Path | None, **kwargs: Any) -> None:
     from model_partition.loop.stages import stage_ingest, stage_plan
 
     spec = resolve_spec(target)
-    options = build_options(config, **kwargs)
+    options = build_options(config, spec=spec, **kwargs)
     ctx = PartitionLoop(spec=spec, options=options).build_context()
 
     ingest_result = stage_ingest(ctx)
@@ -238,6 +251,7 @@ def run_loop(target: str, config: Path | None, iterations: int | None, no_agent:
         )
     options = build_options(
         config,
+        spec=spec,
         max_iterations=iterations,
         use_agent_planner=False if no_agent else None,
         retain=False if no_retain else None,

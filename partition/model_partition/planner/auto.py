@@ -24,11 +24,22 @@ from model_partition.sizing import CostModel, ModelInventory, config_get
 #: calls it something else.
 DEFAULT_LM_HEAD = "lm_head"
 
-#: Global tensor name fragments -> module kind.
+#: Owning module's last path component -> module kind. Checked first, and exactly,
+#: because a substring rule cannot tell ``head.weight`` (the output projection) from
+#: ``hc_head_base`` (a per-layer scalar that happens to contain "head"). The head is
+#: checked before the embedding so a tied ``embed_out`` lands on the head.
+GLOBAL_COMPONENTS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("lm_head", "head", "output", "output_layer", "embed_out"), "lm_head", "lm_head"),
+    (("embed", "embed_tokens", "embed_in", "wte", "tok_embeddings"), "embed", "embed"),
+    (("norm", "final_norm", "ln_f", "final_layernorm"), "norm", "final_norm"),
+)
+
+#: Fallback: global tensor name fragments -> module kind, for namings the component
+#: rule does not recognize.
 GLOBAL_KINDS: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("embed_tokens", "embed_in", "wte", "tok_embeddings"), "embed", "embed"),
     (("lm_head", "output.weight", "embed_out"), "lm_head", "lm_head"),
-    (("norm", "ln_f", "final_layernorm"), "norm", "final_norm"),
+    (("ln_f", "final_layernorm"), "norm", "final_norm"),
 )
 
 
@@ -49,6 +60,10 @@ class PlanOptions:
 
 def classify_global(name: str) -> tuple[str, str] | None:
     """Map a global tensor name to ``(kind, module_id)``."""
+    component = module_path_of(name).rsplit(".", 1)[-1]
+    for names, kind, module_id in GLOBAL_COMPONENTS:
+        if component in names:
+            return kind, module_id
     for fragments, kind, module_id in GLOBAL_KINDS:
         if any(fragment in name for fragment in fragments):
             return kind, module_id
@@ -212,7 +227,7 @@ def plan(
 
 
 def _tensor_bytes(inventory: ModelInventory, name: str) -> int:
-    return sum(e.nbytes for e in inventory.index.entries if e.name == name)
+    return sum(e.nbytes for e in inventory.entries if e.name == name)
 
 
 #: Component-name fragments that put a layer's direct child on the FFN side of the
@@ -274,7 +289,9 @@ def layer_parts(inventory: ModelInventory, index: int) -> LayerParts:
     parts = LayerParts()
     buckets = {"attention": parts.attention, "ffn": parts.ffn, "other": parts.other}
     seen: set[str] = set()
-    for entry in inventory.index.entries:
+    # In-scope tensors only: an excluded subtree can live inside a layer, and giving
+    # it a module would put 100 GiB of n-gram memory in the budget.
+    for entry in inventory.entries:
         if entry.layer_index != index or entry.layer_prefix != inventory.stack_prefix:
             continue
         if not entry.name.startswith(prefix):
@@ -318,7 +335,7 @@ def moe_parts(inventory: ModelInventory, ffn_path: str) -> tuple[list[str], dict
     def account(key: str, value: int) -> None:
         nbytes[key] = nbytes.get(key, 0) + value
 
-    for entry in inventory.index.entries:
+    for entry in inventory.entries:
         if not entry.name.startswith(prefix):
             continue
         component, _, remainder = entry.name[len(prefix):].partition(".")
@@ -406,6 +423,12 @@ def _split_layer(
     signature = _signature_key(profile.signature)
     parts = layer_parts(inventory, index)
     activation = cost.activation_bytes(options.seq_len)
+    if parts.own_params:
+        # Tensors the layer module holds itself (DeepSeek's Hyper-Connections
+        # scalars) belong to no child module, so no module can own them. Recorded
+        # here so the gap is visible rather than discovered during emulation.
+        unassigned = graph.metadata.setdefault("layer_owned_params", [])
+        unassigned.extend(parts.own_params)
 
     cursor = input_tensor
     if parts.attention:

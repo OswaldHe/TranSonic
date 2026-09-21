@@ -74,19 +74,38 @@ def test_every_bundled_spec_is_valid_yaml_and_parses():
         assert "inputs" in payload
 
 
-def test_deepseek_v41_ships_disabled_with_a_reason():
-    """The ultimate target is documented but must not run yet."""
-    spec = resolve_spec("deepseek-v4.1-flash")
-    assert spec.enabled is False
-    assert "765" in spec.notes or "exceeds local disk" in spec.notes
-
-
-def test_deepseek_specs_use_the_vendor_inference_code():
+def test_deepseek_specs_say_what_is_reachable_on_one_machine():
+    """Both exceed this machine's memory, and the notes have to be honest about it."""
     for name in ("deepseek-v4-flash", "deepseek-v4.1-flash"):
-        spec = resolve_spec(name)
-        assert spec.loader == "repo_code"
-        assert spec.entry == "inference/model.py"
-        assert spec.trust_remote_code is True
+        notes = resolve_spec(name).notes
+        assert "inspect" in notes and "plan" in notes
+        assert "trace" in notes
+
+
+def test_deepseek_v41_uses_the_vendor_inference_code():
+    """transformers does not recognize deepseek_v41, so vendor code is the only path."""
+    spec = resolve_spec("deepseek-v4.1-flash")
+    assert spec.loader == "repo_code"
+    assert spec.entry == "inference/model.py"
+    assert spec.trust_remote_code is True
+
+
+def test_deepseek_v4_uses_the_vendor_inference_code():
+    """transformers names its deepseek_v4 modules the HF way, so it loads nothing."""
+    spec = resolve_spec("deepseek-v4-flash")
+    assert spec.loader == "repo_code"
+    assert spec.entry == "inference/model.py"
+    assert spec.trust_remote_code is True
+
+
+def test_every_bundled_spec_states_how_it_wants_to_be_partitioned():
+    from model_partition.cli import MODELS_DIR
+    from model_partition.spec import load_spec
+
+    for path in MODELS_DIR.glob("*.yaml"):
+        spec = load_spec(path)
+        assert spec.partition.split_attention_ffn, path.name
+        assert "attention" in spec.partition.prompt.lower(), path.name
 
 
 def test_qwen_specs_leave_the_loader_on_auto():
@@ -156,17 +175,23 @@ def test_retention_layers_from_yaml_become_a_tuple(tmp_path):
 # -- commands ----------------------------------------------------------------
 
 
-def test_list_shows_bundled_specs_and_marks_disabled(runner):
+def test_list_shows_bundled_specs(runner):
     result = runner.invoke(partition, ["list"])
     assert result.exit_code == 0
     assert "qwen3.8-27b" in result.output
-    assert "(disabled)" in result.output
+    assert "deepseek-v4.1-flash" in result.output
 
 
-def test_disabled_spec_refuses_to_run(runner):
-    result = runner.invoke(partition, ["run", "deepseek-v4.1-flash"])
+def test_a_disabled_spec_refuses_to_run(runner, tmp_path):
+    path = tmp_path / "off.yaml"
+    path.write_text(yaml.safe_dump({
+        "source": "hf:a/b", "name": "off", "enabled": False,
+        "notes": "not ready",
+    }))
+    result = runner.invoke(partition, ["run", str(path)])
     assert result.exit_code != 0
-    assert "enabled: false" in str(result.output) + str(result.exception)
+    combined = str(result.output) + str(result.exception)
+    assert "enabled: false" in combined and "not ready" in combined
 
 
 def test_report_renders_stage_status(runner, tmp_path):
@@ -321,3 +346,39 @@ def test_resource_lookup_falls_back_to_the_source_layout(tmp_path, monkeypatch):
     (tmp_path / "config").mkdir()
     monkeypatch.setattr(cli, "__file__", str(package / "cli.py"))
     assert cli._resource_dir("config") == tmp_path / "config"
+
+
+# -- spec overrides ----------------------------------------------------------
+
+
+def test_spec_overrides_sit_above_the_shared_defaults():
+    """A model that cannot afford a dequant mirror has to be able to say so."""
+    spec = resolve_spec("deepseek-v4.1-flash")
+    assert spec.overrides, "this spec should carry loop overrides"
+    options = build_options(None, spec=spec)
+    assert options.cache_dequant is False
+    assert options.cache_weights is False
+
+
+def test_the_command_line_wins_over_a_spec_override():
+    spec = resolve_spec("deepseek-v4.1-flash")
+    assert build_options(None, spec=spec, cache_weights=True).cache_weights is True
+
+
+def test_a_spec_overriding_an_unknown_option_is_rejected(tmp_path):
+    """Silently ignoring it is how `cache_dequant: false` stopped meaning anything."""
+    from model_partition.spec import parse_spec
+
+    spec = parse_spec({"source": "hf:a/b", "name": "x", "overrides": {"cahce_weights": False}})
+    import click
+
+    with pytest.raises(click.ClickException, match="unknown loop option"):
+        build_options(None, spec=spec)
+
+
+def test_every_bundled_spec_overrides_only_real_options():
+    from model_partition.cli import MODELS_DIR
+    from model_partition.spec import load_spec
+
+    for path in MODELS_DIR.glob("*.yaml"):
+        build_options(None, spec=load_spec(path))

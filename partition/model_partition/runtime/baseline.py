@@ -120,19 +120,50 @@ def build_from_dumps(
         )
 
     def run_sequence(*args: Any, **kwargs: Any) -> Any:
-        """Run a multi-layer group as its sequence of submodule calls.
+        """Run a group as its sequence of submodule calls.
 
-        Later layers get the first layer's kwargs, which is what a stack of like
-        layers receives in a real forward: position embeddings and masks are
-        shared, only the hidden state advances.
+        Each submodule is given the flowing tensor plus whichever of the group's
+        keywords it actually accepts. Filtering matters for a heterogeneous group: a
+        normalization takes only the hidden state, while the attention after it needs
+        the rotary embeddings and mask, and passing either one the other's arguments
+        fails.
         """
-        output = targets[0](*args, **kwargs)
-        for target in targets[1:]:
-            hidden = output[0] if isinstance(output, tuple) else output
-            output = target(hidden, **kwargs)
+        output = None
+        flowing = args[0] if args else None
+        rest = args[1:]
+        for index, target in enumerate(targets):
+            if index:
+                flowing = output[0] if isinstance(output, tuple) else output
+                rest = ()
+            accepted = _accepted_kwargs(target, kwargs)
+            output = target(flowing, *rest, **accepted)
         return output
 
     return run_sequence
+
+
+def _accepted_kwargs(target: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The subset of ``kwargs`` this submodule's forward declares.
+
+    Everything when it takes ``**kwargs``, which is the common case for a decoder
+    layer and means the filter costs nothing there. Either way the first parameter
+    is dropped: the flowing tensor is passed positionally, and a group's merged
+    keywords may well name it too — the trace records however the model called it,
+    and most call it ``hidden_states=``.
+    """
+    import inspect
+
+    forward = getattr(target, "forward", target)
+    try:
+        parameters = inspect.signature(forward).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins only
+        return dict(kwargs)
+    names = list(parameters)
+    flowing = names[0] if names else None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return {key: value for key, value in kwargs.items() if key != flowing}
+    accepted = set(names[1:])
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 def _execution_order(run: Any, module_id: str, submodules: list[str]) -> list[str]:

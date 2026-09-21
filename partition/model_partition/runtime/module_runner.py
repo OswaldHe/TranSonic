@@ -123,6 +123,30 @@ def decode_call(record: CallRecord, store: TensorStore, device: str = "cpu") -> 
     return args, kwargs
 
 
+def decode_group_call(records: list[CallRecord], store: TensorStore,
+                      device: str = "cpu") -> tuple[tuple, dict]:
+    """Arguments for a whole sequential group, not just its first submodule.
+
+    A group can be heterogeneous — a normalization followed by attention — and then
+    the first submodule's recorded call says nothing about the rotary embeddings and
+    masks the attention needs. Taking positional arguments from the first call and
+    the union of every keyword any submodule received makes the module
+    self-contained: whatever it does internally, it was given everything.
+
+    First occurrence wins, so a keyword that changes down the group keeps the value
+    the group's entry point saw.
+    """
+    if not records:
+        return (), {}
+    args, kwargs = decode_call(records[0], store, device)
+    merged = dict(kwargs)
+    for record in records[1:]:
+        _, extra = decode_call(record, store, device)
+        for key, value in extra.items():
+            merged.setdefault(key, value)
+    return args, merged
+
+
 def load_dumped_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
     """Load a module's dumped weights, keyed by their filesystem-safe names."""
     load = tensor_loader(bundle.store, device)

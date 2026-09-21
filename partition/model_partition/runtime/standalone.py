@@ -145,7 +145,7 @@ def verify_impl(
     and covers every tensor the module returns, not only the first.
     """
     from model_partition.runtime.module_impl import load_impl, run_impl
-    from model_partition.runtime.module_runner import decode_call, load_named_weights
+    from model_partition.runtime.module_runner import decode_group_call, load_named_weights
 
     run = load_run(run_dir)
     graph_module = _module_or_raise(run.graph, module_id)
@@ -163,7 +163,8 @@ def verify_impl(
              else [(records[0], records[-1])])
     results: list[Comparison] = []
     for source, reference_record in pairs:
-        args, kwargs = decode_call(source, run.bundle.store, device)
+        group = records if len(pairs) == 1 else [source]
+        args, kwargs = decode_group_call(group, run.bundle.store, device)
         actual = run_impl(impl, config, weights, args, kwargs, device=device,
                           submodule=source.submodule if graph_module.is_parallel else None)
         reference = expected_output(reference_record, run.bundle.store, device=device)

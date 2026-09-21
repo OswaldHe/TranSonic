@@ -22,6 +22,9 @@ from model_partition.runtime.module_runner import (
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
 
+#: Where a check retreats to when the accelerator runs out of memory.
+CPU = "cpu"
+
 
 def poison_parameters(model: Any, value: float = float("nan"),
                       only: set[str] | None = None) -> int:
@@ -103,6 +106,8 @@ class ModuleVerification:
     #: Set when no numeric check was possible. Neither a pass nor a failure: it is
     #: reported so missing coverage is visible rather than assumed away.
     skipped: str = ""
+    #: Something worth saying about how the check ran, without changing its verdict.
+    note: str = ""
 
     def summary(self) -> str:
         if self.skipped:
@@ -112,13 +117,16 @@ class ModuleVerification:
         head = "ok" if self.passed else "FAIL"
         detail = "; ".join(c.summary() for c in self.comparisons if not c.passed) or "all tensors match"
         where = f" on {self.device}" if self.device else ""
-        return f"{self.module_id} [{self.sample_id}]: {head} ({self.weights_applied} weights{where}) {detail}"
+        tail = f" [{self.note}]" if self.note else ""
+        return (f"{self.module_id} [{self.sample_id}]: {head} "
+                f"({self.weights_applied} weights{where}) {detail}{tail}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "module_id": self.module_id, "sample_id": self.sample_id,
             "passed": self.passed, "weights_applied": self.weights_applied,
             "error": self.error, "device": self.device, "skipped": self.skipped,
+            "note": self.note,
             "comparisons": [c.to_dict() for c in self.comparisons],
         }
 
@@ -258,8 +266,8 @@ def verify_modules(
                 records = bundle.select(module_id=module_id, sample_id=sample_id)
                 if not records:
                     continue
-                for source, reference_record in _record_pairs(graph_module, records,
-                                                              with_impl=builder is not None):
+                pairs = _record_pairs(graph_module, records, with_impl=builder is not None)
+                for source, reference_record in pairs:
                     if source.sliced or reference_record.sliced:
                         report.results.append(ModuleVerification(
                             module_id=module_id, sample_id=sample_id, passed=False,
@@ -267,29 +275,73 @@ def verify_modules(
                                     "not a function of the recorded input",
                         ))
                         continue
+                    # A group run as one computation is handed every argument any
+                    # of its submodules received.
+                    group = records if len(pairs) == 1 else [source]
                     comparisons: list[Comparison] = []
+                    note = ""
                     try:
                         actual = _run_once(model, source, bundle, builder, residency,
-                                           branch=branch)
+                                           branch=branch, group=group)
                         reference = expected_output(reference_record, bundle.store,
                                                    device=residency)
                         comparisons = compare_outputs(actual, reference, module_id, tolerance)
                     except Exception as exc:
-                        report.results.append(ModuleVerification(
-                            module_id=module_id, sample_id=sample_id, passed=False,
-                            weights_applied=applied, error=str(exc), device=residency,
-                        ))
-                        continue
+                        if not (_is_out_of_memory(exc) and residency.startswith("cuda")):
+                            report.results.append(ModuleVerification(
+                                module_id=module_id, sample_id=sample_id, passed=False,
+                                weights_applied=applied, error=str(exc), device=residency,
+                            ))
+                            continue
+                        # The module fits, but this sample's transient buffers do
+                        # not: full attention is quadratic in the sequence and a
+                        # vocabulary-sized logit tensor is enormous at long context,
+                        # neither of which the plan's budget covers. A capacity limit
+                        # is not a correctness failure, so the check moves to the
+                        # host rather than being reported as one.
+                        failed_on = residency
+                        move_submodules(model, graph_module, CPU)
+                        _release(failed_on)
+                        residency = CPU
+                        builder = (_impl_builder(impl_dir, bundle, module_id, CPU)
+                                   if impl_dir else None)
+                        note = f"moved to {CPU}: not enough {failed_on} memory for this sample"
+                        try:
+                            actual = _run_once(model, source, bundle, builder, CPU,
+                                               branch=branch, group=group)
+                            reference = expected_output(reference_record, bundle.store,
+                                                        device=CPU)
+                            comparisons = compare_outputs(actual, reference, module_id,
+                                                          tolerance)
+                        except Exception as retry:
+                            report.results.append(ModuleVerification(
+                                module_id=module_id, sample_id=sample_id, passed=False,
+                                weights_applied=applied, error=str(retry), device=CPU,
+                            ))
+                            continue
                     report.results.append(ModuleVerification(
                         module_id=module_id, sample_id=sample_id,
                         passed=bool(comparisons) and all(c.passed for c in comparisons),
                         weights_applied=applied, comparisons=comparisons, device=residency,
+                        note=note,
                     ))
         finally:
             if residency != host:
                 move_submodules(model, graph_module, host)
-                _release(residency)
+            _release(target)
     return report
+
+
+def _is_out_of_memory(exc: Exception) -> bool:
+    """True for an accelerator allocation failure, whatever torch version raised it."""
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except (ImportError, AttributeError):  # pragma: no cover
+        pass
+    return "out of memory" in str(exc).lower()
 
 
 def _record_pairs(graph_module: Any, records: list[Any], with_impl: bool):
@@ -337,8 +389,8 @@ def _impl_builder(impl_dir: Any, bundle: TraceBundle, module_id: str, device: st
     return build
 
 
-def _run_once(model: Any, record: Any, bundle: TraceBundle,
-              builder: Any, device: str, branch: bool = False) -> Any:
+def _run_once(model: Any, record: Any, bundle: TraceBundle, builder: Any, device: str,
+              branch: bool = False, group: list[Any] | None = None) -> Any:
     """Produce a module's output for one recorded call.
 
     Calls the extracted implementation when there is one, so verification
@@ -350,13 +402,13 @@ def _run_once(model: Any, record: Any, bundle: TraceBundle,
     if builder is None:
         return replay_record(model, record, bundle.store, device=device)
 
-    from model_partition.runtime.module_runner import decode_call
+    from model_partition.runtime.module_runner import decode_group_call
 
     if record.has_unsupported():
         raise RuntimeError(
             f"{record.module_id}: recorded arguments include an unserializable value"
         )
     impl_callable = builder(record.submodule if branch else None)
-    args, kwargs = decode_call(record, bundle.store, device)
+    args, kwargs = decode_group_call(group or [record], bundle.store, device)
     with torch.no_grad():
         return impl_callable(*args, **kwargs)

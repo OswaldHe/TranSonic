@@ -104,6 +104,14 @@ class StorageEstimate:
         return "\n".join(rows)
 
 
+#: Sequence-length tensors dumped per module per sample. A module records its input
+#: and its output, plus whatever its architecture passes alongside the hidden state —
+#: rotary cos/sin, an attention mask, convolution state — and those are dumped too
+#: because replay needs them. Measured at just under 7 for Qwen3.5's hybrid stack;
+#: this is a preflight, so it rounds up rather than down.
+DEFAULT_TENSORS_PER_MODULE = 7
+
+
 @dataclass
 class TraceShape:
     """The shape of the tracing workload, as far as storage is concerned."""
@@ -116,6 +124,7 @@ class TraceShape:
     #: Extra per-module state dumped once per sample regardless of length
     #: (routing maps, per-layer scalars).
     aux_bytes_per_module: int = 0
+    tensors_per_module: int = DEFAULT_TENSORS_PER_MODULE
 
 
 def estimate_storage(
@@ -143,13 +152,12 @@ def estimate_storage(
     if policy.cache_dequant:
         est.add("bf16 dequant mirror", dequant_bytes, "set cache_dequant=false to recompute")
 
-    # Each module writes its input and its output: 2 boundary tensors per module
-    # per sample. Long samples are sliced per the policy.
     def _featmap_bytes(seq_lens: list[int]) -> int:
         total = 0
         for seq_len in seq_lens:
             kept = policy.kept_positions(seq_len)
-            total += 2 * trace.n_modules * kept * trace.boundary_bytes_per_token
+            total += (trace.tensors_per_module * trace.n_modules
+                      * kept * trace.boundary_bytes_per_token)
         return total
 
     short_bytes = _featmap_bytes(trace.short_seq_lens)
@@ -162,7 +170,8 @@ def estimate_storage(
     if policy.decode_steps and trace.short_seq_lens:
         est.add(
             "feature maps (decode)",
-            2 * trace.n_modules * policy.decode_steps * trace.boundary_bytes_per_token,
+            trace.tensors_per_module * trace.n_modules * policy.decode_steps
+            * trace.boundary_bytes_per_token,
             f"{policy.decode_steps} steps, first sample only",
         )
 

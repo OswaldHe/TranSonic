@@ -1,31 +1,26 @@
-# The ultimate deployment target. Kept as a specification only: disabled until
-# the storage and quantization work lands.
+# The deployment target. 510.3 GB across 48 shards, 96 085 tensors: fp8_e4m3
+# weights (32x32 blocks, ue8m0 scales) with int8-packed fp4 experts.
 #
-# 763 B reported params, ~765 GB on disk (fp8_e4m3 204 GB + int8-packed fp4
-# experts 557 GB + bf16 2 GB), 48 shards -- more than the 465 GB local volume,
-# so it needs shard-stream-and-evict or a larger volume.
-#
-# Architecture, from config.json: 40 text layers + 3 MTP, hidden 5120, MLA-style
-# attention (q_lora_rank 1280, o_lora_rank 1024, o_groups 8, head_dim 512,
-# qk_rope_head_dim 64, num_key_value_heads 1), MoE with 384 routed fp4 experts
-# plus 1 shared at top-6 (noaux_tc / sqrtsoftplus), a second "DSpark" MoE of 128
-# experts at top-3, sparse attention driven by per-layer compress_ratios with
-# cross-layer KV reuse (kv_source_layer_ids) and a lightning indexer
+# Architecture, from inference/config.json: 40 text layers + 3 MTP, hidden 5120,
+# MLA-style attention (q_lora_rank 1280, o_lora_rank 1024, o_groups 8, head_dim
+# 512, qk_rope_head_dim 64, num_key_value_heads 1), MoE with 384 routed fp4
+# experts plus 1 shared at top-6 (noaux_tc / sqrtsoftplus), a second "DSpark" MoE
+# of 128 experts at top-3, sparse attention driven by per-layer compress_ratios
+# with cross-layer KV reuse (kv_source_layer_ids) and a lightning indexer
 # (index_source_layer_ids, index_topk, candidate_topk_blocks), engram n-gram
-# memory layers, sliding_window 128, 1 M context via YaRN, and a 32-layer
-# vision tower.
+# memory layers, sliding_window 128, 1 M context via YaRN, and a 32-layer vision
+# tower. Each layer also carries Hyper-Connections scalars (hc_*) directly.
 #
-# The cross-layer edges are why the partition graph is a DAG: a module consumes
+# Those cross-layer edges are why the partition graph is a DAG: a module consumes
 # tensors produced far upstream, which a linear pipeline cannot express.
 name: deepseek-v4.1-flash
 source: hf:deepseek-ai/DeepSeek-V4.1-Flash
-enabled: false
 loader: repo_code
 entry: inference/model.py
 code_paths: [inference, encoding]
 config_file: inference/config.json
 dtype: bfloat16
-trust_remote_code: true
+trust_remote_code: true     # required: importing inference/model.py runs repo code
 
 scope:
   vision: false
@@ -46,22 +41,36 @@ partition:
     per-module budget, or when two computations inside it would genuinely be
     developed and tuned separately.
 
+    Two things about this model in particular. Attention is sparse and reads KV
+    from other layers, with a lightning indexer fed from elsewhere again: express
+    those as tensor edges in the graph rather than duplicating the computation. And
+    the FFN side has two independent MoEs plus a shared expert, which are three
+    separate pieces of work, not one.
+
 inputs:
   # max_short / max_long cap how many prompts of each set this run uses. Cost is
   # per sample: one full traced forward, one set of dumped feature maps per module,
   # and one generation pass during emulation. Omit for no cap.
   short: ../../inputs/short.jsonl
   long: ../../inputs/long.jsonl
-  max_short: 2
-  max_long: 1
+  max_short: 1
+  max_long: 0
 
 overrides:
-  cache_dequant: false
-  cache_weights: false
+  cache_dequant: false      # a bf16 mirror of 510 GB of fp8/fp4 would not fit
+  cache_weights: false      # nor would a second copy; read them from the shards
 
 notes: |
-  Disabled on purpose. Before enabling: (1) ~765 GB exceeds local disk, so the
-  shard stream-and-evict path must be wired into tracing; (2) fp8 block and fp4
-  expert dequantization must exist; (3) encoding/tests/test_input_*.json ->
-  test_output_*.txt in the repo give free tokenizer ground truth worth checking
-  first.
+  `inspect` and `plan` work from metadata alone and need no weights. Everything
+  from `trace` onward needs the whole model resident for one forward, and 510 GB
+  exceeds this machine (46 GiB GPU + 124 GiB host) by more than 3x; transformers
+  also does not recognize `deepseek_v41`, so the only code path is the vendor
+  implementation under inference/, which wants a checkpoint converted to one file
+  per tensor-parallel rank (inference/convert.py) before it will load anything.
+
+  So: plan it here, run it where the memory is. `autohelix partition plan
+  deepseek-v4.1-flash` produces the module graph, per-module byte budgets and the
+  deduplicated implementation groups without fetching a shard.
+
+  encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
+  tokenizer ground truth and are worth checking before anything else.
