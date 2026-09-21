@@ -64,6 +64,20 @@ def _print(message: str) -> None:
     print(message, flush=True)
 
 
+def _release_accelerator() -> None:
+    """Return cached blocks to the driver so the next stage sees a full card."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 @dataclass
 class PartitionLoop:
     """Drives stages, invalidation, and agent repair."""
@@ -317,6 +331,11 @@ class PartitionLoop:
                 continue
 
             started = time.time()
+            # Hand back whatever the previous stage left reserved. The allocator
+            # holds on to freed blocks, and a stage that traced a 16k-token forward
+            # can leave tens of GB reserved — enough to make the next stage fall off
+            # the GPU for no reason.
+            _release_accelerator()
             try:
                 result = runner(ctx)
             except Exception as exc:
@@ -351,7 +370,11 @@ class PartitionLoop:
         wanted = self.options.refine_plan or bool(self.options.partition_prompt.strip())
         if self._refined or not wanted or not self.options.use_agent_planner:
             return
-        if ctx.graph is None:
+        if ctx.graph is None or state.refined:
+            # Recorded in the run state, so resuming an interrupted run does not pay
+            # for refinement again — or worse, refine differently and throw away a
+            # trace that is already correct for the plan on disk.
+            self._refined = True
             return
         self._refined = True
 
@@ -369,6 +392,8 @@ class PartitionLoop:
             self.report(f"  refinement failed, keeping the seed plan: {outcome.error}")
             ctx.notes.append(f"plan refinement failed: {outcome.error}")
             return
+        state.refined = True
+        state.save(ctx.layout.state_file)
         if revised.to_dict() == before:
             self.report("  agent kept the seed plan unchanged")
             return
@@ -419,7 +444,7 @@ class PartitionLoop:
                                timeout_seconds=self.options.agent_timeout_seconds)
         self._review(ctx, planner, stage_name, result, iteration)
 
-        if stage_name == "verify_modules":
+        if stage_name == "verify_modules" and result.repair_surface == "modules":
             return self._repair_modules(ctx, state, result, iteration)
 
         self.report("  asking the agent to revise the plan...")

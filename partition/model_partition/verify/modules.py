@@ -13,18 +13,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from model_partition.hardware import MIB
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import (
     TraceBundle,
-    apply_dumped_weights,
+    apply_named_weights,
     expected_output,
+    load_named_weights,
     replay_record,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
-
-#: Where a check retreats to when the accelerator runs out of memory.
-CPU = "cpu"
-
 
 def poison_parameters(model: Any, value: float = float("nan"),
                       only: set[str] | None = None) -> int:
@@ -106,8 +104,9 @@ class ModuleVerification:
     #: Set when no numeric check was possible. Neither a pass nor a failure: it is
     #: reported so missing coverage is visible rather than assumed away.
     skipped: str = ""
-    #: Something worth saying about how the check ran, without changing its verdict.
-    note: str = ""
+    #: The module would not fit the device it was sized for. A plan failure rather
+    #: than a numeric one, so the loop repartitions instead of editing arithmetic.
+    oversized: bool = False
 
     def summary(self) -> str:
         if self.skipped:
@@ -117,16 +116,15 @@ class ModuleVerification:
         head = "ok" if self.passed else "FAIL"
         detail = "; ".join(c.summary() for c in self.comparisons if not c.passed) or "all tensors match"
         where = f" on {self.device}" if self.device else ""
-        tail = f" [{self.note}]" if self.note else ""
         return (f"{self.module_id} [{self.sample_id}]: {head} "
-                f"({self.weights_applied} weights{where}) {detail}{tail}")
+                f"({self.weights_applied} weights{where}) {detail}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "module_id": self.module_id, "sample_id": self.sample_id,
             "passed": self.passed, "weights_applied": self.weights_applied,
             "error": self.error, "device": self.device, "skipped": self.skipped,
-            "note": self.note,
+            "oversized": self.oversized,
             "comparisons": [c.to_dict() for c in self.comparisons],
         }
 
@@ -154,6 +152,11 @@ class VerifyReport:
     def failures(self) -> list[ModuleVerification]:
         return [r for r in self.checked if not r.passed]
 
+    @property
+    def oversized(self) -> list[ModuleVerification]:
+        """Failures that are about capacity, so the plan is what needs changing."""
+        return [r for r in self.failures if r.oversized]
+
     def module_ids(self) -> list[str]:
         return sorted({r.module_id for r in self.results})
 
@@ -179,6 +182,7 @@ class VerifyReport:
             "n_checks": len(self.checked),
             "n_failed": len(self.failures),
             "n_skipped": len(self.skipped),
+            "n_oversized": len(self.oversized),
             "worst_cosine": self.worst_cosine(),
             "max_abs_err": self.max_abs_err(),
             "results": [r.to_dict() for r in self.results],
@@ -239,25 +243,29 @@ def verify_modules(
             ))
             continue
 
-        applied = apply_dumped_weights(model, bundle, module_id, graph_module, device=host)
+        weights = load_named_weights(bundle, module_id, device=host)
+        applied = apply_named_weights(model, weights, graph_module)
         residency = target
         if target != host:
             try:
                 move_submodules(model, graph_module, target)
             except RuntimeError as exc:
-                # The module did not fit after all; fall back rather than abort.
+                # The plan said this module would fit and it did not. That is a
+                # partition failure, not something to work around by finishing the
+                # check on the host and calling the promise kept.
                 move_submodules(model, graph_module, host)
                 _release(target)
-                residency = host
                 report.results.append(ModuleVerification(
-                    module_id=module_id, sample_id="-", passed=True,
-                    weights_applied=applied,
-                    error=f"ran on {host}: {exc}",
+                    module_id=module_id, sample_id="-", passed=False,
+                    weights_applied=applied, device=target, oversized=True,
+                    error=f"will not load on {target}: {exc}. Partition it further.",
                 ))
+                continue
         impl_dir = (impl_dirs or {}).get(module_id)
         # Built once per (module, branch): the baseline instantiates the model's
         # structure, too expensive to repeat for every recorded call.
-        builder = _impl_builder(impl_dir, bundle, module_id, residency) if impl_dir else None
+        builder = (_impl_builder(impl_dir, weights, bundle, module_id, residency)
+                   if impl_dir else None)
         # Only a parallel group has a branch to select; naming one for a sequential
         # group would ask for a prefix of the module.
         branch = graph_module.is_parallel
@@ -279,57 +287,54 @@ def verify_modules(
                     # of its submodules received.
                     group = records if len(pairs) == 1 else [source]
                     comparisons: list[Comparison] = []
-                    note = ""
                     try:
                         actual = _run_once(model, source, bundle, builder, residency,
                                            branch=branch, group=group)
                         reference = expected_output(reference_record, bundle.store,
                                                    device=residency)
                         comparisons = compare_outputs(actual, reference, module_id, tolerance)
+                        del actual, reference
                     except Exception as exc:
-                        if not (_is_out_of_memory(exc) and residency.startswith("cuda")):
-                            report.results.append(ModuleVerification(
-                                module_id=module_id, sample_id=sample_id, passed=False,
-                                weights_applied=applied, error=str(exc), device=residency,
-                            ))
-                            continue
-                        # The module fits, but this sample's transient buffers do
-                        # not: full attention is quadratic in the sequence and a
-                        # vocabulary-sized logit tensor is enormous at long context,
-                        # neither of which the plan's budget covers. A capacity limit
-                        # is not a correctness failure, so the check moves to the
-                        # host rather than being reported as one.
-                        failed_on = residency
-                        move_submodules(model, graph_module, CPU)
-                        _release(failed_on)
-                        residency = CPU
-                        builder = (_impl_builder(impl_dir, bundle, module_id, CPU)
-                                   if impl_dir else None)
-                        note = f"moved to {CPU}: not enough {failed_on} memory for this sample"
-                        try:
-                            actual = _run_once(model, source, bundle, builder, CPU,
-                                               branch=branch, group=group)
-                            reference = expected_output(reference_record, bundle.store,
-                                                        device=CPU)
-                            comparisons = compare_outputs(actual, reference, module_id,
-                                                          tolerance)
-                        except Exception as retry:
-                            report.results.append(ModuleVerification(
-                                module_id=module_id, sample_id=sample_id, passed=False,
-                                weights_applied=applied, error=str(retry), device=CPU,
-                            ))
-                            continue
+                        # A module that will not run on the accelerator is a partition
+                        # problem, not an arithmetic one: the plan promised it would
+                        # fit. Report it as such — the loop's answer is to cut the
+                        # module smaller, not to quietly finish the check somewhere
+                        # slower and call the promise kept.
+                        oversized = _is_out_of_memory(exc)
+                        needed = _check_bytes(group + [reference_record], bundle)
+                        detail = (f"{residency} ran out of memory; the module's tensors "
+                                  f"are about {needed // MIB} MiB for this sample. "
+                                  "Partition it further." if oversized else str(exc))
+                        report.results.append(ModuleVerification(
+                            module_id=module_id, sample_id=sample_id, passed=False,
+                            weights_applied=applied, error=detail, device=residency,
+                            oversized=oversized,
+                        ))
+                        _release(residency)
+                        continue
                     report.results.append(ModuleVerification(
                         module_id=module_id, sample_id=sample_id,
                         passed=bool(comparisons) and all(c.passed for c in comparisons),
                         weights_applied=applied, comparisons=comparisons, device=residency,
-                        note=note,
                     ))
         finally:
             if residency != host:
                 move_submodules(model, graph_module, host)
             _release(target)
     return report
+
+
+def _check_bytes(records: list[Any], bundle: TraceBundle) -> int:
+    """Bytes of recorded tensors one check has to hold.
+
+    Read from the manifest rather than measured, because the point is to decide
+    whether to allocate at all.
+    """
+    wanted: set[str] = set()
+    for record in records:
+        wanted.update(record.tensor_names())
+    by_name = {entry.name: entry for entry in bundle.store.entries}
+    return sum(by_name[name].nbytes for name in wanted if name in by_name)
 
 
 def _is_out_of_memory(exc: Exception) -> bool:
@@ -358,10 +363,15 @@ def _record_pairs(graph_module: Any, records: list[Any], with_impl: bool):
     return [(record, record) for record in records]
 
 
-def _impl_builder(impl_dir: Any, bundle: TraceBundle, module_id: str, device: str):
-    """Return ``submodule -> callable``, memoized, or a raiser if unusable."""
+def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
+                  module_id: str, device: str):
+    """Return ``submodule -> callable``, memoized, or a raiser if unusable.
+
+    Takes the weights already loaded for the live model rather than reading them
+    again: a module's parameters are the same tensors either way, and ``copy_``
+    moves them to wherever the implementation was built.
+    """
     from model_partition.runtime.module_impl import load_impl
-    from model_partition.runtime.module_runner import load_named_weights
 
     cache: dict[str | None, Any] = {}
 
@@ -373,7 +383,6 @@ def _impl_builder(impl_dir: Any, bundle: TraceBundle, module_id: str, device: st
             return built
         try:
             impl = load_impl(impl_dir)
-            weights = load_named_weights(bundle, module_id, device=device)
             if not weights:
                 raise RuntimeError(f"no weights available for {module_id!r}")
             built = impl.build(bundle.config, weights, device, submodule=submodule)

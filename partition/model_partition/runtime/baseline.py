@@ -26,10 +26,26 @@ class BaselineError(RuntimeError):
 #: one module's weights stand in for another's missing dump.
 _STRUCTURE_CACHE: dict[tuple[str, str], Any] = {}
 
+#: A run's plan and trace manifest, parsed once. Opening them per module meant
+#: re-parsing a multi-megabyte manifest for every module of every sample.
+_RUN_CACHE: dict[str, Any] = {}
+
 
 def clear_structure_cache() -> None:
-    """Drop cached structures. Call when a run's code or config changed."""
+    """Drop cached structures and manifests. Call when a run's contents changed."""
     _STRUCTURE_CACHE.clear()
+    _RUN_CACHE.clear()
+
+
+def _run_for(run_dir: str | Path) -> Any:
+    from model_partition.runtime.standalone import load_run
+
+    key = str(Path(run_dir).resolve())
+    run = _RUN_CACHE.get(key)
+    if run is None:
+        run = load_run(key)
+        _RUN_CACHE[key] = run
+    return run
 
 
 def _structure(run: Any, device: str) -> Any:
@@ -74,13 +90,12 @@ def build_from_dumps(
     parallel group — which expert of an expert group is being run.
     """
     from model_partition.runtime.module_runner import apply_named_weights
-    from model_partition.runtime.standalone import load_run
     from model_partition.trace import _lookup
 
     if run_dir is None or not module_ids:
         raise BaselineError("build_from_dumps needs a run directory and module ids")
 
-    run = load_run(run_dir)
+    run = _run_for(run_dir)
     module_id = _module_for_weights(run.graph, module_ids, weights)
     if module_id is None:
         raise BaselineError(

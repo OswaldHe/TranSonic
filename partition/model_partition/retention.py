@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+from model_partition import yamlio
 
 from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
@@ -206,7 +206,7 @@ def _prune_empty_dirs(root: Path) -> None:
 def write_retention_report(path: str | Path, result: RetentionResult) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(yaml.safe_dump({
+    target.write_text(yamlio.dumps({
         "dry_run": result.dry_run,
         "removed_files": result.removed_files,
         "bytes_freed": result.bytes_freed,

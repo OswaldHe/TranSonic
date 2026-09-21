@@ -103,9 +103,9 @@ def find_impl_dirs(modules_dir: str | Path) -> dict[str, Path]:
     index = root / "index.yaml"
     if not index.is_file():
         return {}
-    import yaml
+    from model_partition import yamlio
 
-    payload = yaml.safe_load(index.read_text()) or {}
+    payload = yamlio.load_path(index) or {}
     mapping: dict[str, Path] = {}
     for group in payload.get("groups", []):
         directory = group.get("directory")

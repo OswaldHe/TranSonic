@@ -58,6 +58,10 @@ class LoopState:
 
     slug: str = ""
     iteration: int = 0
+    #: The agent has already refined this run's plan. Kept in the state rather than
+    #: in the plan itself, because anything inside the plan feeds the stage hashes
+    #: and recording it there would invalidate the trace it was refined for.
+    refined: bool = False
     stages: dict[str, StageRecord] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
     finished: bool = False
@@ -116,6 +120,7 @@ class LoopState:
         return {
             "slug": self.slug,
             "iteration": self.iteration,
+            "refined": self.refined,
             "finished": self.finished,
             "passed": self.passed,
             "stages": {name: asdict(entry) for name, entry in self.stages.items()},
@@ -140,6 +145,7 @@ class LoopState:
         state = cls(
             slug=payload.get("slug", ""),
             iteration=int(payload.get("iteration", 0)),
+            refined=bool(payload.get("refined", False)),
             finished=bool(payload.get("finished", False)),
             passed=bool(payload.get("passed", False)),
             history=list(payload.get("history") or []),

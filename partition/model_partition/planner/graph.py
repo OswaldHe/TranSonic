@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from model_partition import yamlio
+
 #: Recommended module kinds. ``decoder_layers`` is the repeating stack; the rest are
 #: either one-off (embed, lm_head) or architecture-specific. Not a closed set: an
 #: architecture the list does not anticipate should be nameable, and rejecting a
@@ -345,7 +347,7 @@ class PartitionGraph:
         }
 
     def to_yaml(self) -> str:
-        return yaml.safe_dump(self.to_dict(), sort_keys=False, default_flow_style=False)
+        return yamlio.dumps(self.to_dict())
 
     def save(self, path: str | Path) -> Path:
         target = Path(path)
@@ -391,7 +393,7 @@ class PartitionGraph:
         if not source.is_file():
             raise GraphError(f"Partition graph not found: {source}")
         try:
-            data = yaml.safe_load(source.read_text())
+            data = yamlio.load_path(source)
         except yaml.YAMLError as exc:
             raise GraphError(f"Invalid YAML in {source}: {exc}") from exc
         return cls.from_dict(data or {})

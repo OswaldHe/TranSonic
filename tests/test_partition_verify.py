@@ -648,34 +648,60 @@ def test_each_submodule_gets_only_the_keywords_it_declares():
 # -- running out of accelerator memory ---------------------------------------
 
 
-def test_an_out_of_memory_check_moves_to_the_host_and_still_counts(tiny_run, tmp_path,
-                                                                  monkeypatch):
-    """Full attention at long context is quadratic; that is capacity, not error."""
+def test_an_out_of_memory_module_is_a_partition_failure(tiny_run, tmp_path, monkeypatch):
+    """A module the plan said would fit and does not is the plan's problem.
+
+    Finishing the check somewhere slower would report the promise as kept. The loop's
+    answer to a module that will not fit is a smaller module.
+    """
     from model_partition.verify import modules as modules_module
 
     impl_dirs = _extract_impls(tiny_run, tmp_path)
     target = next(m.id for m in tiny_run.graph.partitioned_modules
                   if m.kind == "decoder_layers")
-    real_run_once = modules_module._run_once
-    calls = {"n": 0}
 
-    def flaky(model, record, bundle, builder, device, branch=False, group=None):
-        if record.module_id == target and device == "cuda" and calls["n"] == 0:
-            calls["n"] += 1
+    def out_of_memory(model, record, bundle, builder, device, branch=False, group=None):
+        if record.module_id == target:
             raise RuntimeError("CUDA out of memory. Tried to allocate 16.00 GiB")
-        return real_run_once(model, record, bundle, builder, device,
-                             branch=branch, group=group)
+        return modules_module.replay_record(model, record, bundle.store, device=device)
 
-    monkeypatch.setattr(modules_module, "_run_once", flaky)
-    monkeypatch.setattr(modules_module, "move_submodules", lambda *a, **k: 0)
-
+    monkeypatch.setattr(modules_module, "_run_once", out_of_memory)
     report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
-                            model_device="cpu", module_device="cuda",
                             impl_dirs=impl_dirs)
-    assert calls["n"] == 1, "the failure should have been injected once"
-    moved = [r for r in report.checked if r.note]
-    assert moved and "not enough cuda memory" in moved[0].note
-    assert all(r.passed for r in report.checked), report.render()
+
+    oversized = report.oversized
+    assert oversized and all(r.module_id == target for r in oversized)
+    assert "Partition it further" in oversized[0].error
+    assert not report.passed
+    # Not a skip: the check did not pass and the report says why.
+    assert target not in {r.module_id for r in report.skipped}
+
+
+def test_an_oversized_module_sends_the_repair_to_the_plan(tiny_run, tmp_path, monkeypatch):
+    """Arithmetic cannot make a module fit, so the plan is the surface to edit."""
+    from model_partition.loop.stages import stage_verify_modules
+    from model_partition.verify import modules as modules_module
+
+    def out_of_memory(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 16.00 GiB")
+
+    monkeypatch.setattr(modules_module, "_run_once", out_of_memory)
+
+    class Ctx:
+        graph = tiny_run.graph
+        bundle = tiny_run.bundle
+        build_model = staticmethod(tiny_run.build_model)
+        layout = tiny_run.layout
+        options = type("O", (), {"device": "cpu"})()
+        result = tiny_run.result
+        budget = type("B", (), {"gpu": None, "total_bytes": 0})()
+        notes: list = []
+        verify_report = None
+
+    result = stage_verify_modules(Ctx())
+    assert not result.ok and result.repairable
+    assert result.repair_surface == "plan"
+    assert "Partition it further" in result.detail or "need partitioning" in result.detail
 
 
 def test_an_allocation_failure_is_told_apart_from_a_real_error():

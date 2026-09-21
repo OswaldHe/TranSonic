@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+from model_partition import yamlio
 
 MANIFEST_NAME = "manifest.yaml"
 
@@ -229,7 +229,7 @@ class TensorStore:
             "tensors": [e.to_dict() for e in self.entries],
         }
         self.root.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+        self.manifest_path.write_text(yamlio.dumps(payload))
         return self.manifest_path
 
     @classmethod
@@ -238,7 +238,7 @@ class TensorStore:
         path = store.manifest_path
         if not path.is_file():
             raise TensorStoreError(f"No manifest at {path}")
-        payload = yaml.safe_load(path.read_text()) or {}
+        payload = yamlio.load_path(path) or {}
         store.entries = [TensorMeta.from_dict(e) for e in payload.get("tensors", [])]
         store.metadata = payload.get("metadata", {})
         for entry in store.entries:

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+from model_partition import yamlio
 
 from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
@@ -213,7 +213,7 @@ def extract(
                 group.preserved = True
                 continue
             path.write_text(_render_template(template, context))
-        (directory / "meta.yaml").write_text(yaml.safe_dump({
+        (directory / "meta.yaml").write_text(yamlio.dumps({
             **group.to_dict(),
             "kind": representative.kind,
             "param_bytes": representative.param_bytes,
@@ -223,7 +223,7 @@ def extract(
         }, sort_keys=False))
         groups.append(group)
 
-    (root / "index.yaml").write_text(yaml.safe_dump({
+    (root / "index.yaml").write_text(yamlio.dumps({
         "n_groups": len(groups),
         "n_modules": len(graph.partitioned_modules),
         "groups": [

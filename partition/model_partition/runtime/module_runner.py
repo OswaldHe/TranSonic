@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+from model_partition import yamlio
 
 from model_partition.trace import CallRecord, _lookup, decode_value
 from model_partition.tensorstore import TensorStore
@@ -78,7 +78,7 @@ class TraceBundle:
     def save(self) -> Path:
         self.store.save_manifest(self.metadata)
         path = self.root / RECORDS_NAME
-        path.write_text(yaml.safe_dump({
+        path.write_text(yamlio.dumps({
             "metadata": self.metadata,
             "weights": self.weights,
             "weight_params": self.weight_params,
@@ -92,7 +92,7 @@ class TraceBundle:
         path = Path(root) / RECORDS_NAME
         if not path.is_file():
             raise ReplayError(f"No trace records at {path}")
-        payload = yaml.safe_load(path.read_text()) or {}
+        payload = yamlio.load_path(path) or {}
         return cls(
             store=store,
             records=[CallRecord.from_dict(r) for r in payload.get("records", [])],

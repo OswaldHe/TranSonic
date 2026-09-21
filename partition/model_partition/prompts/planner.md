@@ -105,7 +105,11 @@ Common causes, in rough order of likelihood:
   was never hooked and has no trace records.
 - A module boundary sits mid-computation, so its recorded arguments include a
   value that cannot be replayed.
-- A module's `resident_bytes` exceeds the budget.
+- A module's `resident_bytes` exceeds the budget, or it ran out of device memory
+  even though the plan said it would fit. Either way the answer is a smaller module:
+  the budget covers parameters and a nominal activation, not a transient that scales
+  with the square of the sequence or with the vocabulary. Split the module, or cut the
+  layer group it belongs to into fewer layers.
 - A layer group mixes two layer signatures, so one implementation cannot serve
   every layer in it.
 

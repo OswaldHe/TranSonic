@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
+from model_partition import yamlio
 
 DEFAULT_ARTIFACT_ROOT = Path(
     os.environ.get("MODEL_PARTITION_ARTIFACTS", "~/transonic_artifacts")
@@ -91,13 +91,13 @@ class RunLayout:
 
     def write_run(self, payload: dict[str, Any]) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        self.run_file.write_text(yaml.safe_dump(payload, sort_keys=False))
+        self.run_file.write_text(yamlio.dumps(payload))
         return self.run_file
 
     def read_run(self) -> dict[str, Any]:
         if not self.run_file.is_file():
             raise FileNotFoundError(f"No run manifest at {self.run_file}")
-        return yaml.safe_load(self.run_file.read_text()) or {}
+        return yamlio.load_path(self.run_file) or {}
 
     @classmethod
     def at(cls, run_dir: str | Path) -> RunLayout:

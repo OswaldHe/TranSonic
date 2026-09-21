@@ -107,6 +107,10 @@ class StageResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     #: Set when a failure should be handed to the agent for repair.
     repairable: bool = False
+    #: Which editable surface the repair belongs to. A module that does not fit its
+    #: device is a partition problem; one that runs but disagrees is an arithmetic
+    #: problem, and pointing the agent at the wrong one wastes an iteration.
+    repair_surface: str = "plan"
     failing_modules: list[str] = field(default_factory=list)
     #: The stage succeeded mechanically but the judge was not satisfied. Advisory:
     #: it keeps the loop iterating without marking the run failed.
@@ -633,21 +637,31 @@ def stage_verify_modules(ctx: LoopContext) -> StageResult:
 
     if not report.passed:
         failing = sorted({r.module_id for r in report.failures})
+        oversized = sorted({r.module_id for r in report.oversized})
+        detail = (f"{len(report.failures)}/{len(report.checked)} checks failed; "
+                  f"modules: {', '.join(failing[:8])}")
+        if oversized:
+            detail += (f". {len(oversized)} did not fit {target} and need partitioning "
+                       f"further: {', '.join(oversized[:8])}")
         return StageResult(
-            ok=False, repairable=True, failing_modules=failing,
-            detail=(f"{len(report.failures)}/{len(report.results)} checks failed; "
-                    f"modules: {', '.join(failing[:8])}"),
+            ok=False, repairable=True, failing_modules=failing, detail=detail,
+            # Capacity first: an arithmetic fix cannot make a module fit.
+            repair_surface="plan" if oversized else "modules",
             metrics=_verify_metrics(report),
         )
-    return StageResult(ok=True, detail=(
-        f"{len(report.results)} checks passed, worst cosine {report.worst_cosine():.6f}"
-    ), metrics=_verify_metrics(report))
+    detail = (f"{len(report.checked)} checks passed, "
+              f"worst cosine {report.worst_cosine():.6f}")
+    if report.skipped:
+        detail += f"; {len(report.skipped)} skipped"
+    return StageResult(ok=True, detail=detail, metrics=_verify_metrics(report))
 
 
 def _verify_metrics(report) -> dict[str, Any]:
     return {
         "n_checks": len(report.results),
         "n_failed": len(report.failures),
+        "n_skipped": len(report.skipped),
+        "n_oversized": len(report.oversized),
         "worst_cosine": report.worst_cosine(),
         "max_abs_err": report.max_abs_err(),
         "devices": sorted({r.device for r in report.results if r.device}),

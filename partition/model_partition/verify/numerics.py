@@ -95,9 +95,22 @@ class Comparison:
         }
 
 
+#: Elements compared at a time. Comparison memory has to be bounded rather than
+#: proportional to the tensor: a 16k-token logits tensor is 8 GB, and materializing
+#: a handful of full-size float32 intermediates of it is how a verification run on a
+#: 1.6 GiB model reached 126 GB and was killed by the host. 8 M elements is 32 MiB
+#: per float32 buffer, so a whole comparison costs a few hundred MiB whatever the
+#: tensor's size.
+COMPARE_CHUNK = 1 << 23
+
+
 def compare(actual: Any, reference: Any, name: str = "tensor",
             tolerance: Tolerance | None = None) -> Comparison:
-    """Compare two tensors and decide whether they match."""
+    """Compare two tensors and decide whether they match.
+
+    Streams over the data in chunks, accumulating in float64 so the statistics do
+    not drift over a billion elements.
+    """
     import torch
 
     if actual is None or reference is None:
@@ -110,32 +123,43 @@ def compare(actual: Any, reference: Any, name: str = "tensor",
     dtype_name = str(reference.dtype).removeprefix("torch.")
     tol = tolerance or Tolerance.for_dtype(dtype_name)
 
-    a = actual.detach().to(torch.float32).flatten()
-    b = reference.detach().to(torch.float32).flatten()
+    a = actual.detach().reshape(-1)
+    b = reference.detach().reshape(-1)
     n = a.numel()
     if n == 0:
         return Comparison(name=name, passed=True, n_elements=0)
 
-    finite = torch.isfinite(a) & torch.isfinite(b)
-    if not bool(finite.all()):
-        bad = int((~finite).sum())
-        return Comparison(name=name, passed=False, n_elements=n,
-                          reason=f"{bad} non-finite value(s)")
+    max_abs, worst_at, max_rel, n_close = 0.0, 0, 0.0, 0
+    dot, norm_a, norm_b = 0.0, 0.0, 0.0
+    for start in range(0, n, COMPARE_CHUNK):
+        x = a[start:start + COMPARE_CHUNK].to(torch.float32)
+        y = b[start:start + COMPARE_CHUNK].to(torch.float32)
+        bad = int((~(torch.isfinite(x) & torch.isfinite(y))).sum())
+        if bad:
+            return Comparison(name=name, passed=False, n_elements=n,
+                              reason=f"{bad} non-finite value(s)")
+        diff = (x - y).abs()
+        chunk_max = float(diff.max())
+        if chunk_max > max_abs:
+            max_abs, worst_at = chunk_max, start + int(diff.argmax())
+        magnitude = y.abs()
+        max_rel = max(max_rel, float((diff / magnitude.clamp_min(1e-12)).max()))
+        n_close += int((diff <= (tol.atol + tol.rtol * magnitude)).sum())
+        dot += float(torch.sum(x * y, dtype=torch.float64))
+        norm_a += float(torch.sum(x * x, dtype=torch.float64))
+        norm_b += float(torch.sum(y * y, dtype=torch.float64))
+        del x, y, diff, magnitude
 
-    diff = (a - b).abs()
-    max_abs = float(diff.max())
     if max_abs == 0.0:
         # Identical tensors. Worth special-casing: cosine is undefined for two zero
         # vectors, so an all-zero output — a fully masked region, say — would
         # otherwise be reported as a mismatch against itself.
         return Comparison(name=name, passed=True, n_elements=n)
-    denom = b.abs().clamp_min(1e-12)
-    max_rel = float((diff / denom).max())
-    close = diff <= (tol.atol + tol.rtol * b.abs())
-    pass_fraction = float(close.float().mean())
-    cosine = float(torch.nn.functional.cosine_similarity(a, b, dim=0, eps=1e-12))
-    flat_worst = int(diff.argmax())
-    worst_index = list(_unravel(flat_worst, tuple(reference.shape)))
+
+    scale = (norm_a * norm_b) ** 0.5
+    cosine = (dot / scale) if scale > 0 else 0.0
+    pass_fraction = n_close / n
+    worst_index = list(_unravel(worst_at, tuple(reference.shape)))
 
     reasons: list[str] = []
     if pass_fraction < tol.min_pass_fraction:
