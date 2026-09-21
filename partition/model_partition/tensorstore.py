@@ -39,6 +39,11 @@ DTYPES: dict[str, tuple[int, str | None]] = {
     "int64": (8, "<i8"),
     "bool": (1, "|b1"),
     "fp4_packed": (1, "|u1"),
+    # A precomputed rotary table is complex: DeepSeek's `precompute_freqs_cis` returns
+    # `torch.polar` output, and it is a derived buffer, so the recording is the only
+    # place a module can get it from.
+    "complex64": (8, "<c8"),
+    "complex128": (16, "<c16"),
 }
 
 

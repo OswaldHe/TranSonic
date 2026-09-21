@@ -34,6 +34,15 @@ from pathlib import Path
 from typing import Any
 
 from model_partition.loaders.base import LoaderError
+from model_partition.runtime.launcher import (
+    aliases_of,
+    device_of,
+    dequantize,
+    moved,
+    rebind,
+    set_tensor,
+    tensor_of,
+)
 
 #: A tensor at or below this may stay resident once read: a norm or a block scale, not
 #: a weight matrix.
@@ -265,7 +274,7 @@ def derived_bytes(model: Any, index: dict[str, ShardEntry]) -> int:
 def _all_tensors(model: Any):
     for prefix, module in model.named_modules():
         for leaf in list(module._parameters) + list(module._buffers):
-            tensor = _tensor_of(module, leaf)
+            tensor = tensor_of(module, leaf)
             if tensor is not None:
                 yield (f"{prefix}.{leaf}" if prefix else leaf), tensor
 
@@ -322,7 +331,7 @@ def _subtree_tensors(root: Any, prefix: str) -> list[tuple[Any, str, str, Any]]:
     for name, module in root.named_modules():
         path = f"{prefix}.{name}" if prefix and name else (prefix or name)
         for leaf in list(module._parameters) + list(module._buffers):
-            tensor = _tensor_of(module, leaf)
+            tensor = tensor_of(module, leaf)
             if tensor is not None:
                 rows.append((module, leaf, f"{path}.{leaf}" if path else leaf, tensor))
     return rows
@@ -336,7 +345,7 @@ def _classify(rows: list[tuple[Any, str, str, Any]], index: dict[str, ShardEntry
 
     streamed: list[tuple[Any, str, str]] = []
     for owner, leaf, full, tensor in rows:
-        aliases = _aliases(owner)
+        aliases = aliases_of(owner)
         entry = index.get(full)
         if entry is None:
             # Not in the checkpoint. Either the model computed it at construction — fine,
@@ -346,17 +355,17 @@ def _classify(rows: list[tuple[Any, str, str, Any]], index: dict[str, ShardEntry
             continue
         nbytes = tensor.numel() * tensor.element_size()
         if nbytes <= keep_bytes and report.resident_bytes + nbytes <= resident_budget:
-            _set(owner, leaf, _read(entry, tensor, device))
+            set_tensor(owner, leaf, _read(entry, tensor, device))
             report.resident_tensors += 1
             report.resident_bytes += nbytes
-            _rebind(owner, aliases)
+            rebind(owner, aliases)
             continue
         # Released now rather than at the first forward: a tensor the checkpoint supplies
         # may have been allocated during construction, and holding it until something
         # calls this module defeats the point of streaming.
         if not tensor.is_meta:
-            _set(owner, leaf, torch.empty(tensor.shape, dtype=tensor.dtype, device="meta"))
-            _rebind(owner, aliases)
+            set_tensor(owner, leaf, torch.empty(tensor.shape, dtype=tensor.dtype, device="meta"))
+            rebind(owner, aliases)
         streamed.append((owner, leaf, full))
     return streamed
 
@@ -372,112 +381,36 @@ def _install_hooks(module: Any, streamed: list[tuple[Any, str, str]],
     """
     import torch
 
-    shapes = {(id(owner), leaf): (_tensor_of(owner, leaf).shape,
-                                  _tensor_of(owner, leaf).dtype)
+    shapes = {(id(owner), leaf): (tensor_of(owner, leaf).shape,
+                                  tensor_of(owner, leaf).dtype)
               for owner, leaf, _ in streamed}
-    aliases = {id(owner): _aliases(owner) for owner, _, _ in streamed}
+    aliases = {id(owner): aliases_of(owner) for owner, _, _ in streamed}
     origin: list[Any] = [None]
 
     def materialize(_module: Any, args: tuple, kwargs: dict):
         for owner, leaf, full in streamed:
-            current = _tensor_of(owner, leaf)
+            current = tensor_of(owner, leaf)
             if current.is_meta:
-                _set(owner, leaf, _read(index[full], current, device))
+                set_tensor(owner, leaf, _read(index[full], current, device))
         for owner, _, _ in streamed:
-            _rebind(owner, aliases[id(owner)])
+            rebind(owner, aliases[id(owner)])
         if not moves:
             return None
-        origin[0] = _device_of(args) or _device_of(tuple(kwargs.values()))
-        return _moved(args, device), _moved(kwargs, device)
+        origin[0] = device_of(args) or device_of(tuple(kwargs.values()))
+        return moved(args, device), moved(kwargs, device)
 
     def release(_module: Any, args: tuple, kwargs: dict, output: Any):
         for owner, leaf, _ in streamed:
             shape, dtype = shapes[(id(owner), leaf)]
-            _set(owner, leaf, torch.empty(shape, dtype=dtype, device="meta"))
+            set_tensor(owner, leaf, torch.empty(shape, dtype=dtype, device="meta"))
         for owner, _, _ in streamed:
-            _rebind(owner, aliases[id(owner)])
+            rebind(owner, aliases[id(owner)])
         if moves and origin[0] is not None:
-            return _moved(output, origin[0])
+            return moved(output, origin[0])
         return None
 
     module.register_forward_pre_hook(materialize, with_kwargs=True)
     module.register_forward_hook(release, with_kwargs=True)
-
-
-def _device_of(value: Any) -> Any:
-    """The device of the first tensor in an argument tree."""
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        return value.device
-    if isinstance(value, (tuple, list)):
-        for item in value:
-            found = _device_of(item)
-            if found is not None:
-                return found
-    if isinstance(value, dict):
-        return _device_of(tuple(value.values()))
-    return None
-
-
-def _moved(value: Any, device: Any) -> Any:
-    """The same argument tree with every tensor on ``device``."""
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        return value.to(device)
-    if isinstance(value, tuple):
-        return tuple(_moved(item, device) for item in value)
-    if isinstance(value, list):
-        return [_moved(item, device) for item in value]
-    if isinstance(value, dict):
-        return {key: _moved(item, device) for key, item in value.items()}
-    return value
-
-
-def _tensor_of(module: Any, leaf: str) -> Any:
-    if leaf in module._parameters:
-        return module._parameters[leaf]
-    return module._buffers.get(leaf)
-
-
-def _set(module: Any, leaf: str, value: Any) -> None:
-    import torch
-
-    if leaf in module._parameters:
-        module._parameters[leaf] = torch.nn.Parameter(value, requires_grad=False)
-    else:
-        module._buffers[leaf] = value
-
-
-def _aliases(module: Any) -> list[tuple[str, str, str]]:
-    """Attributes on one tensor that point at another of the same module's tensors.
-
-    A vendor's quantized ``Linear`` hangs its block scale off the weight so its kernel
-    can reach it — ``self.weight.scale = self.scale`` — and replacing either tensor
-    breaks the link unless it is put back.
-    """
-    found: list[tuple[str, str, str]] = []
-    names = list(module._parameters) + list(module._buffers)
-    for leaf in names:
-        holder = _tensor_of(module, leaf)
-        if holder is None:
-            continue
-        for attribute, value in list(vars(holder).items()):
-            for other in names:
-                if other != leaf and _tensor_of(module, other) is value:
-                    found.append((leaf, attribute, other))
-    return found
-
-
-def _rebind(module: Any, aliases: list[tuple[str, str, str]]) -> None:
-    for leaf, attribute, other in aliases:
-        holder, target = _tensor_of(module, leaf), _tensor_of(module, other)
-        if holder is not None and target is not None:
-            try:
-                setattr(holder, attribute, target)
-            except Exception:  # pragma: no cover - a read-only attribute
-                continue
 
 
 def _read(entry: ShardEntry, target: Any, device: str) -> Any:
@@ -491,7 +424,7 @@ def _read(entry: ShardEntry, target: Any, device: str) -> Any:
     if raw.dtype != target.dtype:
         if scale is not None and target.dtype in (torch.bfloat16, torch.float16,
                                                   torch.float32):
-            raw = _dequantize(raw, scale, target.dtype)
+            raw = dequantize(raw, scale, target.dtype)
         elif raw.element_size() == target.element_size():
             # Same bytes, different reading of them: an int8 pair of fp4 values.
             raw = raw.view(target.dtype)
@@ -500,20 +433,3 @@ def _read(entry: ShardEntry, target: Any, device: str) -> Any:
     if tuple(raw.shape) != tuple(target.shape):
         raw = raw.reshape(target.shape)
     return raw.to(device)
-
-
-def _dequantize(weight: Any, scale: Any, dtype: Any) -> Any:
-    """Expand a block-scaled weight to ``dtype``, one scale per block.
-
-    The arithmetic a vendor conversion script does for the weights its kernels want in
-    bfloat16: each block of the weight is multiplied by its own scale.
-    """
-    if weight.dim() != 2 or scale.dim() != 2:
-        return weight.to(dtype)
-    out_block = weight.shape[0] // scale.shape[0]
-    in_block = weight.shape[1] // scale.shape[1]
-    if out_block < 1 or in_block < 1:
-        return weight.to(dtype)
-    expanded = (weight.unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block)).float()
-                * scale[:, None, :, None].float())
-    return expanded.flatten(2, 3).flatten(0, 1).to(dtype)

@@ -20,6 +20,7 @@ from model_partition.runtime.launcher import weights_bytes
 from model_partition.runtime.module_runner import (
     TraceBundle,
     apply_named_weights,
+    apply_state,
     expected_output,
     load_named_weights,
     replay_record,
@@ -287,16 +288,17 @@ def verify_modules(
         applied = (len(weights) if placeholders
                    else apply_named_weights(model, weights, graph_module))
         residency = target
-        if target != host and not _weights_fit(target, weights):
-            # Not a broken promise and not something partitioning fixes: a single 94.4
-            # GiB embedding table is one piece of work whatever it is cut into, and no
-            # card here holds it. Checked on the host, and the report says where.
-            residency = host
+        if not _weights_fit(target, weights):
+            # Not a broken promise and not something partitioning fixes: one 94.4 GiB
+            # embedding table is one piece of work whatever it is cut into. The check
+            # still runs on the accelerator — the launcher leaves the table on the host
+            # and moves what crosses it — because the fp8 GEMM beside it runs nowhere
+            # else.
             report.notes.append(
-                f"{module_id}: weights are {format_bytes(weights_bytes(weights))}, more "
-                f"than {target} holds; verified on {host}"
+                f"{module_id}: {format_bytes(weights_bytes(weights))} of weights, more "
+                f"than {target} holds; the oversized ones stay on {host}"
             )
-        elif target != host and not placeholders:
+        if target != host and not placeholders:
             try:
                 move_submodules(model, graph_module, target)
             except RuntimeError as exc:
@@ -385,18 +387,6 @@ def verify_modules(
     return report
 
 
-def _has_placeholders(model: Any) -> bool:
-    """True when the model's weights are placeholders rather than values.
-
-    Which is how a model larger than this machine gets built at all: each module reads
-    its own for its forward and releases them after.
-    """
-    for tensor in list(model.parameters()) + list(model.buffers()):
-        if getattr(tensor, "is_meta", False):
-            return True
-    return False
-
-
 def _weights_fit(device: str, weights: dict[str, Any]) -> bool:
     """Whether one module's weights have room on ``device`` as things stand."""
     if not device.startswith("cuda"):
@@ -412,6 +402,16 @@ def _weights_fit(device: str, weights: dict[str, Any]) -> bool:
     return weights_bytes(weights) < free * 0.8
 
 
+def _has_placeholders(model: Any) -> bool:
+    """True when the model's weights are placeholders rather than values.
+
+    Which is how a model larger than this machine gets built at all: each module reads
+    its own for its forward and releases them after.
+    """
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if getattr(tensor, "is_meta", False):
+            return True
+    return False
 
 
 def _check_bytes(records: list[Any], bundle: TraceBundle) -> int:
@@ -461,6 +461,7 @@ def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
     again: a module's parameters are the same tensors either way, and ``copy_``
     moves them to wherever the implementation was built.
     """
+    from model_partition.runtime.launcher import load_source
     from model_partition.runtime.module_impl import load_impl
 
     cache: dict[str | None, Any] = {}
@@ -485,6 +486,9 @@ def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
         cache[submodule] = built
         return built
 
+    # The module's own `source.py`, so a caller can put back the cross-module state a
+    # recorded call ran on: that is where the module reads it from.
+    build.source = lambda: load_source(impl_dir, device=device)
     return build
 
 
@@ -508,6 +512,10 @@ def _run_once(model: Any, record: Any, bundle: TraceBundle, builder: Any, device
             f"{record.module_id}: recorded arguments include an unserializable value"
         )
     impl_callable = builder(record.submodule if branch else None)
+    # The state this call read, put back where the module reads it. A consumer of
+    # DeepSeek's shared compressed KV has no argument naming it.
+    if getattr(record, "state", None):
+        apply_state(builder.source(), record, bundle.store, device)
     args, kwargs = decode_group_call(group or [record], bundle.store, device)
     with torch.no_grad():
         return impl_callable(*args, **kwargs)

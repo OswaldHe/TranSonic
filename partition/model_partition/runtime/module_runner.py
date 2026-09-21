@@ -130,9 +130,16 @@ def decode_group_call(records: list[CallRecord], store: TensorStore,
 
     A group can be heterogeneous — a normalization followed by attention — and then
     the first submodule's recorded call says nothing about the rotary embeddings and
-    masks the attention needs. Taking positional arguments from the first call and
-    the union of every keyword any submodule received makes the module
-    self-contained: whatever it does internally, it was given everything.
+    masks the attention needs. The value flowing in comes from the group's entry point;
+    everything beyond it is the union over the group, so whatever the module does
+    internally, it was given everything.
+
+    Extra *positional* arguments count too, and not every model passes its extras by
+    keyword: DeepSeek's attention takes ``(x, start_pos, ...)``, so a group of
+    ``[attn_norm, attn]`` driven by the norm's one argument alone cannot call the
+    attention at all. They come from whichever recorded call carries the most, and
+    :func:`~model_partition.runtime.launcher._chain` hands each submodule as many as its
+    own signature takes.
 
     First occurrence wins, so a keyword that changes down the group keeps the value
     the group's entry point saw.
@@ -141,11 +148,39 @@ def decode_group_call(records: list[CallRecord], store: TensorStore,
         return (), {}
     args, kwargs = decode_call(records[0], store, device)
     merged = dict(kwargs)
+    extras: tuple = args[1:]
     for record in records[1:]:
-        _, extra = decode_call(record, store, device)
+        other, extra = decode_call(record, store, device)
         for key, value in extra.items():
             merged.setdefault(key, value)
-    return args, merged
+        if len(other) - 1 > len(extras):
+            extras = other[1:]
+    return (args[:1] + extras if args else extras), merged
+
+
+def apply_state(source: Any, record: Any, store: TensorStore, device: str = "cpu") -> int:
+    """Put the cross-module state a recorded call ran on back where it reads it.
+
+    A model that passes tensors between modules through a module-level object — the
+    compressed KV DeepSeek's attention layers share — leaves a consumer with no argument
+    naming the largest thing it reads. The trace records it per call; this restores it on
+    the module's own ``source.py``, so the check is of the module against its reference
+    and not of one module against another having run first.
+    """
+    from model_partition.trace import decode_value
+
+    if not getattr(record, "state", None):
+        return 0
+    load = tensor_loader(store, device)
+    applied = 0
+    for dotted, encoded in record.state.items():
+        holder_name, _, attribute = dotted.rpartition(".")
+        holder = getattr(source, holder_name, None)
+        if holder is None:
+            continue
+        setattr(holder, attribute, decode_value(encoded, load))
+        applied += 1
+    return applied
 
 
 def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
@@ -153,24 +188,27 @@ def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu")
 
     This is what an extracted implementation is handed, so its code reads
     ``weights["model.layers.0.self_attn.q_proj.weight"]`` rather than a flattened
-    filesystem name. Values come from the dumps, or from the checkpoint when the
-    run chose not to cache them.
+    filesystem name.
+
+    Both sources contribute, and the dumps win. A run that does not cache weights still
+    dumps the derived buffers — a rotary table is in no checkpoint — so neither source
+    is complete on its own: the recording holds what the checkpoint cannot, and the
+    checkpoint holds what the run chose not to copy.
     """
-    dumped = bundle.weights.get(module_id)
+    result: dict[str, Any] = {}
+    dumped = bundle.weights.get(module_id) or []
     if dumped:
         load = tensor_loader(bundle.store, device)
         by_name = {entry.name: entry for entry in bundle.store.entries}
-        result: dict[str, Any] = {}
         for name in dumped:
             entry = by_name.get(name)
             original = (entry.extra or {}).get("param") if entry else None
             result[original or name] = load(name)
-        return result
 
-    params = bundle.weight_params.get(module_id) or []
-    if params and bundle.checkpoint is not None:
-        return bundle.checkpoint.load(params, device=device)
-    return {}
+    wanted = [p for p in (bundle.weight_params.get(module_id) or []) if p not in result]
+    if wanted and bundle.checkpoint is not None:
+        result.update(bundle.checkpoint.load(wanted, device=device))
+    return result
 
 
 def apply_named_weights(model: Any, weights: dict[str, Any], graph_module: Any) -> int:

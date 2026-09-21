@@ -5,8 +5,8 @@
 
 import pytest
 
-from model_partition.runtime.streaming import (
-    StreamingError,
+from model_partition.runtime.emulation import (
+    EmulationError,
     capture_boundaries,
     fill_from_dumps,
     generate,
@@ -53,7 +53,7 @@ def test_incomplete_dumps_are_reported_not_tolerated(tiny_run):
     target = next(m.id for m in tiny_run.graph.partitioned_modules
                   if m.kind == "decoder_layers")
     tiny_run.bundle.weights[target] = tiny_run.bundle.weights[target][:2]
-    with pytest.raises(StreamingError, match="no dumped value"):
+    with pytest.raises(EmulationError, match="no dumped value"):
         fill_from_dumps(tiny_run.build_model(), tiny_run.bundle, tiny_run.graph)
 
 
@@ -259,7 +259,7 @@ def _impls(run, tmp_path):
 
 def test_installing_the_implementations_replaces_every_submodule(tiny_run, tmp_path):
     from model_partition.runtime import launcher
-    from model_partition.runtime.assemble import install_implementations
+    from model_partition.runtime.emulation import install_implementations
     from model_partition.trace import _lookup
 
     launcher.clear_source_cache()
@@ -276,7 +276,7 @@ def test_installing_the_implementations_replaces_every_submodule(tiny_run, tmp_p
 def test_installation_does_not_instantiate_another_model(tiny_run, tmp_path):
     """The wrappers call source.py, so nothing else gets built to serve them."""
     from model_partition.runtime import launcher
-    from model_partition.runtime.assemble import install_implementations
+    from model_partition.runtime.emulation import install_implementations
     from model_partition.trace import _lookup
 
     launcher.clear_source_cache()
@@ -330,7 +330,7 @@ def test_emulation_generates_through_the_extracted_implementations(tiny_run, tmp
 def test_emulation_says_when_a_submodule_kept_the_model_s_own_code(tiny_run, tmp_path):
     """Partial installation has to be visible, not assumed away."""
     from model_partition.runtime import launcher
-    from model_partition.runtime.assemble import install_implementations
+    from model_partition.runtime.emulation import install_implementations
 
     launcher.clear_source_cache()
     try:
@@ -408,10 +408,10 @@ def test_generate_keeps_only_the_last_position(tiny_run):
 
 def test_boundary_hooks_are_gone_before_generation_starts(tiny_run, monkeypatch):
     """Otherwise every module's output is held for the whole generation."""
-    from model_partition.runtime import streaming
+    from model_partition.runtime import emulation
 
     hooked_during_generate = {"any": False}
-    real_generate = streaming.generate
+    real_generate = emulation.generate
 
     def checking(model, *args, **kwargs):
         for module in model.modules():
@@ -438,7 +438,7 @@ def _first_input_ids(run):
 
 def test_generation_asks_the_model_for_only_the_last_row(tiny_run):
     """A full-sequence logits tensor is 8 GB at long context, and unused but for one row."""
-    from model_partition.runtime.streaming import _last_logits_argument
+    from model_partition.runtime.emulation import _last_logits_argument
 
     model = tiny_run.build_model()
     keyword = _last_logits_argument(model)
@@ -461,16 +461,16 @@ def test_generation_asks_the_model_for_only_the_last_row(tiny_run):
 
 
 def test_generation_still_works_when_the_model_takes_no_such_argument(tiny_run):
-    from model_partition.runtime import streaming
+    from model_partition.runtime import emulation
 
     model = tiny_run.build_model()
     ids = _first_input_ids(tiny_run)
-    with_flag, _ = streaming.generate(model, ids, max_new_tokens=3)
+    with_flag, _ = emulation.generate(model, ids, max_new_tokens=3)
 
-    real = streaming._last_logits_argument
-    streaming._last_logits_argument = lambda _model: None
+    real = emulation._last_logits_argument
+    emulation._last_logits_argument = lambda _model: None
     try:
-        without, _ = streaming.generate(model, ids, max_new_tokens=3)
+        without, _ = emulation.generate(model, ids, max_new_tokens=3)
     finally:
-        streaming._last_logits_argument = real
+        emulation._last_logits_argument = real
     assert with_flag == without

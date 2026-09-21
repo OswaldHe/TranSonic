@@ -50,6 +50,11 @@ class CallRecord:
     kwargs: dict[str, Any] = field(default_factory=dict)
     output: Any = None
     order: int = 0
+    #: Cross-module state as it stood when this call started, by dotted name — the
+    #: tensors a model passes between modules through a module-level object rather than
+    #: through arguments. Without them a consumer of DeepSeek's shared compressed KV has
+    #: no record of the largest thing it reads.
+    state: dict[str, Any] = field(default_factory=dict)
     #: At least one tensor in this record was windowed rather than dumped whole.
     #: Such a record documents the module but cannot verify it: attention mixes
     #: every position, so the windowed output is not a function of the windowed
@@ -62,6 +67,8 @@ class CallRecord:
             "sample_id": self.sample_id, "step": self.step, "order": self.order,
             "args": self.args, "kwargs": self.kwargs, "output": self.output,
         }
+        if self.state:
+            data["state"] = self.state
         if self.sliced:
             data["sliced"] = True
         return data
@@ -73,6 +80,7 @@ class CallRecord:
             sample_id=data["sample_id"], step=int(data.get("step", 0)),
             args=data.get("args") or [], kwargs=data.get("kwargs") or {},
             output=data.get("output"), order=int(data.get("order", 0)),
+            state=data.get("state") or {},
             sliced=bool(data.get("sliced", False)),
         )
 
@@ -80,6 +88,7 @@ class CallRecord:
         names: list[str] = []
         _collect_tensor_names(self.args, names)
         _collect_tensor_names(self.kwargs, names)
+        _collect_tensor_names(self.state, names)
         _collect_tensor_names(self.output, names)
         return names
 
@@ -164,11 +173,17 @@ class Tracer:
         graph: PartitionGraph,
         store: TensorStore,
         policy: DumpPolicy | None = None,
+        state_objects: tuple[str, ...] = (),
     ):
         self.model = model
         self.graph = graph
         self.store = store
         self.policy = policy or DumpPolicy()
+        #: Module-level objects of the model's file holding state that passes between
+        #: modules without being anyone's argument. From the spec's ``trace.state``.
+        self.state_objects = tuple(state_objects)
+        #: The state the call now running read, filled by a pre-forward hook.
+        self._state: dict[str, Any] = {}
         self.records: list[CallRecord] = []
         self.bytes_written = 0
         #: What the last traced forward returned, and the hidden state its decoder
@@ -370,6 +385,36 @@ class Tracer:
         self.records.extend(produced)
         return produced
 
+    def _make_state_hook(self, submodule_name: str, sample_id: str, step: int,
+                         seq_len: int, module_id: str):
+        """A pre-forward hook that dumps the cross-module state this call will read."""
+        def hook(_module, args):
+            prefix = f"{sample_id}/s{step}/{_safe_name(submodule_name)}/state"
+            captured: dict[str, Any] = {}
+            for holder_name, attribute, value in self._shared_tensors():
+                self._sliced = False
+                dotted = f"{holder_name}.{attribute}"
+                captured[dotted] = self._encode(
+                    value, f"{prefix}/{_safe_name(dotted)}", seq_len, module_id,
+                    sample_id, step, role="weight",
+                )
+            self._state = captured
+            return None
+        return hook
+
+    def _shared_tensors(self):
+        """``(object name, attribute, tensor)`` for the state the spec named."""
+        import sys
+
+        vendor = sys.modules.get(type(self.model).__module__)
+        for holder_name in self.state_objects:
+            holder = getattr(vendor, holder_name, None) if vendor else None
+            if holder is None:
+                continue
+            for attribute, value in vars(holder).items():
+                if is_tensor(value):
+                    yield holder_name, attribute, value
+
     def _pass_pool(self, input_ids: Any, extra: Any,
                    returns: tuple[str, ...]) -> tuple[dict[str, Any], Any]:
         """The values an extra pass can ask for, and the ids it runs on."""
@@ -439,8 +484,10 @@ class Tracer:
                                             step, role="output"),
                     )
                     record.sliced = self._sliced
+                    record.state = dict(self._state)
                     produced.append(record)
                 counter["n"] += 1
+                self._state = {}
             return hook
 
         handles = []
@@ -450,6 +497,13 @@ class Tracer:
             submodule = _lookup(self.model, submodule_name)
             if submodule is None:
                 continue
+            if self.state_objects:
+                # Before the call, not after: shared state is what this module *reads*,
+                # and the module that publishes it may be this one.
+                handles.append(submodule.register_forward_pre_hook(
+                    self._make_state_hook(submodule_name, sample_id, step, seq_len,
+                                          module_ids[0]),
+                ))
             handles.append(submodule.register_forward_hook(
                 make_hook(submodule_name, module_ids), with_kwargs=True,
             ))

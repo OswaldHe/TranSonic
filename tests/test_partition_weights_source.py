@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from model_partition.weights_source import CheckpointWeights, WeightSourceError
+from model_partition.weights_index import CheckpointWeights, WeightSourceError
 
 pytest.importorskip("torch")
 pytest.importorskip("safetensors")

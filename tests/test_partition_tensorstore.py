@@ -158,7 +158,19 @@ def test_dtype_name_normalizes_torch_and_numpy():
     assert dtype_name(torch.float32) == "float32"
     assert dtype_name(np.dtype("int64")) == "int64"
     with pytest.raises(TensorStoreError, match="Unsupported dtype"):
-        dtype_name("complex128")
+        dtype_name("float128")
+
+
+def test_a_complex_rotary_table_round_trips_exactly():
+    """DeepSeek's `precompute_freqs_cis` returns `torch.polar` output, and it is a
+    derived buffer — no checkpoint holds it, so the recording is the only source."""
+    import tempfile
+
+    table = torch.polar(torch.ones(4, 3), torch.arange(12, dtype=torch.float32).reshape(4, 3))
+    store = TensorStore(tempfile.mkdtemp())
+    meta = store.write("freqs_cis", table)
+    assert meta.dtype == "complex64" and meta.nbytes == 96
+    assert torch.equal(store.read_torch(meta), table)
 
 
 def test_element_count():

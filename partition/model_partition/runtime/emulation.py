@@ -1,16 +1,22 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a whole model assembled exclusively from dumped per-module weights.
+"""Run a whole model from the partition's own artifacts, and generate from it.
 
-The emulation contract: build the model structure, fill every parameter from the
-partition artifacts (never from the original checkpoint), then generate. If the
-dumps are incomplete the fill reports exactly which parameters were left
-unsatisfied instead of quietly falling back.
+The emulation contract, in two halves. Fill: build the model structure and fill every
+parameter from the partition artifacts, never from the original checkpoint, reporting
+exactly which parameters were left unsatisfied rather than quietly falling back.
+Install: replace every partitioned submodule with a wrapper that calls its group's
+``inference.py``, so what generates is the implementations the loop verified and not
+the vendor's own code. Assembling the vendor model from dumps and generating from that
+would check the reference against itself and print tokens the shipped code never
+produced.
 
-Module boundaries are captured on their own forward, then released before
-generation: leaving the hooks installed would hold one output per module for every
-step, and at long context the logits alone are gigabytes.
+The surrounding model still computes masks and rotary embeddings and passes them in,
+which is what lets the chain run at a sequence length no recording covers. Module
+boundaries are captured on their own forward, then released before generation: leaving
+the hooks installed would hold one output per module for every step, and at long
+context the logits alone are gigabytes.
 """
 
 from __future__ import annotations
@@ -23,8 +29,8 @@ from model_partition.runtime.module_runner import TraceBundle, load_named_weight
 from model_partition.trace import _lookup
 
 
-class StreamingError(RuntimeError):
-    """Raised when a model cannot be assembled from its dumps."""
+class EmulationError(RuntimeError):
+    """Raised when a model cannot be assembled from its artifacts, or run from them."""
 
 
 @dataclass
@@ -121,7 +127,7 @@ def fill_from_dumps(
             detail.append(f"{len(report.unclaimed)} parameter(s) belong to no module of "
                           f"the plan and would keep their checkpoint values "
                           f"({', '.join(report.unclaimed[:6])})")
-        raise StreamingError("Cannot assemble the model from dumps: " + "; ".join(detail))
+        raise EmulationError("Cannot assemble the model from dumps: " + "; ".join(detail))
     return report
 
 
@@ -257,3 +263,144 @@ def generate(
                 dim=-1,
             )
     return produced, last
+
+
+# -- installing the implementations ------------------------------------------
+@dataclass
+class InstallReport:
+    """Which submodules now run the loop's code, and which do not."""
+
+    installed: list[str] = field(default_factory=list)
+    skipped: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.installed) and not self.skipped
+
+    def summary(self) -> str:
+        text = f"{len(self.installed)} submodule(s) running the extracted implementation"
+        if self.skipped:
+            first = ", ".join(list(self.skipped)[:3])
+            text += f"; {len(self.skipped)} left as the model's own ({first})"
+        return text
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "installed": list(self.installed),
+            "skipped": dict(self.skipped),
+            "complete": self.complete,
+        }
+
+
+def install_implementations(
+    model: Any,
+    graph: Any,
+    bundle: Any,
+    impl_dirs: dict[str, Any],
+    device: str = "cpu",
+) -> InstallReport:
+    """Replace every partitioned submodule with its implementation.
+
+    One wrapper per submodule rather than one per module: a wrapper installed at a
+    submodule is called with exactly the arguments that submodule received, so the
+    substitution needs to know nothing about how the surrounding architecture glues
+    its pieces together. A group spanning several submodules is checked as a span by
+    ``verify_modules`` and ``verify_chain``; here each of its submodules runs the
+    group's code for its own part.
+    """
+    return _install_all(model, graph, bundle, impl_dirs, device, InstallReport())
+
+
+def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
+                 device: str, report: InstallReport) -> InstallReport:
+    import torch
+
+    from model_partition.runtime.module_impl import load_impl
+    from model_partition.runtime.module_runner import load_named_weights
+    from model_partition.trace import _lookup
+
+    pending: list[tuple[str, Any]] = []
+    for module in graph.partitioned_modules:
+        impl_dir = impl_dirs.get(module.id)
+        if impl_dir is None:
+            report.skipped[module.id] = "no extracted implementation"
+            continue
+        if module.functional:
+            report.skipped[module.id] = "functional: nothing to replace"
+            continue
+        try:
+            impl = load_impl(impl_dir)
+            weights = load_named_weights(bundle, module.id, device=device)
+            if not weights:
+                raise EmulationError("no weights available")
+        except Exception as exc:
+            report.skipped[module.id] = str(exc)
+            continue
+
+        for submodule_name in module.submodules:
+            original = _lookup(model, submodule_name)
+            if original is None:
+                report.skipped[submodule_name] = "not present in the model"
+                continue
+            try:
+                built = impl.build(bundle.config, weights, device, submodule=submodule_name)
+            except Exception as exc:
+                report.skipped[submodule_name] = f"build failed: {exc}"
+                continue
+            if not callable(built):
+                report.skipped[submodule_name] = "build_module() returned a non-callable"
+                continue
+            pending.append((submodule_name, _wrapper_class()(built, original)))
+
+    for submodule_name, wrapper in pending:
+        _install(model, submodule_name, wrapper)
+        report.installed.append(submodule_name)
+    if isinstance(model, torch.nn.Module):
+        model.eval()
+    return report
+
+
+#: Defined on first use so importing this module does not require torch.
+_WRAPPER: Any = None
+
+
+def _wrapper_class() -> Any:
+    """An ``nn.Module`` standing in for a submodule, calling the loop's code.
+
+    It has to be an ``nn.Module``: the model walks its own tree to move parameters
+    between devices, and forward hooks are what boundary capture attaches to.
+    """
+    global _WRAPPER
+    if _WRAPPER is None:
+        import torch
+
+        class Implemented(torch.nn.Module):
+            def __init__(self, built: Any, original: Any):
+                super().__init__()
+                self._built = built
+                #: Kept so the original parameters stay reachable from the model tree
+                #: rather than being freed while the wrapper is in their place.
+                self.original = original
+
+            def forward(self, *args: Any, **kwargs: Any) -> Any:
+                return self._built(*args, **kwargs)
+
+            def extra_repr(self) -> str:
+                return "extracted implementation"
+
+        _WRAPPER = Implemented
+    return _WRAPPER
+
+
+def _install(model: Any, qualified_name: str, replacement: Any) -> None:
+    """Put ``replacement`` at ``qualified_name`` in the module tree."""
+    from model_partition.trace import _lookup
+
+    parent_name, _, attribute = qualified_name.rpartition(".")
+    parent = _lookup(model, parent_name) if parent_name else model
+    if parent is None:
+        raise EmulationError(f"no parent module for {qualified_name}")
+    if attribute.isdigit() and hasattr(parent, "__setitem__"):
+        parent[int(attribute)] = replacement
+        return
+    setattr(parent, attribute, replacement)

@@ -60,6 +60,13 @@ trace:
   # returns third, and the position. It needs a decode step: at start_pos 0 a
   # DSparkBlock only seeds its window KV cache and returns its input (model.py:1124).
   # Inert while `scope.mtp` is false — no module is unreached, so no pass runs.
+  # Compressed KV and the top-k indices over it pass between layers through a module-level
+  # singleton, not through arguments: layers 2, 8, 14 and 20 compress their own KV and
+  # publish it, and the layers after each of them attend over it (`kv_source_layers`,
+  # `_compress_kv` at model.py:739). So a consumer's recorded call carries no trace of the
+  # largest thing it reads, and without this its module can be neither checked nor
+  # optimized on its own.
+  state: [shared_attn]
   returns: [output_ids, logits, main_hidden]
   extra_passes:
     - entry: forward_spec
@@ -106,12 +113,22 @@ inputs:
   # and one generation pass during emulation. Omit for no cap.
   short: ../../inputs/short.jsonl
   long: ../../inputs/long.jsonl
-  max_short: 1
-  max_long: 0
+  max_short: 2
+  max_long: 1
+  # 8192 tokens, because that is where the lightning indexer's selection starts to mean
+  # something: the compressed axis is the sequence over `compress_ratio` 2, so 8192 tokens
+  # give 4096 compressed positions against an `index_topk` of 512 — one in eight kept.
+  # At 2048 it would keep half, and a top-k that discards almost nothing tests almost
+  # nothing. 16384 doubles the cost again for the same conclusion.
+  long_token_budgets: [8192]
 
 overrides:
   cache_dequant: false      # a bf16 mirror of 510 GB of fp8/fp4 would not fit
   cache_weights: false      # nor would a second copy; read them from the shards
+  # Emulation re-runs the prefill per step, and a step here streams the whole checkpoint.
+  # Sixteen tokens is enough for a human to read whether the partition still writes the
+  # model's text; thirty-two would double the longest stage of the run to show the same.
+  max_new_tokens: 16
 
 notes: |
   `inspect` and `plan` work from metadata alone and need no weights, and the rest runs

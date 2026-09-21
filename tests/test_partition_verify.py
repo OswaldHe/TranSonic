@@ -12,7 +12,6 @@ from model_partition.verify.modules import (
 )
 from model_partition.verify.numerics import (
     TOLERANCES,
-    Comparison,
     Tolerance,
     compare,
     top1_agreement,
@@ -316,18 +315,53 @@ def test_a_model_of_placeholders_is_verified_without_moving_it(tiny_run):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_a_module_too_large_for_the_card_is_verified_on_the_host(tiny_run, monkeypatch):
-    """An engram table is 94.4 GiB and one piece of work: no partitioning makes it fit,
-    so the check runs where the weights do and the report says where."""
+def test_a_module_whose_weights_the_card_cannot_hold_still_runs_on_it(tiny_run, monkeypatch):
+    """An engram table is 94.4 GiB and one piece of work: no partitioning makes it fit.
+    The check stays on the accelerator anyway — the launcher leaves the oversized tensor
+    on the host — because the fp8 GEMM in the same module runs nowhere else."""
     from model_partition.verify import modules as verify_module
 
     monkeypatch.setattr(verify_module, "weights_bytes", lambda _weights: 1 << 50)
     report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
                             model_device="cpu", module_device="cuda")
     assert report.passed, report.render()
-    assert {r.device for r in report.results} == {"cpu"}
-    assert any("verified on cpu" in note for note in report.notes)
-    assert not report.oversized, "running on the host is not a partition failure"
+    assert {r.device for r in report.results} == {"cuda"}
+    assert any("stay on cpu" in note for note in report.notes)
+    assert not report.oversized, "an indivisible module is not a partition failure"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_weight_too_large_for_the_card_stays_on_the_host(monkeypatch):
+    """What lets an engram module run at all: the table on the host, the rest on the
+    card, and the lookup's indices and rows moved across the boundary."""
+    import torch
+    from torch import nn
+
+    from model_partition.runtime import launcher
+
+    class Lookup(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = nn.Embedding(8, 4)
+            self.proj = nn.Linear(4, 4)
+
+        def forward(self, ids):
+            return self.proj(self.table(ids))
+
+    module = Lookup()
+    table = module.table.weight.numel() * 4
+    projection = (module.proj.weight.numel() + module.proj.bias.numel()) * 4
+    assert projection < table
+    # Free memory that leaves room for the projection and not for the table.
+    free = int((projection + table) / 2 / 0.8)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (free, free))
+    left = launcher.place(module, "cuda")
+
+    assert left == ["table"]
+    assert module.table.weight.device.type == "cpu"
+    assert module.proj.weight.device.type == "cuda"
+    out = module(torch.zeros(2, dtype=torch.long, device="cuda"))
+    assert out.device.type == "cuda"
 
 
 def test_accumulated_tolerance_is_looser_than_single_step():
@@ -466,21 +500,21 @@ def test_a_derived_buffer_the_recording_lacks_is_not_missing(tmp_path):
     assert missing == ["scale"]
 
 
-def test_a_module_too_large_to_hold_twice_takes_its_weights_by_reference():
-    """Constructing allocates the parameters and copying into them doubles the module.
-    An engram table is 94.4 GiB: this machine holds it once, so the recorded tensor
-    becomes the parameter instead of being copied into a second one."""
+def test_a_recorded_tensor_that_already_fits_becomes_the_parameter():
+    """Copying into a freshly allocated parameter holds the module twice, which a 94.4
+    GiB n-gram table does not allow — and fp4-packed expert weights have no `copy_` at
+    all. A tensor of the right dtype and shape is installed as it is."""
     import torch
     from torch import nn
 
-    from model_partition.runtime.launcher import assign_weights
+    from model_partition.runtime.launcher import load_weights
 
     with torch.device("meta"):
         module = nn.Linear(4, 4, bias=False)
     assert module.weight.is_meta
 
     recorded = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-    loaded, missing = assign_weights(module, {"m.weight": recorded})
+    loaded, missing = load_weights(module, {"m.weight": recorded})
     assert loaded == 1 and not missing
     assert module.weight.data_ptr() == recorded.data_ptr(), "copied rather than assigned"
 
@@ -491,11 +525,11 @@ def test_a_parameter_no_recording_covers_stays_missing_rather_than_meta():
     import torch
     from torch import nn
 
-    from model_partition.runtime.launcher import assign_weights
+    from model_partition.runtime.launcher import load_weights
 
     with torch.device("meta"):
         module = nn.Linear(4, 4)
-    loaded, missing = assign_weights(module, {"m.weight": torch.zeros(4, 4)})
+    loaded, missing = load_weights(module, {"m.weight": torch.zeros(4, 4)})
     assert loaded == 1 and missing == ["bias"]
 
 

@@ -194,6 +194,7 @@ def stage_ingest(ctx: LoopContext) -> StageResult:
         ctx.samples = load_input_set(
             short, long, ctx.tokenizer,
             max_short=ctx.spec.inputs.max_short, max_long=ctx.spec.inputs.max_long,
+            long_token_budgets=tuple(ctx.spec.inputs.long_token_budgets),
         )
     else:
         # Planning only needs a sequence length, so a spec with no inputs can
@@ -465,6 +466,7 @@ def stage_extract(ctx: LoopContext) -> StageResult:
         sample_ids=[s.id for s in ctx.samples],
         weight_tensors=ctx.bundle.weights if ctx.bundle else None,
         param_names=_param_names(ctx),
+        config=_extraction_config(ctx),
     )
     lines = sum(g.source_lines for g in groups)
     preserved = sum(1 for g in groups if g.preserved)
@@ -474,6 +476,22 @@ def stage_extract(ctx: LoopContext) -> StageResult:
     return StageResult(ok=True, detail=detail, metrics={
         "n_groups": len(groups), "source_lines": lines, "preserved": preserved,
     })
+
+
+def _extraction_config(ctx: LoopContext) -> dict[str, Any]:
+    """The model's config, plus the dtype its activations flow in.
+
+    A module has to be built the way the model was built, and the weights do not say
+    how: DeepSeek's MoE holds two float32 biases and one bfloat16 gate among 2 300 fp4
+    and fp8 tensors, so nothing about them points at the bfloat16 its kernels compute in.
+    Recorded here so a module directory carries it and can be built without this run.
+    """
+    from model_partition.extract import COMPUTE_DTYPE_KEY
+    from model_partition.loaders.repo_code_loader import compute_dtype_for
+
+    config = dict(ctx.result.config) if ctx.result else {}
+    config[COMPUTE_DTYPE_KEY] = compute_dtype_for(ctx.spec.dtype)
+    return config
 
 
 def _param_names(ctx: LoopContext) -> dict[str, list[str]]:
@@ -624,7 +642,8 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         device = ctx.options.trace_device or _accelerator(ctx)
         model, device = move_to_device(model, device)
 
-    tracer = Tracer(model, ctx.graph, store, policy=policy)
+    tracer = Tracer(model, ctx.graph, store, policy=policy,
+                    state_objects=ctx.spec.trace.state)
     unresolved = tracer.unresolved_submodules()
     if unresolved:
         return _unresolved_result(ctx, unresolved)
@@ -776,10 +795,17 @@ def attach_weight_source(ctx: LoopContext, bundle: TraceBundle) -> None:
     Without this, ``cache_weights: false`` would reach verification with no
     parameter values at all. The checkpoint is the fallback — never the default,
     because a dump is what makes a module replayable away from this machine.
-    """
-    from model_partition.weights_source import CheckpointWeights
 
-    if bundle.weights or not bundle.weight_params or ctx.result is None:
+    Decided by the policy the trace recorded, not by whether anything was dumped: such
+    a run still dumps its derived buffers, so a non-empty dump does not mean the
+    checkpoint is unnecessary.
+    """
+    from model_partition.weights_index import CheckpointWeights
+
+    cached = bundle.metadata.get("cache_weights")
+    if cached is None:
+        cached = bool(bundle.weights)
+    if cached or not bundle.weight_params or ctx.result is None:
         return
     bundle.checkpoint = CheckpointWeights.from_ingest(ctx.result)
 

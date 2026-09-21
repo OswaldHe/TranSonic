@@ -42,6 +42,16 @@ NATIVE_DTYPES = ("checkpoint", "native", "auto", "")
 DEFAULT_COMPUTE_DTYPE = "bfloat16"
 
 
+def compute_dtype_for(spec_dtype: str) -> str:
+    """The dtype activations flow in, for a spec asking for ``spec_dtype``.
+
+    One rule, because two places need the answer: the loader, which sets it as torch's
+    default before building the model, and extraction, which records it beside each
+    module so the module can be built the same way away from this run.
+    """
+    return DEFAULT_COMPUTE_DTYPE if spec_dtype in NATIVE_DTYPES else spec_dtype
+
+
 @dataclass
 class RepoCodeLoader:
     """Instantiate a model via the repo's own entry module."""
@@ -69,7 +79,7 @@ class RepoCodeLoader:
     @property
     def compute_dtype(self) -> str:
         """The dtype activations flow in, which is not always the weights'."""
-        return (DEFAULT_COMPUTE_DTYPE if self.dtype in NATIVE_DTYPES else self.dtype)
+        return compute_dtype_for(self.dtype)
 
     def _entry_path(self) -> Path:
         path = self.root / self.entry

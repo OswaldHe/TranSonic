@@ -162,6 +162,22 @@ def test_load_input_set_combines_short_and_long(tmp_path):
     assert samples[1].is_long
 
 
+def test_a_long_budget_picks_the_context_length_to_exercise(tmp_path):
+    """Length is what turns a sparse-attention model's selection on, so which long prompt
+    runs is a choice, not whatever comes first in the file."""
+    short = tmp_path / "short.jsonl"
+    short.write_text(json.dumps({"id": "s", "prompt": "a b c"}))
+    long = tmp_path / "long.jsonl"
+    long.write_text("\n".join(
+        json.dumps({"id": f"l{n}", "prompt": "x " * n, "target_tokens": n})
+        for n in (2048, 8192)
+    ))
+    picked = load_input_set(short, long, WordTokenizer(), long_token_budgets=(8192,))
+    assert [s.id for s in picked] == ["s", "l8192"]
+    # And with no budget every long prompt is on the table, capped by max_long.
+    assert len(load_input_set(short, long, WordTokenizer())) == 3
+
+
 def test_load_input_set_tolerates_an_absent_long_file(tmp_path):
     short = tmp_path / "short.jsonl"
     short.write_text(json.dumps({"id": "s", "prompt": "a b"}))

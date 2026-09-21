@@ -60,20 +60,32 @@ class Launched:
     class_name: str
     weights_loaded: int = 0
     missing: list[str] = field(default_factory=list)
+    #: Submodules whose weights the device would not hold, left on the host with their
+    #: inputs and outputs moved across the boundary.
+    on_host: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         text = f"{self.class_name} from source.py, {self.weights_loaded} weight(s) loaded"
+        if self.on_host:
+            text += f"; {', '.join(self.on_host)} on the host, too large for the device"
         if self.missing:
             text += f"; {len(self.missing)} parameter(s) left unset: {', '.join(self.missing[:4])}"
         return text
 
 
-def load_source(directory: str | Path, source_module: str | None = None) -> Any:
+def load_source(directory: str | Path, source_module: str | None = None,
+                device: Any = None) -> Any:
     """Import the ``source.py`` beside a module directory.
 
     Loaded under the name its classes originally had, so the relative imports in a
     vendored modeling file still resolve. Falls back to a private name when no
     original is recorded.
+
+    Any compatibility patch of the run is applied to it, the same way the loader applies
+    them to the model. ``source.py`` is a copy of the vendor's file and carries the
+    vendor's kernels, so without this a module would ask this card for a kernel written
+    for another one — and the reference it is checked against was produced with the patch
+    in place, so running without it would be checking a different computation.
     """
     import importlib.util
     import sys
@@ -111,8 +123,41 @@ def load_source(directory: str | Path, source_module: str | None = None) -> Any:
         raise LauncherError(f"{path} failed to import: {exc}") from exc
     finally:
         sys.dont_write_bytecode = written
+    _apply_compat(module, Path(directory), device)
     _SOURCE_CACHE[key] = module
     return module
+
+
+def _apply_compat(module: Any, directory: Path, device: Any) -> None:
+    """Apply the run's compatibility patches to a freshly imported ``source.py``.
+
+    The patches live at the run root, beside ``modules/``, and are part of the artifacts —
+    so a module directory copied elsewhere with ``compat/`` beside it gets them too.
+    """
+    from model_partition.runtime.compat import apply_patches, patch_paths
+
+    for root in (directory.parent.parent, directory.parent, directory):
+        paths = patch_paths(root)
+        if paths:
+            apply_patches(module, paths, _device_info(device))
+            return
+
+
+def _device_info(device: Any) -> Any:
+    """What a patch needs to know about the card it is adapting to.
+
+    A patch decides for itself whether this hardware needs it — the one that replaces a
+    kernel asking for more shared memory than the card allows applies nowhere else — so
+    it is handed the card rather than a device string.
+    """
+    if device is None or hasattr(device, "shared_memory_per_block"):
+        return device
+    if not str(device).startswith("cuda"):
+        return None
+    from model_partition.hardware import detect_gpus
+
+    found = detect_gpus()
+    return found[0] if found else None
 
 
 def module_config(directory: str | Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -243,7 +288,13 @@ def _weights_under(weights: dict[str, Any], path: str) -> dict[str, Any]:
 
 
 def _chain(built: list[Any]) -> Any:
-    """Run a group's submodules in order, each given the keywords it declares."""
+    """Run a group's submodules in order, each given the arguments it declares.
+
+    The group's extra arguments belong to whichever submodules take them: a
+    normalization takes the flowing tensor alone while the attention after it also takes
+    a position and a shared state. So each submodule gets the flowing value plus as much
+    of the rest as its own signature has room for.
+    """
     import torch
 
     def run(*args: Any, **kwargs: Any) -> Any:
@@ -254,27 +305,52 @@ def _chain(built: list[Any]) -> Any:
             for index, target in enumerate(built):
                 if index:
                     flowing = output[0] if isinstance(output, tuple) else output
-                    rest = ()
-                output = target(flowing, *rest, **_accepted(target, kwargs))
+                extras = _positional(target, rest)
+                output = target(flowing, *extras,
+                                **_accepted(target, kwargs, filled=1 + len(extras)))
         return output
 
     return run
 
 
-def _accepted(target: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """The keywords this submodule declares, minus the flowing tensor it gets first."""
+def _parameters(target: Any) -> Any:
+    """The signature of what this submodule is called as, or None."""
     import inspect
 
-    forward = getattr(target, "forward", target)
     try:
-        parameters = inspect.signature(forward).parameters
+        return inspect.signature(getattr(target, "forward", target)).parameters
     except (TypeError, ValueError):
+        return None
+
+
+def _positional(target: Any, rest: tuple) -> tuple:
+    """As many of the group's extra positional arguments as this submodule takes."""
+    import inspect
+
+    parameters = _parameters(target)
+    if parameters is None:
+        return rest
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters.values()):
+        return rest
+    return rest[:max(len(parameters) - 1, 0)]
+
+
+def _accepted(target: Any, kwargs: dict[str, Any], filled: int = 1) -> dict[str, Any]:
+    """The keywords this submodule declares and has not already been given.
+
+    ``filled`` is how many of its parameters arrived positionally — the flowing tensor
+    and any extras — so a name supplied both ways is not passed twice.
+    """
+    import inspect
+
+    parameters = _parameters(target)
+    if parameters is None:
         return dict(kwargs)
     names = list(parameters)
-    flowing = names[0] if names else None
+    taken = set(names[:filled])
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        return {k: v for k, v in kwargs.items() if k != flowing}
-    return {k: v for k, v in kwargs.items() if k in set(names[1:])}
+        return {k: v for k, v in kwargs.items() if k not in taken}
+    return {k: v for k, v in kwargs.items() if k in set(names[filled:])}
 
 
 def build(
@@ -296,121 +372,117 @@ def build(
     """
     import torch
 
-    module = source if source is not None else load_source(directory, source_module)
+    module = (source if source is not None
+              else load_source(directory, source_module, device=device))
     cls = _resolve_class(module, class_name)
 
     settings = _config_object(module, config, config_class)
     by_reference = weights_bytes(weights) > ASSIGN_THRESHOLD
+    # The recorded weights decide the module's precision, and the way to apply that is
+    # torch's default dtype — the same thing a vendor's entry script sets before building
+    # the model, and for the same two reasons. Casting the parameters afterwards instead
+    # would overwrite a dtype the class asked for deliberately: DeepSeek builds its
+    # confidence head and its hyper-connection scalars in float32 inside a bfloat16
+    # model, and a module cast wholesale to bfloat16 meets its own float32 activations
+    # and will not multiply. And it is not only construction that reads the default —
+    # DeepSeek's fp8 GEMM allocates its output buffer with it, and a float32 buffer is
+    # rejected by the kernel — so it is left set rather than restored, which is what
+    # `generate.py` does for the whole process.
+    dtype = _compute_dtype(config) or _weights_dtype(weights)
+    if dtype is not None:
+        torch.set_default_dtype(dtype)
+    # And the default device, for the same reason and with the same reach: DeepSeek's
+    # attention builds its window's top-k indices with a bare `torch.arange`, so they
+    # land wherever the default points and its kernel requires them beside the KV it
+    # gathers. `generate.py` sets this too.
+    if device and not str(device).startswith("meta"):
+        torch.set_default_device(device)
     if by_reference:
         with torch.device("meta"):
             instance = _construct(cls, settings, layer_index, weights, config)
     else:
         instance = _construct(cls, settings, layer_index, weights, config)
-    # The recorded weights decide the module's precision. A class constructs itself in
-    # torch's default dtype, which is float32, and a bf16 checkpoint's feature maps
-    # would then meet float32 parameters — the same matmul, refusing to run.
-    dtype = _weights_dtype(weights)
-    if dtype is not None:
-        _cast_weights(instance, dtype)
-    loaded, missing = (assign_weights(instance, weights) if by_reference
-                       else load_weights(instance, weights))
-    instance = instance.to(device)
+    loaded, missing = load_weights(instance, weights, derived_optional=not by_reference)
+    on_host = place(instance, device)
     instance.eval()
     torch.set_grad_enabled(False)
     return Launched(callable=instance, class_name=class_name,
-                    weights_loaded=loaded, missing=missing)
+                    weights_loaded=loaded, missing=missing, on_host=on_host)
 
 
-def _cast_weights(instance: Any, dtype: Any) -> None:
-    """Put the weights in the recorded dtype, leaving derived buffers as computed.
+def _compute_dtype(config: dict[str, Any]) -> Any:
+    """The dtype the model's activations flow in, as extraction recorded it."""
+    from model_partition.extract import COMPUTE_DTYPE_KEY
 
-    A derived buffer's precision is part of what the module computes, not of what the
-    checkpoint stores. Rotary ``inv_freq`` is the case that found this: computed in
-    float32, used to build angles that reach thousands of radians, so rounding it to
-    bfloat16 moves the last positions of a 2048-token sample by a tenth of a radian —
-    a module that reproduces short samples and quietly drifts on long ones.
-    """
-    for module in instance.modules():
-        derived = getattr(module, "_non_persistent_buffers_set", set()) or set()
-        for parameter in module._parameters.values():
-            if parameter is not None and parameter.is_floating_point():
-                parameter.data = parameter.data.to(dtype)
-        for name, buffer in list(module._buffers.items()):
-            if buffer is not None and buffer.is_floating_point() and name not in derived:
-                module._buffers[name] = buffer.to(dtype)
+    name = config.get(COMPUTE_DTYPE_KEY)
+    if not name:
+        return None
+    try:
+        from model_partition.loaders.base import torch_dtype
+
+        return torch_dtype(str(name))
+    except Exception:
+        return None
 
 
 def _weights_dtype(weights: dict[str, Any]) -> Any:
-    """The floating dtype most of the recorded weights are in, or None."""
+    """The dtype to construct the module in, from its weights: a fallback.
+
+    Used for a module directory written before the compute dtype was recorded beside it.
+    Counting tensors is a guess, and a poor one on a quantized model — DeepSeek's MoE
+    votes float32 two to one, on two bias vectors.
+
+    A quantized checkpoint's own dtype is not a candidate — ``torch.set_default_dtype``
+    takes float16, bfloat16, float32 and float64 and nothing else, and rightly: fp8 is
+    what a bfloat16 module multiplies with, not what it is built in. So a DeepSeek
+    attention module is built in the bfloat16 its norms and biases are stored in, and its
+    ``Linear`` weights keep the fp8 the class asks for.
+    """
     from collections import Counter
 
+    import torch
+
+    accepted = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
     counts: Counter = Counter()
     for tensor in weights.values():
         dtype = getattr(tensor, "dtype", None)
-        if dtype is not None and getattr(dtype, "is_floating_point", False):
+        if dtype in accepted:
             counts[dtype] += 1
     return counts.most_common(1)[0][0] if counts else None
 
 
-def load_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[str]]:
-    """Copy ``weights`` into ``instance``, matching by name suffix.
+def load_weights(instance: Any, weights: dict[str, Any],
+                 derived_optional: bool = True) -> tuple[int, list[str]]:
+    """Install ``weights`` into ``instance``, matching by name suffix.
 
     The instance's names are relative to itself (``q_proj.weight``) while the recorded
     names are absolute (``model.layers.3.self_attn.q_proj.weight``), so the longest
     suffix that identifies exactly one recorded tensor wins.
+
+    A recorded tensor of the same dtype and shape becomes the parameter rather than
+    being copied into it. Copying costs a second allocation of the whole module — which
+    a 94.4 GiB n-gram table does not have room for — and some dtypes cannot be copied at
+    all: fp4-packed expert weights have no ``copy_``. A tensor that does not match is
+    reshaped and cast, which is the only case that needs one.
 
     A derived buffer is installed at the dtype it was recorded in rather than cast into
     the one the class happened to construct: the trace records these as the forward saw
     them, and their precision is part of what the module computes. A rotary ``inv_freq``
     recorded in float32 and cast down to the weights' bfloat16 moves the last positions
     of a long sample by a tenth of a radian.
+
+    ``derived_optional`` is false for an instance built on the meta device, where the
+    class computed nothing and a missing buffer cannot be recovered.
     """
     import torch
 
     loaded, missing = 0, []
-    for name, tensor in instance.named_parameters():
-        candidate = _recorded(weights, name)
-        if candidate is None:
-            missing.append(name)
-            continue
-        with torch.no_grad():
-            tensor.copy_(candidate.reshape(tensor.shape).to(tensor.dtype))
-        loaded += 1
-
     for prefix, module in instance.named_modules():
         derived = getattr(module, "_non_persistent_buffers_set", set()) or set()
-        for leaf, buffer in list(module._buffers.items()):
-            if buffer is None:
-                continue
-            name = f"{prefix}.{leaf}" if prefix else leaf
-            candidate = _recorded(weights, name)
-            if candidate is None:
-                # A derived buffer the recording does not carry is not missing: the
-                # class computed it at construction, which is where it comes from.
-                if leaf not in derived:
-                    missing.append(name)
-                continue
-            if leaf in derived and candidate.dtype != buffer.dtype:
-                module._buffers[leaf] = candidate.reshape(buffer.shape).to(buffer.device)
-            else:
-                with torch.no_grad():
-                    buffer.copy_(candidate.reshape(buffer.shape).to(buffer.dtype))
-            loaded += 1
-    return loaded, missing
-
-
-def assign_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[str]]:
-    """Install ``weights`` into ``instance`` by reference, not by copy.
-
-    For a module whose parameters are too large to hold twice. The instance was built on
-    the meta device, so there is nothing to copy into: the recorded tensor becomes the
-    parameter. Anything left on meta afterwards is reported as missing rather than
-    handed back as a module that raises on its first read.
-    """
-    import torch
-
-    loaded, missing = 0, []
-    for prefix, module in instance.named_modules():
+        # Installing a tensor replaces the object the class put there, and a quantized
+        # `Linear` hangs its block scale off the weight so its kernel can reach it.
+        # Recorded before the replacements and put back after.
+        aliases = aliases_of(module)
         for leaf, parameter in list(module._parameters.items()):
             if parameter is None:
                 continue
@@ -420,7 +492,7 @@ def assign_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[st
                 missing.append(name)
                 continue
             module._parameters[leaf] = torch.nn.Parameter(
-                candidate.reshape(parameter.shape), requires_grad=False)
+                _fitted(candidate, parameter, _scale_for(weights, name)), requires_grad=False)
             loaded += 1
         for leaf, buffer in list(module._buffers.items()):
             if buffer is None:
@@ -428,13 +500,197 @@ def assign_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[st
             name = f"{prefix}.{leaf}" if prefix else leaf
             candidate = _recorded(weights, name)
             if candidate is None:
-                # A class computes a derived buffer at construction, which on the meta
-                # device produces no value. Nothing here can recover it.
-                missing.append(name)
+                # A derived buffer the recording does not carry is not missing: the
+                # class computed it at construction, which is where it comes from.
+                if leaf not in derived or not derived_optional:
+                    missing.append(name)
                 continue
-            module._buffers[leaf] = candidate.reshape(buffer.shape)
+            module._buffers[leaf] = (candidate.reshape(buffer.shape).to(buffer.device)
+                                     if leaf in derived else _fitted(candidate, buffer))
             loaded += 1
+        rebind(module, aliases)
     return loaded, missing
+
+
+def aliases_of(module: Any) -> list[tuple[str, str, str]]:
+    """Attributes on one tensor that point at another of the same module's tensors.
+
+    A vendor's quantized ``Linear`` hangs its block scale off the weight so its kernel
+    can reach it — ``self.weight.scale = self.scale`` — and replacing either tensor
+    breaks the link unless it is put back.
+    """
+    found: list[tuple[str, str, str]] = []
+    names = list(module._parameters) + list(module._buffers)
+    for leaf in names:
+        holder = tensor_of(module, leaf)
+        if holder is None:
+            continue
+        for attribute, value in list(vars(holder).items()):
+            for other in names:
+                if other != leaf and tensor_of(module, other) is value:
+                    found.append((leaf, attribute, other))
+    return found
+
+
+def rebind(module: Any, aliases: list[tuple[str, str, str]]) -> None:
+    """Put back the links :func:`aliases_of` recorded."""
+    for leaf, attribute, other in aliases:
+        holder, target = tensor_of(module, leaf), tensor_of(module, other)
+        if holder is not None and target is not None:
+            try:
+                setattr(holder, attribute, target)
+            except Exception:  # pragma: no cover - a read-only attribute
+                continue
+
+
+def tensor_of(module: Any, leaf: str) -> Any:
+    """The parameter or buffer a module holds under ``leaf``, or None."""
+    if leaf in module._parameters:
+        return module._parameters[leaf]
+    return module._buffers.get(leaf)
+
+
+def device_of(value: Any) -> Any:
+    """The device of the first tensor in an argument tree."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.device
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = device_of(item)
+            if found is not None:
+                return found
+    if isinstance(value, dict):
+        return device_of(tuple(value.values()))
+    return None
+
+
+def moved(value: Any, device: Any) -> Any:
+    """The same argument tree with every tensor on ``device``."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(moved(item, device) for item in value)
+    if isinstance(value, list):
+        return [moved(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: moved(item, device) for key, item in value.items()}
+    return value
+
+
+def place(instance: Any, device: str) -> list[str]:
+    """Move the module to ``device``, leaving behind what will not fit.
+
+    Returns the submodules left on the host. An n-gram table is 94.4 GiB and no card
+    here holds it, while the fp8 GEMM beside it in the same module runs nowhere else —
+    so the table stays where it is and its lookup is wrapped to take its indices and
+    hand its rows back across the boundary. Placing the module as a whole has no answer
+    to that: one half does not fit and the other half does not run.
+    """
+    import torch
+
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        instance.to(device)
+        return []
+    free, _total = torch.cuda.mem_get_info(torch.device(device))
+    budget = int(free * 0.8)
+
+    left: list[str] = []
+    for name, module in instance.named_modules():
+        own = [(leaf, t) for leaf, t in
+               list(module._parameters.items()) + list(module._buffers.items())
+               if t is not None]
+        held = sum(t.numel() * t.element_size() for _leaf, t in own)
+        if held > budget:
+            left.append(name or "(root)")
+            _host_boundary(module, device)
+            continue
+        aliases = aliases_of(module)
+        for leaf, tensor in own:
+            set_tensor(module, leaf, tensor.to(device))
+        rebind(module, aliases)
+    return left
+
+
+def _host_boundary(module: Any, device: Any) -> None:
+    """Take this module's inputs to where its weights are, and send its output back."""
+
+    def to_host(_module: Any, args: tuple, kwargs: dict):
+        return moved(args, "cpu"), moved(kwargs, "cpu")
+
+    def to_device(_module: Any, _args: tuple, _kwargs: dict, output: Any):
+        return moved(output, device)
+
+    module.register_forward_pre_hook(to_host, with_kwargs=True)
+    module.register_forward_hook(to_device, with_kwargs=True)
+
+
+def set_tensor(module: Any, leaf: str, value: Any) -> None:
+    """Install ``value`` as the module's ``leaf``, as a parameter or a buffer."""
+    import torch
+
+    if leaf in module._parameters:
+        module._parameters[leaf] = torch.nn.Parameter(value, requires_grad=False)
+    else:
+        module._buffers[leaf] = value
+
+
+def dequantize(weight: Any, scale: Any, dtype: Any) -> Any:
+    """Expand a block-scaled weight to ``dtype``, one scale per block.
+
+    The arithmetic a vendor conversion script does for the weights its kernels want in
+    bfloat16: each block of the weight is multiplied by its own scale.
+    """
+    if weight.dim() != 2 or scale.dim() != 2:
+        return weight.to(dtype)
+    out_block = weight.shape[0] // scale.shape[0]
+    in_block = weight.shape[1] // scale.shape[1]
+    if out_block < 1 or in_block < 1:
+        return weight.to(dtype)
+    expanded = (weight.unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block)).float()
+                * scale[:, None, :, None].float())
+    return expanded.flatten(2, 3).flatten(0, 1).to(dtype)
+
+
+def _fitted(candidate: Any, existing: Any, scale: Any = None) -> Any:
+    """``candidate`` as the parameter it replaces: by reference when it already is.
+
+    Three ways a recorded tensor can differ from the parameter it fills, and they are not
+    interchangeable:
+
+    - same width, different dtype: the same bytes read differently. A checkpoint stores a
+      pair of fp4 values as ``int8`` and the class declares ``float4_e2m1fn_x2``.
+      Reinterpreting is both right and the only option — that dtype has no conversion and
+      no ``copy_``.
+    - narrower than the parameter, with a block scale beside it: the class wants this one
+      dequantized, which is what the vendor's conversion script does for the weights its
+      kernels take in bfloat16. DeepSeek's ``wo_a`` is the case, and casting it without
+      its scale leaves an attention output four thousand times too large — wrong by a
+      factor, which reads as a plausible-looking 0.94 cosine rather than as a crash.
+    - anything else: cast.
+    """
+    import torch
+
+    wide = (torch.bfloat16, torch.float16, torch.float32)
+    if candidate.dtype != existing.dtype and candidate.element_size() == existing.element_size():
+        candidate = candidate.view(existing.dtype)
+    elif (scale is not None and existing.dtype in wide
+          and candidate.element_size() < existing.element_size()):
+        candidate = dequantize(candidate, scale, existing.dtype)
+    if tuple(candidate.shape) != tuple(existing.shape):
+        candidate = candidate.reshape(existing.shape)
+    return candidate if candidate.dtype == existing.dtype else candidate.to(existing.dtype)
+
+
+def _scale_for(weights: dict[str, Any], name: str) -> Any:
+    """The block scale recorded beside a quantized weight, if there is one."""
+    leaf = name.rsplit(".", 1)[-1]
+    if leaf != "weight":
+        return None
+    return _recorded(weights, f"{name[:-len(leaf)]}scale")
 
 
 def weights_bytes(weights: dict[str, Any]) -> int:
@@ -563,6 +819,71 @@ SHAPE_CONSTRUCTORS: dict[str, Any] = {
 }
 
 
+#: Parameter names that mean "which repetition of the stack is this".
+INDEX_PARAMETERS = ("layer_idx", "layer_index", "layer_id", "layer")
+
+#: Classmethods that build a helper object from the model's config alone.
+FROM_CONFIG = ("from_args", "from_config")
+
+
+def _config_dataclass(cls: Any, parameters: list[str], config: dict[str, Any]) -> Any:
+    """The model's own config object, from the recorded fields plus its own defaults.
+
+    A vendor class annotated ``args: ModelArgs`` wants that dataclass and not a mapping:
+    it carries defaults the published ``config.json`` never mentions — a maximum batch
+    size, a sliding window — and the class reads them straight off it. Rebuilding it
+    from its own definition is the only way to get those; a wrapper around the recorded
+    fields raises on the first one the file left to its default.
+    """
+    import dataclasses
+    import inspect
+    import sys
+    import typing
+
+    try:
+        hints = typing.get_type_hints(cls.__init__, vars(sys.modules.get(cls.__module__)))
+    except Exception:
+        return None
+    for name in parameters:
+        annotation = hints.get(name)
+        if inspect.isclass(annotation) and dataclasses.is_dataclass(annotation):
+            fields = {f.name for f in dataclasses.fields(annotation)}
+            try:
+                return annotation(**{k: v for k, v in config.items() if k in fields})
+            except Exception:
+                return None
+    return None
+
+
+def _built_from_config(cls: Any, names: list[str], settings: Any) -> dict[str, Any]:
+    """Arguments a class needs that are themselves built from the config.
+
+    ``Engram(args, layer_id, layout)`` is the case: ``layout`` is an ``EngramLayout``,
+    which the model builds once with ``EngramLayout.from_args(args)``. Nothing but that
+    class knows how, and the annotation is what says which class it is.
+    """
+    import inspect
+    import sys
+    import typing
+
+    try:
+        hints = typing.get_type_hints(cls.__init__, vars(sys.modules.get(cls.__module__)))
+    except Exception:
+        return {}
+    built: dict[str, Any] = {}
+    for name in names:
+        annotation = hints.get(name)
+        factory = next((getattr(annotation, f) for f in FROM_CONFIG
+                        if inspect.isclass(annotation) and hasattr(annotation, f)), None)
+        if factory is None:
+            return {}
+        try:
+            built[name] = factory(settings)
+        except Exception:
+            return {}
+    return built
+
+
 def _construct(cls: Any, settings: Any, layer_index: int | None,
                weights: dict[str, Any], config: dict[str, Any]) -> Any:
     """Instantiate a module class the way that class actually wants to be built.
@@ -593,10 +914,28 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
             pass
     # Only where the parameter is named for it. Passing the index into whatever the
     # second parameter happens to be built a MoE block with zero experts once.
-    index_name = next((name for name in ("layer_idx", "layer_index", "layer")
-                       if name in parameters), None)
+    index_name = next((name for name in INDEX_PARAMETERS if name in parameters), None)
+    # The class's own config object where it has one, so its defaults are in play.
+    own = _config_dataclass(cls, parameters, config)
     if layer_index is not None and index_name:
         attempts.append(((settings,), {index_name: layer_index}))
+        for holder in ([own, settings] if own is not None else [settings]):
+            if parameters[0] == index_name:
+                # The index first and the config second: DeepSeek's whole modeling file
+                # is written `Attention(layer_id, args)`, so the config cannot lead.
+                attempts.append(((layer_index, holder), {}))
+                rest = _built_from_config(cls, parameters[2:], holder)
+                if rest:
+                    attempts.append(((layer_index, holder), rest))
+            elif len(parameters) > 1 and parameters[1] == index_name:
+                # The config first, then the index, then whatever else it wants —
+                # `Engram(args, layer_id, layout)`.
+                attempts.append(((holder, layer_index), {}))
+                rest = _built_from_config(cls, parameters[2:], holder)
+                if rest:
+                    attempts.append(((holder, layer_index), rest))
+    if own is not None:
+        attempts.append(((own,), {}))
     # A class that wants the config plus a scalar the config does carry but does not
     # pass itself — `Qwen3_5MLP(config, config.intermediate_size)`. Filling the rest by
     # name gets it built; leaving it unbuilt would lose the whole feed-forward module.
@@ -604,6 +943,20 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
     if beyond:
         attempts.append(((settings,), beyond))
     attempts.append(((settings,), {}))
+    # A class taking one number takes a width, and the weights are what say which: a
+    # head whose width is `dim + rank` is in no config field, but it is the in-features
+    # of the projection the recording holds.
+    required = [name for name, p in inspect.signature(cls).parameters.items()
+                if p.default is inspect.Parameter.empty
+                and p.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                                   inspect.Parameter.VAR_KEYWORD)] if parameters else []
+    if len(required) == 1:
+        for tensor in weights.values():
+            if getattr(tensor, "dim", lambda: 0)() == 2:
+                attempts.append(((int(tensor.shape[1]),), {}))
+                attempts.append(((int(tensor.shape[0]),), {}))
+                break
+
     # A norm is its width, and often an epsilon the config carries.
     weight = weights.get("weight")
     width = int(weight.shape[0]) if weight is not None and weight.dim() == 1 else None

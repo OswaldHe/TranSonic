@@ -17,6 +17,7 @@ import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 #: safetensors dtype tag -> (name in tensorstore.DTYPES, bytes per element)
 ST_DTYPES: dict[str, tuple[str, int]] = {
@@ -239,3 +240,105 @@ def read_safetensors_header(path: str | Path) -> dict:
         return json.loads(payload)
     except json.JSONDecodeError as exc:
         raise WeightIndexError(f"{file_path} has a corrupt safetensors header: {exc}") from exc
+
+
+# -- reading them ------------------------------------------------------------
+
+
+class WeightSourceError(RuntimeError):
+    """Raised when a requested tensor is not in the checkpoint."""
+
+
+@dataclass
+class CheckpointWeights:
+    """Resolves original parameter names to tensors in local safetensors shards."""
+
+    root: Path
+    shard_of: dict[str, str] = field(default_factory=dict)
+    #: Names that needed a suffix match, for the run's notes.
+    remapped: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_ingest(cls, result: Any) -> CheckpointWeights:
+        return cls(
+            root=Path(result.root),
+            shard_of={entry.name: entry.shard for entry in result.index.entries},
+        )
+
+    def resolve(self, name: str) -> str | None:
+        """Checkpoint tensor name for a model parameter name.
+
+        Vendor code often names modules differently from the checkpoint, so an
+        exact miss falls back to the longest suffix that identifies exactly one
+        tensor — the same rule plan reconciliation uses.
+        """
+        if name in self.shard_of:
+            return name
+        parts = name.split(".")
+        for start in range(1, len(parts)):
+            suffix = "." + ".".join(parts[start:])
+            matches = [n for n in self.shard_of if n.endswith(suffix)]
+            if len(matches) == 1:
+                self.remapped[name] = matches[0]
+                return matches[0]
+            if not matches:
+                break
+        return None
+
+    def scale_of(self, name: str) -> str | None:
+        """The block scale stored beside a quantized weight, if the checkpoint has one.
+
+        Asked for even when the model has no parameter to put it in. DeepSeek's ``wo_a``
+        is stored fp8 with a scale and declared bfloat16 — its conversion script
+        dequantizes it — so nothing in the model's parameter list names the scale, and
+        loading the weight without it gives values wrong by the scale's magnitude.
+        """
+        resolved = self.resolve(name)
+        if resolved is None or not resolved.endswith(".weight"):
+            return None
+        candidate = f"{resolved[:-len('weight')]}scale"
+        return candidate if candidate in self.shard_of else None
+
+    def load(self, names: list[str], device: str = "cpu") -> dict[str, Any]:
+        """Load the named parameters, keyed by the name that was asked for.
+
+        A weight's block scale comes along whether or not it was asked for, since
+        whether it is needed depends on the dtype the module declares and only the
+        module knows that.
+
+        Shards are opened once each and read lazily, so a module's weights cost one
+        pass over the shards holding them rather than over the whole checkpoint.
+        """
+        from safetensors import safe_open
+
+        wanted: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        missing: list[str] = []
+        asked = set(names)
+        for name in names:
+            resolved = self.resolve(name)
+            if resolved is None:
+                missing.append(name)
+                continue
+            wanted[self.shard_of[resolved]].append((name, resolved))
+            scale = self.scale_of(name)
+            sibling = f"{name[:-len('weight')]}scale" if name.endswith(".weight") else None
+            if scale is not None and sibling is not None and sibling not in asked:
+                wanted[self.shard_of[scale]].append((sibling, scale))
+                asked.add(sibling)
+        if missing:
+            raise WeightSourceError(
+                f"{len(missing)} parameter(s) are not in the checkpoint: "
+                f"{', '.join(missing[:8])}"
+            )
+
+        loaded: dict[str, Any] = {}
+        for shard, pairs in wanted.items():
+            path = self.root / shard
+            if not path.is_file():
+                raise WeightSourceError(
+                    f"Shard {shard} is not present at {path}; fetch the weights first"
+                )
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                for name, resolved in pairs:
+                    loaded[name] = handle.get_tensor(resolved).to(device)
+        return loaded

@@ -327,6 +327,28 @@ def test_a_slice_keeps_what_its_classes_reference(tiny_run, tmp_path):
     assert kept < total
 
 
+def test_a_slice_keeps_what_the_module_level_statements_build(tmp_path):
+    """DeepSeek's attention reads a module-level `shared_attn = SharedAttentionRuntime()`.
+    The statement is kept whatever the module is, so the class it constructs has to come
+    with it — and has to come *before* it, or the file raises on import."""
+    from model_partition.extract import _slice_source
+
+    origin = tmp_path / "vendor.py"
+    origin.write_text(
+        "import torch\n\n\n"
+        "class Runtime:\n    def __init__(self):\n        self.slot = None\n\n\n"
+        "shared = Runtime()\n\n\n"
+        "class Unrelated:\n    pass\n\n\n"
+        "class Wanted:\n    def forward(self, x):\n        shared.slot = x\n"
+        "        return shared.slot\n"
+    )
+    sliced, kept, total = _slice_source(origin, ["Wanted"])
+    assert "class Unrelated" not in sliced
+    namespace: dict = {}
+    exec(compile(sliced, "source.py", "exec"), namespace)
+    assert namespace["Wanted"]().forward(3) == 3
+
+
 def test_slicing_declines_rather_than_shipping_an_incomplete_file(tmp_path):
     """When the wanted class is not there to take, the whole file is copied instead."""
     from model_partition.extract import _slice_source

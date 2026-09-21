@@ -25,7 +25,7 @@ from model_partition.runtime.module_runner import (
     expected_output,
     first_tensor,
 )
-from model_partition.runtime.streaming import (
+from model_partition.runtime.emulation import (
     FillReport,
     capture_boundaries,
     fill_from_dumps,
@@ -233,7 +233,7 @@ def emulate(
     report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill,
                                   out_of_scope=out_of_scope)
     if impl_dirs:
-        from model_partition.runtime.assemble import install_implementations
+        from model_partition.runtime.emulation import install_implementations
 
         report.install = install_implementations(model, graph, bundle, impl_dirs,
                                                  device=device)

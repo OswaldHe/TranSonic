@@ -121,13 +121,25 @@ def load_input_set(
     tokenizer: Any,
     max_short: int | None = None,
     max_long: int | None = None,
+    long_token_budgets: tuple[int, ...] = (),
 ) -> list[SampleInput]:
-    """Load and tokenize the short and long input sets."""
+    """Load and tokenize the short and long input sets.
+
+    ``long_token_budgets`` keeps only the long prompts written for those lengths, which
+    is how a run picks the context it wants to exercise rather than taking whatever comes
+    first in the file. It matters because length is what turns a sparse-attention model's
+    selection on: DeepSeek V4.1 keeps 512 compressed positions, so a 2048-token prompt
+    discards half of them and an 8192-token one discards seven eighths.
+    """
     samples: list[SampleInput] = []
     if short_path:
         samples.extend(tokenize_samples(read_jsonl(short_path), tokenizer, limit=max_short))
     if long_path and Path(long_path).is_file():
-        samples.extend(tokenize_samples(read_jsonl(long_path), tokenizer, limit=max_long))
+        records = read_jsonl(long_path)
+        if long_token_budgets:
+            wanted = {int(budget) for budget in long_token_budgets}
+            records = [r for r in records if int(r.get("target_tokens") or 0) in wanted]
+        samples.extend(tokenize_samples(records, tokenizer, limit=max_long))
     if not samples:
         raise InputError("Input set is empty; nothing to trace")
     return samples

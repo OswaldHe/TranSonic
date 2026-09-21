@@ -39,6 +39,12 @@ CONFIG_FILENAME = "config.json"
 #: applied causality itself, and rebuilding the module as eager attention then lets
 #: every position see the future — a module that looks close and is wrong.
 PRIVATE_CONFIG_KEYS = ("_attn_implementation",)
+
+#: Where the dtype the model's activations flow in is recorded. Not a field of any
+#: framework config: a quantized checkpoint names its *storage* dtype and computes in
+#: another, and a module built in the wrong one has its kernels reject their own output
+#: buffers. Read by the launcher before it constructs anything.
+COMPUTE_DTYPE_KEY = "_compute_dtype"
 HARNESS_TEMPLATES = {
     "verify.py": "module_verify.py.tmpl",
     "README.md": "module_readme.md.tmpl",
@@ -238,11 +244,15 @@ def extract(
     weight_tensors: dict[str, list[str]] | None = None,
     param_names: dict[str, list[str]] | None = None,
     regenerate: bool = False,
+    config: dict[str, Any] | None = None,
 ) -> list[ExtractedGroup]:
     """Write one implementation directory per signature group.
 
     ``param_names`` maps a module id to the original parameter names its
-    implementation will be handed, so the generated file can document them.
+    implementation will be handed, so the generated file can document them. ``config``
+    is the model's own, written beside a module whose classes keep no config object of
+    their own — DeepSeek's copy their fields onto themselves and drop it — so the
+    directory is a unit someone can build from without this run.
 
     An existing ``source.py`` and ``inference.py`` are preserved: they are the loop's
     editable surface and may carry the agent's numerical fixes, or someone's kernel
@@ -279,7 +289,8 @@ def extract(
 
         principal = _principal(targets) if targets else None
         group.source_module = type(principal).__module__ if principal is not None else ""
-        settings, config_class = _module_config(model, representative.submodules)
+        settings, config_class = _module_config(model, representative.submodules,
+                                               fallback=config)
         group.config_class = config_class
         (directory / CONFIG_FILENAME).write_text(
             json.dumps(settings, indent=2, sort_keys=True, default=str) + "\n")
@@ -352,7 +363,8 @@ def extract(
     return groups
 
 
-def _module_config(model: Any, submodule_names: list[str]) -> tuple[dict[str, Any], str]:
+def _module_config(model: Any, submodule_names: list[str],
+                   fallback: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
     """The config a module's own subtree was built from, and that config's class.
 
     The model's top-level config is not always what the module was constructed with.
@@ -388,7 +400,7 @@ def _module_config(model: Any, submodule_names: list[str]) -> tuple[dict[str, An
             if found is not None:
                 return found
             parts.pop()
-    return settings_of(model) or ({}, "")
+    return settings_of(model) or (dict(fallback or {}), "")
 
 
 def _wanted_classes(principal: Any, classes: list[str]) -> list[str]:
@@ -450,10 +462,9 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
     if not wanted or missing:
         return None
 
-    needed = set(wanted)
-    frontier = list(wanted)
-    while frontier:
-        node = definitions[frontier.pop()]
+    def referenced(node: Any) -> set[str]:
+        """Top-level definitions this node mentions by name."""
+        found: set[str] = set()
         for inner in ast.walk(node):
             name = inner.id if isinstance(inner, ast.Name) else None
             if name is None and isinstance(inner, ast.Attribute):
@@ -461,15 +472,29 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
                 while isinstance(root, ast.Attribute):
                     root = root.value
                 name = root.id if isinstance(root, ast.Name) else None
-            if name in definitions and name not in needed:
-                needed.add(name)
-                frontier.append(name)
+            if name in definitions:
+                found.add(name)
+        return found
 
-    def segment(start: int, end: int) -> str:
-        return "".join(lines[start - 1:end])
+    needed = set(wanted)
+    # The preamble is kept whole, so whatever it constructs has to be kept too. A
+    # module-level `shared_attn = SharedAttentionRuntime()` is the case that found this:
+    # keeping the statement without the class gives a file that will not import.
+    frontier = list(wanted)
+    for node in tree.body:
+        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            frontier.extend(referenced(node) - needed)
+    needed.update(frontier)
+    while frontier:
+        for name in referenced(definitions[frontier.pop()]) - needed:
+            needed.add(name)
+            frontier.append(name)
 
-    parts = [segment(start, end) for start, end in preamble]
-    parts += [segment(start, end) for start, end, name in sorted(order) if name in needed]
+    # In file order, preamble and definitions together: a module-level statement can
+    # depend on a class defined above it, and emitting every statement first would put
+    # that use before its definition in a file that has to import.
+    kept = sorted(preamble + [(start, end) for start, end, name in order if name in needed])
+    parts = ["".join(lines[start - 1:end]) for start, end in kept]
     sliced = "\n".join(part.rstrip("\n") for part in parts) + "\n"
     try:
         ast.parse(sliced)

@@ -156,9 +156,16 @@ class TraceSpec:
 
     returns: tuple[str, ...] = ()
     extra_passes: tuple[ExtraPass, ...] = ()
+    #: Module-level objects of the model's own file whose tensors pass between modules
+    #: without being anybody's argument. DeepSeek V4.1's ``shared_attn`` is the case: a
+    #: layer that compresses its KV publishes it there and the next several layers attend
+    #: over it, so a consumer's recorded call carries no trace of the largest thing it
+    #: reads. Naming it here has the trace record it per call, which is the only way such
+    #: a module can be checked, or optimized, on its own.
+    state: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {"returns": list(self.returns),
+        return {"returns": list(self.returns), "state": list(self.state),
                 "extra_passes": [p.to_dict() for p in self.extra_passes]}
 
 
@@ -370,12 +377,15 @@ def _parse_trace(raw: dict[str, Any]) -> TraceSpec:
     """Validate the ``trace`` block, including every argument name it uses."""
     if not isinstance(raw, dict):
         raise SpecError("trace must be a mapping")
-    unknown = set(raw) - {"returns", "extra_passes"}
+    unknown = set(raw) - {"returns", "extra_passes", "state"}
     if unknown:
         raise SpecError(f"Unknown trace key(s): {', '.join(sorted(unknown))}")
     returns = raw.get("returns") or []
     if not isinstance(returns, list) or not all(isinstance(name, str) for name in returns):
         raise SpecError("trace.returns must be a list of names for the forward's return tuple")
+    state = raw.get("state") or []
+    if not isinstance(state, list) or not all(isinstance(name, str) for name in state):
+        raise SpecError("trace.state must be a list of module-level object names")
     # Names an extra pass may ask for. A typo here would otherwise surface as a
     # failed trace after the model is loaded, which for a large one is an hour away.
     available = set(returns) | {"input_ids", "start_pos", "hidden"}
@@ -401,7 +411,7 @@ def _parse_trace(raw: dict[str, Any]) -> TraceSpec:
             )
         passes.append(ExtraPass(entry=target, args=tuple(args),
                                 decode=bool(entry.get("decode", False))))
-    return TraceSpec(returns=tuple(returns), extra_passes=tuple(passes))
+    return TraceSpec(returns=tuple(returns), state=tuple(state), extra_passes=tuple(passes))
 
 
 def load_spec(path: str | Path) -> ModelSpec:
