@@ -28,10 +28,17 @@ LONG_THRESHOLD_TOKENS = 1024
 class DumpPolicy:
     """How much tensor data tracing is allowed to write."""
 
-    full_dumps: bool = False
+    #: Cut long-sample activations down to a head/tail window. Off by default,
+    #: and deliberately: attention mixes every position, so a module's sliced
+    #: output is *not* a function of its sliced input. Sliced records are kept for
+    #: inspection and excluded from numeric verification, which is a real loss of
+    #: coverage — worth it only when disk genuinely cannot hold the full maps.
+    slice_long: bool = False
     slice_head: int = DEFAULT_SLICE_HEAD
     slice_tail: int = DEFAULT_SLICE_TAIL
-    #: Persist per-module weight dumps; ``False`` re-reads from the checkpoint.
+    #: Persist per-module weight dumps. ``False`` keeps only the index of which
+    #: parameters each module owns and reads their values from the checkpoint on
+    #: demand, so verification still runs but nothing large is written.
     cache_weights: bool = True
     #: Persist the bf16 dequant mirror; ``False`` recomputes it per load.
     cache_dequant: bool = True
@@ -43,9 +50,13 @@ class DumpPolicy:
     def is_long(self, seq_len: int) -> bool:
         return seq_len >= LONG_THRESHOLD_TOKENS
 
+    def slices(self, seq_len: int) -> bool:
+        """True when a sample of this length gets a windowed dump."""
+        return self.slice_long and self.is_long(seq_len)
+
     def kept_positions(self, seq_len: int) -> int:
         """Sequence positions actually dumped for a tensor of length ``seq_len``."""
-        if self.full_dumps or not self.is_long(seq_len):
+        if not self.slices(seq_len):
             return seq_len
         return min(seq_len, self.slice_head + self.slice_tail)
 
@@ -144,7 +155,8 @@ def estimate_storage(
     short_bytes = _featmap_bytes(trace.short_seq_lens)
     long_bytes = _featmap_bytes(trace.long_seq_lens)
     est.add("feature maps (short)", short_bytes, f"{len(trace.short_seq_lens)} samples, full")
-    slicing = "full" if policy.full_dumps else f"sliced to {policy.slice_head}+{policy.slice_tail}"
+    slicing = (f"windowed to {policy.slice_head}+{policy.slice_tail}"
+               if policy.slice_long else "full")
     est.add("feature maps (long)", long_bytes, f"{len(trace.long_seq_lens)} samples, {slicing}")
 
     if policy.decode_steps and trace.short_seq_lens:

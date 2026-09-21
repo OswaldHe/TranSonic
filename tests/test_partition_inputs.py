@@ -41,10 +41,30 @@ class WordTokenizer:
 # -- jsonl reading -----------------------------------------------------------
 
 
-def test_read_jsonl_skips_blanks_and_comments(tmp_path):
+def test_read_jsonl_skips_blank_lines(tmp_path):
     path = tmp_path / "in.jsonl"
-    path.write_text('# a comment\n\n{"id": "a", "prompt": "x"}\n\n{"id": "b", "prompt": "y"}\n')
+    path.write_text('\n{"id": "a", "prompt": "x"}\n\n{"id": "b", "prompt": "y"}\n')
     assert [r["id"] for r in read_jsonl(path)] == ["a", "b"]
+
+
+def test_read_jsonl_rejects_a_comment_line(tmp_path):
+    """JSONL is JSON: a comment is a malformed line, not something to skip."""
+    path = tmp_path / "in.jsonl"
+    path.write_text('# a comment\n{"id": "a", "prompt": "x"}\n')
+    with pytest.raises(InputError, match=r"in\.jsonl:1 is not valid JSON"):
+        read_jsonl(path)
+
+
+def test_committed_input_sets_are_pure_jsonl():
+    """The bundled sets must parse with any JSON reader, comments included nowhere."""
+    import json
+    from pathlib import Path
+
+    inputs = Path(__file__).resolve().parent.parent / "partition" / "inputs"
+    for name in ("short.jsonl", "long.jsonl"):
+        for line in (inputs / name).read_text().splitlines():
+            if line.strip():
+                assert isinstance(json.loads(line), dict)
 
 
 def test_read_jsonl_reports_the_bad_line_number(tmp_path):

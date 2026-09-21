@@ -185,9 +185,17 @@ def ensure_shards(result: IngestResult, shards: list[str], token: str | None = N
         if local.is_file():
             paths.append(local)
             continue
-        paths.append(Path(hf_hub_download(
+        downloaded = Path(hf_hub_download(
             result.spec.repo_id, filename=shard, revision=result.revision, token=token,
-        )))
+        ))
+        # Pinning the same revision puts the download in this snapshot directory,
+        # which is where every later reader looks. Link it into place if a future
+        # hub layout ever puts it elsewhere, rather than returning a path the rest
+        # of the run cannot see.
+        if downloaded.resolve() != local.resolve():
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.symlink_to(downloaded)
+        paths.append(local)
     return paths
 
 
@@ -214,6 +222,11 @@ def evict_shards(result: IngestResult, shards: list[str]) -> int:
 
     The streaming path for checkpoints too large to hold at once. Never touches a
     local-source model, whose weights are the user's own files.
+
+    The Hub cache stores one blob per digest and symlinks every snapshot entry at
+    it, so a blob can be shared with another revision or another run. Only a blob
+    that nothing else points at is deleted; otherwise this run's link goes and the
+    bytes stay, which is reported as nothing reclaimed rather than pretended away.
     """
     if result.is_local:
         return 0
@@ -222,10 +235,28 @@ def evict_shards(result: IngestResult, shards: list[str]) -> int:
         link = result.shard_path(shard)
         if not link.exists() and not link.is_symlink():
             continue
-        # The Hub cache symlinks snapshot entries at blobs; the blob holds the bytes.
         blob = link.resolve()
-        if blob.is_file():
+        link.unlink(missing_ok=True)
+        if blob.is_file() and not _blob_is_shared(blob, result.root):
             freed += blob.stat().st_size
             blob.unlink()
-        link.unlink(missing_ok=True)
     return freed
+
+
+def _blob_is_shared(blob: Path, snapshot: Path) -> bool:
+    """True when a cache blob is still referenced by some snapshot entry.
+
+    Walks the repo's ``snapshots/`` tree, which is where every reference lives:
+    ``<cache>/models--org--name/snapshots/<sha>/<file>`` symlinked at
+    ``<cache>/models--org--name/blobs/<digest>``.
+    """
+    repo_cache = blob.parent.parent
+    snapshots = repo_cache / "snapshots"
+    if not snapshots.is_dir():
+        # Not a hub cache layout: treat the file as exclusively ours only when it
+        # sits inside this run's snapshot.
+        return snapshot not in blob.parents and blob.parent != snapshot
+    for entry in snapshots.rglob("*"):
+        if entry.is_symlink() and entry.resolve() == blob:
+            return True
+    return False

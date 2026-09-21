@@ -40,32 +40,36 @@ def test_short_samples_are_never_sliced():
     assert policy.kept_positions(1023) == 1023
 
 
-def test_long_samples_are_sliced_to_head_plus_tail():
+def test_long_samples_are_dumped_whole_by_default():
+    """Windowing costs verification coverage, so it is never the default."""
     policy = DumpPolicy()
+    assert policy.kept_positions(16384) == 16384
+    assert not policy.slices(16384)
+
+
+def test_slice_long_windows_long_samples_only():
+    policy = DumpPolicy(slice_long=True)
     assert policy.kept_positions(16384) == 256
     assert policy.kept_positions(2048) == 256
+    assert policy.kept_positions(128) == 128
 
 
-def test_slice_never_exceeds_sequence_length():
-    policy = DumpPolicy()
-    assert policy.kept_positions(1100) == 256
-    assert DumpPolicy(slice_head=1024, slice_tail=1024).kept_positions(1100) == 1100
+def test_window_never_exceeds_sequence_length():
+    assert DumpPolicy(slice_long=True).kept_positions(1100) == 256
+    assert DumpPolicy(slice_long=True, slice_head=1024,
+                      slice_tail=1024).kept_positions(1100) == 1100
 
 
-def test_full_dumps_disable_slicing():
-    assert DumpPolicy(full_dumps=True).kept_positions(16384) == 16384
-
-
-def test_slicing_dominates_the_long_context_estimate():
-    """The headline reason slicing exists: full 16k dumps are ~26x larger."""
+def test_windowing_dominates_the_long_context_estimate():
+    """Why the option exists at all: full 16k dumps are ~26x larger."""
     trace = qwen27b_trace()
     sliced = estimate_storage(
         checkpoint_bytes=0, module_weight_bytes=0, dequant_bytes=0,
-        trace=trace, policy=DumpPolicy(),
+        trace=trace, policy=DumpPolicy(slice_long=True),
     )
     full = estimate_storage(
         checkpoint_bytes=0, module_weight_bytes=0, dequant_bytes=0,
-        trace=trace, policy=DumpPolicy(full_dumps=True),
+        trace=trace, policy=DumpPolicy(),
     )
     assert full.total_bytes > 20 * sliced.total_bytes
 
@@ -150,7 +154,7 @@ def test_preflight_non_strict_returns_warning_instead():
 def test_preflight_warns_near_the_limit():
     est = estimate_storage(
         checkpoint_bytes=90 * GIB, module_weight_bytes=0, dequant_bytes=0,
-        trace=qwen27b_trace(), policy=DumpPolicy(), host=host(100),
+        trace=qwen27b_trace(), policy=DumpPolicy(slice_long=True), host=host(100),
     )
     warnings = preflight(est)
     assert any("over 80%" in w for w in warnings)

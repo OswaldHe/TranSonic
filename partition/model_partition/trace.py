@@ -49,13 +49,21 @@ class CallRecord:
     kwargs: dict[str, Any] = field(default_factory=dict)
     output: Any = None
     order: int = 0
+    #: At least one tensor in this record was windowed rather than dumped whole.
+    #: Such a record documents the module but cannot verify it: attention mixes
+    #: every position, so the windowed output is not a function of the windowed
+    #: input.
+    sliced: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "module_id": self.module_id, "submodule": self.submodule,
             "sample_id": self.sample_id, "step": self.step, "order": self.order,
             "args": self.args, "kwargs": self.kwargs, "output": self.output,
         }
+        if self.sliced:
+            data["sliced"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CallRecord:
@@ -64,6 +72,7 @@ class CallRecord:
             sample_id=data["sample_id"], step=int(data.get("step", 0)),
             args=data.get("args") or [], kwargs=data.get("kwargs") or {},
             output=data.get("output"), order=int(data.get("order", 0)),
+            sliced=bool(data.get("sliced", False)),
         )
 
     def tensor_names(self) -> list[str]:
@@ -122,24 +131,27 @@ def is_tensor(value: Any) -> bool:
 def slice_for_dump(tensor: Any, seq_len: int, policy: DumpPolicy) -> tuple[Any, SliceInfo | None]:
     """Cut a long-context tensor down to a head and tail window.
 
-    Only an axis whose length equals the sample's sequence length is sliced, so
-    weights and per-head shapes are never touched.
+    Every axis whose length equals the sample's sequence length is windowed — an
+    attention mask is square in the sequence, and windowing only its query axis
+    would leave a tensor that describes no real computation. Weights and per-head
+    shapes have no such axis and are never touched.
     """
-    if policy.full_dumps or not policy.is_long(seq_len):
+    if not policy.slices(seq_len):
         return tensor, None
-    axis = next((i for i, size in enumerate(tensor.shape) if size == seq_len), None)
-    if axis is None:
-        return tensor, None
+    axes = [i for i, size in enumerate(tensor.shape) if size == seq_len]
     head, tail = policy.slice_head, policy.slice_tail
-    if head + tail >= seq_len:
+    if not axes or head + tail >= seq_len:
         return tensor, None
     import torch
 
-    kept = torch.cat([
-        tensor.index_select(axis, torch.arange(head, device=tensor.device)),
-        tensor.index_select(axis, torch.arange(seq_len - tail, seq_len, device=tensor.device)),
-    ], dim=axis)
-    return kept, SliceInfo(axis=axis, head=head, tail=tail, original_length=seq_len)
+    index = torch.cat([
+        torch.arange(head, device=tensor.device),
+        torch.arange(seq_len - tail, seq_len, device=tensor.device),
+    ])
+    kept = tensor
+    for axis in axes:
+        kept = kept.index_select(axis, index)
+    return kept, SliceInfo(axes=axes, head=head, tail=tail, original_length=seq_len)
 
 
 class Tracer:
@@ -158,6 +170,8 @@ class Tracer:
         self.policy = policy or DumpPolicy()
         self.records: list[CallRecord] = []
         self.bytes_written = 0
+        #: Set while encoding one record, read back onto it afterwards.
+        self._sliced = False
         self._targets = self._resolve_targets()
 
     def _account(self, nbytes: int) -> None:
@@ -193,6 +207,19 @@ class Tracer:
 
     # -- weights ---------------------------------------------------------------
 
+    def _module_tensors(self, module: Any):
+        """Yield ``(original name, tensor)`` for everything a module owns."""
+        for submodule_name in module.submodules:
+            submodule = _lookup(self.model, submodule_name)
+            if submodule is None:
+                continue
+            if hasattr(submodule, "named_parameters"):
+                items = list(submodule.named_parameters()) + list(submodule.named_buffers())
+                for param_name, tensor in items:
+                    yield (f"{submodule_name}.{param_name}" if param_name else submodule_name), tensor
+            else:
+                yield submodule_name, submodule
+
     def dump_weights(self, module_ids: list[str] | None = None) -> dict[str, list[str]]:
         """Dump each module's real parameters; returns module id -> tensor names."""
         wanted = set(module_ids) if module_ids else None
@@ -201,31 +228,26 @@ class Tracer:
             if wanted is not None and module.id not in wanted:
                 continue
             names: list[str] = []
-            for submodule_name in module.submodules:
-                submodule = _lookup(self.model, submodule_name)
-                if submodule is None:
-                    continue
-                if hasattr(submodule, "named_parameters"):
-                    items = list(submodule.named_parameters()) + list(submodule.named_buffers())
-                    for param_name, tensor in items:
-                        full = f"{submodule_name}.{param_name}" if param_name else submodule_name
-                        meta = self.store.write(
-                            _safe_name(full), tensor, role="weight",
-                            module_id=module.id, subdir=f"weights/{module.id}",
-                            extra={"param": full},
-                        )
-                        self._account(meta.nbytes)
-                        names.append(meta.name)
-                else:
-                    meta = self.store.write(
-                        _safe_name(submodule_name), submodule, role="weight",
-                        module_id=module.id, subdir=f"weights/{module.id}",
-                        extra={"param": submodule_name},
-                    )
-                    self._account(meta.nbytes)
-                    names.append(meta.name)
+            for full, tensor in self._module_tensors(module):
+                meta = self.store.write(
+                    _safe_name(full), tensor, role="weight",
+                    module_id=module.id, subdir=f"weights/{module.id}",
+                    extra={"param": full},
+                )
+                self._account(meta.nbytes)
+                names.append(meta.name)
             dumped[module.id] = names
         return dumped
+
+    def index_weights(self) -> dict[str, list[str]]:
+        """Which parameters each module owns, writing nothing.
+
+        What ``cache_weights=false`` leaves behind: the mapping is all a run needs
+        to read those tensors back out of the checkpoint on demand, so
+        verification still has real weights without a second copy on disk.
+        """
+        return {module.id: [name for name, _ in self._module_tensors(module)]
+                for module in self.graph.partitioned_modules}
 
     # -- activations -----------------------------------------------------------
 
@@ -241,6 +263,7 @@ class Tracer:
             def hook(_module, args, kwargs, output):
                 for module_id in module_ids:
                     prefix = f"{sample_id}/s{step}/{_safe_name(submodule_name)}"
+                    self._sliced = False
                     record = CallRecord(
                         module_id=module_id, submodule=submodule_name,
                         sample_id=sample_id, step=step, order=counter["n"],
@@ -250,6 +273,7 @@ class Tracer:
                         output=self._encode(output, f"{prefix}/out", seq_len, module_id, sample_id,
                                             step, role="output"),
                     )
+                    record.sliced = self._sliced
                     produced.append(record)
                 counter["n"] += 1
             return hook
@@ -279,6 +303,7 @@ class Tracer:
         """Encode an argument tree, dumping tensors as it goes."""
         if is_tensor(value):
             sliced, slice_info = slice_for_dump(value, seq_len, self.policy)
+            self._sliced = self._sliced or slice_info is not None
             meta = self.store.write(
                 _safe_name(path), sliced, role=role, module_id=module_id,
                 sample_id=sample_id, step=step, subdir=f"activations/{module_id}",

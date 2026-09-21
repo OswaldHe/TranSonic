@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from model_partition.planner.graph import PartitionGraph
-from model_partition.runtime.module_runner import TraceBundle, load_dumped_weights
-from model_partition.trace import _lookup, _safe_name
+from model_partition.runtime.module_runner import TraceBundle, load_named_weights
+from model_partition.trace import _lookup
 
 
 class StreamingError(RuntimeError):
@@ -54,7 +54,7 @@ def fill_from_dumps(
     device: str = "cpu",
     strict: bool = True,
 ) -> FillReport:
-    """Overwrite every partitioned module's parameters with dumped values."""
+    """Overwrite every partitioned module's parameters with its recorded values."""
     import torch
 
     report = FillReport()
@@ -64,7 +64,7 @@ def fill_from_dumps(
         # Do not skip a module with no dumped weights: if it owns parameters,
         # every one of them is missing, and that must be reported rather than
         # leaving them silently unclaimed.
-        dumped = load_dumped_weights(bundle, module.id, device=device)
+        dumped = load_named_weights(bundle, module.id, device=device)
         count = 0
         for submodule_name in module.submodules:
             submodule = _lookup(model, submodule_name)
@@ -73,9 +73,8 @@ def fill_from_dumps(
             items = list(submodule.named_parameters()) + list(submodule.named_buffers())
             for param_name, tensor in items:
                 full = f"{submodule_name}.{param_name}" if param_name else submodule_name
-                key = _safe_name(full)
                 claimed.add(full)
-                candidate = dumped.get(key)
+                candidate = dumped.get(full)
                 if candidate is None:
                     report.missing.append(full)
                     continue

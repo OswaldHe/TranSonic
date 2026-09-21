@@ -77,6 +77,7 @@ class PartitionLoop:
     _refined: bool = field(default=False, repr=False)
 
     def build_context(self) -> LoopContext:
+        self._adopt_spec_partition()
         layout = RunLayout.create(self.spec.slug, self.options.artifact_root).ensure()
         budget = resolve_budget(
             headroom=self.options.headroom,
@@ -88,6 +89,18 @@ class PartitionLoop:
         ctx.build_model = self._model_builder(ctx)
         ctx.build_meta_model = self._meta_builder(ctx)
         return ctx
+
+    def _adopt_spec_partition(self) -> None:
+        """Let the spec supply the partition instruction the command line did not.
+
+        A model's spec is the natural place to say how it wants to be cut up, so it
+        travels with the model; an explicit command-line value still wins.
+        """
+        wanted = self.spec.partition
+        if wanted.prompt and not self.options.partition_prompt:
+            self.options.partition_prompt = wanted.prompt
+        if wanted.split_attention_ffn:
+            self.options.split_attention_ffn = True
 
     def _meta_builder(self, ctx: LoopContext) -> Callable[[], Any]:
         """Structure-only builder: no weights, so it works for any model size."""
@@ -236,7 +249,6 @@ class PartitionLoop:
 
         from model_partition.planner.agent import AgentPlanner
 
-        self.report("  asking the agent to improve the module implementations...")
         planner = AgentPlanner(model=self.options.agent_model,
                                timeout_seconds=self.options.agent_timeout_seconds)
         result = StageResult(
@@ -246,6 +258,8 @@ class PartitionLoop:
                     "that is close enough to pass a per-module check yet degrades the "
                     "output over the whole stack."),
         )
+        self._review(ctx, planner, "emulate", result, iteration)
+        self.report("  asking the agent to improve the module implementations...")
         outcome = planner.repair_modules(ctx.layout, dump_agent_context(ctx, "emulate", result),
                                         iteration)
         if not outcome.ok:
@@ -330,9 +344,12 @@ class PartitionLoop:
 
         Runs once, right after planning. Even a model that fits whole on the GPU
         benefits from boundaries chosen for how a kernel gets written and tested,
-        which is a judgement call the deterministic planner cannot make.
+        which is a judgement call the deterministic planner cannot make. A spec that
+        states how it wants to be partitioned implies this step, since otherwise the
+        instruction would never reach anything that can act on it.
         """
-        if self._refined or not self.options.refine_plan or not self.options.use_agent_planner:
+        wanted = self.options.refine_plan or bool(self.options.partition_prompt.strip())
+        if self._refined or not wanted or not self.options.use_agent_planner:
             return
         if ctx.graph is None:
             return
@@ -344,7 +361,7 @@ class PartitionLoop:
         planner = AgentPlanner(model=self.options.agent_model,
                                timeout_seconds=self.options.agent_timeout_seconds)
         before = ctx.graph.to_dict()
-        outcome, revised = planner.refine_plan(
+        outcome, revised = planner.edit_plan(
             ctx.layout, ctx.graph, dump_agent_context(ctx, "plan", StageResult(ok=True)),
             state.iteration,
         )
@@ -368,16 +385,16 @@ class PartitionLoop:
         Ingest is metadata-only and cheap, but later stages depend on the context
         it populates, so a fresh process must re-run it rather than skip it.
         """
+        from model_partition.loop.stages import load_bundle
         from model_partition.planner.graph import PartitionGraph
-        from model_partition.runtime.module_runner import TraceBundle
 
         if name == "ingest":
             return ctx.result is not None and ctx.inventory is not None and bool(ctx.samples)
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)
-            if name in ("trace", "verify_modules", "emulate", "retain") and ctx.bundle is None:
-                ctx.bundle = TraceBundle.load(ctx.layout.trace_dir)
+            if name in ("trace", "verify_modules", "emulate", "retain"):
+                load_bundle(ctx)
         except Exception:
             return False
         return True
@@ -398,14 +415,17 @@ class PartitionLoop:
 
         from model_partition.planner.agent import AgentPlanner
 
+        planner = AgentPlanner(model=self.options.agent_model,
+                               timeout_seconds=self.options.agent_timeout_seconds)
+        self._review(ctx, planner, stage_name, result, iteration)
+
         if stage_name == "verify_modules":
             return self._repair_modules(ctx, state, result, iteration)
 
         self.report("  asking the agent to revise the plan...")
-        planner = AgentPlanner(model=self.options.agent_model,
-                               timeout_seconds=self.options.agent_timeout_seconds)
         context = dump_agent_context(ctx, stage_name, result)
-        outcome, revised = planner.repair_plan(ctx.layout, ctx.graph, context, iteration)
+        outcome, revised = planner.edit_plan(ctx.layout, ctx.graph, context, iteration,
+                                             tag="repair")
         if not outcome.ok:
             self.report(f"  agent repair failed: {outcome.error}")
             ctx.notes.append(f"iteration {iteration}: agent repair failed: {outcome.error}")
@@ -420,6 +440,23 @@ class PartitionLoop:
         cleared = state.invalidate_from("plan")
         ctx.bundle = None
         self.report(f"  plan revised; invalidated: {', '.join(cleared) or 'nothing'}")
+        return True
+
+    def _review(self, ctx: LoopContext, planner: Any, stage_name: str,
+                result: StageResult, iteration: int) -> bool:
+        """Have a reviewer diagnose the failure before anything is changed.
+
+        The fix agent then works from a written diagnosis rather than from the raw
+        failure. A reviewer that cannot produce one is not fatal: the fix proceeds
+        with the failure detail alone, which is what it had before.
+        """
+        self.report("  asking the reviewer to diagnose the failure...")
+        context = dump_agent_context(ctx, stage_name, result)
+        outcome = planner.review(ctx.layout, context, iteration)
+        if not outcome.ok:
+            self.report(f"  no review produced: {outcome.error}")
+            return False
+        self.report(f"  review written to {ctx.layout.review_file}")
         return True
 
     def _repair_modules(

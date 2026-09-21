@@ -716,7 +716,7 @@ class _PartitionGroup(click.Group):
     def __init__(self) -> None:
         super().__init__(
             name="partition",
-            help="Partition, trace and verify a model for Trainium bring-up.",
+            help="Partition, trace and verify a large language model for deployment.",
         )
 
     def _delegate(self) -> click.Group:

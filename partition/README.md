@@ -1,24 +1,28 @@
 # Model partitioning, tracing and verification
 
-Takes a model specification — config, inference code, weights — plus sample
-inputs, and runs a specialized loop that partitions the model into modules each
-runnable on one local GPU, traces real per-module IO, verifies every module
-replays from its dumped artifacts, then emulates end-to-end inference and has the
-sampled tokens judged.
+`autohelix partition` takes a model specification — config, inference code,
+weights — plus sample inputs, and runs a specialized loop that cuts the model into
+modules each runnable on one local GPU, traces real per-module IO, verifies every
+module replays from its dumped artifacts, then emulates end-to-end inference and
+has the sampled tokens judged.
 
-The artifacts are the deliverable: per-module code, input feature maps, weights
-and output feature maps in a portable binary format, ready to replay against a
-Trainium kernel.
+The artifacts are the deliverable: per-module code, input feature maps, weights and
+output feature maps in a portable binary format, plus a verifier for each module,
+ready to gate a port to another backend.
 
 ```bash
-autohelix partition list                      # bundled model specs
-autohelix partition inspect qwen3.8-27b       # structure and projected size, no work done
-autohelix partition plan qwen3.8-27b          # produce the partition plan and stop
-autohelix partition run qwen3.8-27b           # the full loop
-autohelix partition report <run-dir>          # stage status
-autohelix partition tokens <run-dir>          # sampled continuations
-autohelix partition replay <run-dir> layers.0-2   # replay one module, no checkpoint needed
+autohelix partition list                    # bundled model specs
+autohelix partition inspect <spec>          # structure and projected size, no work done
+autohelix partition plan <spec>             # produce the partition plan and stop
+autohelix partition run <spec>              # the full loop
+autohelix partition report <run-dir>        # stage status
+autohelix partition tokens <run-dir>        # sampled continuations
+autohelix partition replay <run-dir> <mod>  # replay one module, no checkpoint needed
 ```
+
+A spec is a bundled name, a path to a YAML file, a HuggingFace repo id, or a local
+directory. See [`config/models/README.md`](config/models/README.md) for the
+bundled ones and how to write another.
 
 ## The loop
 
@@ -28,23 +32,31 @@ something it depends on changed.
 | Stage | What it does | Who does it |
 |---|---|---|
 | `ingest` | Resolve the spec, pin a revision, read the tensor inventory, load the tokenizer and inputs, check disk | script |
-| `plan` | Group the stack into runnable modules; reconcile submodule names against the real module tree | script, agent on failure |
-| `extract` | Write one implementation per structural signature: inference code, a verifier, and the real source | script |
+| `plan` | Group the stack into runnable modules; reconcile submodule names against the real module tree | script, agent to refine or repair |
+| `extract` | Write one implementation per structural signature: inference code, a verifier, a README, and the real source | script |
 | `trace` | Hook a real forward; dump per-module inputs, weights and outputs | script |
-| `verify_modules` | Replay each module from its dumps and compare against the trace | script |
+| `verify_modules` | Run each module's extracted implementation from its dumps and compare against the trace | script |
 | `emulate` | Assemble the model from dumps only, generate tokens, judge them | script + LLM judge |
-| | The judge is **advisory**: it never fails a run. A score of 4 or 5 (readable, correctly formed, connected to the input) ends the loop; below that the loop keeps iterating while `--iterations` allows, then reports and prints the tokens anyway | |
 | `retain` | Prune tensors to a representative layer set, keeping deduplicated code | script |
 
 The loop exits as soon as every module verifies and every sample's continuation
-scores 4 or 5, printing the sampled tokens for human review. `--iterations/-n`
-caps how many iterations it may take (default 5).
+scores 4 or 5. `--iterations/-n` caps how many iterations it may take (default 5).
 
-A judge that stays unconvinced never fails the run: the partition either
-reproduced the model or it did not, and that is decided by the module checks and
-boundary comparisons. An unconvinced judge keeps the loop iterating on the module
-implementations while iterations remain, then the run concludes as passed with the
-judge's reservation reported and the tokens printed for a human to settle.
+A judge that stays unconvinced never fails the run: the partition either reproduced
+the model or it did not, and that is decided by the module checks and boundary
+comparisons, not by an opinion about text. An unconvinced judge keeps the loop
+iterating on the module implementations while iterations remain, then the run
+concludes as passed with the reservation reported and the tokens printed for a human
+to settle.
+
+### Review, then change
+
+When a stage fails, a **reviewer** agent runs first. It reads the reports and
+writes a diagnosis to `reports/review.md`, changing nothing else. Only then does the
+agent that makes the change run, with that review as its brief — the same split
+AutoHelix's own loop uses, and for the same reason: the agent that has to produce a
+fix is the wrong one to decide what went wrong. Each review is archived under
+`reports/reviews/iter-N.md`.
 
 ### What the loop owns, and what the harness owns
 
@@ -57,10 +69,12 @@ judgement calls:
 - **`modules/<group>/inference.py`** — each module's inference code, which is what
   gets fixed when a module does not reproduce its reference numerically.
 
-Everything that decides *whether* a module is correct belongs to the harness and
-the agent does not edit it: the tolerances, the comparison, the boundary checks,
-the verifier scripts, and the dumped artifacts they compare against. An agent that
-could relax its own acceptance test would make the loop worthless.
+Everything that decides *whether* a module is correct belongs to the harness: the
+tolerances, the comparisons, the boundary checks, the verifier scripts, and the
+dumped artifacts they compare against. An agent that could relax its own acceptance
+test would make the loop worthless, so those files are snapshotted around every
+agent call and restored afterwards; a reference tensor that changed fails the
+iteration outright, since it cannot be put back.
 
 | Failure | Editable surface the agent is pointed at |
 |---|---|
@@ -72,73 +86,126 @@ could relax its own acceptance test would make the loop worthless.
 
 AutoHelix's harness isolates each iteration in a git worktree and discards it on
 rejection. That is exactly wrong here: a rejected iteration must not force a
-re-trace of hundreds of gigabytes. So this loop keeps worktree-style isolation
-for *code* — the plan is snapshotted and rolled back if the agent proposes
-something invalid — while tensor artifacts live outside the repo and survive.
-Invalidation is explicit and ordered: touching the plan invalidates everything
-downstream of it and nothing upstream.
+re-trace of hundreds of gigabytes. So this loop keeps worktree-style isolation for
+*code* — the plan and the implementations are snapshotted and rolled back if the
+agent proposes something invalid — while tensor artifacts live outside the repo and
+survive. Invalidation is explicit and ordered: touching the plan invalidates
+everything downstream of it and nothing upstream.
 
 It reuses AutoHelix's Claude backend (`ClaudeCodeAgent`) for the agent stages, so
 transport, flags and Bedrock routing are identical to the rest of the project.
 
+## Saying how you want the model partitioned
+
+Two ways, and they compose. A spec can carry the instruction, so it travels with the
+model:
+
+```yaml
+partition:
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules...
+```
+
+- `prompt` is free text handed to the agent whenever it plans or repairs. Supplying
+  one implies plan refinement, since otherwise nothing would act on it.
+- `split_attention_ffn` is the deterministic form of the most common instruction.
+  The seed planner acts on it directly, so that partition does not depend on an
+  agent call succeeding.
+
+Both have command-line equivalents, which win over the spec:
+`--partition-prompt TEXT`, `--partition-prompt-file PATH`, `--split-attention-ffn`.
+
+### Finding the granularity
+
+The planner prompt states the trade-off, and it cuts both ways. Too coarse and a
+module bundles several distinct computations, so a numerical mismatch has many
+possible causes and no way to isolate them. Too fine and every boundary becomes a
+materialized tensor, which forecloses the fusions that make a kernel fast — an
+epilogue folded into a GEMM, a norm fused into what follows it. The target is the
+coarsest module that still corresponds to one thing a kernel author would sit down
+and write.
+
 ## Key design decisions
 
-**Hooks capture arguments, not just hidden states.** A module is verified by
-calling it with the arguments it actually received during a real forward. That is
-what keeps extraction and verification architecture-agnostic — rotary embeddings,
-attention masks, sliding-window state and per-architecture extras need no special
-handling. Tracing runs with caching disabled, because a cache object cannot be
-serialized or rebuilt and would make every layer unreplayable.
+**Hooks capture arguments, not just hidden states.** A module is verified by calling
+it with the arguments it actually received during a real forward. That is what keeps
+extraction and verification architecture-agnostic — rotary embeddings, attention
+masks, sliding-window state and per-architecture extras need no special handling.
+Tracing runs with caching disabled, because a cache object cannot be serialized or
+rebuilt and would make every layer unreplayable.
 
-**The partition graph is a DAG, not a chain.** DeepSeek V4.1 shares KV across
-layers (`kv_source_layer_ids`) and feeds a sparse-attention indexer from
-non-adjacent layers (`index_source_layer_ids`). A linear pipeline cannot express
-that dataflow, so modules are nodes and named tensors are edges.
+**The partition graph is a DAG, not a chain.** Architectures route tensors across
+non-adjacent layers: shared KV, sparse-attention indexers fed from earlier layers.
+A linear pipeline cannot express that dataflow, so modules are nodes and named
+tensors are edges.
 
 **Groups are signature-homogeneous.** Modules that share a structural signature
-share one extracted implementation. A 64-layer hybrid stack such as Qwen3.8-27B
-(linear attention 3:1 with full attention) resolves to 35 modules but only **5
-implementations**, and no group ever mixes two kernel variants.
+share one extracted implementation, so a hybrid stack that alternates two attention
+variants yields two decoder implementations rather than one per layer — and no group
+ever mixes two kernel variants.
+
+**A module says how its submodules relate.** `composition: sequential` chains them,
+which is what a stack of like decoder layers is. `composition: parallel` marks
+alternatives — a group of MoE experts, where each sees the tokens routed to it and
+none feeds the next. The two are verified differently: a sequential group is one
+computation from its first submodule's input to its last submodule's output, while a
+parallel group is checked call by call.
+
+**Submodule order comes from the trace, not from the plan.** A norm and the
+projection it feeds have to run in the model's order, and no ordering of names can
+say which that is, so the baseline orders a group's submodules by when they were
+actually observed.
 
 **Two different numeric bars, for two different questions.** Replaying one module
 against its own recorded input is a single step, so it is held to a near-exact
-elementwise bar. A module *boundary* seen during end-to-end emulation is the
-product of every layer before it, where bf16 rounding accumulates — at layer 63 of
-Qwen3.8-27B a good boundary had only 64% of elements within 2e-2 yet cosine
-0.999714, while a genuine wiring error scored cosine 0.707. So boundaries are
-gated on cosine, with the pass fraction kept as a coarse floor and still reported.
+elementwise bar. A module *boundary* seen during end-to-end emulation is the product
+of every layer before it, where bf16 rounding accumulates: deep in a 64-layer stack
+a measured-good boundary had only 64% of elements within 2e-2 yet cosine 0.9997,
+while a genuine wiring error scored cosine 0.707. So boundaries are gated on cosine,
+with the pass fraction kept as a coarse floor and still reported.
+
+**Every tensor a module returns is compared.** Attention modules commonly return
+several values; checking only the first would pass a module whose primary output is
+right and whose auxiliary output is corrupt.
 
 **Verification proves the dumps are sufficient.** Parameters the plan owns are
-NaN-poisoned before each module's dumped weights are applied, so a forgotten
-tensor fails loudly instead of quietly reusing whatever was in memory. Poisoning
-is limited to plan-owned tensors: non-persistent buffers like rotary `inv_freq`
-are computed at init and no dump can restore them.
+NaN-poisoned before each module's recorded weights are applied, so a forgotten
+tensor fails loudly instead of quietly reusing whatever was in memory. Poisoning is
+limited to plan-owned tensors: non-persistent buffers like rotary `inv_freq` are
+computed at init and no dump can restore them.
 
-**Use the GPU as far as it goes.** Module verification always runs on the GPU:
-the plan sizes every module to fit, so each is moved onto the accelerator, replayed
-and moved back — the whole model never needs to be resident. Tracing and
-emulation do need the whole model, so a checkpoint larger than the GPU is spread
-across GPU and host by layer placement rather than abandoning the GPU. On one
-L40S, 33 of Qwen3.8-27B's 51.7 GiB sit on the card.
+**Unverifiable is reported, never assumed.** A *functional* module — one with no
+submodule of its own, such as an expert-combine step — belongs in the plan because a
+kernel has to implement it, but a hook-based trace has nothing to attach to. Those
+are reported as skipped rather than counted as passing, and the same goes for
+windowed long-context records.
 
-**A module replays without the checkpoint.** Structure comes from config and
-code, weights and inputs from the dumps. So a module of a model far too large to
-hold locally stays replayable — which is also what makes the artifacts useful to
-hand to kernel development.
+**Use the GPU as far as it goes.** Module verification always runs on the GPU: the
+plan sizes every module to fit, so each is moved onto the accelerator, replayed and
+moved back — the whole model never needs to be resident. Tracing and emulation do
+need the whole model, so a checkpoint larger than the GPU is spread across GPU and
+host by layer placement rather than abandoning the GPU.
 
-**Every module ships with its own verifier.** `extract` writes two files per
-implementation group. `inference.py` is the module's inference code and the loop's
-to edit; it is written once and never overwritten, so the agent's fixes survive.
-`verify.py` belongs to the harness: it builds that implementation, runs it on the
-dumped input feature map and dumped weights, and exits non-zero when the output
-disagrees with the dumped reference. So verification exercises the code the loop
-owns, and the same pairing is the handoff artifact — swap in a Trainium
-implementation and `verify.py` tells you whether the port still reproduces the
-reference.
+**A module replays without the checkpoint.** Structure comes from config and code,
+weights and inputs from the dumps. So a module of a model far too large to hold
+locally stays replayable — which is what makes the artifacts useful to hand to
+kernel development.
+
+**Every module ships with its own verifier and README.** `extract` writes four files
+per implementation group. `inference.py` is the module's inference code and the
+loop's to edit; it is written once and never overwritten, so the agent's fixes
+survive. `verify.py` belongs to the harness: it builds that implementation, runs it
+on the dumped input feature map and dumped weights, and exits non-zero when the
+output disagrees with the dumped reference. `README.md` states what the module does,
+its pre-conditions and its post-conditions. `source.py` is the real
+implementation's source, for reading and porting.
 
 ```bash
-cd <run-dir>/modules/04-decoder_layers-a5e57f50
-python inference.py --module layers.0-3          # run it
+cd <run-dir>/modules/<group>
+cat README.md                                    # what it does, what it needs
+python inference.py --module <module-id>         # run it
 python verify.py --all-modules --all-samples     # gate it
 ```
 
@@ -148,14 +215,13 @@ python verify.py --all-modules --all-samples     # gate it
 partition/
 ├── config/
 │   ├── defaults.yaml            # loop defaults, all overridable on the CLI
-│   └── models/*.yaml            # model specs
-├── inputs/
-│   ├── short.jsonl              # complete instructions, 120-142 tokens (committed)
-│   └── fetch_long_inputs.py     # generates long.jsonl at 2k/8k/16k
+│   └── models/                  # model specs, and a README on writing one
+├── inputs/                      # sample input sets, and a README on their format
 └── model_partition/
     ├── spec.py                  # what to partition and how to load it
     ├── ingest.py                # metadata first, weights on demand
     ├── weights_index.py         # per-tensor inventory without reading weights
+    ├── weights_source.py        # reading a module's weights from the checkpoint
     ├── sizing.py                # structural view + memory cost model
     ├── hardware.py storage.py   # GPU budget; footprint estimate and preflight
     ├── planner/                 # graph, seed planner, agent planner, reconcile
@@ -164,89 +230,63 @@ partition/
     ├── runtime/                 # module replay, assembly from dumps, standalone
     ├── verify/                  # numerics, module checks, emulation, judge
     ├── retention.py             # post-loop pruning
-    └── loop/                    # the specialized loop
+    └── loop/                    # the specialized loop, and the harness guard
 ```
 
-Artifacts live **outside** the repo, at `~/transonic_artifacts/<slug>/` by
-default (`MODEL_PARTITION_ARTIFACTS` or `--artifact-root`):
+Artifacts live **outside** the repo, at `~/transonic_artifacts/<slug>/` by default
+(`MODEL_PARTITION_ARTIFACTS` or `--artifact-root`):
 
 ```
-run.yaml              resolved spec, pinned revision, storage estimate
-plan/                 partition_graph.yaml, valid_submodules.txt, history/
+run.yaml              resolved spec, pinned revision, model config, storage estimate
+plan/                 partition_graph.yaml, valid_submodules.txt, rationale.md, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
 modules/              one directory per implementation group:
-                        inference.py  runs the module from its dumped input + weights
+                        inference.py  runs the module from its recorded input + weights
                         verify.py     checks inference.py against the dumped output
+                        README.md     what it does, pre-conditions, post-conditions
                         source.py     the real implementation's source, for reference
                         meta.yaml     module ids, layers, shapes
-reports/              verify.json, emulate.json, summary.md, tokens.txt
+reports/              verify.json, emulate.json, summary.md, tokens.txt,
+                      review.md, reviews/
 ```
 
 ## Binary format
 
 Raw little-endian `.bin` per tensor, a JSON sidecar, and a `manifest.yaml` index.
-Chosen over safetensors for portability: a contiguous blob plus explicit
-dtype/shape metadata is readable from any toolchain a Trainium bring-up needs.
-Every blob carries a sha256, and identical blobs are hardlinked, which is what
-makes tied embeddings and repeated layers cheap.
+Chosen over safetensors for portability: a contiguous blob plus explicit dtype/shape
+metadata is readable from whatever toolchain a kernel bring-up uses. Every blob
+carries a sha256, and identical blobs are hardlinked, which is what makes tied
+embeddings and repeated layers cheap.
 
 dtypes without a numpy equivalent (bfloat16, fp8, packed fp4) round-trip as raw
 bytes; `TensorStore.read_torch` reinterprets them.
 
-## Long context and storage
-
-Feature maps dominate the footprint at long context: one 16k boundary tensor for
-Qwen3.8-27B is 168 MB. Short samples are dumped whole; long ones keep a
-deterministic head/tail window (128 + 128 positions), which preserves the
-prefix/suffix behaviour kernel bring-up needs — RoPE phase, sliding-window edges
-— at a fraction of the bytes. `--full-dumps` overrides this.
+## Storage
 
 `autohelix partition run` prints a storage estimate before doing any work and
-refuses to start if the projection exceeds free disk, so a run fails on
-arithmetic rather than ENOSPC mid-trace. `--no-cache-weights` and
-`--no-cache-dequant` trade disk for recomputation; `--allow-overflow` downgrades
-the refusal to a warning.
+refuses to start if the projection exceeds free disk, so a run fails on arithmetic
+rather than ENOSPC mid-trace. `--allow-overflow` downgrades the refusal to a
+warning. A re-trace clears the previous one first, so iterations do not accumulate.
+
+Feature maps dominate the footprint at long context, and there are two ways to trade
+that down:
+
+- `--no-cache-weights` keeps only an index of which parameters each module owns and
+  reads their values from the checkpoint on demand. Verification still runs against
+  real weights; what it gives up is replaying a module on a machine the checkpoint
+  never reaches.
+- `--slice-long` windows long-sample activations to a head and tail (128 + 128
+  positions). This costs verification coverage and is off by default: attention
+  mixes every position, so a windowed output is not a function of the windowed
+  input. Windowed records are kept for inspection and reported as skipped.
 
 ## Retention
 
 After the loop passes, artifacts are pruned to what a kernel developer needs:
-deduplicated per-module code, plus tensors for a representative layer set —
-first, 1, 5, middle, last, **and a guaranteed representative per distinct
-signature**. That last term matters: index-based selection alone would discard
-the only copy of a kernel variant in a hybrid stack. Disable with `--no-retain`.
-
-## Model specs
-
-| Spec | Size | Fits one L40S? | Purpose |
-|---|---|---|---|
-| `qwen3.5-0.8b` | 1.6 GiB | yes | smoke test; hybrid attention, MTP, tied embeddings |
-| `qwen3.8-27b` | 51.7 GiB | **no** | primary target; 64 layers, 2 signatures, hidden 5120 |
-| `qwen3.5-35b-a3b` | 71.9 GiB | no | MoE rehearsal: expert groups and routing capture |
-| `deepseek-v4-flash` | ~291 GB | no | fp8 + fp4 rehearsal, text-only, vendor inference code |
-| `deepseek-v4.1-flash` | ~765 GB | no | the deployment target — **disabled**, see below |
-
-A spec may name a HuggingFace repo, a local directory, or nothing but a repo id
-on the command line. With `loader: auto` a repo that ships its own inference code
-gets `repo_code` and its entry module is detected; otherwise `transformers`.
-Vendor code is preferred because it defines the model's numerics and may cover
-architectures transformers does not know — importing it requires
-`trust_remote_code: true`.
-
-### DeepSeek V4.1 Flash
-
-Present as a specification, `enabled: false`. Blockers, in order:
-
-1. **Storage.** ~765 GB on disk (fp8_e4m3 204 GB + int8-packed fp4 experts
-   557 GB + bf16 2 GB) against 465 GB local. The shard stream-and-evict path
-   (`ensure_shards` / `evict_shards`) exists but is not yet wired into tracing.
-2. **Quantization.** fp8 blockwise (32×32, ue8m0 scales) and fp4 expert unpacking
-   must be implemented to run anything on an L40S.
-3. **Architecture.** 40 layers + 3 MTP, MLA-style attention, 384 routed fp4
-   experts + 1 shared at top-6, a second 128-expert MoE, sparse attention with
-   cross-layer KV reuse and a lightning indexer, engram n-gram memory, a
-   32-layer vision tower. The cross-layer edges are why the graph is a DAG.
-4. `encoding/tests/test_input_*.json` → `test_output_*.txt` in the repo give free
-   tokenizer ground truth and are worth checking first.
+deduplicated per-module code, plus tensors for a representative layer set — first,
+1, 5, middle, last, **and a guaranteed representative per distinct signature**. That
+last term matters: index-based selection alone would discard the only copy of a
+kernel variant in a hybrid stack. Disable with `--no-retain`.
 
 ## Testing
 
@@ -266,17 +306,18 @@ generated module harness as a subprocess to confirm it actually replays.
 - Emulation re-runs the full prefill for each generated token rather than using a
   KV cache. Quadratic, but it needs nothing from the model beyond
   `model(input_ids) -> logits`, which is what keeps it architecture-agnostic.
-- A plan that splits *within* a layer produces modules with no corresponding
-  submodule (an expert-combine step, for instance). Those cannot be hooked, so
-  they trace and verify but are not emulatable; the seed planner only splits
-  within a layer when a single layer exceeds the budget.
+- A functional module (an expert-combine step, for instance) has no traced
+  reference, so it is reported as unverified rather than checked.
+- A dense FFN that exceeds the per-module budget is left as one module and reported;
+  splitting a single matmul chain apart is the operator's call or the agent's.
+- Parameters a layer module owns directly, rather than through a child module, are
+  not assigned to any partition module. They appear in the fill report as unclaimed.
 - Decode-step tracing is accounted for in the storage estimate but not yet
   captured; prefill IO is.
-- Tracing and emulation need the whole model resident, so a checkpoint larger
-  than the GPU is spread across GPU and host by layer placement. Most of the
-  compute still lands on the GPU, but the host-resident layers are slow: one
-  generated token of Qwen3.8-27B costs roughly a minute on a single L40S. Full
-  GPU residency for such models needs sequential module streaming.
+- Tracing and emulation need the whole model resident, so a checkpoint larger than
+  the GPU is spread across GPU and host by layer placement. Most of the compute
+  still lands on the GPU, but the host-resident layers are slow. Full GPU residency
+  for such models needs sequential module streaming.
 - Because tracing and emulation may place layers differently, their bf16 results
   diverge slightly with depth. That is why accumulated boundaries are gated on
   cosine rather than an elementwise pass fraction.

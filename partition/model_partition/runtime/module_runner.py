@@ -5,8 +5,8 @@
 
 Verification reloads weights *from the dump* rather than reusing the live model,
 so a passing module proves the dumped artifacts are sufficient to reproduce it —
-which is the property that matters when the same data is later replayed on
-Trainium.
+which is the property that matters when the same data is later replayed against
+another implementation.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from model_partition.trace import CallRecord, _lookup, _safe_name, decode_value
+from model_partition.trace import CallRecord, _lookup, decode_value
 from model_partition.tensorstore import TensorStore
 
 RECORDS_NAME = "records.yaml"
@@ -33,12 +33,23 @@ class TraceBundle:
 
     store: TensorStore
     records: list[CallRecord] = field(default_factory=list)
+    #: module id -> dumped tensor names in the store. Empty when weights were not
+    #: cached, in which case ``weight_params`` says what to read instead.
     weights: dict[str, list[str]] = field(default_factory=dict)
+    #: module id -> original parameter names the module owns. Always populated.
+    weight_params: dict[str, list[str]] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Set at runtime when the dumps were skipped, never serialized.
+    checkpoint: Any = field(default=None, repr=False)
 
     @property
     def root(self) -> Path:
         return self.store.root
+
+    @property
+    def config(self) -> dict[str, Any]:
+        """The model config tracing resolved, for implementations that need it."""
+        return dict(self.metadata.get("config") or {})
 
     def sample_ids(self) -> list[str]:
         seen: list[str] = []
@@ -70,6 +81,7 @@ class TraceBundle:
         path.write_text(yaml.safe_dump({
             "metadata": self.metadata,
             "weights": self.weights,
+            "weight_params": self.weight_params,
             "records": [r.to_dict() for r in self.records],
         }, sort_keys=False))
         return path
@@ -85,6 +97,7 @@ class TraceBundle:
             store=store,
             records=[CallRecord.from_dict(r) for r in payload.get("records", [])],
             weights=payload.get("weights") or {},
+            weight_params=payload.get("weight_params") or {},
             metadata=payload.get("metadata") or {},
         )
 
@@ -117,32 +130,38 @@ def load_dumped_weights(bundle: TraceBundle, module_id: str, device: str = "cpu"
 
 
 def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
-    """Load a module's dumped weights keyed by their original parameter names.
+    """Load a module's weights keyed by their original parameter names.
 
     This is what an extracted implementation is handed, so its code reads
     ``weights["model.layers.0.self_attn.q_proj.weight"]`` rather than a flattened
-    filesystem name.
+    filesystem name. Values come from the dumps, or from the checkpoint when the
+    run chose not to cache them.
     """
-    load = tensor_loader(bundle.store, device)
-    by_name = {entry.name: entry for entry in bundle.store.entries}
-    result: dict[str, Any] = {}
-    for name in bundle.weights.get(module_id, []):
-        entry = by_name.get(name)
-        original = (entry.extra or {}).get("param") if entry else None
-        result[original or name] = load(name)
-    return result
+    dumped = bundle.weights.get(module_id)
+    if dumped:
+        load = tensor_loader(bundle.store, device)
+        by_name = {entry.name: entry for entry in bundle.store.entries}
+        result: dict[str, Any] = {}
+        for name in dumped:
+            entry = by_name.get(name)
+            original = (entry.extra or {}).get("param") if entry else None
+            result[original or name] = load(name)
+        return result
+
+    params = bundle.weight_params.get(module_id) or []
+    if params and bundle.checkpoint is not None:
+        return bundle.checkpoint.load(params, device=device)
+    return {}
 
 
-def apply_dumped_weights(model: Any, bundle: TraceBundle, module_id: str, graph_module: Any,
-                         device: str = "cpu") -> int:
-    """Overwrite a module's live parameters with the dumped ones.
+def apply_named_weights(model: Any, weights: dict[str, Any], graph_module: Any) -> int:
+    """Overwrite a module's live parameters from ``{original name: tensor}``.
 
-    Returns the number of tensors applied. Names were flattened for the
-    filesystem, so they are matched back by their safe form.
+    Returns the number of tensors applied. One place decides how a module's
+    parameters are matched, whether they came from the dumps or the checkpoint.
     """
     import torch
 
-    dumped = load_dumped_weights(bundle, module_id, device=device)
     applied = 0
     for submodule_name in graph_module.submodules:
         submodule = _lookup(model, submodule_name)
@@ -151,13 +170,20 @@ def apply_dumped_weights(model: Any, bundle: TraceBundle, module_id: str, graph_
         items = list(submodule.named_parameters()) + list(submodule.named_buffers())
         for param_name, tensor in items:
             full = f"{submodule_name}.{param_name}" if param_name else submodule_name
-            candidate = dumped.get(_safe_name(full))
+            candidate = weights.get(full)
             if candidate is None:
                 continue
             with torch.no_grad():
                 tensor.copy_(candidate.reshape(tensor.shape).to(tensor.dtype))
             applied += 1
     return applied
+
+
+def apply_dumped_weights(model: Any, bundle: TraceBundle, module_id: str, graph_module: Any,
+                         device: str = "cpu") -> int:
+    """Overwrite a module's live parameters with its recorded ones."""
+    weights = load_named_weights(bundle, module_id, device=device)
+    return apply_named_weights(model, weights, graph_module)
 
 
 def replay_record(model: Any, record: CallRecord, store: TensorStore, device: str = "cpu") -> Any:

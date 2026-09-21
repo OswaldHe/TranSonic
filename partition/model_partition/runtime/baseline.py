@@ -65,12 +65,15 @@ def build_from_dumps(
     device: str = "cpu",
     run_dir: str | Path | None = None,
     module_ids: list[str] | None = None,
+    submodule: str | None = None,
 ) -> Any:
     """Build a module's callable from its config and dumped weights.
 
     Returns a callable with the same signature the traced submodule had, so the
-    recorded arguments apply unchanged.
+    recorded arguments apply unchanged. ``submodule`` selects one branch of a
+    parallel group — which expert of an expert group is being run.
     """
+    from model_partition.runtime.module_runner import apply_named_weights
     from model_partition.runtime.standalone import load_run
     from model_partition.trace import _lookup
 
@@ -88,20 +91,33 @@ def build_from_dumps(
 
     model = _structure(run, device)
     _poison(model, graph_module)
-    applied = _apply_named(model, graph_module, weights)
+    applied = apply_named_weights(model, weights, graph_module)
     if not applied:
         raise BaselineError(
             f"No weights matched {module_id!r}; expected keys like "
             f"{next(iter(weights), '(none supplied)')}"
         )
 
-    targets = [_lookup(model, name) for name in graph_module.submodules]
+    # Only a parallel group has branches to choose between. A sequential group runs
+    # all of its submodules however the caller names them, or it would silently
+    # compute a prefix of the module and compare it against the whole.
+    names = ([submodule] if submodule and graph_module.is_parallel
+             and submodule in graph_module.submodules
+             else _execution_order(run, module_id, graph_module.submodules))
+    targets = [_lookup(model, name) for name in names]
     targets = [t for t in targets if t is not None and callable(t)]
     if not targets:
         raise BaselineError(f"{module_id!r} names no callable submodule")
 
     if len(targets) == 1:
         return targets[0]
+
+    if graph_module.is_parallel:
+        raise BaselineError(
+            f"{module_id!r} is a parallel group of {len(targets)} submodules "
+            f"({graph_module.submodules[0]}, ...); one call runs one branch, so the "
+            "caller must name which — pass submodule=<name> to build_module()"
+        )
 
     def run_sequence(*args: Any, **kwargs: Any) -> Any:
         """Run a multi-layer group as its sequence of submodule calls.
@@ -117,6 +133,23 @@ def build_from_dumps(
         return output
 
     return run_sequence
+
+
+def _execution_order(run: Any, module_id: str, submodules: list[str]) -> list[str]:
+    """Order a sequential group's submodules the way the model ran them.
+
+    The plan lists submodules; the trace *observed* them. A norm and the projection
+    it feeds must run in the model's order, and no ordering of names can be relied
+    on to say which that is — so take it from the recording, falling back to the
+    plan's order when a module has no records yet.
+    """
+    first_seen: dict[str, int] = {}
+    for record in run.bundle.records:
+        if record.module_id == module_id and record.submodule not in first_seen:
+            first_seen[record.submodule] = record.order
+    if not all(name in first_seen for name in submodules):
+        return list(submodules)
+    return sorted(submodules, key=lambda name: first_seen[name])
 
 
 def _module_for_weights(graph: Any, module_ids: list[str],
@@ -139,26 +172,3 @@ def _module_for_weights(graph: Any, module_ids: list[str],
         if matches and (best is None or matches > best[0]):
             best = (matches, module_id)
     return best[1] if best else None
-
-
-def _apply_named(model: Any, graph_module: Any, weights: dict[str, Any]) -> int:
-    """Copy weights keyed by original parameter name into the model."""
-    import torch
-
-    from model_partition.trace import _lookup
-
-    applied = 0
-    for submodule_name in graph_module.submodules:
-        submodule = _lookup(model, submodule_name)
-        if submodule is None or not hasattr(submodule, "named_parameters"):
-            continue
-        items = list(submodule.named_parameters()) + list(submodule.named_buffers())
-        for param_name, tensor in items:
-            full = f"{submodule_name}.{param_name}" if param_name else submodule_name
-            candidate = weights.get(full)
-            if candidate is None:
-                continue
-            with torch.no_grad():
-                tensor.copy_(candidate.reshape(tensor.shape).to(tensor.dtype))
-            applied += 1
-    return applied

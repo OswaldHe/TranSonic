@@ -8,10 +8,13 @@ import json
 import pytest
 
 from model_partition.hardware import GIB
+from model_partition.planner.graph import GraphError
 from model_partition.planner.auto import (
     PlanOptions,
-    _layer_role_bytes,
     classify_global,
+    component_role,
+    layer_parts,
+    moe_parts,
     plan,
 )
 from model_partition.sizing import CostModel, ModelInventory
@@ -136,12 +139,15 @@ def test_tight_budget_splits_the_stack_into_more_modules():
 def test_oversized_moe_layer_splits_into_attention_router_experts_combine(tmp_path):
     inventory = tiny_inventory(tmp_path, n_experts=8)
     graph = plan(inventory, budget_bytes=300_000, options=PlanOptions(seq_len=8))
-    assert graph.validate() == []
+    # The combine step is functional, which validate() reports rather than rejects.
+    assert all("Functional module" in w for w in graph.validate())
     kinds = {m.kind for m in graph.modules}
     assert {"attention", "moe_router", "moe_experts"} <= kinds
 
     experts = [m for m in graph.modules if m.kind == "moe_experts" and m.layer_indices == [1]]
     assert len(experts) > 1
+    # Experts are alternatives, not a pipeline.
+    assert all(e.composition == "parallel" for e in experts)
     # Fan-out from the router, fan-in to the combine module.
     combine = graph.by_id("layers.1.combine")
     assert all(e.outputs[0] in combine.inputs for e in experts)
@@ -199,12 +205,19 @@ def test_excluded_subtrees_appear_as_unpartitioned_nodes():
     assert "vision" not in [m.id for m in graph.partitioned_modules]
 
 
-def test_tied_embeddings_reuse_embed_weights_for_the_head(tmp_path):
+def test_tied_head_names_the_head_module_not_the_embedding(tmp_path):
+    """A tied head owns no tensor but is still its own module.
+
+    Falling back to the embedding would hook the embedding, so the head's recorded
+    "output" would be the embedding's and verification would compare the wrong
+    tensor while appearing to pass.
+    """
     inventory = tiny_inventory(tmp_path, tie_word_embeddings=True)
     graph = plan(inventory, budget_bytes=GIB, options=PlanOptions(seq_len=8))
     head = graph.by_id("lm_head")
     assert "tied" in head.notes
-    assert head.submodules == ["model.embed_tokens"]
+    assert head.submodules == ["lm_head"]
+    assert head.param_bytes == graph.by_id("embed").param_bytes
 
 
 def test_kv_bytes_recorded_for_decoder_modules():
@@ -255,14 +268,142 @@ def test_module_path_of_strips_parameter_suffix(tensor_name, expected):
     assert module_path_of(tensor_name) == expected
 
 
-def test_layer_role_bytes_buckets_by_role():
+# -- role discovery ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("component,role", [
+    ("self_attn", "attention"),
+    ("linear_attn", "attention"),
+    ("attn", "attention"),
+    ("attn_norm", "attention"),
+    ("input_layernorm", "attention"),
+    ("mlp", "ffn"),
+    ("ffn", "ffn"),
+    ("ffn_norm", "ffn"),
+    ("post_attention_layernorm", "ffn"),
+    ("pre_feedforward_layernorm", "ffn"),
+    ("indexer", "other"),
+])
+def test_component_role_buckets_by_side_of_the_residual_stream(component, role):
+    assert component_role(component) == role
+
+
+def _moe_layer_inventory():
     index = WeightIndex(entries=[
         TensorEntry("model.layers.0.self_attn.q_proj.weight", "bfloat16", (8,), 10, "s0"),
         TensorEntry("model.layers.0.input_layernorm.weight", "bfloat16", (8,), 20, "s0"),
+        TensorEntry("model.layers.0.post_attention_layernorm.weight", "bfloat16", (8,), 5, "s0"),
         TensorEntry("model.layers.0.mlp.gate.weight", "bfloat16", (8,), 40, "s0"),
         TensorEntry("model.layers.0.mlp.experts.0.up_proj.weight", "bfloat16", (8,), 80, "s0"),
-        TensorEntry("model.layers.0.mlp.down_proj.weight", "bfloat16", (8,), 160, "s0"),
+        TensorEntry("model.layers.0.mlp.experts.1.up_proj.weight", "bfloat16", (8,), 80, "s0"),
+        TensorEntry("model.layers.0.mlp.shared_experts.up_proj.weight", "bfloat16", (8,), 7, "s0"),
+        TensorEntry("model.layers.0.hc_attn_base", "bfloat16", (8,), 1, "s0"),
     ])
-    inventory = ModelInventory.build(index, {"hidden_size": 8, "num_hidden_layers": 1})
-    roles = _layer_role_bytes(inventory, 0)
-    assert roles == {"attention": 10, "norm": 20, "router": 40, "experts": 80, "mlp": 160, "other": 0}
+    return ModelInventory.build(index, {"hidden_size": 8, "num_hidden_layers": 1})
+
+
+def test_layer_parts_splits_a_layer_across_its_children():
+    parts = layer_parts(_moe_layer_inventory(), 0)
+    # Norms lead: submodules run in listed order.
+    assert parts.attention == ["model.layers.0.input_layernorm", "model.layers.0.self_attn"]
+    assert parts.ffn == ["model.layers.0.post_attention_layernorm", "model.layers.0.mlp"]
+    assert parts.bytes_for("attention") == 30
+    assert parts.bytes_for("ffn") == 5 + 40 + 80 + 80 + 7
+
+
+def test_layer_parts_reports_tensors_the_layer_owns_directly():
+    """A parameter of the layer module itself belongs to no child module."""
+    parts = layer_parts(_moe_layer_inventory(), 0)
+    assert parts.own_params == ["model.layers.0.hc_attn_base"]
+    assert not any("hc_attn_base" in path for path in parts.attention + parts.ffn)
+
+
+def test_moe_parts_separates_router_experts_and_shared():
+    router, experts, shared, nbytes = moe_parts(_moe_layer_inventory(), "model.layers.0.mlp")
+    assert router == ["model.layers.0.mlp.gate"]
+    assert experts == {0: "model.layers.0.mlp.experts.0", 1: "model.layers.0.mlp.experts.1"}
+    assert shared == ["model.layers.0.mlp.shared_experts"]
+    assert nbytes == {"router": 40, "experts": 160, "shared": 7}
+
+
+# -- attention / FFN separation ----------------------------------------------
+
+
+def test_split_attention_ffn_gives_each_side_its_own_module(tmp_path):
+    """Requested by instruction, not by capacity: it applies whatever the budget."""
+    inventory = tiny_inventory(tmp_path)
+    graph = plan(inventory, budget_bytes=10 * GIB,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True))
+
+    kinds = {m.kind for m in graph.partitioned_modules}
+    assert "decoder_layers" not in kinds
+    assert {"attention", "mlp"} <= kinds
+    for index in range(len(inventory.layers)):
+        attention = graph.by_id(f"layers.{index}.attention")
+        ffn = graph.by_id(f"layers.{index}.ffn")
+        assert ffn.inputs == attention.outputs
+        assert all("attn" in s or "norm" in s for s in attention.submodules)
+        assert any("mlp" in s or "ffn" in s for s in ffn.submodules)
+
+
+def test_split_attention_ffn_conserves_every_parameter(tmp_path):
+    inventory = tiny_inventory(tmp_path, n_experts=4)
+    graph = plan(inventory, budget_bytes=10 * GIB,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True))
+    planned = sum(m.param_bytes for m in graph.partitioned_modules)
+    assert planned == inventory.total_param_bytes()
+
+
+def test_split_attention_ffn_chains_the_residual_stream(tmp_path):
+    inventory = tiny_inventory(tmp_path)
+    graph = plan(inventory, budget_bytes=10 * GIB,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True))
+    assert graph.validate() == []
+    order = graph.topological_order()
+    for index in range(len(inventory.layers)):
+        assert order.index(f"layers.{index}.attention") < order.index(f"layers.{index}.ffn")
+
+
+def test_an_over_budget_moe_ffn_splits_into_router_experts_and_combine(tmp_path):
+    inventory = tiny_inventory(tmp_path, n_experts=8)
+    graph = plan(inventory, budget_bytes=150_000,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True,
+                                     experts_per_group=2))
+    experts = [m for m in graph.partitioned_modules
+               if m.kind == "moe_experts" and m.layer_indices == [1]]
+    assert len(experts) == 4
+    assert all(len(m.submodules) == 2 and m.is_parallel for m in experts)
+    router = graph.by_id("layers.1.router")
+    assert any("gate" in s for s in router.submodules)
+    assert graph.by_id("layers.1.combine").functional
+
+
+def test_a_dense_layer_keeps_one_ffn_module(tmp_path):
+    """Nothing to route, so there is nothing to split the FFN into."""
+    inventory = tiny_inventory(tmp_path, n_experts=8)
+    graph = plan(inventory, budget_bytes=150_000,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True,
+                                     experts_per_group=2))
+    # The toy model puts experts on odd layers only.
+    dense = graph.by_id("layers.0.ffn")
+    assert dense.kind == "mlp" and not dense.functional
+    assert "layers.0.router" not in [m.id for m in graph.modules]
+
+
+def test_a_dense_ffn_over_budget_is_reported_not_carved_up(tmp_path):
+    """Cutting a single matmul chain apart is not the seed planner's call."""
+    inventory = tiny_inventory(tmp_path)
+    graph = plan(inventory, budget_bytes=60_000,
+                 options=PlanOptions(seq_len=8, split_attention_ffn=True))
+    ffn = graph.by_id("layers.0.ffn")
+    assert "over the per-module budget" in ffn.notes
+    with pytest.raises(GraphError, match="over the .* budget"):
+        graph.validate(60_000)
+
+
+def test_norms_are_listed_before_the_computation_they_normalize_for(tmp_path):
+    """Submodules run in listed order, and checkpoint order says nothing about it."""
+    inventory = tiny_inventory(tmp_path)
+    parts = layer_parts(inventory, 0)
+    assert "norm" in parts.attention[0]
+    assert "norm" in parts.ffn[0]

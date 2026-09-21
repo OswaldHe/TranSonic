@@ -25,6 +25,12 @@ KINDS = (
     "mlp", "norm", "lm_head", "vision", "mtp", "engram", "other",
 )
 
+#: How a module's submodules relate to each other. ``sequential`` chains them —
+#: a stack of like decoder layers. ``parallel`` gives each the same position in
+#: the dataflow — a group of MoE experts, which all read the routed activation
+#: and none of which feeds the next.
+COMPOSITIONS = ("sequential", "parallel")
+
 
 class GraphError(ValueError):
     """Raised when a graph is malformed or violates the budget."""
@@ -80,11 +86,28 @@ class ModuleNode:
     #: False for nodes discovered but out of scope (vision, MTP, engram).
     partitioned: bool = True
     expert_range: list[int] = field(default_factory=list)
+    #: One of :data:`COMPOSITIONS`.
+    composition: str = "sequential"
     notes: str = ""
 
     @property
     def resident_bytes(self) -> int:
         return self.param_bytes + self.activation_bytes + self.kv_bytes
+
+    @property
+    def functional(self) -> bool:
+        """True when this node is pure tensor algebra with no submodule of its own.
+
+        An expert-combine step is the example: it sums partials into the residual
+        stream. It belongs in the plan — a kernel has to implement it — but a
+        hook-based trace has nothing to attach to, so it carries no reference of
+        its own and is reported as unverified rather than silently passing.
+        """
+        return self.partitioned and not self.submodules
+
+    @property
+    def is_parallel(self) -> bool:
+        return self.composition == "parallel" and len(self.submodules) > 1
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -96,6 +119,8 @@ class ModuleNode:
             "activation_bytes": self.activation_bytes,
             "partitioned": self.partitioned,
         }
+        if self.composition != "sequential":
+            data["composition"] = self.composition
         for key, value in (
             ("layer_indices", self.layer_indices),
             ("submodules", self.submodules),
@@ -120,6 +145,12 @@ class ModuleNode:
             raise GraphError(f"Module missing required key(s): {', '.join(sorted(missing))}")
         if data["kind"] not in KINDS:
             raise GraphError(f"Module {data['id']!r} has unknown kind {data['kind']!r}; expected one of {KINDS}")
+        composition = str(data.get("composition", "sequential"))
+        if composition not in COMPOSITIONS:
+            raise GraphError(
+                f"Module {data['id']!r} has unknown composition {composition!r}; "
+                f"expected one of {COMPOSITIONS}"
+            )
         return cls(
             id=str(data["id"]),
             kind=str(data["kind"]),
@@ -133,6 +164,7 @@ class ModuleNode:
             code_signature=data.get("code_signature"),
             partitioned=bool(data.get("partitioned", True)),
             expert_range=list(data.get("expert_range") or []),
+            composition=composition,
             notes=str(data.get("notes") or ""),
         )
 
@@ -179,11 +211,20 @@ class PartitionGraph:
             groups[module.code_signature or module.id].append(module.id)
         return dict(groups)
 
+    @property
+    def functional_modules(self) -> list[ModuleNode]:
+        return [m for m in self.partitioned_modules if m.functional]
+
     def topological_order(self) -> list[str]:
-        """Module ids in dependency order. Raises :class:`GraphError` on a cycle."""
+        """Module ids in dependency order. Raises :class:`GraphError` on a cycle.
+
+        A module listing one of its own outputs as an input is a cycle of length
+        one and is reported as such: it cannot be scheduled, and dropping the
+        self-edge would hide the mistake instead of surfacing it.
+        """
         producers = self.producers()
         entry = set(self.entry_tensors)
-        pending = {m.id: {producers[t] for t in m.inputs if t in producers and producers[t] != m.id}
+        pending = {m.id: {producers[t] for t in m.inputs if t in producers}
                    for m in self.modules}
         for module in self.modules:
             for name in module.inputs:
@@ -232,6 +273,13 @@ class PartitionGraph:
         for name in self.output_tensors:
             if name not in produced and name not in self.entry_tensors:
                 raise GraphError(f"Declared output tensor {name!r} is never produced")
+
+        functional = [m.id for m in self.functional_modules]
+        if functional:
+            warnings.append(
+                f"Functional module(s) with no submodule of their own, so no traced "
+                f"reference and no numeric verification: {', '.join(functional)}"
+            )
 
         known = set(self.tensors)
         referenced = {n for m in self.modules for n in (*m.inputs, *m.outputs)} | set(self.entry_tensors)

@@ -166,13 +166,16 @@ def apply_retention(
     drop_entries = [e for e in bundle.store.entries if e.module_id is not None and e.module_id in dropped]
     surviving_hashes = {e.sha256 for e in keep_entries}
 
+    # Identical tensors are hardlinked, so releasing the last name for a digest
+    # frees one blob's worth of bytes however many names pointed at it.
+    counted: set[str] = set()
     for entry in drop_entries:
         blob = bundle.store.blob_path(entry)
         sidecar = blob.with_suffix(".json")
         if not blob.is_file():
             continue
-        # Only count bytes freed when no surviving entry shares the blob.
-        if entry.sha256 not in surviving_hashes:
+        if entry.sha256 not in surviving_hashes and entry.sha256 not in counted:
+            counted.add(entry.sha256)
             result.bytes_freed += entry.nbytes
         result.removed_files += 1
         if not dry_run:
@@ -183,6 +186,8 @@ def apply_retention(
         bundle.store.entries = keep_entries
         bundle.records = [r for r in bundle.records if r.module_id not in dropped]
         bundle.weights = {k: v for k, v in bundle.weights.items() if k not in dropped}
+        bundle.weight_params = {k: v for k, v in bundle.weight_params.items()
+                                if k not in dropped}
         bundle.metadata = {
             **bundle.metadata,
             "retention": plan.to_dict(),

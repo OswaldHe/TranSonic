@@ -162,9 +162,9 @@ def test_slice_for_dump_leaves_short_tensors_alone():
 
 def test_slice_for_dump_cuts_the_sequence_axis():
     tensor = torch.arange(16384 * 4, dtype=torch.float32).reshape(1, 16384, 4)
-    kept, info = slice_for_dump(tensor, 16384, DumpPolicy())
+    kept, info = slice_for_dump(tensor, 16384, DumpPolicy(slice_long=True))
     assert info is not None
-    assert info.axis == 1 and info.head == 128 and info.tail == 128
+    assert info.axes == [1] and info.head == 128 and info.tail == 128
     assert info.original_length == 16384
     assert kept.shape == (1, 256, 4)
     # Head and tail windows, not a resample.
@@ -172,19 +172,27 @@ def test_slice_for_dump_cuts_the_sequence_axis():
     assert torch.equal(kept[0, 128:], tensor[0, -128:])
 
 
-def test_slice_for_dump_ignores_axes_that_merely_match_by_accident():
-    """Only an axis equal to the sequence length is sliced."""
-    tensor = torch.zeros(2048, 4)
-    kept, info = slice_for_dump(tensor, 2048, DumpPolicy())
-    assert info is not None and info.axis == 0
+def test_slice_for_dump_only_touches_sequence_axes():
+    """Only an axis equal to the sequence length is windowed."""
+    policy = DumpPolicy(slice_long=True)
+    kept, info = slice_for_dump(torch.zeros(2048, 4), 2048, policy)
+    assert info is not None and info.axes == [0] and kept.shape == (256, 4)
     weights = torch.zeros(64, 64)
-    kept2, info2 = slice_for_dump(weights, 2048, DumpPolicy())
+    kept2, info2 = slice_for_dump(weights, 2048, policy)
     assert info2 is None and kept2.shape == (64, 64)
 
 
-def test_full_dumps_disable_slicing():
+def test_slice_for_dump_windows_every_sequence_axis():
+    """A mask square in the sequence must stay square, or it describes nothing."""
+    mask = torch.zeros(1, 1, 2048, 2048)
+    kept, info = slice_for_dump(mask, 2048, DumpPolicy(slice_long=True))
+    assert info.axes == [2, 3]
+    assert kept.shape == (1, 1, 256, 256)
+
+
+def test_windowing_is_off_by_default():
     tensor = torch.zeros(1, 4096, 4)
-    kept, info = slice_for_dump(tensor, 4096, DumpPolicy(full_dumps=True))
+    kept, info = slice_for_dump(tensor, 4096, DumpPolicy())
     assert info is None and kept.shape == tensor.shape
 
 
@@ -195,7 +203,8 @@ def test_slicing_is_recorded_in_the_manifest(tiny_run):
     store = tiny_run.bundle.store
     meta = store.write("sliced", torch.zeros(1, 256, 4), role="output",
                        module_id="layers.0", sample_id="s0",
-                       slice_info=SliceInfo(axis=1, head=128, tail=128, original_length=16384))
+                       slice_info=SliceInfo(axes=[1], head=128, tail=128,
+                                            original_length=16384))
     assert meta.slice_info["original_length"] == 16384
 
 

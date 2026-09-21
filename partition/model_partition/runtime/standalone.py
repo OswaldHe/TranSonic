@@ -22,11 +22,10 @@ from model_partition.runtime.module_runner import (
     TraceBundle,
     apply_dumped_weights,
     expected_output,
-    first_tensor,
     replay_record,
 )
 from model_partition.spec import parse_spec
-from model_partition.verify.numerics import Comparison, compare
+from model_partition.verify.numerics import Comparison, compare_outputs
 
 
 class StandaloneError(RuntimeError):
@@ -120,16 +119,14 @@ def replay_module(
     """Run a module's inference and compare it against the dumped output."""
     run, model, _ = load_module(run_dir, module_id, device=device)
     sample = sample_id or (run.bundle.sample_ids() or [None])[0]
-    records = run.bundle.select(module_id=module_id, sample_id=sample)
-    if not records:
-        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
+    records = _records_or_raise(run, module_id, sample)
 
     results: list[Comparison] = []
     for record in records:
-        actual = first_tensor(replay_record(model, record, run.bundle.store, device=device))
-        reference = first_tensor(expected_output(record, run.bundle.store, device=device))
+        actual = replay_record(model, record, run.bundle.store, device=device)
+        reference = expected_output(record, run.bundle.store, device=device)
         label = f"{module_id}@{sample}" if len(records) == 1 else f"{record.submodule}@{sample}"
-        results.append(compare(actual, reference, name=label, tolerance=tolerance))
+        results.extend(compare_outputs(actual, reference, label, tolerance))
     return results
 
 
@@ -144,30 +141,42 @@ def verify_impl(
     """Run a module's *extracted implementation* and compare against the dump.
 
     This is the check that matters: it exercises the code the loop owns, not the
-    original model. The comparison itself stays here, out of the agent's reach.
+    original model. The comparison itself stays here, out of the agent's reach —
+    and covers every tensor the module returns, not only the first.
     """
     from model_partition.runtime.module_impl import load_impl, run_impl
     from model_partition.runtime.module_runner import decode_call, load_named_weights
 
     run = load_run(run_dir)
-    _module_or_raise(run.graph, module_id)
+    graph_module = _module_or_raise(run.graph, module_id)
     sample = sample_id or (run.bundle.sample_ids() or [None])[0]
-    records = run.bundle.select(module_id=module_id, sample_id=sample)
-    if not records:
-        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
+    records = _records_or_raise(run, module_id, sample)
 
     impl = load_impl(impl_dir)
     weights = load_named_weights(run.bundle, module_id, device=device)
-    config = run.manifest.get("config") or (run.spec.overrides or {})
+    config = run.bundle.config or run.manifest.get("config") or (run.spec.overrides or {})
 
+    # A parallel group's recorded calls are independent — one expert each — so
+    # every one is checked. A sequential group is one computation from the first
+    # call's input to the last call's output.
+    pairs = ([(r, r) for r in records] if graph_module.is_parallel
+             else [(records[0], records[-1])])
     results: list[Comparison] = []
-    for record in records[:1] if len(records) > 1 else records:
-        args, kwargs = decode_call(record, run.bundle.store, device)
-        actual = first_tensor(run_impl(impl, config, weights, args, kwargs, device=device))
-        reference = first_tensor(expected_output(records[-1], run.bundle.store, device=device))
-        results.append(compare(actual, reference, name=f"impl:{module_id}@{sample}",
-                               tolerance=tolerance))
+    for source, reference_record in pairs:
+        args, kwargs = decode_call(source, run.bundle.store, device)
+        actual = run_impl(impl, config, weights, args, kwargs, device=device,
+                          submodule=source.submodule if graph_module.is_parallel else None)
+        reference = expected_output(reference_record, run.bundle.store, device=device)
+        results.extend(compare_outputs(actual, reference, f"impl:{module_id}@{sample}",
+                                       tolerance))
     return results
+
+
+def _records_or_raise(run: LoadedRun, module_id: str, sample: str | None) -> list[Any]:
+    records = run.bundle.select(module_id=module_id, sample_id=sample)
+    if not records:
+        raise StandaloneError(f"No trace records for module {module_id!r} sample {sample!r}")
+    return records
 
 
 def _module_or_raise(graph: PartitionGraph, module_id: str):

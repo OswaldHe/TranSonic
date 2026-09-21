@@ -35,7 +35,9 @@ class TinyRun:
 
 
 def _build(tmp_path: Path, n_experts: int, n_samples: int, seq_len: int, n_layers: int,
-           one_layer_per_module: bool = False) -> TinyRun:
+           one_layer_per_module: bool = False, split_attention_ffn: bool = False,
+           experts_per_group: int | None = None,
+           budget_bytes: int = 10 ** 9) -> TinyRun:
     from safetensors.torch import load_file
 
     from model_partition.ingest import ingest
@@ -70,8 +72,10 @@ def _build(tmp_path: Path, n_experts: int, n_samples: int, seq_len: int, n_layer
     config = json.loads((repo / "config.json").read_text())
     inventory = ModelInventory.build(WeightIndex.from_local(repo), config)
     graph = plan(
-        inventory, 10 ** 9,
-        PlanOptions(seq_len=seq_len, one_layer_per_module=one_layer_per_module),
+        inventory, budget_bytes,
+        PlanOptions(seq_len=seq_len, one_layer_per_module=one_layer_per_module,
+                    split_attention_ffn=split_attention_ffn,
+                    experts_per_group=experts_per_group),
         model_name="tiny",
     )
 
@@ -95,9 +99,11 @@ def _build(tmp_path: Path, n_experts: int, n_samples: int, seq_len: int, n_layer
         sample_ids.append(sample_id)
 
     bundle = TraceBundle(store=store, records=tracer.records, weights=weights,
-                         metadata={"model": "tiny"})
+                         weight_params=tracer.index_weights(),
+                         metadata={"model": "tiny", "config": config})
     bundle.save()
-    layout.write_run({"spec": spec.to_dict(), "revision": None, "loader": result.loader})
+    layout.write_run({"spec": spec.to_dict(), "revision": None,
+                      "loader": result.loader, "config": config})
 
     return TinyRun(root=tmp_path, repo=repo, spec=spec, result=result, graph=graph,
                    bundle=TraceBundle.load(layout.trace_dir), inventory=inventory,
@@ -131,3 +137,16 @@ def tiny_deep_run(tmp_path):
     pytest.importorskip("safetensors")
     return _build(tmp_path, n_experts=0, n_samples=1, seq_len=8, n_layers=12,
                   one_layer_per_module=True)
+
+
+@pytest.fixture
+def tiny_split_run(tmp_path):
+    """Toy MoE model partitioned with attention and FFN as separate modules.
+
+    The shape a spec asking for attention/FFN separation produces, including a
+    parallel expert group when the FFN does not fit.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    return _build(tmp_path, n_experts=4, n_samples=1, seq_len=8, n_layers=4,
+                  split_attention_ffn=True, experts_per_group=2, budget_bytes=60_000)

@@ -206,3 +206,82 @@ def test_collect_sources_deduplicates_repeated_child_classes(tiny_run):
 def test_collect_sources_respects_the_class_cap(tiny_run):
     _, names, _ = collect_sources(tiny_run.build_model(), max_classes=2)
     assert len(names) <= 2
+
+
+# -- the per-module README ---------------------------------------------------
+
+
+def _readme(run, tmp_path):
+    from model_partition.extract import extract
+
+    groups = extract(run.graph, run.build_model(), tmp_path / "modules",
+                     run_root=run.layout.root, sample_ids=run.sample_ids,
+                     weight_tensors=run.bundle.weights,
+                     param_names=run.bundle.weight_params)
+    return groups, {g.signature: (g.directory / "README.md").read_text() for g in groups}
+
+
+def test_every_group_gets_a_readme(tiny_run, tmp_path):
+    groups, readmes = _readme(tiny_run, tmp_path)
+    assert len(readmes) == len(groups)
+    assert all(text.strip() for text in readmes.values())
+
+
+def test_the_readme_states_purpose_preconditions_and_postconditions(tiny_run, tmp_path):
+    _, readmes = _readme(tiny_run, tmp_path)
+    for text in readmes.values():
+        assert "## What this module does" in text
+        assert "## Pre-conditions" in text
+        assert "## Post-conditions" in text
+        assert "python verify.py" in text
+
+
+def test_the_readme_names_the_modules_and_dataflow(tiny_run, tmp_path):
+    groups, readmes = _readme(tiny_run, tmp_path)
+    for group in groups:
+        text = readmes[group.signature]
+        for module_id in group.module_ids:
+            assert f"`{module_id}`" in text
+        module = tiny_run.graph.by_id(group.module_ids[0])
+        for tensor in module.inputs + module.outputs:
+            assert f"`{tensor}`" in text
+
+
+def test_the_readme_records_how_many_weights_the_module_needs(tiny_run, tmp_path):
+    groups, readmes = _readme(tiny_run, tmp_path)
+    group = next(g for g in groups if tiny_run.bundle.weight_params.get(g.module_ids[0]))
+    count = len(tiny_run.bundle.weight_params[group.module_ids[0]])
+    assert f"{count} tensor(s)" in readmes[group.signature]
+
+
+def test_the_readme_flags_a_module_that_cannot_be_verified(tiny_run, tmp_path):
+    """A functional module has no reference, and its README has to say so."""
+    from model_partition.planner.graph import ModuleNode
+
+    tiny_run.graph.modules.append(ModuleNode(
+        id="layers.0.combine", kind="mlp", layer_indices=[0], code_signature="combine",
+    ))
+    _, readmes = _readme(tiny_run, tmp_path)
+    assert "functional" in readmes["combine"]
+    assert "cannot check it" in readmes["combine"]
+
+
+def test_the_readme_explains_a_parallel_group(tiny_split_run, tmp_path):
+    graph = tiny_split_run.graph
+    parallel = [m for m in graph.partitioned_modules if m.is_parallel]
+    assert parallel, "fixture should produce a parallel expert group"
+    _, readmes = _readme(tiny_split_run, tmp_path)
+    text = readmes[parallel[0].code_signature]
+    assert "parallel" in text and "submodule=" in text
+
+
+def test_the_readme_is_regenerated_unlike_inference_py(tiny_run, tmp_path):
+    """It belongs to the harness, so a stale copy must not survive."""
+    groups, _ = _readme(tiny_run, tmp_path)
+    directory = groups[0].directory
+    (directory / "README.md").write_text("stale\n")
+    (directory / "inference.py").write_text("# agent's fix\n")
+
+    _readme(tiny_run, tmp_path)
+    assert (directory / "README.md").read_text() != "stale\n"
+    assert (directory / "inference.py").read_text() == "# agent's fix\n"

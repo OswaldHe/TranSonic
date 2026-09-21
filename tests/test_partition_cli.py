@@ -31,7 +31,7 @@ def test_partition_is_registered_under_autohelix():
     from autohelix.cli import main
 
     assert "partition" in main.commands
-    assert "Trainium" in (main.commands["partition"].help or "")
+    assert "Partition" in (main.commands["partition"].help or "")
 
 
 def test_autohelix_partition_lists_subcommands(runner):
@@ -243,3 +243,81 @@ def test_replay_verifies_a_module_from_artifacts_alone(runner, tiny_run):
     result = runner.invoke(partition, ["replay", str(tiny_run.layout.root), module_id])
     assert result.exit_code == 0, result.output + str(result.exception)
     assert ": ok" in result.output
+
+
+# -- the partition instruction on the command line ---------------------------
+
+
+def test_partition_prompt_reaches_the_options():
+    options = build_options(None, partition_prompt="split the layers")
+    assert options.partition_prompt == "split the layers"
+
+
+def test_partition_prompt_can_come_from_a_file(tmp_path):
+    path = tmp_path / "how.md"
+    path.write_text("Split attention from the FFN.\n")
+    assert build_options(None, partition_prompt_file=path).partition_prompt == \
+        "Split attention from the FFN.\n"
+
+
+def test_an_explicit_prompt_wins_over_the_file(tmp_path):
+    path = tmp_path / "how.md"
+    path.write_text("from the file\n")
+    options = build_options(None, partition_prompt="inline", partition_prompt_file=path)
+    assert options.partition_prompt == "inline"
+
+
+def test_the_prompt_file_is_not_mistaken_for_an_option():
+    """partition_prompt_file is a CLI convenience, not a LoopOptions field."""
+    from dataclasses import fields
+
+    from model_partition.loop.stages import LoopOptions
+
+    assert "partition_prompt_file" not in {f.name for f in fields(LoopOptions)}
+
+
+def test_split_attention_ffn_is_a_flag():
+    assert build_options(None, split_attention_ffn=True).split_attention_ffn is True
+    assert build_options(None).split_attention_ffn is False
+
+
+# -- bundled resources -------------------------------------------------------
+
+
+def test_bundled_resources_resolve_in_the_source_tree():
+    from model_partition.cli import CONFIG_DIR, DEFAULTS_FILE, MODELS_DIR
+
+    assert DEFAULTS_FILE.is_file()
+    assert CONFIG_DIR.is_dir() and MODELS_DIR.is_dir()
+    assert list(MODELS_DIR.glob("*.yaml"))
+
+
+def test_a_spec_finds_its_input_set_relative_to_itself():
+    """The relation the wheel's force-include has to preserve."""
+    from model_partition.cli import MODELS_DIR
+    from model_partition.spec import load_spec
+
+    spec = load_spec(MODELS_DIR / "qwen3.5-0.8b.yaml")
+    short, long = spec.inputs.resolve(spec.base_dir())
+    assert short.is_file() and long.is_file()
+
+
+def test_resource_lookup_prefers_a_directory_beside_the_package(tmp_path, monkeypatch):
+    """Inside an installed wheel the data sits next to the package, not above it."""
+    from model_partition import cli
+
+    package = tmp_path / "model_partition"
+    (package / "config").mkdir(parents=True)
+    (tmp_path / "config").mkdir()
+    monkeypatch.setattr(cli, "__file__", str(package / "cli.py"))
+    assert cli._resource_dir("config") == package / "config"
+
+
+def test_resource_lookup_falls_back_to_the_source_layout(tmp_path, monkeypatch):
+    from model_partition import cli
+
+    package = tmp_path / "model_partition"
+    package.mkdir(parents=True)
+    (tmp_path / "config").mkdir()
+    monkeypatch.setattr(cli, "__file__", str(package / "cli.py"))
+    assert cli._resource_dir("config") == tmp_path / "config"

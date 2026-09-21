@@ -9,18 +9,24 @@ Shared by {{ module_ids | length }} module(s):
 {% endfor %}
 ## The contract
 
-    build_module(config, weights, device) -> callable
+    build_module(config, weights, device, submodule=None) -> callable
 
-`weights` is keyed by original parameter name, e.g.
+`config` is the model's resolved config; `weights` is keyed by original parameter
+name, e.g.
 {% if weight_names %}    {{ weight_names[0] }}
 {% endif %}The returned callable is invoked with the arguments the module actually received
-during tracing, and its output is compared against the dumped reference.
+during tracing, and every tensor it returns is compared against the dumped
+reference.
+
+`submodule` names which branch to run and matters only for a `parallel` group — a
+set of MoE experts, where one recorded call exercises one expert. Drop it from the
+signature if this module has a single submodule.
 
 ## Where to start
 
 The baseline below instantiates the model's own class and loads the dumped
 weights into it, so it is correct from the outset. Replace its body with an
-explicit implementation when you need one — for porting to a Trainium kernel, or
+explicit implementation when you need one — for porting to a target accelerator, or
 because the module should be expressed in simpler operations. `source.py` beside
 this file holds the real implementation's source to work from.
 
@@ -36,20 +42,21 @@ LAYER_MAP = {{ layer_map | tojson }}
 SIGNATURE = {{ signature | tojson }}
 CLASS_NAME = {{ class_name | tojson }}
 SUBMODULES = {{ submodules | tojson }}
+COMPOSITION = {{ composition | tojson }}
 WEIGHT_NAMES = {{ weight_names | tojson }}
 DEFAULT_RUN = {{ run_root | tojson }}
 
 
-def build_module(config, weights, device="cpu"):
+def build_module(config, weights, device="cpu", submodule=None):
     """Return a callable that computes this module's forward.
 
-    Baseline: build the model's structure from its config and code, then load the
-    dumped weights for this module. Nothing is read from the original checkpoint.
+    Baseline: build the model's structure from its config and code, then load this
+    module's recorded weights into it.
     """
     from model_partition.runtime.baseline import build_from_dumps
 
-    return build_from_dumps(config, weights, device=device,
-                            run_dir=DEFAULT_RUN, module_ids=MODULE_IDS)
+    return build_from_dumps(config, weights, device=device, run_dir=DEFAULT_RUN,
+                            module_ids=MODULE_IDS, submodule=submodule)
 
 
 def main(argv=None):
@@ -93,8 +100,8 @@ def main(argv=None):
 
     impl = ExtractedImpl(path=__file__, module=sys.modules[__name__],
                          module_ids=MODULE_IDS)
-    output = run_impl(impl, run.bundle.metadata.get("config") or {},
-                      weights, args_, kwargs_, device=args.device)
+    output = run_impl(impl, run.bundle.config, weights, args_, kwargs_,
+                      device=args.device, submodule=records[0].submodule)
     tensor = first_tensor(output)
     print(f"  output shape={tuple(tensor.shape) if tensor is not None else None} "
           f"dtype={getattr(tensor, 'dtype', None)}")

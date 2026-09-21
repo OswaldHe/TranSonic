@@ -18,13 +18,36 @@ from typing import Any
 
 import yaml
 
+from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
 from model_partition.trace import _lookup
 
 #: The implementation is the loop's to edit, so it is written once and then left
 #: alone. Everything else belongs to the harness and is regenerated every run.
 EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
-HARNESS_TEMPLATES = {"verify.py": "module_verify.py.tmpl"}
+HARNESS_TEMPLATES = {
+    "verify.py": "module_verify.py.tmpl",
+    "README.md": "module_readme.md.tmpl",
+}
+
+#: Module kind -> what the module is for, in one sentence. Read by a kernel author
+#: before anything else in the directory.
+KIND_PURPOSE = {
+    "embed": "Turns token ids into the initial hidden state.",
+    "decoder_layers": "Runs one or more complete decoder layers of the stack: "
+                      "attention and the feed-forward block, residuals included.",
+    "attention": "The attention side of a decoder layer: its normalization, the "
+                 "projections, the attention itself, and the output projection.",
+    "moe_router": "Scores each token against the experts and decides which ones "
+                  "it is routed to.",
+    "moe_experts": "Runs a contiguous group of MoE experts over the tokens routed "
+                   "to them.",
+    "mlp": "The feed-forward side of a decoder layer.",
+    "norm": "A normalization applied to the residual stream.",
+    "lm_head": "Projects the final hidden state to vocabulary logits.",
+    "other": "A component of a decoder layer that is neither attention nor the "
+             "feed-forward block.",
+}
 
 SOURCE_HEADER = '''\
 """Source of the real implementation for partition group `{signature}`.
@@ -159,25 +182,37 @@ def extract(
             SOURCE_HEADER.format(signature=signature, provenance=provenance)
             + "\n\n".join(sources)
         )
+        weight_names = list(param_names.get(representative.id, []))
         context = {
             "signature": signature,
             "module_ids": list(module_ids),
             "layer_map": {m.id: list(m.layer_indices) for m in modules},
+            "submodule_map": {m.id: list(m.submodules) for m in modules},
             "class_name": group.class_name,
             "sample_ids": list(sample_ids or []),
             "weight_tensors": {mid: list((weight_tensors or {}).get(mid, [])) for mid in module_ids},
             "submodules": list(representative.submodules),
-            "weight_names": list(param_names.get(representative.id, [])),
+            "weight_names": weight_names,
+            "weight_count": len(weight_names),
             "run_root": str(run_root),
+            "kind": representative.kind,
+            "purpose": KIND_PURPOSE.get(representative.kind, "A partition module."),
+            "notes": representative.notes,
+            "composition": representative.composition,
+            "verifiable": not representative.functional,
+            "inputs": list(representative.inputs),
+            "outputs": list(representative.outputs),
+            "param_bytes_h": format_bytes(representative.param_bytes),
+            "kv_bytes_h": format_bytes(representative.kv_bytes) if representative.kv_bytes else "",
         }
         for filename, template in HARNESS_TEMPLATES.items():
             (directory / filename).write_text(_render_template(template, context))
         for filename, template in EDITABLE_TEMPLATES.items():
-            target = directory / filename
-            if target.is_file() and not regenerate:
+            path = directory / filename
+            if path.is_file() and not regenerate:
                 group.preserved = True
                 continue
-            target.write_text(_render_template(template, context))
+            path.write_text(_render_template(template, context))
         (directory / "meta.yaml").write_text(yaml.safe_dump({
             **group.to_dict(),
             "kind": representative.kind,

@@ -57,7 +57,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for lineno, line in enumerate(file_path.read_text().splitlines(), start=1):
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             continue
         try:
             payload = json.loads(stripped)

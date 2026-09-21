@@ -309,19 +309,28 @@ def test_force_reruns_a_completed_run(tiny_run, tmp_path):
 
 
 class _RecordingPlanner:
-    """Stands in for AgentPlanner, recording each refine_plan call."""
+    """Stands in for AgentPlanner, recording each call it receives."""
 
     calls: list[dict] = []
 
     def __init__(self, **kwargs):
         pass
 
-    def refine_plan(self, layout, graph, context, iteration):
+    def edit_plan(self, layout, graph, context, iteration, tag="plan"):
         from model_partition.planner.agent import AgentOutcome
 
-        type(self).calls.append({"context": context, "iteration": iteration})
+        type(self).calls.append({"context": context, "iteration": iteration, "kind": tag})
         graph.metadata["refined_by"] = "agent"
         return AgentOutcome(ok=True), graph
+
+    def review(self, layout, context, iteration):
+        from model_partition.planner.agent import AgentOutcome
+
+        type(self).calls.append({"context": context, "iteration": iteration,
+                                 "kind": "review"})
+        layout.review_file.parent.mkdir(parents=True, exist_ok=True)
+        layout.review_file.write_text("diagnosis\n")
+        return AgentOutcome(ok=True)
 
     def repair_modules(self, layout, context, iteration):
         from model_partition.planner.agent import AgentOutcome
@@ -387,7 +396,7 @@ def test_failed_refinement_keeps_the_seed_plan(tiny_run, tmp_path, monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def refine_plan(self, layout, graph, context, iteration):
+        def edit_plan(self, layout, graph, context, iteration, tag="plan"):
             return AgentOutcome(ok=False, error="rolled back"), graph
 
     _patch_planner(monkeypatch, FailingPlanner)
@@ -575,3 +584,192 @@ def test_extraction_preserves_an_edited_implementation(tiny_run, tmp_path):
 
     loop_for(tiny_run, tmp_path, retain=False, judge=AcceptingJudge(), force=True).run()
     assert marker in impl.read_text()
+
+
+# -- the resolved config travels with the run --------------------------------
+
+
+def test_the_resolved_config_is_persisted_for_implementations(tiny_run, tmp_path):
+    """An implementation is built against config; an empty one is a silent trap."""
+    import yaml
+
+    from model_partition.runtime.module_runner import TraceBundle
+
+    result = loop_for(tiny_run, tmp_path).run()
+    layout = result.context.layout
+
+    bundle = TraceBundle.load(layout.trace_dir)
+    assert bundle.config.get("hidden_size")
+    manifest = yaml.safe_load(layout.run_file.read_text())
+    assert manifest["config"]["hidden_size"] == bundle.config["hidden_size"]
+
+
+def test_the_weight_index_is_recorded_even_when_weights_are_cached(tiny_run, tmp_path):
+    from model_partition.runtime.module_runner import TraceBundle
+
+    result = loop_for(tiny_run, tmp_path).run()
+    bundle = TraceBundle.load(result.context.layout.trace_dir)
+    assert bundle.weight_params
+    for module_id, names in bundle.weight_params.items():
+        assert len(names) == len(bundle.weights[module_id])
+        assert all("." in name for name in names)
+
+
+# -- trace invalidation and cleanup ------------------------------------------
+
+
+def test_a_changed_prompt_of_the_same_length_retraces(tiny_run, tmp_path):
+    """Sample ids and token counts are not the input; the tokens are."""
+    from model_partition.loop.stages import hash_trace
+    from model_partition.loop.state import content_hash
+
+    loop = loop_for(tiny_run, tmp_path)
+    ctx = loop.build_context()
+    from model_partition.loop.stages import stage_ingest
+
+    stage_ingest(ctx)
+    ctx.graph = tiny_run.graph
+    before = content_hash(*hash_trace(ctx))
+
+    ctx.samples[0].token_ids = list(reversed(ctx.samples[0].token_ids))
+    assert content_hash(*hash_trace(ctx)) != before
+
+
+def test_retracing_does_not_leave_the_previous_trace_behind(tiny_run, tmp_path):
+    """Superseded blobs are outside the new manifest, so retention never sees them."""
+    from model_partition.loop.stages import clear_trace
+
+    result = loop_for(tiny_run, tmp_path, retain=False).run()
+    trace_dir = result.context.layout.trace_dir
+    orphan = trace_dir / "activations" / "stale" / "orphan.bin"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"\x00" * 4096)
+
+    freed = clear_trace(trace_dir)
+    assert freed >= 4096
+    assert not orphan.exists()
+    assert list(trace_dir.iterdir()) == []
+
+
+def test_a_second_run_retraces_into_a_clean_directory(tiny_run, tmp_path):
+    loop_for(tiny_run, tmp_path, retain=False).run()
+    layout = loop_for(tiny_run, tmp_path, retain=False).build_context().layout
+    orphan = layout.trace_dir / "activations" / "gone" / "orphan.bin"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"\x00" * 1024)
+
+    # decode_steps is part of the trace hash, so changing it re-runs that stage.
+    assert loop_for(tiny_run, tmp_path, retain=False, decode_steps=8).run().passed
+    assert not orphan.exists()
+
+
+# -- the partition instruction ----------------------------------------------
+
+
+def test_a_spec_instruction_reaches_the_agent_and_turns_refinement_on(tiny_run, tmp_path,
+                                                                     monkeypatch):
+    """A prompt nothing acts on would be a prompt that does nothing."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    tiny_run.spec.partition.prompt = "Split attention from the FFN."
+
+    loop = loop_for(tiny_run, tmp_path, retain=False, use_agent_planner=True)
+    assert loop.options.refine_plan is False
+    assert loop.run().passed
+
+    assert len(_RecordingPlanner.calls) == 1
+    assert _RecordingPlanner.calls[0]["context"]["partition_prompt"] == \
+        "Split attention from the FFN."
+
+
+def test_an_explicit_instruction_wins_over_the_spec(tiny_run, tmp_path, monkeypatch):
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+    tiny_run.spec.partition.prompt = "from the spec"
+    loop = loop_for(tiny_run, tmp_path, retain=False, use_agent_planner=True,
+                    partition_prompt="from the command line")
+    assert loop.run().passed
+    assert _RecordingPlanner.calls[0]["context"]["partition_prompt"] == "from the command line"
+
+
+def test_a_spec_asking_for_split_attention_ffn_gets_it(tiny_run, tmp_path):
+    """The deterministic half of the instruction, so it needs no agent call."""
+    tiny_run.spec.partition.split_attention_ffn = True
+    result = loop_for(tiny_run, tmp_path, retain=False).run()
+    assert result.passed, result.error
+
+    kinds = {m.kind for m in result.context.graph.partitioned_modules}
+    assert {"attention", "mlp"} <= kinds
+    assert "decoder_layers" not in kinds
+    for module in result.context.graph.partitioned_modules:
+        if module.kind == "attention":
+            assert all("attn" in s or "norm" in s for s in module.submodules)
+
+
+# -- review before repair ---------------------------------------------------
+
+
+def test_a_failure_is_reviewed_before_anything_is_changed(tiny_run, tmp_path, monkeypatch):
+    """The agent that has to produce a fix is the wrong one to decide what broke."""
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+
+    layout = _broken_plan(tiny_run, tmp_path)
+    loop_for(tiny_run, tmp_path, use_agent_planner=True, max_iterations=2).run()
+    kinds = [call["kind"] for call in _RecordingPlanner.calls]
+    ctx_layout = layout
+    assert kinds[0] == "review"
+    assert "repair" in kinds
+    assert ctx_layout.review_file.is_file()
+
+
+def test_the_review_is_handed_to_the_agent_that_fixes_things(tiny_run, tmp_path,
+                                                             monkeypatch):
+    _RecordingPlanner.calls = []
+    _patch_planner(monkeypatch, _RecordingPlanner)
+
+    _broken_plan(tiny_run, tmp_path)
+    loop_for(tiny_run, tmp_path, use_agent_planner=True, max_iterations=2).run()
+    repair = next(c for c in _RecordingPlanner.calls if c["kind"] == "repair")
+    assert repair["context"]["review"] == "diagnosis"
+
+
+def _broken_plan(run, tmp_path):
+    """Plan the run, then point a module at a submodule the model does not have."""
+    from model_partition.loop.stages import stage_ingest, stage_plan
+
+    loop = loop_for(run, tmp_path)
+    ctx = loop.build_context()
+    stage_ingest(ctx)
+    stage_plan(ctx)
+    module = next(m for m in ctx.graph.partitioned_modules if m.kind == "decoder_layers")
+    module.submodules = ["model.layers.nope"]
+    ctx.graph.save(ctx.layout.graph_path)
+    return ctx.layout
+
+
+def test_the_reviewer_archives_each_review_and_requires_one(tiny_run, tmp_path):
+    """The trail survives the next review, and a reviewer that wrote nothing fails."""
+    from model_partition.planner.agent import AgentOutcome, AgentPlanner
+
+    layout = loop_for(tiny_run, tmp_path).build_context().layout
+    planner = AgentPlanner()
+    context = {
+        "model": "tiny", "num_layers": 4, "hidden_size": 8, "n_signatures": 1,
+        "budget_h": "1 GiB", "gpu_name": "none", "run_root": str(layout.root),
+        "failed_stage": "verify_modules", "failure_detail": "mismatch",
+        "failing_modules": ["layers.0"], "n_modules": 4, "n_groups": 1,
+        "module_table": "|m|", "partition_prompt": "", "review_path": str(layout.review_file),
+    }
+
+    def writes_a_review(**kwargs):
+        layout.review_file.write_text("root cause\n")
+        return AgentOutcome(ok=True)
+
+    planner.invoke = writes_a_review
+    assert planner.review(layout, context, 2).ok
+    assert (layout.reports_dir / "reviews" / "iter-2.md").read_text() == "root cause\n"
+
+    planner.invoke = lambda **kwargs: AgentOutcome(ok=True)
+    outcome = planner.review(layout, context, 3)
+    assert not outcome.ok and "wrote no review.md" in outcome.error

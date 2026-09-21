@@ -446,3 +446,129 @@ def test_reuse_does_not_let_one_module_cover_another_s_missing_dump(tiny_deep_ru
         baseline.clear_structure_cache()
     assert not report.passed
     assert victim in {r.module_id for r in report.failures}
+
+
+# -- parallel groups, functional nodes, windowed records ----------------------
+#
+# Three kinds of module the single-sequential-group assumption got wrong.
+
+
+def test_a_parallel_group_is_checked_call_by_call(tiny_split_run, tmp_path):
+    """Experts are alternatives: each recorded call is its own computation.
+
+    Running the group as a pipeline — first expert's output into the second — would
+    reproduce no reference at all, and comparing one call's input against the last
+    call's output compares two different experts.
+    """
+    from model_partition.runtime import baseline
+
+    graph = tiny_split_run.graph
+    parallel = [m for m in graph.partitioned_modules if m.is_parallel]
+    if not parallel:
+        pytest.skip("this plan produced no parallel expert group")
+
+    baseline.clear_structure_cache()
+    try:
+        impl_dirs = _extract_impls(tiny_split_run, tmp_path)
+        report = verify_modules(tiny_split_run.build_model, tiny_split_run.bundle,
+                                graph, impl_dirs=impl_dirs)
+    finally:
+        baseline.clear_structure_cache()
+
+    target = parallel[0]
+    checks = [r for r in report.checked if r.module_id == target.id]
+    records = tiny_split_run.bundle.select(module_id=target.id,
+                                          sample_id=tiny_split_run.sample_ids[0])
+    assert len(checks) == len(records), report.render()
+    assert all(r.passed for r in checks), report.render()
+
+
+def test_a_functional_module_is_skipped_not_passed(tiny_run):
+    """No submodule means no reference, which must not read as a pass."""
+    from model_partition.planner.graph import ModuleNode
+
+    graph = tiny_run.graph
+    graph.tensors["h.extra"] = graph.tensors[graph.by_id("final_norm").inputs[0]]
+    graph.modules.append(ModuleNode(
+        id="layers.0.combine", kind="mlp", inputs=["h.0"], outputs=[],
+        layer_indices=[0], code_signature="combine",
+    ))
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, graph,
+                            module_ids=["layers.0.combine"])
+    assert report.skipped and not report.checked
+    assert report.passed is False  # nothing was checked, so nothing passed
+    assert "no submodule" in report.skipped[0].skipped
+    assert "skipped" in report.render()
+
+
+def test_a_windowed_record_is_skipped_not_compared(tiny_run, tmp_path):
+    """A windowed output is not a function of the windowed input."""
+    impl_dirs = _extract_impls(tiny_run, tmp_path)
+    target = next(m.id for m in tiny_run.graph.partitioned_modules
+                  if m.kind == "decoder_layers")
+    for record in tiny_run.bundle.records:
+        if record.module_id == target:
+            record.sliced = True
+
+    report = verify_modules(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                            impl_dirs=impl_dirs)
+    skipped = {r.module_id for r in report.skipped}
+    assert target in skipped
+    assert "windowed" in next(r.skipped for r in report.skipped if r.module_id == target)
+    assert report.passed, report.render()
+
+
+def test_every_returned_tensor_is_compared_not_just_the_first():
+    """A module returning a tuple must be checked element by element.
+
+    Reducing both sides to their first tensor would pass a module whose primary
+    output is right and whose auxiliary output is corrupt — attention modules
+    commonly return several values.
+    """
+    import torch
+
+    from model_partition.verify.numerics import compare_outputs
+
+    reference = (torch.ones(2, 2), torch.ones(2, 2))
+    actual = (torch.ones(2, 2), torch.ones(2, 2) * 3.0)
+    results = compare_outputs(actual, reference, "attn")
+    assert [c.name for c in results] == ["attn[0]", "attn[1]"]
+    assert results[0].passed and not results[1].passed
+
+
+def test_nested_outputs_are_walked_by_path():
+    import torch
+
+    from model_partition.verify.numerics import compare_outputs
+
+    reference = {"hidden": torch.zeros(2), "aux": [torch.ones(2), torch.ones(2)]}
+    actual = {"hidden": torch.zeros(2), "aux": [torch.ones(2), torch.zeros(2)]}
+    results = compare_outputs(actual, reference, "out")
+    names = {c.name: c.passed for c in results}
+    assert names == {"out.hidden": True, "out.aux[0]": True, "out.aux[1]": False}
+
+
+def test_a_missing_element_is_a_failure_not_an_absence():
+    import torch
+
+    from model_partition.verify.numerics import compare_outputs
+
+    results = compare_outputs((torch.ones(2),), (torch.ones(2), torch.ones(2)), "out")
+    assert len(results) == 2
+    assert not results[1].passed and "missing" in results[1].reason
+
+
+def test_a_structure_with_no_tensors_falls_back_to_one_comparison():
+    from model_partition.verify.numerics import compare_outputs
+
+    results = compare_outputs({"cache": None}, {"cache": None}, "out")
+    assert len(results) == 1 and not results[0].passed
+
+
+def test_identical_zero_tensors_match():
+    """Cosine is undefined for zero vectors; a tensor still matches itself."""
+    import torch
+
+    from model_partition.verify.numerics import compare
+
+    assert compare(torch.zeros(4), torch.zeros(4)).passed

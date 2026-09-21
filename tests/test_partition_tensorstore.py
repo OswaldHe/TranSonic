@@ -140,9 +140,9 @@ def test_slice_info_is_recorded(tmp_path):
     store = TensorStore(tmp_path)
     meta = store.write(
         "h", np.zeros((256, 8), dtype=np.float32),
-        slice_info=SliceInfo(axis=0, head=128, tail=128, original_length=16384),
+        slice_info=SliceInfo(axes=[0], head=128, tail=128, original_length=16384),
     )
-    expected = {"axis": 0, "head": 128, "tail": 128, "original_length": 16384}
+    expected = {"axes": [0], "head": 128, "tail": 128, "original_length": 16384}
     assert meta.slice_info == expected
     store.save_manifest()
     assert TensorStore.load(tmp_path).entries[0].slice_info == expected

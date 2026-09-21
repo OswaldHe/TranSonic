@@ -18,10 +18,9 @@ from model_partition.runtime.module_runner import (
     TraceBundle,
     apply_dumped_weights,
     expected_output,
-    first_tensor,
     replay_record,
 )
-from model_partition.verify.numerics import Comparison, Tolerance, compare
+from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
 
 
 def poison_parameters(model: Any, value: float = float("nan"),
@@ -101,8 +100,13 @@ class ModuleVerification:
     error: str = ""
     #: Where the module actually ran.
     device: str = ""
+    #: Set when no numeric check was possible. Neither a pass nor a failure: it is
+    #: reported so missing coverage is visible rather than assumed away.
+    skipped: str = ""
 
     def summary(self) -> str:
+        if self.skipped:
+            return f"{self.module_id} [{self.sample_id}]: SKIP {self.skipped}"
         if self.error:
             return f"{self.module_id} [{self.sample_id}]: ERROR {self.error}"
         head = "ok" if self.passed else "FAIL"
@@ -114,7 +118,7 @@ class ModuleVerification:
         return {
             "module_id": self.module_id, "sample_id": self.sample_id,
             "passed": self.passed, "weights_applied": self.weights_applied,
-            "error": self.error, "device": self.device,
+            "error": self.error, "device": self.device, "skipped": self.skipped,
             "comparisons": [c.to_dict() for c in self.comparisons],
         }
 
@@ -126,36 +130,47 @@ class VerifyReport:
     results: list[ModuleVerification] = field(default_factory=list)
 
     @property
+    def checked(self) -> list[ModuleVerification]:
+        """Results that carry a verdict. Skips are reported, never counted."""
+        return [r for r in self.results if not r.skipped]
+
+    @property
+    def skipped(self) -> list[ModuleVerification]:
+        return [r for r in self.results if r.skipped]
+
+    @property
     def passed(self) -> bool:
-        return bool(self.results) and all(r.passed for r in self.results)
+        return bool(self.checked) and all(r.passed for r in self.checked)
 
     @property
     def failures(self) -> list[ModuleVerification]:
-        return [r for r in self.results if not r.passed]
+        return [r for r in self.checked if not r.passed]
 
     def module_ids(self) -> list[str]:
         return sorted({r.module_id for r in self.results})
 
     def worst_cosine(self) -> float:
-        values = [c.cosine for r in self.results for c in r.comparisons]
+        values = [c.cosine for r in self.checked for c in r.comparisons]
         return min(values) if values else 1.0
 
     def max_abs_err(self) -> float:
-        values = [c.max_abs_err for r in self.results for c in r.comparisons]
+        values = [c.max_abs_err for r in self.checked for c in r.comparisons]
         return max(values) if values else 0.0
 
     def render(self) -> str:
         lines = [r.summary() for r in self.results]
-        lines.append(
-            f"{len(self.results) - len(self.failures)}/{len(self.results)} module checks passed"
-        )
+        checked = len(self.checked)
+        lines.append(f"{checked - len(self.failures)}/{checked} module checks passed")
+        if self.skipped:
+            lines.append(f"{len(self.skipped)} check(s) skipped, unverified")
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
-            "n_checks": len(self.results),
+            "n_checks": len(self.checked),
             "n_failed": len(self.failures),
+            "n_skipped": len(self.skipped),
             "worst_cosine": self.worst_cosine(),
             "max_abs_err": self.max_abs_err(),
             "results": [r.to_dict() for r in self.results],
@@ -208,6 +223,14 @@ def verify_modules(
             ))
             continue
 
+        if graph_module.functional:
+            report.results.append(ModuleVerification(
+                module_id=module_id, sample_id="-", passed=False,
+                skipped="functional module: no submodule, so the trace holds no "
+                        "reference to compare against",
+            ))
+            continue
+
         applied = apply_dumped_weights(model, bundle, module_id, graph_module, device=host)
         residency = target
         if target != host:
@@ -224,34 +247,33 @@ def verify_modules(
                     error=f"ran on {host}: {exc}",
                 ))
         impl_dir = (impl_dirs or {}).get(module_id)
-        # Built once per module: the baseline instantiates the model's structure,
-        # which is far too expensive to repeat for every recorded call.
-        impl_callable = None
-        impl_error = ""
-        if impl_dir is not None:
-            try:
-                impl_callable = _build_impl(impl_dir, bundle, module_id, residency)
-            except Exception as exc:
-                impl_error = str(exc)
+        # Built once per (module, branch): the baseline instantiates the model's
+        # structure, too expensive to repeat for every recorded call.
+        builder = _impl_builder(impl_dir, bundle, module_id, residency) if impl_dir else None
+        # Only a parallel group has a branch to select; naming one for a sequential
+        # group would ask for a prefix of the module.
+        branch = graph_module.is_parallel
         try:
             for sample_id in wanted_samples:
                 records = bundle.select(module_id=module_id, sample_id=sample_id)
                 if not records:
                     continue
-                # With an implementation the module is checked as a whole: its
-                # input is the first submodule's, its output the last submodule's.
-                # Without one, each submodule is replayed against its own record.
-                pairs = ([(records[0], records[-1])] if impl_dir is not None
-                         else [(r, r) for r in records])
-                for source, reference_record in pairs:
+                for source, reference_record in _record_pairs(graph_module, records,
+                                                              with_impl=builder is not None):
+                    if source.sliced or reference_record.sliced:
+                        report.results.append(ModuleVerification(
+                            module_id=module_id, sample_id=sample_id, passed=False,
+                            skipped="windowed long-context dump: the recorded output is "
+                                    "not a function of the recorded input",
+                        ))
+                        continue
                     comparisons: list[Comparison] = []
                     try:
-                        if impl_error:
-                            raise RuntimeError(f"implementation unusable: {impl_error}")
-                        actual = _run_once(model, source, bundle, impl_callable, residency)
+                        actual = _run_once(model, source, bundle, builder, residency,
+                                           branch=branch)
                         reference = expected_output(reference_record, bundle.store,
                                                    device=residency)
-                        comparisons = _compare_outputs(actual, reference, module_id, tolerance)
+                        comparisons = compare_outputs(actual, reference, module_id, tolerance)
                     except Exception as exc:
                         report.results.append(ModuleVerification(
                             module_id=module_id, sample_id=sample_id, passed=False,
@@ -270,32 +292,62 @@ def verify_modules(
     return report
 
 
-def _build_impl(impl_dir: Any, bundle: TraceBundle, module_id: str, device: str) -> Any:
-    """Build a module's extracted implementation once, ready to call."""
+def _record_pairs(graph_module: Any, records: list[Any], with_impl: bool):
+    """Which (input record, reference record) pairs to check for one module.
+
+    A sequential group run through its implementation is one computation: input
+    from the first submodule's call, reference from the last submodule's output.
+    A parallel group is not — each expert sees its own routed tokens — so every
+    recorded call is checked against its own output. Without an implementation,
+    each submodule is replayed against its own record either way.
+    """
+    if with_impl and not graph_module.is_parallel:
+        return [(records[0], records[-1])]
+    return [(record, record) for record in records]
+
+
+def _impl_builder(impl_dir: Any, bundle: TraceBundle, module_id: str, device: str):
+    """Return ``submodule -> callable``, memoized, or a raiser if unusable."""
     from model_partition.runtime.module_impl import load_impl
     from model_partition.runtime.module_runner import load_named_weights
 
-    impl = load_impl(impl_dir)
-    weights = load_named_weights(bundle, module_id, device=device)
-    if not weights:
-        raise RuntimeError(f"no dumped weights for {module_id!r}")
-    built = impl.build(bundle.metadata.get("config") or {}, weights, device)
-    if not callable(built):
-        raise RuntimeError(f"{impl.path}: build_module() returned a non-callable")
-    return built
+    cache: dict[str | None, Any] = {}
+
+    def build(submodule: str | None):
+        if submodule in cache:
+            built = cache[submodule]
+            if isinstance(built, Exception):
+                raise built
+            return built
+        try:
+            impl = load_impl(impl_dir)
+            weights = load_named_weights(bundle, module_id, device=device)
+            if not weights:
+                raise RuntimeError(f"no weights available for {module_id!r}")
+            built = impl.build(bundle.config, weights, device, submodule=submodule)
+            if not callable(built):
+                raise RuntimeError(f"{impl.path}: build_module() returned a non-callable")
+        except Exception as exc:
+            wrapped = RuntimeError(f"implementation unusable: {exc}")
+            cache[submodule] = wrapped
+            raise wrapped from exc
+        cache[submodule] = built
+        return built
+
+    return build
 
 
 def _run_once(model: Any, record: Any, bundle: TraceBundle,
-              impl_callable: Any, device: str) -> Any:
+              builder: Any, device: str, branch: bool = False) -> Any:
     """Produce a module's output for one recorded call.
 
-    Calls the extracted implementation when one was built, so verification
+    Calls the extracted implementation when there is one, so verification
     exercises the code the loop owns; otherwise replays the original submodule,
     which is the case before extraction has run.
     """
     import torch
 
-    if impl_callable is None:
+    if builder is None:
         return replay_record(model, record, bundle.store, device=device)
 
     from model_partition.runtime.module_runner import decode_call
@@ -304,35 +356,7 @@ def _run_once(model: Any, record: Any, bundle: TraceBundle,
         raise RuntimeError(
             f"{record.module_id}: recorded arguments include an unserializable value"
         )
+    impl_callable = builder(record.submodule if branch else None)
     args, kwargs = decode_call(record, bundle.store, device)
     with torch.no_grad():
         return impl_callable(*args, **kwargs)
-
-
-def _compare_outputs(actual: Any, reference: Any, label: str,
-                     tolerance: Tolerance | None) -> list[Comparison]:
-    """Compare every tensor in a possibly-nested output structure."""
-    from model_partition.trace import is_tensor
-
-    pairs = list(_walk_pairs(actual, reference, label))
-    if not pairs:
-        primary = compare(first_tensor(actual), first_tensor(reference), label, tolerance)
-        return [primary]
-    return [compare(a, b, name, tolerance) for name, a, b in pairs if is_tensor(b)]
-
-
-def _walk_pairs(actual: Any, reference: Any, path: str):
-    from model_partition.trace import is_tensor
-
-    if is_tensor(reference):
-        yield path, actual, reference
-        return
-    if isinstance(reference, dict):
-        for key, value in reference.items():
-            child = actual.get(key) if isinstance(actual, dict) else None
-            yield from _walk_pairs(child, value, f"{path}.{key}")
-        return
-    if isinstance(reference, (list, tuple)):
-        for i, value in enumerate(reference):
-            child = actual[i] if isinstance(actual, (list, tuple)) and i < len(actual) else None
-            yield from _walk_pairs(child, value, f"{path}[{i}]")

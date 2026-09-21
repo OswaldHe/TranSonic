@@ -124,6 +124,11 @@ def compare(actual: Any, reference: Any, name: str = "tensor",
 
     diff = (a - b).abs()
     max_abs = float(diff.max())
+    if max_abs == 0.0:
+        # Identical tensors. Worth special-casing: cosine is undefined for two zero
+        # vectors, so an all-zero output — a fully masked region, say — would
+        # otherwise be reported as a mismatch against itself.
+        return Comparison(name=name, passed=True, n_elements=n)
     denom = b.abs().clamp_min(1e-12)
     max_rel = float((diff / denom).max())
     close = diff <= (tol.atol + tol.rtol * b.abs())
@@ -143,6 +148,43 @@ def compare(actual: Any, reference: Any, name: str = "tensor",
         pass_fraction=pass_fraction, cosine=cosine, n_elements=n,
         reason="; ".join(reasons), worst_index=worst_index,
     )
+
+
+def compare_outputs(actual: Any, reference: Any, label: str = "output",
+                    tolerance: Tolerance | None = None) -> list[Comparison]:
+    """Compare every tensor in a possibly-nested output structure.
+
+    One comparison per reference tensor, named by its path. Attention modules
+    commonly return a tuple, and checking only the first element would let a
+    corrupted auxiliary output through — so every caller that compares a module's
+    output uses this rather than reducing to one tensor.
+    """
+    from model_partition.trace import is_tensor
+
+    pairs = list(walk_pairs(actual, reference, label))
+    if not pairs:
+        from model_partition.runtime.module_runner import first_tensor
+
+        return [compare(first_tensor(actual), first_tensor(reference), label, tolerance)]
+    return [compare(a, b, name, tolerance) for name, a, b in pairs if is_tensor(b)]
+
+
+def walk_pairs(actual: Any, reference: Any, path: str = "output"):
+    """Yield ``(path, actual, reference)`` for each tensor in the reference tree."""
+    from model_partition.trace import is_tensor
+
+    if is_tensor(reference):
+        yield path, actual, reference
+        return
+    if isinstance(reference, dict):
+        for key, value in reference.items():
+            child = actual.get(key) if isinstance(actual, dict) else None
+            yield from walk_pairs(child, value, f"{path}.{key}")
+        return
+    if isinstance(reference, (list, tuple)):
+        for i, value in enumerate(reference):
+            child = actual[i] if isinstance(actual, (list, tuple)) and i < len(actual) else None
+            yield from walk_pairs(child, value, f"{path}[{i}]")
 
 
 def _unravel(flat: int, shape: tuple[int, ...]) -> tuple[int, ...]:

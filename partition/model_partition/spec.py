@@ -72,6 +72,24 @@ class InputSpec:
 
 
 @dataclass
+class PartitionSpec:
+    """How this model should be cut up.
+
+    ``prompt`` is free text handed to the agent that plans and repairs, so a model
+    can carry its own instruction rather than needing one on every command line.
+    ``split_attention_ffn`` is the deterministic form of the most common such
+    instruction: the seed planner acts on it directly, so the partition does not
+    depend on an agent call succeeding.
+    """
+
+    prompt: str = ""
+    split_attention_ffn: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"prompt": self.prompt, "split_attention_ffn": self.split_attention_ffn}
+
+
+@dataclass
 class ScopeSpec:
     """Structural parts the loop owns.
 
@@ -102,6 +120,7 @@ class ModelSpec:
     dtype: str = "bfloat16"
     scope: ScopeSpec = field(default_factory=ScopeSpec)
     inputs: InputSpec = field(default_factory=InputSpec)
+    partition: PartitionSpec = field(default_factory=PartitionSpec)
     overrides: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     notes: str = ""
@@ -153,6 +172,7 @@ class ModelSpec:
             "dtype": self.dtype,
             "enabled": self.enabled,
             "scope": {"vision": self.scope.vision, "mtp": self.scope.mtp, "engram": self.scope.engram},
+            "partition": self.partition.to_dict(),
             "inputs": {
                 "short": self.inputs.short,
                 "long": self.inputs.long,
@@ -181,7 +201,8 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
 
     unknown = set(data) - {
         "name", "source", "revision", "loader", "code_paths", "entry", "config_file",
-        "trust_remote_code", "dtype", "scope", "inputs", "overrides", "enabled", "notes",
+        "trust_remote_code", "dtype", "scope", "inputs", "partition", "overrides",
+        "enabled", "notes",
     }
     if unknown:
         raise SpecError(f"Unknown spec key(s): {', '.join(sorted(unknown))}")
@@ -223,6 +244,17 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         max_long=raw_inputs.get("max_long"),
     )
 
+    raw_partition = data.get("partition") or {}
+    if not isinstance(raw_partition, dict):
+        raise SpecError("partition must be a mapping")
+    partition_unknown = set(raw_partition) - {"prompt", "split_attention_ffn"}
+    if partition_unknown:
+        raise SpecError(f"Unknown partition key(s): {', '.join(sorted(partition_unknown))}")
+    partition = PartitionSpec(
+        prompt=str(raw_partition.get("prompt") or ""),
+        split_attention_ffn=bool(raw_partition.get("split_attention_ffn", False)),
+    )
+
     code_paths = data.get("code_paths") or []
     if not isinstance(code_paths, list) or not all(isinstance(c, str) for c in code_paths):
         raise SpecError("code_paths must be a list of strings")
@@ -248,6 +280,7 @@ def parse_spec(data: dict[str, Any], spec_path: Path | None = None) -> ModelSpec
         dtype=str(data.get("dtype", "bfloat16")),
         scope=scope,
         inputs=inputs,
+        partition=partition,
         overrides=dict(overrides),
         enabled=bool(data.get("enabled", True)),
         notes=str(data.get("notes", "")),

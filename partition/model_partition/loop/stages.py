@@ -50,9 +50,15 @@ class LoopOptions:
     max_layers_per_module: int | None = None
     one_layer_per_module: bool = False
     experts_per_group: int | None = None
+    #: Give attention and the FFN/MoE of every layer their own module.
+    split_attention_ffn: bool = False
+    #: Free-text instruction on how the model should be partitioned. Comes from
+    #: the spec's ``partition.prompt`` or the command line, and is handed to the
+    #: agent whenever it plans or repairs.
+    partition_prompt: str = ""
     cache_weights: bool = True
     cache_dequant: bool = True
-    full_dumps: bool = False
+    slice_long: bool = False
     decode_steps: int = 4
     max_new_tokens: int = 32
     temperature: float = 0.0
@@ -76,7 +82,7 @@ class LoopOptions:
 
     def dump_policy(self) -> DumpPolicy:
         return DumpPolicy(
-            full_dumps=self.full_dumps,
+            slice_long=self.slice_long,
             cache_weights=self.cache_weights,
             cache_dequant=self.cache_dequant,
             decode_steps=self.decode_steps,
@@ -88,6 +94,7 @@ class LoopOptions:
             max_layers_per_module=self.max_layers_per_module,
             one_layer_per_module=self.one_layer_per_module,
             experts_per_group=self.experts_per_group,
+            split_attention_ffn=self.split_attention_ffn,
         )
 
 
@@ -194,6 +201,10 @@ def stage_ingest(ctx: LoopContext) -> StageResult:
         "revision": ctx.result.revision,
         "loader": ctx.result.loader,
         "snapshot": str(ctx.result.root),
+        # Extracted implementations are built against this, so it travels with the
+        # run rather than being re-read from a snapshot that may be gone.
+        "config": ctx.result.config,
+        "partition_prompt": ctx.options.partition_prompt,
         "inputs": [s.to_dict() for s in ctx.samples],
         "storage_estimate": {
             "total_bytes": estimate.total_bytes,
@@ -318,6 +329,7 @@ def hash_plan(ctx: LoopContext) -> list[Any]:
     return [
         ctx.budget.usable_bytes, ctx.seq_len, options.max_layers_per_module,
         options.one_layer_per_module, options.experts_per_group,
+        options.split_attention_ffn, options.partition_prompt,
         _graph_fingerprint(ctx.layout.graph_path),
     ]
 
@@ -365,6 +377,8 @@ def _param_names(ctx: LoopContext) -> dict[str, list[str]]:
     """Original parameter names per module, for the generated implementations."""
     if ctx.bundle is None:
         return {}
+    if ctx.bundle.weight_params:
+        return dict(ctx.bundle.weight_params)
     by_name = {entry.name: entry for entry in ctx.bundle.store.entries}
     result: dict[str, list[str]] = {}
     for module_id, names in ctx.bundle.weights.items():
@@ -404,22 +418,27 @@ def stage_trace(ctx: LoopContext) -> StageResult:
         return StageResult(ok=False, detail=(
             "no sample inputs: set inputs.short (and optionally inputs.long) in the spec"
         ))
+    # A re-trace replaces the previous one entirely. Leaving the old blobs behind
+    # would grow the run by a whole trace per iteration, and retention only ever
+    # sees what the new manifest lists.
+    freed = clear_trace(ctx.layout.trace_dir)
+    if freed:
+        ctx.notes.append(f"cleared {format_bytes(freed)} of superseded trace data")
     store = TensorStore(ctx.layout.trace_dir)
     policy = ctx.options.dump_policy()
 
     # Weights are read straight off the parameters, and layer placement leaves
     # host-assigned layers on the meta device between forwards, so dump from a
     # single-device copy and release it before placing the model for the forward.
-    weights: dict[str, list[str]] = {}
-    if policy.cache_weights:
-        host_model = ctx.build_model()
-        unresolved = Tracer(host_model, ctx.graph, store).unresolved_submodules()
-        if unresolved:
-            return _unresolved_result(ctx, unresolved)
-        weight_tracer = Tracer(host_model, ctx.graph, store, policy=policy)
-        weights = weight_tracer.dump_weights()
-        del host_model, weight_tracer
-        _collect()
+    host_model = ctx.build_model()
+    unresolved = Tracer(host_model, ctx.graph, store).unresolved_submodules()
+    if unresolved:
+        return _unresolved_result(ctx, unresolved)
+    weight_tracer = Tracer(host_model, ctx.graph, store, policy=policy)
+    weight_params = weight_tracer.index_weights()
+    weights = weight_tracer.dump_weights() if policy.cache_weights else {}
+    del host_model, weight_tracer
+    _collect()
 
     model = ctx.build_model(placed=True)
     if ctx.last_placement == "auto":
@@ -435,28 +454,77 @@ def stage_trace(ctx: LoopContext) -> StageResult:
     for sample in ctx.samples:
         tracer.trace_sample(sample.id, sample.tensor(device))
 
-    bundle = TraceBundle(store=store, records=tracer.records, weights=weights, metadata={
+    bundle = TraceBundle(store=store, records=tracer.records, weights=weights,
+                         weight_params=weight_params, metadata={
         "model": ctx.spec.source, "revision": ctx.result.revision if ctx.result else None,
         "device": device, "samples": [s.to_dict() for s in ctx.samples],
+        # Implementations are handed this: hidden size, head counts, RoPE settings.
+        # Without it every extracted module would be built against an empty config.
+        "config": ctx.result.config if ctx.result else {},
+        "cache_weights": policy.cache_weights,
     })
     bundle.save()
+    attach_weight_source(ctx, bundle)
     ctx.bundle = bundle
     traced = {r.module_id for r in bundle.records}
-    missing = [m.id for m in ctx.graph.partitioned_modules if m.id not in traced]
+    # Functional nodes own no submodule, so a hook-based trace cannot produce
+    # records for them; they are unverified by construction, not untraced.
+    missing = [m.id for m in ctx.graph.partitioned_modules
+               if m.id not in traced and not m.functional]
     if missing:
         return StageResult(
             ok=False, repairable=True, failing_modules=missing,
             detail=f"{len(missing)} module(s) produced no trace records: {', '.join(missing[:8])}",
         )
-    return StageResult(ok=True, detail=(
-        f"{len(bundle.records)} record(s) over {len(ctx.samples)} sample(s), "
-        f"{format_bytes(sum(e.nbytes for e in store.entries))} dumped"
-    ), metrics={
+    sliced = sum(1 for r in bundle.records if r.sliced)
+    if sliced:
+        ctx.notes.append(f"{sliced} record(s) were windowed by --slice-long and will "
+                         "not be numerically verified")
+    detail = (f"{len(bundle.records)} record(s) over {len(ctx.samples)} sample(s), "
+              f"{format_bytes(sum(e.nbytes for e in store.entries))} dumped")
+    if not policy.cache_weights:
+        detail += "; weights indexed, read from the checkpoint on demand"
+    return StageResult(ok=True, detail=detail, metrics={
         "n_records": len(bundle.records),
         "bytes_dumped": sum(e.nbytes for e in store.entries),
         "unique_blobs": len({e.sha256 for e in store.entries}),
+        "n_sliced_records": sliced,
         "device": device,
     })
+
+
+def clear_trace(trace_dir: Path) -> int:
+    """Delete a previous trace's contents; returns the bytes reclaimed."""
+    import shutil
+
+    if not trace_dir.is_dir():
+        return 0
+    freed = sum(p.stat().st_size for p in trace_dir.rglob("*") if p.is_file())
+    for path in trace_dir.iterdir():
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+    return freed
+
+
+def load_bundle(ctx: LoopContext) -> TraceBundle:
+    """The run's trace, from memory or disk, with a weight source attached."""
+    bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
+    attach_weight_source(ctx, bundle)
+    ctx.bundle = bundle
+    return bundle
+
+
+def attach_weight_source(ctx: LoopContext, bundle: TraceBundle) -> None:
+    """Give a bundle with no dumped weights a way to read them.
+
+    Without this, ``cache_weights: false`` would reach verification with no
+    parameter values at all. The checkpoint is the fallback — never the default,
+    because a dump is what makes a module replayable away from this machine.
+    """
+    from model_partition.weights_source import CheckpointWeights
+
+    if bundle.weights or not bundle.weight_params or ctx.result is None:
+        return
+    bundle.checkpoint = CheckpointWeights.from_ingest(ctx.result)
 
 
 def _unresolved_result(ctx: LoopContext, unresolved: list[str]) -> StageResult:
@@ -487,10 +555,13 @@ def _collect() -> None:
 
 def hash_trace(ctx: LoopContext) -> list[Any]:
     options = ctx.options
+    # The token ids, not just their count: two different prompts can tokenize to
+    # the same length, and reusing the old activations against a new prompt would
+    # verify a computation nothing asked for.
     return [
         _graph_fingerprint(ctx.layout.graph_path),
-        [s.id for s in ctx.samples], [s.n_tokens for s in ctx.samples],
-        options.full_dumps, options.cache_weights, options.decode_steps,
+        [[s.id, s.token_ids] for s in ctx.samples],
+        options.slice_long, options.cache_weights, options.decode_steps,
     ]
 
 
@@ -500,8 +571,7 @@ def hash_trace(ctx: LoopContext) -> list[Any]:
 def stage_verify_modules(ctx: LoopContext) -> StageResult:
     """Replay every module from its dumps and compare against the trace."""
     assert ctx.graph is not None and ctx.build_model is not None
-    bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
-    ctx.bundle = bundle
+    bundle = load_bundle(ctx)
     if bundle.metadata.get("retention"):
         kept = bundle.metadata["retention"].get("kept_layers")
         ctx.notes.append(
@@ -620,8 +690,7 @@ def input_device(model: Any) -> str:
 def stage_emulate(ctx: LoopContext) -> StageResult:
     """Assemble the model from dumps, generate tokens, and judge them."""
     assert ctx.graph is not None and ctx.build_model is not None
-    bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
-    ctx.bundle = bundle
+    bundle = load_bundle(ctx)
     judge = ctx.judge or StubJudge()
     eos = getattr(ctx.tokenizer, "eos_token_id", None)
     # Emulation overwrites parameters with dumped values, so the model is
@@ -715,7 +784,7 @@ def stage_retain(ctx: LoopContext) -> StageResult:
     assert ctx.graph is not None and ctx.inventory is not None
     if not ctx.options.retain:
         return StageResult(ok=True, detail="retention disabled")
-    bundle = ctx.bundle or TraceBundle.load(ctx.layout.trace_dir)
+    bundle = load_bundle(ctx)
     policy = RetentionPolicy(preferred_layers=tuple(ctx.options.retention_layers))
     plan = plan_retention(ctx.graph, ctx.inventory, bundle, policy)
     result = apply_retention(bundle, plan)
@@ -800,8 +869,13 @@ def dump_agent_context(ctx: LoopContext, failed_stage: str, result: StageResult)
                         f"| {format_bytes(module.resident_bytes)} |")
         module_table = "\n".join(rows)
     layer_types = inventory.layer_types if inventory else []
+    review_path = ctx.layout.review_file
     return {
         "model": ctx.spec.source,
+        "partition_prompt": ctx.options.partition_prompt.strip(),
+        "review": review_path.read_text().strip() if review_path.is_file() else "",
+        "review_path": str(review_path),
+        "run_root": str(ctx.layout.root),
         "num_layers": len(inventory.layers) if inventory else 0,
         "hidden_size": inventory.hidden_size if inventory else 0,
         "n_signatures": len(inventory.signature_groups()) if inventory else 0,

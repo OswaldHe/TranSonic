@@ -75,6 +75,20 @@ class RunLayout:
     def summary_file(self) -> Path:
         return self.reports_dir / "summary.md"
 
+    @property
+    def review_file(self) -> Path:
+        """The reviewer's latest diagnosis, read by the agent that fixes things."""
+        return self.reports_dir / "review.md"
+
+    def archive_review(self, iteration: int) -> Path | None:
+        """Keep a copy of the current review so the trail survives the next one."""
+        if not self.review_file.is_file():
+            return None
+        target = self.reports_dir / "reviews" / f"iter-{iteration}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.review_file.read_text())
+        return target
+
     def write_run(self, payload: dict[str, Any]) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
         self.run_file.write_text(yaml.safe_dump(payload, sort_keys=False))

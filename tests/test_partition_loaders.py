@@ -301,3 +301,92 @@ def test_tied_checkpoint_loads_despite_the_missing_head(tmp_path):
     loaded = build_loader(ingest(local_spec(tied))).build()
     out = loaded.model(torch.zeros(1, 4, dtype=torch.long))
     assert out.shape == (1, 4, 128)
+
+
+# -- shard eviction ----------------------------------------------------------
+#
+# The Hub cache keeps one blob per digest and symlinks every snapshot entry at it,
+# so a blob can belong to another revision or another run.
+
+
+def _fake_cache(tmp_path, revisions=("rev-a",)):
+    """A hub-style cache: one blob, one snapshot symlink per revision."""
+    repo = tmp_path / "models--org--model"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    blob = blobs / "deadbeef"
+    blob.write_bytes(b"\x00" * 2048)
+    snapshots = []
+    for revision in revisions:
+        snapshot = repo / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.safetensors").symlink_to(blob)
+        snapshots.append(snapshot)
+    return blob, snapshots
+
+
+def _remote_result(snapshot, revision):
+    from model_partition.ingest import IngestResult
+    from model_partition.spec import parse_spec
+    from model_partition.weights_index import TensorEntry, WeightIndex
+
+    index = WeightIndex(entries=[
+        TensorEntry("w", "bfloat16", (2, 2), 2048, "model.safetensors"),
+    ])
+    return IngestResult(
+        spec=parse_spec({"source": "hf:org/model", "name": "m"}),
+        root=snapshot, config={}, loader="transformers", index=index, revision=revision,
+    )
+
+
+def test_evicting_the_only_reference_frees_the_blob(tmp_path):
+    from model_partition.ingest import evict_shards
+
+    blob, (snapshot,) = _fake_cache(tmp_path)
+    result = _remote_result(snapshot, "rev-a")
+    assert evict_shards(result, ["model.safetensors"]) == 2048
+    assert not blob.exists()
+
+
+def test_a_blob_another_revision_still_uses_is_left_alone(tmp_path):
+    """Deleting it would corrupt the cache for every other user of those bytes."""
+    from model_partition.ingest import evict_shards
+
+    blob, (mine, theirs) = _fake_cache(tmp_path, revisions=("rev-a", "rev-b"))
+    result = _remote_result(mine, "rev-a")
+    freed = evict_shards(result, ["model.safetensors"])
+
+    assert freed == 0, "shared bytes were not reclaimed, so none should be reported"
+    assert blob.exists()
+    assert (theirs / "model.safetensors").resolve() == blob
+    assert not (mine / "model.safetensors").exists()
+
+
+def test_evicting_an_absent_shard_is_a_no_op(tmp_path):
+    from model_partition.ingest import evict_shards
+
+    _, (snapshot,) = _fake_cache(tmp_path)
+    result = _remote_result(snapshot, "rev-a")
+    assert evict_shards(result, ["missing.safetensors"]) == 0
+
+
+def test_a_downloaded_shard_is_visible_where_the_run_looks(tmp_path, monkeypatch):
+    """ensure_shards must leave the shard at result.shard_path, not only in a cache."""
+    from model_partition import ingest as ingest_module
+
+    elsewhere = tmp_path / "hub" / "blobs"
+    elsewhere.mkdir(parents=True)
+    downloaded = elsewhere / "abc123"
+    downloaded.write_bytes(b"\x01" * 16)
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    result = _remote_result(snapshot, "rev-a")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download",
+                        lambda *a, **k: str(downloaded))
+    paths = ingest_module.ensure_shards(result, ["model.safetensors"])
+
+    assert paths == [snapshot / "model.safetensors"]
+    assert result.missing_shards() == []
+    assert (snapshot / "model.safetensors").read_bytes() == b"\x01" * 16

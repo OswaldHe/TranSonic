@@ -16,7 +16,24 @@ scope:
   mtp: false
   engram: false
 
+partition:
+  # Attention and the FFN/MoE of a layer are separate pieces of work: different
+  # shapes, different kernels, verified separately. Splitting them is a structural
+  # rule, so the seed planner applies it directly rather than depending on an agent.
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules. Keep each of those as one module where it is one piece of
+    work -- do not split a projection away from the attention it feeds, and do not
+    separate a normalization from the operation it normalizes for, since that
+    forecloses fusing them later. Split further only when a module does not fit the
+    per-module budget, or when two computations inside it would genuinely be
+    developed and tuned separately.
+
 inputs:
+  # max_short / max_long cap how many prompts of each set this run uses. Cost is
+  # per sample: one full traced forward, one set of dumped feature maps per module,
+  # and one generation pass during emulation. Omit for no cap.
   short: ../../inputs/short.jsonl
   long: ../../inputs/long.jsonl
   max_short: 2

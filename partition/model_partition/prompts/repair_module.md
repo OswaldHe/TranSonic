@@ -15,8 +15,15 @@ the implementation.
 
 {% if failing_modules %}Failing modules:
 {% for module in failing_modules %}- `{{ module }}`
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if review %}
+## Review
 
+A reviewer has already diagnosed this. Work from it.
+
+```
+{{ review }}
+```
+{% endif %}
 ## What you can change
 
 Only the `inference.py` of a failing module's group, under `modules/<group>/`.
@@ -35,13 +42,18 @@ Do **not** touch:
 ## The contract your implementation must satisfy
 
 ```python
-def build_module(config, weights, device="cpu"):
+def build_module(config, weights, device="cpu", submodule=None):
     """Return a callable computing this module's forward."""
 ```
 
-`weights` is keyed by original parameter name. The returned callable is invoked
-with exactly the arguments the module received during tracing, and its output is
-compared against the dumped output feature map.
+`config` is the model's resolved config; `weights` is keyed by original parameter
+name. The returned callable is invoked with exactly the arguments the module
+received during tracing, and every tensor it returns is compared against the dumped
+output feature map.
+
+`submodule` only matters for a group whose `composition` is `parallel` — a set of
+MoE experts, where one recorded call exercises one expert. Leave it off the
+signature if the module has a single submodule.
 
 ## How to investigate
 

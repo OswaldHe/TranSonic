@@ -14,7 +14,19 @@ from typing import Any
 import click
 import yaml
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+def _resource_dir(name: str) -> Path:
+    """Locate a bundled resource directory.
+
+    Inside an installed wheel these sit beside the package; in the source tree they
+    are one level up, under ``partition/``. Checking both means a ``pip install``
+    keeps its bundled specs, defaults and input sets.
+    """
+    here = Path(__file__).resolve().parent
+    installed = here / name
+    return installed if installed.is_dir() else here.parent / name
+
+
+CONFIG_DIR = _resource_dir("config")
 DEFAULTS_FILE = CONFIG_DIR / "defaults.yaml"
 MODELS_DIR = CONFIG_DIR / "models"
 
@@ -30,6 +42,10 @@ def _load_defaults(path: Path | None = None) -> dict[str, Any]:
 def build_options(config: Path | None = None, **overrides: Any):
     """Build LoopOptions from defaults.yaml plus non-None CLI overrides."""
     from model_partition.loop.stages import LoopOptions
+
+    prompt_file = overrides.pop("partition_prompt_file", None)
+    if prompt_file and not overrides.get("partition_prompt"):
+        overrides["partition_prompt"] = Path(prompt_file).read_text()
 
     known = {f.name for f in fields(LoopOptions)}
     values = {k: v for k, v in _load_defaults(config).items() if k in known}
@@ -77,12 +93,19 @@ def loop_options(func):
         click.option("--max-layers-per-module", type=int, default=None),
         click.option("--one-layer-per-module", is_flag=True, default=None),
         click.option("--experts-per-group", type=int, default=None),
+        click.option("--split-attention-ffn", is_flag=True, default=None,
+                     help="Give attention and the FFN/MoE of every layer their own module"),
+        click.option("--partition-prompt", default=None,
+                     help="Instruction on how to partition, handed to the agent"),
+        click.option("--partition-prompt-file", type=click.Path(exists=True, path_type=Path),
+                     default=None, help="Read the partition instruction from a file"),
         click.option("--cache-weights/--no-cache-weights", default=None,
-                     help="Persist per-module weight dumps"),
+                     help="Persist per-module weight dumps; off reads them from the checkpoint"),
         click.option("--cache-dequant/--no-cache-dequant", default=None,
                      help="Persist the bf16 dequant mirror of quantized weights"),
-        click.option("--full-dumps", is_flag=True, default=None,
-                     help="Dump long-context feature maps in full (large)"),
+        click.option("--slice-long", is_flag=True, default=None,
+                     help="Window long-context feature maps to a head/tail; those "
+                          "records are then not numerically verified"),
     ]):
         func = decorator(func)
     return func
@@ -90,7 +113,7 @@ def loop_options(func):
 
 @click.group(name="partition")
 def partition() -> None:
-    """Partition, trace and verify a model for Trainium bring-up."""
+    """Partition, trace and verify a large language model for deployment."""
 
 
 @partition.command("list")

@@ -11,11 +11,19 @@ loop:
   # max_layers_per_module: 4
   one_layer_per_module: false
   # experts_per_group: 8
+  split_attention_ffn: false  # true gives attention and the FFN/MoE of every
+                              # layer their own module, whatever their size
+  # partition_prompt: |     # instruction handed to the agent that plans; a spec's
+  #   ...                   # own partition.prompt takes precedence over nothing
+  #                         # and is overridden by --partition-prompt
 
   # --- dumps -----------------------------------------------------------------
-  cache_weights: true       # persist per-module weight dumps
+  cache_weights: true       # persist per-module weight dumps; false reads them
+                            # back from the checkpoint on demand instead
   cache_dequant: true       # persist the bf16 mirror of fp8/fp4 weights
-  full_dumps: false         # true dumps long-context feature maps whole (large)
+  slice_long: false         # true windows long-context feature maps to a
+                            # head/tail, which also means those records cannot be
+                            # numerically verified
   decode_steps: 4
 
   # --- emulation and judging -------------------------------------------------

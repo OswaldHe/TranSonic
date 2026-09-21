@@ -185,3 +185,27 @@ def test_report_is_written(tiny_deep_run, tmp_path):
     assert payload["dry_run"] is True
     assert payload["kept_layers"] == plan.kept_layers
     assert payload["removed_files"] == result.removed_files
+
+
+def test_shared_blobs_are_counted_once(tmp_path):
+    """Hardlinked duplicates release one blob's bytes, not one per name."""
+    import numpy as np
+
+    from model_partition.retention import RetentionPlan
+    from model_partition.runtime.module_runner import TraceBundle
+    from model_partition.tensorstore import TensorStore
+
+    store = TensorStore(tmp_path)
+    payload = np.zeros((64,), dtype=np.float32)
+    for name in ("a", "b", "c"):
+        store.write(name, payload, role="weight", module_id="layers.9")
+    nbytes = store.entries[0].nbytes
+    assert len({e.sha256 for e in store.entries}) == 1
+
+    bundle = TraceBundle(store=store)
+    bundle.save()
+    plan = RetentionPlan(kept_layers=[], kept_modules=[], dropped_modules=["layers.9"])
+    result = apply_retention(bundle, plan, dry_run=True)
+
+    assert result.removed_files == 3
+    assert result.bytes_freed == nbytes

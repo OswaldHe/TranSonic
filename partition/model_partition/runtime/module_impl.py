@@ -11,10 +11,14 @@ harness's, so the agent cannot make a module pass by weakening the check.
 
 The contract an implementation must satisfy:
 
-    def build_module(config: dict, weights: dict[str, Tensor], device: str) -> Callable
+    def build_module(config: dict, weights: dict[str, Tensor], device: str,
+                     submodule: str | None = None) -> Callable
 
 ``weights`` is keyed by original parameter name. The returned callable is invoked
-with the arguments the trace recorded for that module.
+with the arguments the trace recorded for that module. ``submodule`` is optional
+and only matters for a parallel group — a set of MoE experts, where one recorded
+call exercises one expert — so an implementation that needs no such distinction
+can leave it off its signature entirely.
 """
 
 from __future__ import annotations
@@ -41,14 +45,35 @@ class ExtractedImpl:
     module: Any
     module_ids: list[str]
 
-    def build(self, config: dict[str, Any], weights: dict[str, Any], device: str = "cpu") -> Any:
+    def build(self, config: dict[str, Any], weights: dict[str, Any], device: str = "cpu",
+              submodule: str | None = None) -> Any:
+        """Call the implementation's ``build_module``, passing what it accepts.
+
+        The optional arguments are tried widest first so an implementation is free
+        to declare only what it uses; a ``TypeError`` from inside the builder is
+        distinguished from one raised by the call itself by inspecting the
+        signature rather than by catching it.
+        """
+        import inspect
+
         builder = getattr(self.module, BUILD_FUNCTION, None)
         if not callable(builder):
             raise ImplError(f"{self.path} defines no callable {BUILD_FUNCTION}()")
         try:
-            return builder(config, weights, device)
-        except TypeError:
-            return builder(config, weights)
+            parameters = inspect.signature(builder).parameters
+            accepted = (
+                {"device", "submodule"}
+                if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+                else set(parameters)
+            )
+        except (TypeError, ValueError):  # pragma: no cover - builtins only
+            accepted = {"device", "submodule"}
+        kwargs: dict[str, Any] = {}
+        if "device" in accepted:
+            kwargs["device"] = device
+        if "submodule" in accepted and submodule is not None:
+            kwargs["submodule"] = submodule
+        return builder(config, weights, **kwargs)
 
 
 def load_impl(directory: str | Path) -> ExtractedImpl:
@@ -98,11 +123,12 @@ def run_impl(
     args: tuple,
     kwargs: dict[str, Any],
     device: str = "cpu",
+    submodule: str | None = None,
 ) -> Any:
     """Build the implementation and call it with one recorded invocation."""
     import torch
 
-    callable_module = impl.build(config, weights, device)
+    callable_module = impl.build(config, weights, device, submodule=submodule)
     if not callable(callable_module):
         raise ImplError(f"{impl.path}:{BUILD_FUNCTION}() returned a non-callable")
     with torch.no_grad():

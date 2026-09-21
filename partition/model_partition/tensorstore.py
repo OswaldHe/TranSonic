@@ -4,8 +4,8 @@
 """Binary tensor dumps: raw ``.bin`` + JSON sidecar + a manifest index.
 
 Chosen over safetensors for portability: a contiguous little-endian blob plus
-explicit dtype/shape metadata is readable from any toolchain a Trainium kernel
-bring-up might use. Identical blobs are hardlinked, which is what makes tied
+explicit dtype/shape metadata is readable from whatever toolchain a kernel
+bring-up uses. Identical blobs are hardlinked, which is what makes tied
 embeddings and repeated layers cheap.
 
 dtypes with no numpy equivalent (bfloat16, fp8, packed fp4) round-trip as raw
@@ -59,9 +59,12 @@ def dtype_name(dtype: Any) -> str:
 
 @dataclass
 class SliceInfo:
-    """Records that a dump covers only part of a sequence axis."""
+    """Records that a dump covers only a head/tail window of the sequence.
 
-    axis: int
+    ``axes`` lists every windowed axis: a square attention mask has two.
+    """
+
+    axes: list[int]
     head: int
     tail: int
     original_length: int
@@ -81,7 +84,7 @@ class TensorMeta:
     module_id: str | None = None
     sample_id: str | None = None
     step: int | None = None
-    slice_info: dict[str, int] | None = None
+    slice_info: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property

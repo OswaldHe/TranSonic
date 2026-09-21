@@ -49,6 +49,10 @@ partition = [
     "safetensors>=0.4",
     "transformers>=4.45",
     "huggingface-hub>=0.25",
+    # Required, not optional: a checkpoint larger than the GPU is loaded with
+    # device_map/max_memory and the assembled model is dispatched with
+    # accelerate.dispatch_model. Without it those paths fall back to the host.
+    "accelerate>=1.0",
     "numpy>=1.20",
 ]
 
@@ -58,6 +62,14 @@ autohelix = "autohelix.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/autohelix", "partition/model_partition"]
 
+# The bundled model specs, loop defaults and sample inputs are data the CLI reads
+# at runtime (`autohelix partition list/run`), and the specs reference the input
+# sets by a path relative to themselves. Mapping both directories inside the
+# package preserves that relationship in an installed wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"partition/config" = "model_partition/config"
+"partition/inputs" = "model_partition/inputs"
+
 # Scope the source distribution to the package + packaging metadata only, so it
 # doesn't sweep in the whole working tree (docs, examples, assets, CI config, or
 # local-only files). only-include replaces hatchling's default include patterns
@@ -65,7 +77,7 @@ packages = ["src/autohelix", "partition/model_partition"]
 # sdist stays as clean as the wheel. The PyPI readme/LICENSE/NOTICE are added
 # via force-include since they live outside the only-included paths.
 [tool.hatch.build.targets.sdist]
-only-include = ["src/autohelix", "partition/model_partition"]
+only-include = ["src/autohelix", "partition/model_partition", "partition/config", "partition/inputs"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "assets/README-pypi.md" = "assets/README-pypi.md"

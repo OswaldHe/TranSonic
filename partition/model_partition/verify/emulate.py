@@ -253,7 +253,12 @@ def _check_boundaries(
 
 
 def _match_slice(actual: Any, reference: Any, record: Any, bundle: TraceBundle) -> Any:
-    """Reduce a full tensor to the head/tail window a sliced dump recorded."""
+    """Reduce a full tensor to the head/tail window a sliced dump recorded.
+
+    Sound here in a way it is not for module replay: the tensor being windowed
+    came from a full-length forward, so windowing it reproduces exactly what the
+    trace stored.
+    """
     import torch
 
     names = record.tensor_names()
@@ -262,12 +267,15 @@ def _match_slice(actual: Any, reference: Any, record: Any, bundle: TraceBundle) 
     if entry is None:
         return actual
     info = entry.slice_info
-    axis, head, tail = info["axis"], info["head"], info["tail"]
-    if axis >= actual.dim() or actual.shape[axis] < head + tail:
-        return actual
-    length = actual.shape[axis]
-    index = torch.cat([
-        torch.arange(head, device=actual.device),
-        torch.arange(length - tail, length, device=actual.device),
-    ])
-    return actual.index_select(axis, index)
+    head, tail = info["head"], info["tail"]
+    windowed = actual
+    for axis in info.get("axes", []):
+        if axis >= windowed.dim() or windowed.shape[axis] < head + tail:
+            return actual
+        length = windowed.shape[axis]
+        index = torch.cat([
+            torch.arange(head, device=windowed.device),
+            torch.arange(length - tail, length, device=windowed.device),
+        ])
+        windowed = windowed.index_select(axis, index)
+    return windowed
