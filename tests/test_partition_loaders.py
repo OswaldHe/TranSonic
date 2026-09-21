@@ -51,6 +51,34 @@ def test_ingest_resolves_a_local_repo(repo):
     assert result.missing_shards() == []
 
 
+def test_a_cached_remote_snapshot_is_indexed_without_the_hub(repo, monkeypatch):
+    """A Hub hiccup must not fail a run whose checkpoint is already on disk."""
+    from model_partition import ingest as ingest_module
+    from model_partition.weights_index import WeightIndex
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("the Hub was asked for metadata it did not need")
+
+    monkeypatch.setattr(WeightIndex, "from_hub", classmethod(unavailable))
+    index = ingest_module._remote_index(
+        local_spec(repo), repo, "abc123", ["config.json", "model.safetensors"], None)
+    assert index.num_layers == 4
+
+
+def test_an_incomplete_snapshot_still_asks_the_hub(repo, monkeypatch):
+    """Indexing half a checkpoint would under-count it and mis-size the plan."""
+    from model_partition import ingest as ingest_module
+    from model_partition.weights_index import WeightIndex
+
+    asked = []
+    monkeypatch.setattr(WeightIndex, "from_hub",
+                        classmethod(lambda cls, *a, **k: asked.append(a) or WeightIndex()))
+    ingest_module._remote_index(
+        local_spec(repo), repo, "abc123",
+        ["model.safetensors", "model-00002-of-00002.safetensors"], None)
+    assert asked
+
+
 def test_vendor_code_is_preferred_and_its_entry_detected(repo):
     """A repo shipping inference code needs no hand-written entry."""
     result = ingest(local_spec(repo))

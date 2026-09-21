@@ -71,21 +71,36 @@ WEIGHT_NAMES = {{ weight_names | tojson }}
 DEFAULT_RUN = {{ run_root | tojson }}
 
 
+def load_implementation():
+    """Import `source.py` beside this file. That file is the implementation.
+
+    It is loaded under its original package name so its own relative imports resolve,
+    without taking the installed module's place.
+    """
+    from pathlib import Path
+
+    from model_partition.runtime.launcher import load_source
+
+    return load_source(Path(__file__).resolve().parent, SOURCE_MODULE)
+
+
 def build_module(config, weights, device="cpu", submodule=None):
     """Launch this module's implementation from `source.py`.
 
-    Constructs one instance per submodule from the source in this directory, loads the
-    recorded weights into each, and returns the module — the chain of them when the
-    group spans more than one. `submodule` asks for a single piece: which expert of a
-    parallel group, or which submodule when these are installed into a model.
+    Imports `source.py`, constructs one instance per submodule from the classes it
+    defines, loads the recorded weights into each, and returns the module — the chain
+    of them when the group spans more than one. `submodule` asks for a single piece:
+    which expert of a parallel group, or which submodule when these are installed into
+    a model.
     """
     from pathlib import Path
 
     from model_partition.runtime.launcher import build_group
 
+    source = load_implementation()
     return build_group(
         Path(__file__).resolve().parent, config, weights, device=device,
-        source_module=SOURCE_MODULE, class_names=CLASS_NAMES,
+        source=source, source_module=SOURCE_MODULE, class_names=CLASS_NAMES,
         config_class=CONFIG_CLASS, submodules=MODULE_SUBMODULES,
         layer_map=LAYER_MAP, submodule=submodule,
     )

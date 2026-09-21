@@ -219,12 +219,20 @@ implementation before generating, so the tokens printed for human review are the
 shipped code's tokens. The model's own modules appear in exactly one place — `trace`,
 where they *are* the reference every later stage is measured against.
 
-**A module directory is a unit you can optimize on its own.** `extract` writes four
-files per implementation group, and the important thing about them is what depends on
+**A module directory is a unit you can optimize on its own.** `extract` writes one
+directory per implementation group, and the important thing about it is what depends on
 what:
 
-- **`source.py` is the implementation** — the file the module's class is defined in,
-  copied verbatim. This is what you edit to optimize the module.
+- **`source.py` is the implementation** — this module's classes and the helpers they
+  reference, taken verbatim out of the file they are defined in. Not the whole file:
+  a modeling file is the whole model, and a module directory is one module, so the
+  other layer variants and the vision tower are left behind. This is what you edit to
+  optimize the module.
+- **`config.json`** is the config the module's own subtree was constructed with, which
+  for a multimodal checkpoint is the text stack's config rather than the model's. It
+  is recorded because building a layer from the wrong one gives library defaults for
+  every width it does not name, and because it is what makes the directory
+  self-contained.
 - **`inference.py` is the launcher, and the benchmark.** It imports `source.py`,
   constructs the class from the recorded config, loads the dumped weights into it, and
   returns the module. Run directly it times the module and compares it against the
@@ -283,9 +291,10 @@ run.yaml              resolved spec, pinned revision, model config, storage esti
 plan/                 partition_graph.yaml, valid_submodules.txt, rationale.md, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
 modules/              one directory per implementation group:
-                        source.py     the implementation, copied verbatim
-                        inference.py  launches source.py on the recorded config+weights
-                        verify.py     checks inference.py against the dumped output
+                        source.py     the implementation: this module's classes, verbatim
+                        inference.py  launches source.py; run it for latency + error
+                        verify.py     checks the implementation against the dumped output
+                        config.json   the config this module's subtree was built from
                         README.md     what it does, pre-conditions, post-conditions
                         meta.yaml     module ids, layers, shapes
 reports/              verify.json, chain.json, emulate.json, summary.md, tokens.txt,

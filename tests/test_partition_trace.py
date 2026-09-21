@@ -249,3 +249,38 @@ def test_bytes_written_is_tracked_without_a_ceiling(tiny_run):
     tracer = Tracer(tiny_run.build_model(), tiny_run.graph, store)
     tracer.dump_weights()
     assert tracer.bytes_written == sum(e.nbytes for e in store.entries)
+
+
+def test_a_derived_buffer_is_recorded_as_the_forward_saw_it(tiny_run):
+    """The copy a module hands out afterwards is not always the one that ran.
+
+    An offloaded model returns a bfloat16 view of a rotary `inv_freq` that executed in
+    float32, and a module rebuilt from that view drifts as positions grow. So the
+    buffer is captured during the traced call, not read back later.
+    """
+    import torch
+
+    from model_partition.tensorstore import TensorStore
+
+    from model_partition.trace import _lookup
+
+    model = tiny_run.build_model()
+    target = next(m for m in tiny_run.graph.partitioned_modules if m.submodules)
+    owner = _lookup(model, target.submodules[0])
+    executed = torch.full((4,), 0.6042963862, dtype=torch.float32)
+    owner.register_buffer("derived_probe", executed.clone(), persistent=False)
+
+    store = TensorStore(tiny_run.root / "derived")
+    tracer = Tracer(model, tiny_run.graph, store)
+    from tests.fixtures.tiny_llm import sample_inputs
+
+    tracer.trace_sample("s", sample_inputs(1, 8))
+    # Whatever the module hands out now is a different, coarser copy.
+    owner.derived_probe = executed.to(torch.bfloat16).float()
+
+    names = tracer.dump_weights(module_ids=[target.id])[target.id]
+    probe = next(n for n in names if n.endswith("derived_probe"))
+    entry = next(e for e in store.entries if e.name == probe)
+    recorded = store.read_torch(entry)
+    assert recorded.dtype is torch.float32
+    assert recorded[0].item() == pytest.approx(0.6042963862, abs=1e-9)

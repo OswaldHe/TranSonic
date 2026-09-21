@@ -26,6 +26,9 @@ SOURCE_FILENAME = "source.py"
 #: place of the module it was copied from.
 SOURCE_MODULE_PREFIX = "_model_partition_source_"
 
+#: The config the module's subtree was built from, recorded by extraction.
+CONFIG_FILENAME = "config.json"
+
 #: Imported source per directory. Executing a modeling file is not cheap and every
 #: module of a group asks for the same one.
 _SOURCE_CACHE: dict[str, Any] = {}
@@ -97,6 +100,29 @@ def load_source(directory: str | Path, source_module: str | None = None) -> Any:
     return module
 
 
+def module_config(directory: str | Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The config recorded beside a module, or ``fallback`` when there is none.
+
+    This is the config the module's own subtree was constructed with, which for a
+    multimodal checkpoint is the text stack's config and not the model's — building a
+    decoder layer from the top-level config gives library defaults for every width it
+    does not name. A directory written before this was recorded falls back to the
+    run-wide config.
+    """
+    import json
+
+    path = Path(directory) / CONFIG_FILENAME
+    if not path.is_file():
+        return dict(fallback or {})
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise LauncherError(f"{path} is not readable JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not payload:
+        return dict(fallback or {})
+    return payload
+
+
 def _resolve_class(module: Any, class_name: str) -> Any:
     """Find a class in ``source.py``, falling back to the framework.
 
@@ -131,6 +157,7 @@ def build_group(
     submodules: dict[str, list[str]] | None = None,
     layer_map: dict[str, list[int]] | None = None,
     submodule: str | None = None,
+    source: Any = None,
 ) -> Any:
     """Build a whole partition module out of ``source.py`` and return it callable.
 
@@ -141,7 +168,11 @@ def build_group(
 
     ``submodule`` asks for one piece alone: which expert of a parallel group, or which
     submodule when the implementations are installed into a model for emulation.
+
+    ``config`` is what the caller has; the ``config.json`` in the directory wins when
+    it is there, because that is the config this module's subtree was built from.
     """
+    config = module_config(directory, config)
     paths = _module_paths(submodules or {}, weights)
     if not paths:
         raise LauncherError(
@@ -165,7 +196,7 @@ def build_group(
     built = [
         build(directory, name, config, _weights_under(weights, path), device=device,
               source_module=source_module, layer_index=layer_index,
-              config_class=config_class).callable
+              config_class=config_class, source=source).callable
         for path, name in wanted
     ]
     return built[0] if len(built) == 1 else _chain(built)
@@ -240,15 +271,27 @@ def build(
     source_module: str | None = None,
     layer_index: int | None = None,
     config_class: str | None = None,
+    source: Any = None,
 ) -> Launched:
-    """Construct ``class_name`` from ``source.py`` and load ``weights`` into it."""
+    """Construct ``class_name`` from ``source.py`` and load ``weights`` into it.
+
+    ``source`` is the already-imported ``source.py`` when the caller imported it
+    itself, which is how ``inference.py`` does it: the import is on the page there
+    rather than hidden in here.
+    """
     import torch
 
-    module = load_source(directory, source_module)
+    module = source if source is not None else load_source(directory, source_module)
     cls = _resolve_class(module, class_name)
 
     settings = _config_object(module, config, config_class)
     instance = _construct(cls, settings, layer_index, weights, config)
+    # The recorded weights decide the module's precision. A class constructs itself in
+    # torch's default dtype, which is float32, and a bf16 checkpoint's feature maps
+    # would then meet float32 parameters — the same matmul, refusing to run.
+    dtype = _weights_dtype(weights)
+    if dtype is not None:
+        _cast_weights(instance, dtype)
     loaded, missing = load_weights(instance, weights)
     instance = instance.to(device)
     instance.eval()
@@ -257,28 +300,102 @@ def build(
                     weights_loaded=loaded, missing=missing)
 
 
+def _derived_buffers(instance: Any) -> set[str]:
+    """Dotted names of the non-persistent buffers, which no checkpoint holds.
+
+    A class marks a buffer non-persistent precisely because it is derived: it computes
+    the value at construction and it is not part of the weights.
+    """
+    names: set[str] = set()
+    for prefix, module in instance.named_modules():
+        for leaf in getattr(module, "_non_persistent_buffers_set", set()) or set():
+            names.add(f"{prefix}.{leaf}" if prefix else leaf)
+    return names
+
+
+def _cast_weights(instance: Any, dtype: Any) -> None:
+    """Put the weights in the recorded dtype, leaving derived buffers as computed.
+
+    A derived buffer's precision is part of what the module computes, not of what the
+    checkpoint stores. Rotary ``inv_freq`` is the case that found this: computed in
+    float32, used to build angles that reach thousands of radians, so rounding it to
+    bfloat16 moves the last positions of a 2048-token sample by a tenth of a radian —
+    a module that reproduces short samples and quietly drifts on long ones.
+    """
+    for module in instance.modules():
+        derived = getattr(module, "_non_persistent_buffers_set", set()) or set()
+        for parameter in module._parameters.values():
+            if parameter is not None and parameter.is_floating_point():
+                parameter.data = parameter.data.to(dtype)
+        for name, buffer in list(module._buffers.items()):
+            if buffer is not None and buffer.is_floating_point() and name not in derived:
+                module._buffers[name] = buffer.to(dtype)
+
+
+def _weights_dtype(weights: dict[str, Any]) -> Any:
+    """The floating dtype most of the recorded weights are in, or None."""
+    from collections import Counter
+
+    counts: Counter = Counter()
+    for tensor in weights.values():
+        dtype = getattr(tensor, "dtype", None)
+        if dtype is not None and getattr(dtype, "is_floating_point", False):
+            counts[dtype] += 1
+    return counts.most_common(1)[0][0] if counts else None
+
+
 def load_weights(instance: Any, weights: dict[str, Any]) -> tuple[int, list[str]]:
     """Copy ``weights`` into ``instance``, matching by name suffix.
 
     The instance's names are relative to itself (``q_proj.weight``) while the recorded
     names are absolute (``model.layers.3.self_attn.q_proj.weight``), so the longest
     suffix that identifies exactly one recorded tensor wins.
+
+    A derived buffer is installed at the dtype it was recorded in rather than cast into
+    the one the class happened to construct: the trace records these as the forward saw
+    them, and their precision is part of what the module computes. A rotary ``inv_freq``
+    recorded in float32 and cast down to the weights' bfloat16 moves the last positions
+    of a long sample by a tenth of a radian.
     """
     import torch
 
     loaded, missing = 0, []
-    for name, tensor in list(instance.named_parameters()) + list(instance.named_buffers()):
-        # Explicit None: `or` on a tensor asks for its truth value, which raises.
-        candidate = weights.get(name)
-        if candidate is None:
-            candidate = _by_suffix(weights, name)
+    for name, tensor in instance.named_parameters():
+        candidate = _recorded(weights, name)
         if candidate is None:
             missing.append(name)
             continue
         with torch.no_grad():
             tensor.copy_(candidate.reshape(tensor.shape).to(tensor.dtype))
         loaded += 1
+
+    for prefix, module in instance.named_modules():
+        derived = getattr(module, "_non_persistent_buffers_set", set()) or set()
+        for leaf, buffer in list(module._buffers.items()):
+            if buffer is None:
+                continue
+            name = f"{prefix}.{leaf}" if prefix else leaf
+            candidate = _recorded(weights, name)
+            if candidate is None:
+                # A derived buffer the recording does not carry is not missing: the
+                # class computed it at construction, which is where it comes from.
+                if leaf not in derived:
+                    missing.append(name)
+                continue
+            if leaf in derived and candidate.dtype != buffer.dtype:
+                module._buffers[leaf] = candidate.reshape(buffer.shape).to(buffer.device)
+            else:
+                with torch.no_grad():
+                    buffer.copy_(candidate.reshape(buffer.shape).to(buffer.dtype))
+            loaded += 1
     return loaded, missing
+
+
+def _recorded(weights: dict[str, Any], name: str) -> Any:
+    """The recorded tensor for one instance-relative name, or None."""
+    # Explicit None: `or` on a tensor asks for its truth value, which raises.
+    found = weights.get(name)
+    return found if found is not None else _by_suffix(weights, name)
 
 
 def _by_suffix(weights: dict[str, Any], name: str) -> Any:
@@ -300,8 +417,25 @@ def _config_object(module: Any, config: dict[str, Any], config_class: str | None
             continue
         built = _instantiate_config(candidate, config)
         if built is not None:
-            return built
+            return _restore_private(built, config)
     return _AttributeConfig(config)
+
+
+def _restore_private(settings: Any, config: dict[str, Any]) -> Any:
+    """Put back recorded fields a config class does not take as a keyword.
+
+    ``_attn_implementation`` is the one this exists for: a config class drops it on
+    construction, and an attention module built without it runs a different kernel
+    than the trace did — one that needs the explicit mask the recording does not carry.
+    """
+    for key, value in config.items():
+        if not key.startswith("_"):
+            continue
+        try:
+            setattr(settings, key, value)
+        except Exception:  # a validating property may refuse; it keeps its own value
+            continue
+    return settings
 
 
 def _instantiate_config(candidate: Any, config: dict[str, Any]) -> Any:
@@ -406,6 +540,12 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
                        if name in parameters), None)
     if layer_index is not None and index_name:
         attempts.append(((settings,), {index_name: layer_index}))
+    # A class that wants the config plus a scalar the config does carry but does not
+    # pass itself — `Qwen3_5MLP(config, config.intermediate_size)`. Filling the rest by
+    # name gets it built; leaving it unbuilt would lose the whole feed-forward module.
+    beyond = _named_kwargs(parameters, config, layer_index)
+    if beyond:
+        attempts.append(((settings,), beyond))
     attempts.append(((settings,), {}))
     # A norm is its width, and often an epsilon the config carries.
     weight = weights.get("weight")
@@ -427,6 +567,18 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
         f"could not construct {cls.__name__} from the recorded config and weights. "
         "Tried:\n  " + "\n  ".join(errors[:5])
     )
+
+
+def _named_kwargs(parameters: list[str], config: dict[str, Any],
+                  layer_index: int | None) -> dict[str, Any]:
+    """Every constructor parameter after the first that the config can fill by name."""
+    values: dict[str, Any] = {}
+    for name in parameters[1:]:
+        if name in config:
+            values[name] = config[name]
+        elif layer_index is not None and name in ("layer_idx", "layer_index", "layer"):
+            values[name] = layer_index
+    return values
 
 
 def _config_kwargs(cls: Any, config: dict[str, Any],

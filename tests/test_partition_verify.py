@@ -391,6 +391,47 @@ def test_a_module_with_no_implementation_is_a_failure_not_a_free_pass(tiny_run, 
     assert "no implementation" in failure.error
 
 
+def test_a_derived_buffer_keeps_the_precision_it_was_recorded_at(tmp_path):
+    """Casting a rotary inv_freq down to the weights' dtype drifts long positions."""
+    import torch
+    from torch import nn
+
+    from model_partition.runtime.launcher import load_weights
+
+    class Rotary(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+            # Non-persistent: computed here, not read from a checkpoint.
+            self.register_buffer("inv_freq", torch.ones(4), persistent=False)
+
+    module = Rotary()
+    recorded = torch.tensor([1.0, 0.6042963862, 0.365, 0.22], dtype=torch.float32)
+    loaded, missing = load_weights(module, {"m.weight": torch.zeros(4, dtype=torch.bfloat16),
+                                            "m.inv_freq": recorded})
+    assert not missing and loaded == 2
+    assert module.inv_freq.dtype is torch.float32
+    assert module.inv_freq[1].item() == pytest.approx(0.6042963862, abs=1e-9)
+
+
+def test_a_derived_buffer_the_recording_lacks_is_not_missing(tmp_path):
+    """The class computed it at construction; that is where it comes from."""
+    import torch
+    from torch import nn
+
+    from model_partition.runtime.launcher import load_weights
+
+    class Rotary(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("inv_freq", torch.ones(4), persistent=False)
+            self.register_buffer("scale", torch.ones(4))
+
+    loaded, missing = load_weights(Rotary(), {})
+    assert loaded == 0
+    assert missing == ["scale"]
+
+
 def test_the_launcher_identifies_the_module_from_its_weights(tiny_deep_run, tmp_path):
     """One implementation serves a whole group, so the weights say which instance."""
     from model_partition.runtime.launcher import _module_paths

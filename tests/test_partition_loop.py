@@ -236,16 +236,41 @@ def test_editing_the_plan_invalidates_downstream_stages(tiny_run, tmp_path):
     layout = result.context.layout
 
     graph = PartitionGraph.load(layout.graph_path)
-    graph.metadata["nudge"] = "changed"
+    # The partition itself: one module now owns a submodule it did not own before.
+    moved = next(m for m in graph.partitioned_modules if len(m.submodules) > 1)
+    moved.submodules = moved.submodules[:-1]
+    graph.save(layout.graph_path)
+
+    messages: list[str] = []
+    second = loop_for(tiny_run, tmp_path, retain=False)
+    second.report = messages.append
+    second.run()
+    # Changing the plan re-runs everything downstream of it, tracing included.
+    assert not any("trace" in m and "cached" in m for m in messages)
+    assert not any("emulate" in m and "cached" in m for m in messages)
+
+
+def test_rewriting_the_plan_without_changing_it_keeps_the_trace(tiny_run, tmp_path):
+    """A re-plan that lands on the same partition must not re-trace.
+
+    Re-tracing a large model costs hours and hundreds of gigabytes, so the question
+    the cache asks is whether the partition changed — not whether the file did.
+    """
+    from model_partition.planner.graph import PartitionGraph
+
+    first = loop_for(tiny_run, tmp_path, retain=False)
+    layout = first.run().context.layout
+
+    graph = PartitionGraph.load(layout.graph_path)
+    graph.metadata["rationale"] = "reworded, same partition"
+    graph.modules.reverse()
     graph.save(layout.graph_path)
 
     messages: list[str] = []
     second = loop_for(tiny_run, tmp_path, retain=False)
     second.report = messages.append
     assert second.run().passed
-    # Changing the plan re-runs everything downstream of it, tracing included.
-    assert not any("trace" in m and "cached" in m for m in messages)
-    assert not any("emulate" in m and "cached" in m for m in messages)
+    assert any("trace" in m and "cached" in m for m in messages), messages
 
 
 def test_loop_reports_a_failure_without_an_agent(tiny_run, tmp_path):

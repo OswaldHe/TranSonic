@@ -12,6 +12,7 @@ harness.
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,17 @@ from model_partition.trace import _lookup
 #: next extraction. Everything else belongs to the harness and is regenerated.
 EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
 SOURCE_FILENAME = "source.py"
+
+#: The config the module's own subtree was built from, written beside it so the
+#: directory carries everything needed to construct the module.
+CONFIG_FILENAME = "config.json"
+
+#: Config fields a framework keeps private and ``to_dict()`` leaves out, but which
+#: decide what a module computes. The attention implementation is the one that
+#: matters: a recorded call carries ``attention_mask=None`` when the traced kernel
+#: applied causality itself, and rebuilding the module as eager attention then lets
+#: every position see the future — a module that looks close and is wrong.
+PRIVATE_CONFIG_KEYS = ("_attn_implementation",)
 HARNESS_TEMPLATES = {
     "verify.py": "module_verify.py.tmpl",
     "README.md": "module_readme.md.tmpl",
@@ -51,10 +63,10 @@ KIND_PURPOSE = {
              "feed-forward block.",
 }
 
-#: Prepended to a verbatim implementation file, as a comment so the file still
-#: imports. This is the file `inference.py` loads and the file to optimize.
+#: Prepended to the implementation, as a comment so the file still imports. This is
+#: the file `inference.py` loads and the file to optimize.
 SOURCE_BANNER = """\
-# This is the implementation for partition group `{signature}`, copied verbatim from
+# This is the implementation for partition group `{signature}`, {scope}
 #   {origin}
 # `inference.py` beside it imports this file and calls `{class_name}` — so editing
 # here is what changes what runs, and `verify.py` tells you whether the result still
@@ -64,6 +76,12 @@ SOURCE_BANNER = """\
 # file's.
 
 """
+
+#: How much of the originating file ``source.py`` holds. A module directory is one
+#: module, so what it needs is taken and the rest of the model is left behind.
+SLICED_SCOPE = ("{kept} of the {total} definitions — this module's classes and what "
+                "they reference — copied verbatim from")
+WHOLE_SCOPE = "copied verbatim from"
 
 #: Written when there is no importable original to copy: the collected class bodies,
 #: which document the module but cannot be launched.
@@ -80,11 +98,6 @@ because it still documents what the module computes.
 
 '''
 
-#: Where the verbatim originals go, shared across groups since several of them come
-#: from the same file.
-SOURCE_FILES_DIR = "source_files"
-
-
 @dataclass
 class ExtractedGroup:
     """One deduplicated implementation."""
@@ -98,6 +111,9 @@ class ExtractedGroup:
     #: Dotted name the implementation's classes were defined under, so ``source.py``
     #: can be imported with its own relative imports intact.
     source_module: str = ""
+    #: Class of the config recorded in ``config.json``, which is the config this
+    #: module's subtree was built from rather than the model's top-level one.
+    config_class: str = ""
     #: True when ``source.py`` is the real, importable implementation rather than an
     #: excerpt. False means the launcher has nothing to import and says so.
     launchable: bool = False
@@ -115,6 +131,7 @@ class ExtractedGroup:
             "classes": list(self.classes),
             "source_files": list(self.source_files),
             "source_module": self.source_module,
+            "config_class": self.config_class,
             "launchable": self.launchable,
             "source_lines": self.source_lines,
             "preserved": self.preserved,
@@ -232,9 +249,6 @@ def extract(
     work. ``regenerate=True`` overwrites them.
     """
     param_names = param_names or {}
-    # The class the model's own config is, rather than whichever name in the source
-    # file happens to end in "Config" — a modeling file imports several.
-    config_class = type(getattr(model, "config", None)).__name__
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     groups: list[ExtractedGroup] = []
@@ -258,7 +272,6 @@ def extract(
             group.class_name = type(_principal(targets)).__name__
         group.classes = names
         group.source_files = files
-        group.source_lines = sum(s.count("\n") for s in sources)
 
         directory = root / _group_dirname(index, representative, signature)
         directory.mkdir(parents=True, exist_ok=True)
@@ -266,10 +279,19 @@ def extract(
 
         principal = _principal(targets) if targets else None
         group.source_module = type(principal).__module__ if principal is not None else ""
+        settings, config_class = _module_config(model, representative.submodules)
+        group.config_class = config_class
+        (directory / CONFIG_FILENAME).write_text(
+            json.dumps(settings, indent=2, sort_keys=True, default=str) + "\n")
         if (directory / SOURCE_FILENAME).is_file() and not regenerate:
             group.preserved = True
         group.launchable = _write_source(directory, principal, sources, signature, files,
-                                         regenerate=regenerate)
+                                         classes=names, regenerate=regenerate)
+        # What source.py actually holds, so the reported figure is the code someone has
+        # to read rather than the size of the file it was taken from.
+        source_path = directory / SOURCE_FILENAME
+        group.source_lines = (len(source_path.read_text().splitlines())
+                              if source_path.is_file() else 0)
         weight_names = list(param_names.get(representative.id, []))
         # One class name per submodule, positionally. Groups are signature-homogeneous,
         # so submodule i of any module in the group has submodule i's class.
@@ -319,7 +341,6 @@ def extract(
         }, sort_keys=False))
         groups.append(group)
 
-    _copy_source_files(groups, root)
     (root / "index.yaml").write_text(yamlio.dumps({
         "n_groups": len(groups),
         "n_modules": len(graph.partitioned_modules),
@@ -331,15 +352,143 @@ def extract(
     return groups
 
 
+def _module_config(model: Any, submodule_names: list[str]) -> tuple[dict[str, Any], str]:
+    """The config a module's own subtree was built from, and that config's class.
+
+    The model's top-level config is not always what the module was constructed with.
+    A multimodal checkpoint keeps the text stack's widths and head counts under
+    ``text_config`` and hands *that* to the decoder layers, so building a layer from
+    the top-level config gives a module whose shapes are library defaults — twice the
+    heads the recorded weights have, in the case that found this. Walking up from the
+    submodule to the nearest config gets the one the weights actually match.
+    """
+    from dataclasses import asdict, is_dataclass
+
+    def settings_of(holder: Any) -> tuple[dict[str, Any], str] | None:
+        candidate = getattr(holder, "config", None) if holder is not None else None
+        if candidate is None:
+            return None
+        if hasattr(candidate, "to_dict"):
+            payload = dict(candidate.to_dict())
+            for private in PRIVATE_CONFIG_KEYS:
+                value = getattr(candidate, private, None)
+                if value is not None:
+                    payload[private] = value
+            return payload, type(candidate).__name__
+        if is_dataclass(candidate) and not isinstance(candidate, type):
+            return asdict(candidate), type(candidate).__name__
+        if isinstance(candidate, dict):
+            return dict(candidate), ""
+        return None
+
+    for name in submodule_names:
+        parts = name.split(".")
+        while parts:
+            found = settings_of(_lookup(model, ".".join(parts)))
+            if found is not None:
+                return found
+            parts.pop()
+    return settings_of(model) or ({}, "")
+
+
+def _wanted_classes(principal: Any, classes: list[str]) -> list[str]:
+    """Names, defined in the principal's own file, that this group's code needs.
+
+    ``classes`` is dotted and spans the group's submodules and their children, so the
+    framework's classes are in there too; those come from the installed framework and
+    are not part of this file.
+    """
+    module = type(principal).__module__
+    wanted = [type(principal).__name__]
+    for dotted in classes:
+        head, _, leaf = dotted.rpartition(".")
+        if head == module and leaf not in wanted:
+            wanted.append(leaf)
+    return wanted
+
+
+def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | None:
+    """The part of ``origin`` this module needs: its classes, and what they reference.
+
+    Returns ``(text, definitions kept, definitions in the file)``.
+
+    A modeling file holds the whole model — every layer variant, the vision tower, the
+    generation wrapper. A module directory is one module, so copying all of it gives a
+    kernel author thousands of lines to read past and makes the file look shared when
+    it is not. This keeps the module-level statements every version of the file needs
+    (its imports, its constants) plus the transitive closure of definitions the wanted
+    classes actually reference, in their original order and text.
+
+    Returns None when the result would not be trustworthy — a class that is not defined
+    at the top level, a file that does not parse — in which case the caller copies the
+    whole file rather than shipping something incomplete.
+    """
+    import ast
+
+    try:
+        text = origin.read_text()
+        tree = ast.parse(text)
+    except (OSError, SyntaxError):
+        return None
+
+    lines = text.splitlines(keepends=True)
+    definitions: dict[str, Any] = {}
+    order: list[tuple[int, int, str]] = []
+    preamble: list[tuple[int, int]] = []
+    for node in tree.body:
+        start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        end = node.end_lineno or start
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitions[node.name] = node
+            order.append((start, end, node.name))
+        else:
+            # Imports, constants, logger setup, `if TYPE_CHECKING` — cheap to keep and
+            # the file does not import without them.
+            preamble.append((start, end))
+
+    missing = [name for name in wanted if name not in definitions]
+    if not wanted or missing:
+        return None
+
+    needed = set(wanted)
+    frontier = list(wanted)
+    while frontier:
+        node = definitions[frontier.pop()]
+        for inner in ast.walk(node):
+            name = inner.id if isinstance(inner, ast.Name) else None
+            if name is None and isinstance(inner, ast.Attribute):
+                root = inner
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                name = root.id if isinstance(root, ast.Name) else None
+            if name in definitions and name not in needed:
+                needed.add(name)
+                frontier.append(name)
+
+    def segment(start: int, end: int) -> str:
+        return "".join(lines[start - 1:end])
+
+    parts = [segment(start, end) for start, end in preamble]
+    parts += [segment(start, end) for start, end, name in sorted(order) if name in needed]
+    sliced = "\n".join(part.rstrip("\n") for part in parts) + "\n"
+    try:
+        ast.parse(sliced)
+    except SyntaxError:
+        return None
+    return sliced, len(needed), len(definitions)
+
+
 def _write_source(directory: Path, principal: Any, sources: list[str],
-                  signature: str, files: list[str], regenerate: bool = False) -> bool:
+                  signature: str, files: list[str], classes: list[str] | None = None,
+                  regenerate: bool = False) -> bool:
     """Write ``source.py``: the implementation if there is one, else an excerpt.
 
-    Returns whether the result is importable. Copying the defining file verbatim is
-    what makes the module directory a unit you can optimize on its own — the code that
-    runs is the code in front of you, not whatever happens to be installed. An
-    existing one is left alone for the same reason ``inference.py`` is: it is the file
-    being optimized, and re-extracting must not throw that away.
+    Returns whether the result is importable. What makes the module directory a unit
+    you can optimize on its own is that the code that runs is the code in front of you,
+    so this takes the module's own classes out of the model's file verbatim — not the
+    whole file, which is the entire model. An existing one is left alone for the same
+    reason ``inference.py`` is: it is the file being optimized, and re-extracting must
+    not throw that away.
     """
     import inspect
 
@@ -357,10 +506,16 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
             origin = None
 
     if origin is not None:
+        result = _slice_source(origin, _wanted_classes(principal, classes or []))
+        if result is None:
+            body, scope = origin.read_text(), WHOLE_SCOPE
+        else:
+            body, kept, total = result
+            scope = SLICED_SCOPE.format(kept=kept, total=total)
         destination.write_text(
-            SOURCE_BANNER.format(signature=signature, origin=origin,
+            SOURCE_BANNER.format(signature=signature, origin=origin, scope=scope,
                                  class_name=type(principal).__name__)
-            + origin.read_text()
+            + body
         )
         return True
 
@@ -371,35 +526,6 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
         + "\n\n".join(sources)
     )
     return False
-
-
-def _copy_source_files(groups: list[ExtractedGroup], root: Path) -> int:
-    """Copy each implementation's originating file verbatim; returns how many.
-
-    A group's ``source.py`` is the file its *principal* class comes from, and a group
-    can span classes defined elsewhere — a framework primitive alongside the model's
-    own block. Those files are collected here so the whole group can be read, written
-    once beside the groups since several of them come from the same file.
-    """
-    import shutil
-
-    target = root / SOURCE_FILES_DIR
-    wanted = {path for group in groups for path in group.source_files}
-    if not wanted:
-        return 0
-    target.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for path in sorted(wanted):
-        origin = Path(path)
-        if not origin.is_file():
-            continue
-        destination = target / origin.name
-        if destination.exists() and destination.read_bytes() == origin.read_bytes():
-            copied += 1
-            continue
-        shutil.copy2(origin, destination)
-        copied += 1
-    return copied
 
 
 def _group_dirname(index: int, module: Any, signature: str) -> str:

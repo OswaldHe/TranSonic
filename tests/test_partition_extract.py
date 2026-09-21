@@ -239,7 +239,54 @@ def test_missing_submodule_is_recorded_not_fatal(tiny_run, tmp_path):
     groups = extract(graph, tiny_run.build_model(), tmp_path / "modules",
                      run_root=tiny_run.layout.root)
     assert all(g.class_name == "(not instantiated)" for g in groups)
-    assert all(g.source_lines == 0 for g in groups)
+    # Nothing was found to extract, so nothing is claimed: not launchable, and the
+    # source says the classes were not there rather than defining any.
+    assert not any(g.launchable for g in groups)
+    assert all("not present in the loaded model"
+               in (g.directory / "source.py").read_text() for g in groups)
+    assert all("\nclass " not in (g.directory / "source.py").read_text() for g in groups)
+
+
+def test_the_config_the_module_was_built_from_is_recorded(tiny_run, tmp_path):
+    """The model's top-level config is not always what a module was constructed with."""
+    import json
+
+    groups = _extract(tiny_run, tmp_path)
+    for group in groups:
+        recorded = json.loads((group.directory / "config.json").read_text())
+        assert recorded, f"{group.directory.name} records no config"
+        assert recorded["hidden_size"] == tiny_run.bundle.config["hidden_size"]
+        assert group.config_class == "TinyConfig"
+
+
+def test_a_private_config_field_survives_the_round_trip():
+    """`_attn_implementation` decides which kernel runs, and `to_dict()` drops it."""
+    from model_partition.extract import PRIVATE_CONFIG_KEYS, _module_config
+
+    class Held:
+        pass
+
+    class Settings:
+        def __init__(self):
+            self._attn_implementation = "sdpa"
+
+        def to_dict(self):
+            return {"hidden_size": 8}
+
+    holder = Held()
+    holder.config = Settings()
+    recorded, name = _module_config(holder, [])
+    assert "_attn_implementation" in PRIVATE_CONFIG_KEYS
+    assert recorded["_attn_implementation"] == "sdpa"
+    assert name == "Settings"
+
+    # And the launcher puts it back on the config object it builds.
+    from model_partition.runtime.launcher import _restore_private
+
+    class Plain:
+        pass
+
+    assert _restore_private(Plain(), recorded)._attn_implementation == "sdpa"
 
 
 def test_collect_sources_deduplicates_repeated_child_classes(tiny_run):
@@ -252,19 +299,42 @@ def test_collect_sources_deduplicates_repeated_child_classes(tiny_run):
                for name in names), names
 
 
-def test_the_originating_files_are_copied_verbatim(tiny_run, tmp_path):
-    """The extracted source.py does not import; the real file does."""
-    from model_partition.extract import SOURCE_FILES_DIR, extract
-
+def test_source_holds_this_module_and_not_the_rest_of_the_model(tiny_run, tmp_path):
+    """A module directory is one module: the other layers' code has no business here."""
     groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
                      run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
-    copies = tmp_path / "modules" / SOURCE_FILES_DIR
-    assert copies.is_dir()
+    norm = next(g for g in groups if g.class_name == "RMSNorm")
+    source = (norm.directory / "source.py").read_text()
+    assert "class RMSNorm" in source
+    for absent in ("class TinyAttention", "class TinyMoE", "class TinyCausalLM"):
+        assert absent not in source, f"{absent} is not part of this module"
+    origin = Path(next(iter(norm.source_files)))
+    assert len(source) < len(origin.read_text())
 
-    wanted = {Path(path) for group in groups for path in group.source_files}
-    assert wanted, "source_files should not be empty"
-    for origin in wanted:
-        assert (copies / origin.name).read_bytes() == origin.read_bytes()
+
+def test_a_slice_keeps_what_its_classes_reference(tiny_run, tmp_path):
+    """Dropping a referenced definition leaves a file that imports and then fails."""
+    from model_partition.extract import _slice_source
+
+    origin = Path(__file__).resolve().parent / "fixtures" / "tiny_llm.py"
+    sliced, kept, total = _slice_source(origin, ["TinyDecoderLayer"])
+    # The layer holds an attention, an MLP, a MoE and two norms, and is annotated
+    # with the config class: all of them have to come along.
+    for needed in ("class TinyAttention", "class TinyMLP", "class TinyMoE",
+                   "class RMSNorm", "class TinyConfig"):
+        assert needed in sliced, needed
+    assert "class TinyCausalLM" not in sliced
+    assert kept < total
+
+
+def test_slicing_declines_rather_than_shipping_an_incomplete_file(tmp_path):
+    """When the wanted class is not there to take, the whole file is copied instead."""
+    from model_partition.extract import _slice_source
+
+    path = tmp_path / "mod.py"
+    path.write_text("import torch\n\n\nclass A:\n    pass\n")
+    assert _slice_source(path, ["Missing"]) is None
+    assert _slice_source(path, []) is None
 
 
 def test_meta_records_where_the_implementation_came_from(tiny_run, tmp_path):

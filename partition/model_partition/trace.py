@@ -172,6 +172,8 @@ class Tracer:
         self.bytes_written = 0
         #: Set while encoding one record, read back onto it afterwards.
         self._sliced = False
+        #: Non-persistent buffers as the traced forward saw them, by original name.
+        self._derived: dict[str, Any] = {}
         self._targets = self._resolve_targets()
 
     def _account(self, nbytes: int) -> None:
@@ -207,6 +209,24 @@ class Tracer:
 
     # -- weights ---------------------------------------------------------------
 
+    def _capture_derived(self, submodule_name: str, submodule: Any) -> None:
+        """Keep the non-persistent buffers as this forward saw them.
+
+        No checkpoint holds them — the class computes them at construction — and the
+        copy a module hands out afterwards is not always the one that ran: an offloaded
+        model returns a bfloat16 view of a rotary ``inv_freq`` that executed in float32,
+        and a module rebuilt from that view drifts a tenth of a radian by position 2000.
+        Recorded here, at the moment of the call the output is also recorded from.
+        """
+        for prefix, child in submodule.named_modules():
+            for leaf in getattr(child, "_non_persistent_buffers_set", set()) or set():
+                buffer = child._buffers.get(leaf)
+                if buffer is None or getattr(buffer, "is_meta", False):
+                    continue
+                inner = f"{prefix}.{leaf}" if prefix else leaf
+                full = f"{submodule_name}.{inner}" if inner else submodule_name
+                self._derived.setdefault(full, buffer.detach().clone())
+
     def _module_tensors(self, module: Any):
         """Yield ``(original name, tensor)`` for everything a module owns."""
         for submodule_name in module.submodules:
@@ -216,7 +236,8 @@ class Tracer:
             if hasattr(submodule, "named_parameters"):
                 items = list(submodule.named_parameters()) + list(submodule.named_buffers())
                 for param_name, tensor in items:
-                    yield (f"{submodule_name}.{param_name}" if param_name else submodule_name), tensor
+                    full = f"{submodule_name}.{param_name}" if param_name else submodule_name
+                    yield full, self._derived.get(full, tensor)
             else:
                 yield submodule_name, submodule
 
@@ -261,6 +282,7 @@ class Tracer:
 
         def make_hook(submodule_name: str, module_ids: list[str]):
             def hook(_module, args, kwargs, output):
+                self._capture_derived(submodule_name, _module)
                 for module_id in module_ids:
                     prefix = f"{sample_id}/s{step}/{_safe_name(submodule_name)}"
                     self._sliced = False

@@ -125,7 +125,7 @@ def ingest(spec: ModelSpec, token: str | None = None, with_index: bool = True) -
     else:
         revision = resolve_revision(spec, token=token)
         root = Path(_snapshot_metadata(spec, revision, token))
-        index = (WeightIndex.from_hub(spec.repo_id, revision=revision, token=token)
+        index = (_remote_index(spec, root, revision, repo_files, token)
                  if with_index else WeightIndex(source=f"hf:{spec.repo_id}"))
 
     config = load_config(root, spec.config_file)
@@ -147,6 +147,24 @@ def ingest(spec: ModelSpec, token: str | None = None, with_index: bool = True) -
         index=index, revision=revision, repo_files=repo_files,
         entry=entry, code_paths=code_paths,
     )
+
+
+def _remote_index(spec: ModelSpec, root: Path, revision: str | None,
+                  repo_files: list[str], token: str | None) -> WeightIndex:
+    """Inventory a remote checkpoint, from the local snapshot when it is complete.
+
+    A second run of the same model already has every shard in the snapshot, and
+    reading their headers off disk is both faster than asking the Hub and does not
+    put a whole run — trace and all — at the mercy of the Hub answering right now.
+    Falls back to the Hub when a shard is absent, since a partial set would
+    under-count the checkpoint and mis-size the plan.
+    """
+    wanted = [name for name in repo_files if name.endswith(".safetensors")]
+    # Top-level shards only: a local read globs the snapshot's own directory, so a
+    # repo that nests its weights would otherwise be indexed as empty.
+    if wanted and all("/" not in name and (root / name).is_file() for name in wanted):
+        return WeightIndex.from_local(root)
+    return WeightIndex.from_hub(spec.repo_id, revision=revision, token=token)
 
 
 def _snapshot_metadata(spec: ModelSpec, revision: str | None, token: str | None) -> Path:

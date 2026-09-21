@@ -353,9 +353,29 @@ def hash_plan(ctx: LoopContext) -> list[Any]:
 
 
 def _graph_fingerprint(path: Path) -> str:
+    """What the later stages depend on in the plan, canonically.
+
+    The partition itself: which modules there are, what each is, which submodules it
+    owns and how they relate. Hashing the file's bytes instead made a re-plan that
+    produced the *same* partition look like a new one — a reconcile writing the same
+    modules in a different order, a rewritten rationale — and the re-trace that
+    follows costs hours and hundreds of gigabytes on a large model.
+    """
     from model_partition.loop.state import content_hash
 
-    return content_hash(path.read_text()) if path.is_file() else ""
+    if not path.is_file():
+        return ""
+    try:
+        graph = PartitionGraph.load(path)
+    except Exception:
+        # Unreadable, so it is about to fail anyway; hash the bytes rather than
+        # claiming two broken plans are the same one.
+        return content_hash(path.read_text())
+    return content_hash(sorted(
+        [m.id, m.kind, m.composition, list(m.submodules), list(m.layer_indices),
+         list(m.inputs), list(m.outputs)]
+        for m in graph.partitioned_modules
+    ))
 
 
 def _plan_metrics(graph: PartitionGraph) -> dict[str, Any]:

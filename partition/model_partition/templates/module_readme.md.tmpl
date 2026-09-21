@@ -104,6 +104,7 @@ result still reproduces the reference.
 | `source.py` | yours | **the implementation** — this module's classes, copied verbatim; edit this to optimize it |
 | `inference.py` | yours | the launcher: imports `source.py`, builds the class from the recorded config, loads the dumped weights |
 | `verify.py` | the harness | decides whether the implementation is correct; regenerated every run |
+| `config.json` | the harness | the config this module's subtree was built from, as recorded |
 | `meta.yaml` | the harness | module ids, layers, shapes, byte counts |
 | `README.md` | the harness | this file |
 
