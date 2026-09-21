@@ -110,12 +110,26 @@ class EmulationReport:
 
     @property
     def judge_declined(self) -> list[EmulationOutcome]:
-        """Samples that reproduced the model but whose text the judge rejected."""
+        """Samples that reproduced the model but whose text the judge rejected.
+
+        A judge that failed to answer is not a judge that said no, so those are
+        reported separately: iterating on output quality in response to an unanswered
+        question would be spending the loop's budget on nothing.
+        """
         return [o for o in self.outcomes
-                if o.mechanically_passed and not o.passed(self.min_score)]
+                if o.mechanically_passed and not o.passed(self.min_score)
+                and o.verdict is not None and not o.verdict.errored]
+
+    @property
+    def judge_errored(self) -> list[EmulationOutcome]:
+        """Samples the judge did not manage to assess at all."""
+        return [o for o in self.outcomes
+                if o.verdict is None or o.verdict.errored]
 
     def mean_score(self) -> float:
-        scores = [o.verdict.score for o in self.outcomes if o.verdict]
+        """Mean over samples the judge actually assessed."""
+        scores = [o.verdict.score for o in self.outcomes
+                  if o.verdict and not o.verdict.errored]
         return sum(scores) / len(scores) if scores else 0.0
 
     def render(self) -> str:
@@ -143,6 +157,7 @@ class EmulationReport:
             "passed": self.passed,
             "mechanically_passed": self.mechanically_passed,
             "judge_declined": [o.sample_id for o in self.judge_declined],
+            "judge_errored": [o.sample_id for o in self.judge_errored],
             "mean_score": self.mean_score(),
             "n_samples": len(self.outcomes),
             "n_failed": len(self.failures),

@@ -79,6 +79,11 @@ class Verdict:
     raw: str = ""
     error: str = ""
 
+    @property
+    def errored(self) -> bool:
+        """The judge did not answer. No evidence either way, rather than a low score."""
+        return bool(self.error)
+
     def passed(self, min_score: int = DEFAULT_MIN_SCORE) -> bool:
         """True at or above ``min_score`` (4 by default: readable, formed, on-topic).
 

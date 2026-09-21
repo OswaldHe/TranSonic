@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from model_partition.hardware import MIB
+from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import (
     TraceBundle,
@@ -23,6 +23,7 @@ from model_partition.runtime.module_runner import (
     replay_record,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
+
 
 def poison_parameters(model: Any, value: float = float("nan"),
                       only: set[str] | None = None) -> int:
@@ -303,7 +304,7 @@ def verify_modules(
                         oversized = _is_out_of_memory(exc)
                         needed = _check_bytes(group + [reference_record], bundle)
                         detail = (f"{residency} ran out of memory; the module's tensors "
-                                  f"are about {needed // MIB} MiB for this sample. "
+                                  f"are about {format_bytes(needed)} for this sample. "
                                   "Partition it further." if oversized else str(exc))
                         report.results.append(ModuleVerification(
                             module_id=module_id, sample_id=sample_id, passed=False,

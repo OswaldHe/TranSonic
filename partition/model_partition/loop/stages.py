@@ -838,6 +838,15 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     declined = report.judge_declined
     detail = (f"{len(report.outcomes)} sample(s) reproduced the model, "
               f"mean judge score {report.mean_score():.1f}")
+    if report.judge_errored:
+        # Not a verdict, so not something to iterate against.
+        names = ", ".join(o.sample_id for o in report.judge_errored[:3])
+        detail += f"; judge gave no verdict for {len(report.judge_errored)} sample(s) ({names})"
+        ctx.notes.append(
+            f"the judge failed to assess {len(report.judge_errored)} sample(s): "
+            + "; ".join(f"{o.sample_id}: {(o.verdict.error if o.verdict else 'no verdict')[:120]}"
+                        for o in report.judge_errored)
+        )
     if declined:
         # The judge is advisory: the partition is sound, so the stage succeeds and
         # the loop keeps iterating on quality rather than reporting a failure.
@@ -853,6 +862,7 @@ def _emulate_metrics(report) -> dict[str, Any]:
         "n_failed": len(report.failures),
         "mechanically_passed": report.mechanically_passed,
         "judge_declined": [o.sample_id for o in report.judge_declined],
+        "judge_errored": [o.sample_id for o in report.judge_errored],
         "mean_judge_score": report.mean_score(),
         "weights_filled": report.fill.applied if report.fill else 0,
         "implementations_installed": len(report.install.installed) if report.install else 0,

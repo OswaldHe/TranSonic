@@ -35,5 +35,11 @@ inputs:
   short: ../../inputs/short.jsonl
   long: ../../inputs/long.jsonl
   long_token_budgets: [2048, 8192, 16384]
-  max_short: 4
-  max_long: 3
+  max_short: 2
+  max_long: 1
+
+overrides:
+  # 64 layers split into attention and FFN is ~131 modules, and emulation re-runs the
+  # whole prefill per generated token with layers on the host. Both scale with the
+  # sample set, so this model asks for fewer tokens than the shared default.
+  max_new_tokens: 8

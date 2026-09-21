@@ -147,12 +147,6 @@ def decode_group_call(records: list[CallRecord], store: TensorStore,
     return args, merged
 
 
-def load_dumped_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
-    """Load a module's dumped weights, keyed by their filesystem-safe names."""
-    load = tensor_loader(bundle.store, device)
-    return {name: load(name) for name in bundle.weights.get(module_id, [])}
-
-
 def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu") -> dict[str, Any]:
     """Load a module's weights keyed by their original parameter names.
 

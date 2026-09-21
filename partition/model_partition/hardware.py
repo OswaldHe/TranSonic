@@ -16,7 +16,6 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-MIB = 1024 ** 2
 GIB = 1024 ** 3
 
 #: Fraction of GPU memory one module may occupy; the rest absorbs allocator
@@ -137,11 +136,6 @@ def _read_meminfo() -> tuple[int, int]:
         return fields.get("MemTotal", 0), fields.get("MemAvailable", 0)
     except OSError:
         return 0, 0
-
-
-def available_ram_bytes() -> int:
-    """Host memory available right now, or 0 when it cannot be read."""
-    return _read_meminfo()[1]
 
 
 def detect_host(artifact_root: str | Path) -> HostInfo:

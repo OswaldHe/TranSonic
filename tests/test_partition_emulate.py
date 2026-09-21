@@ -356,3 +356,48 @@ def test_emulation_says_when_a_submodule_kept_the_model_s_own_code(tiny_run, tmp
     assert dropped in report.skipped
     assert not report.complete
     assert "left as the model's own" in report.summary()
+
+
+# -- a judge that failed is not a judge that said no -------------------------
+
+
+class JudgeErrors:
+    def judge(self, prompt, continuation, sample_id=""):
+        from model_partition.verify.judge import Verdict
+
+        return Verdict(fluent=False, score=0, sample_id=sample_id,
+                       error="claude exited 1: refusal")
+
+
+def test_an_errored_judge_is_not_counted_as_a_decline(tiny_run):
+    report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                     inputs=inputs_for(tiny_run), judge=JudgeErrors(), max_new_tokens=2)
+    assert report.mechanically_passed
+    assert not report.judge_declined
+    assert len(report.judge_errored) == len(report.outcomes)
+    # Nothing was assessed, so there is no mean to report.
+    assert report.mean_score() == 0.0
+
+
+def test_a_low_score_is_a_decline_not_an_error(tiny_run):
+    report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                     inputs=inputs_for(tiny_run), judge=RejectAll(), max_new_tokens=2)
+    assert report.judge_declined and not report.judge_errored
+
+
+def test_the_mean_score_ignores_samples_the_judge_could_not_assess(tiny_run):
+    from model_partition.verify.judge import Verdict
+
+    class Mixed:
+        def __init__(self):
+            self.n = 0
+
+        def judge(self, prompt, continuation, sample_id=""):
+            self.n += 1
+            if self.n == 1:
+                return Verdict(fluent=False, score=0, error="timed out")
+            return Verdict(fluent=True, score=5)
+
+    report = emulate(tiny_run.build_model, tiny_run.bundle, tiny_run.graph,
+                     inputs=inputs_for(tiny_run), judge=Mixed(), max_new_tokens=2)
+    assert report.mean_score() == 5.0
