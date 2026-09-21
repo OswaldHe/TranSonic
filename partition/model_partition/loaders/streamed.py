@@ -52,6 +52,14 @@ SCALE_SUFFIX = ".scale"
 #: takes, and the alternative to running it slowly is not running the model at all.
 MODULE_BUDGET = 8 << 30
 
+#: A module whose whole subtree is at most this reads the subtree when it is called,
+#: rather than leaving each descendant to read its own. Needed because a parent may use a
+#: child's weight *without calling the child*: this model's attention does
+#: ``self.wo_a.weight.view(...)`` and then an einsum, so no hook of ``wo_a``'s ever fires
+#: and a placeholder propagates silently — einsum on a meta operand returns meta. Kept
+#: small so a whole MoE layer is not pulled in for the six experts a token routes to.
+SUBTREE_BUDGET = 1 << 30
+
 #: Allocations larger than this are placeholders during construction; smaller ones are
 #: made for real. Above a gigabyte a single tensor is a weight, and weights come from the
 #: checkpoint. Below it a tensor is either small enough not to matter or something the
@@ -265,68 +273,98 @@ def _all_tensors(model: Any):
 def install_streaming(model: Any, index: dict[str, ShardEntry], device: str = "cuda",
                       keep_bytes: int = RESIDENT_LIMIT,
                       resident_budget: int = RESIDENT_BUDGET,
-                      module_budget: int = MODULE_BUDGET) -> StreamReport:
-    """Make every module read its own weights when called, and release them after.
+                      module_budget: int = MODULE_BUDGET,
+                      subtree_budget: int = SUBTREE_BUDGET) -> StreamReport:
+    """Give each module a hook that reads the weights its call needs, and drops them.
+
+    Walking top-down, a module whose whole subtree fits ``subtree_budget`` takes
+    responsibility for that subtree — because a parent may reach into a child's weight
+    without calling the child, and only the parent's own call is a reliable moment to
+    have it. Anything bigger is left to its descendants, so a MoE layer is not
+    materialized whole for the few experts a token visits.
 
     A module whose weights exceed ``module_budget`` runs on the host: its tensors are
     materialized there, its inputs are moved across for the call and its output moved
     back. Slow, and the honest alternative to refusing the model outright.
     """
-    import torch
-
     report = StreamReport()
-    owned = _owned_tensors(model)
-    for module, prefix, names in owned:
-        # Before anything is replaced: a vendor module hangs its block scale off its
-        # weight so its kernel can reach it, and swapping either tensor breaks the link.
-        aliases = _aliases(module)
-        streamed: list[tuple[str, str]] = []
-        for leaf, full in names:
-            entry = index.get(full)
-            tensor = _tensor_of(module, leaf)
-            if entry is None:
-                # Not in the checkpoint. Either the model computed it at construction —
-                # fine, it is real and stays — or it is a weight the checkpoint should
-                # have had, and running on a placeholder would validate nothing.
-                (report.unresolved if tensor.is_meta else report.derived).append(full)
-                continue
-            nbytes = tensor.numel() * tensor.element_size()
-            if entry is None:
-                continue
-            if nbytes <= keep_bytes and report.resident_bytes + nbytes <= resident_budget:
-                _set(module, leaf, _read(entry, tensor, device))
-                report.resident_tensors += 1
-                report.resident_bytes += nbytes
-                continue
-            # Released now rather than at the first forward: a tensor the checkpoint
-            # supplies may have been allocated during construction, and holding it until
-            # something calls this module defeats the point of streaming.
-            if not tensor.is_meta:
-                _set(module, leaf, torch.empty(tensor.shape, dtype=tensor.dtype,
-                                               device="meta"))
-            streamed.append((leaf, full))
-        _rebind(module, aliases)
+    claimed: set[int] = set()
+    for prefix, module in model.named_modules():
+        if id(module) in claimed:
+            continue
+        subtree = _subtree_tensors(module, prefix)
+        wanted = sum(tensor.numel() * tensor.element_size()
+                     for _, _, _, tensor in subtree)
+        own_only = wanted > subtree_budget
+        covered = [row for row in subtree if row[0] is module] if own_only else subtree
+        if not own_only:
+            claimed.update(id(child) for child in module.modules())
+        streamed = _classify(covered, index, report, device, keep_bytes, resident_budget)
         if not streamed:
             continue
         report.streamed_modules += 1
         report.streamed_tensors += len(streamed)
-        wanted = sum(_tensor_of(module, leaf).numel() * _tensor_of(module, leaf).element_size()
-                     for leaf, _ in streamed)
-        report.largest_module_bytes = max(report.largest_module_bytes, wanted)
+        held = sum(owner._parameters.get(leaf, owner._buffers.get(leaf)).numel()
+                   * owner._parameters.get(leaf, owner._buffers.get(leaf)).element_size()
+                   for owner, leaf, _ in streamed)
+        report.largest_module_bytes = max(report.largest_module_bytes, held)
         place = device
-        if wanted > module_budget and not device.startswith("cpu"):
+        if held > module_budget and not device.startswith("cpu"):
             place = "cpu"
             report.host_modules.append(prefix or "(root)")
-        _install_hooks(module, streamed, index, place, aliases,
-                       moves=place != device)
-    del torch
+        _install_hooks(module, streamed, index, place, moves=place != device)
     return report
 
 
-def _install_hooks(module: Any, streamed: list[tuple[str, str]],
+def _subtree_tensors(root: Any, prefix: str) -> list[tuple[Any, str, str, Any]]:
+    """``(owner, leaf, full name, tensor)`` for everything under ``root``, root included."""
+    rows: list[tuple[Any, str, str, Any]] = []
+    for name, module in root.named_modules():
+        path = f"{prefix}.{name}" if prefix and name else (prefix or name)
+        for leaf in list(module._parameters) + list(module._buffers):
+            tensor = _tensor_of(module, leaf)
+            if tensor is not None:
+                rows.append((module, leaf, f"{path}.{leaf}" if path else leaf, tensor))
+    return rows
+
+
+def _classify(rows: list[tuple[Any, str, str, Any]], index: dict[str, ShardEntry],
+              report: StreamReport, device: str, keep_bytes: int,
+              resident_budget: int) -> list[tuple[Any, str, str]]:
+    """Read the small ones now, mark the rest for streaming, account for the others."""
+    import torch
+
+    streamed: list[tuple[Any, str, str]] = []
+    for owner, leaf, full, tensor in rows:
+        aliases = _aliases(owner)
+        entry = index.get(full)
+        if entry is None:
+            # Not in the checkpoint. Either the model computed it at construction — fine,
+            # it is real and stays — or it is a weight the checkpoint should have had, and
+            # running on a placeholder would validate nothing.
+            (report.unresolved if tensor.is_meta else report.derived).append(full)
+            continue
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes <= keep_bytes and report.resident_bytes + nbytes <= resident_budget:
+            _set(owner, leaf, _read(entry, tensor, device))
+            report.resident_tensors += 1
+            report.resident_bytes += nbytes
+            _rebind(owner, aliases)
+            continue
+        # Released now rather than at the first forward: a tensor the checkpoint supplies
+        # may have been allocated during construction, and holding it until something
+        # calls this module defeats the point of streaming.
+        if not tensor.is_meta:
+            _set(owner, leaf, torch.empty(tensor.shape, dtype=tensor.dtype, device="meta"))
+            _rebind(owner, aliases)
+        streamed.append((owner, leaf, full))
+    return streamed
+
+
+def _install_hooks(module: Any, streamed: list[tuple[Any, str, str]],
                    index: dict[str, ShardEntry], device: str,
-                   aliases: list[tuple[str, str, str]], moves: bool = False) -> None:
-    """Read this module's weights for its call and drop them after.
+                   moves: bool = False) -> None:
+    """Read the weights this call needs, from anywhere in the subtree, and drop them after.
 
     ``moves`` is for a module placed off the accelerator: its inputs are brought to
     where its weights are and its output sent back, so the rest of the model does not
@@ -334,26 +372,30 @@ def _install_hooks(module: Any, streamed: list[tuple[str, str]],
     """
     import torch
 
-    shapes = {leaf: (_tensor_of(module, leaf).shape, _tensor_of(module, leaf).dtype)
-              for leaf, _ in streamed}
+    shapes = {(id(owner), leaf): (_tensor_of(owner, leaf).shape,
+                                  _tensor_of(owner, leaf).dtype)
+              for owner, leaf, _ in streamed}
+    aliases = {id(owner): _aliases(owner) for owner, _, _ in streamed}
     origin: list[Any] = [None]
 
     def materialize(_module: Any, args: tuple, kwargs: dict):
-        for leaf, full in streamed:
-            current = _tensor_of(module, leaf)
+        for owner, leaf, full in streamed:
+            current = _tensor_of(owner, leaf)
             if current.is_meta:
-                _set(module, leaf, _read(index[full], current, device))
-        _rebind(module, aliases)
+                _set(owner, leaf, _read(index[full], current, device))
+        for owner, _, _ in streamed:
+            _rebind(owner, aliases[id(owner)])
         if not moves:
             return None
         origin[0] = _device_of(args) or _device_of(tuple(kwargs.values()))
         return _moved(args, device), _moved(kwargs, device)
 
     def release(_module: Any, args: tuple, kwargs: dict, output: Any):
-        for leaf, _ in streamed:
-            shape, dtype = shapes[leaf]
-            _set(module, leaf, torch.empty(shape, dtype=dtype, device="meta"))
-        _rebind(module, aliases)
+        for owner, leaf, _ in streamed:
+            shape, dtype = shapes[(id(owner), leaf)]
+            _set(owner, leaf, torch.empty(shape, dtype=dtype, device="meta"))
+        for owner, _, _ in streamed:
+            _rebind(owner, aliases[id(owner)])
         if moves and origin[0] is not None:
             return _moved(output, origin[0])
         return None
@@ -391,18 +433,6 @@ def _moved(value: Any, device: Any) -> Any:
     if isinstance(value, dict):
         return {key: _moved(item, device) for key, item in value.items()}
     return value
-
-
-def _owned_tensors(model: Any) -> list[tuple[Any, str, list[tuple[str, str]]]]:
-    """Every module with tensors of its own, and their names relative to the model."""
-    found: list[tuple[Any, str, list[tuple[str, str]]]] = []
-    for prefix, module in model.named_modules():
-        names = [(leaf, f"{prefix}.{leaf}" if prefix else leaf)
-                 for leaf in list(module._parameters) + list(module._buffers)
-                 if _tensor_of(module, leaf) is not None]
-        if names:
-            found.append((module, prefix, names))
-    return found
 
 
 def _tensor_of(module: Any, leaf: str) -> Any:
