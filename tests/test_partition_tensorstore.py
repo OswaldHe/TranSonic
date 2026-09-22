@@ -176,3 +176,25 @@ def test_a_complex_rotary_table_round_trips_exactly():
 def test_element_count():
     meta = TensorMeta(name="x", dtype="float32", shape=[2, 3, 4], nbytes=96, sha256="", path="x.bin")
     assert meta.element_count == 24
+
+
+def test_a_tensor_is_written_without_being_copied():
+    """Asking for a tensor's bytes copies it, so a tensor larger than half of memory
+    could not be dumped at all — and DeepSeek V4.1's n-gram table is 94.4 GiB on a
+    124 GiB host. The view shares the tensor's memory and is written in chunks."""
+    import tempfile
+
+    from model_partition.tensorstore import contiguous_view
+
+    tensor = torch.arange(64, dtype=torch.float32)
+    view, name, shape = contiguous_view(tensor)
+    assert name == "float32" and shape == [64]
+    # Shared, not copied: a change to the tensor shows through the view.
+    before = bytes(view[:4])
+    tensor[0] = -1.0
+    assert bytes(view[:4]) != before
+
+    store = TensorStore(tempfile.mkdtemp())
+    meta = store.write("big", tensor)
+    assert meta.nbytes == 256
+    assert torch.equal(store.read_torch(meta), tensor)

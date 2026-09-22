@@ -38,18 +38,25 @@ def test_fresh_only_when_status_and_hash_both_match():
     assert not state.is_fresh("plan", "hash-1")
 
 
-def test_invalidation_clears_the_stage_and_everything_after_it():
-    """Editing the plan must not invalidate ingest, which is expensive."""
+def test_invalidation_resets_the_stage_and_leaves_the_rest_to_their_hashes():
+    """A later stage keeps its record: its own input hash says whether it still holds.
+
+    Clearing them here as well would throw away work that is still current — the trace
+    of a 475 GiB model does not depend on which side of a layer an edge was drawn on, and
+    re-taking it because the plan was corrected costs an hour and hundreds of gigabytes.
+    """
     state = LoopState()
     for stage in STAGES:
         state.mark(stage, OK, f"h-{stage}")
-    cleared = state.invalidate_from("plan")
-    assert cleared == ["plan", "trace", "extract", "verify_modules", "verify_chain",
-                       "emulate", "retain"]
-    assert state.record("ingest").status == OK
-    assert state.record("ingest").input_hash == "h-ingest"
-    assert state.record("trace").status == PENDING
-    assert state.record("trace").input_hash == ""
+    assert state.invalidate_from("plan") == ["plan"]
+    assert state.record("plan").status == PENDING
+    assert state.record("plan").input_hash == ""
+    for stage in ("ingest", "trace", "verify_modules"):
+        assert state.record(stage).status == OK
+        assert state.record(stage).input_hash == f"h-{stage}"
+    # And a stage whose inputs did change is not fresh, so it runs anyway.
+    assert state.is_fresh("trace", "h-trace")
+    assert not state.is_fresh("verify_modules", "different")
 
 
 def test_invalidating_the_last_stage_touches_only_it():
@@ -1044,3 +1051,35 @@ def test_a_checkpoint_already_on_disk_is_not_counted_again(tiny_run):
 
     (tiny_run.repo / "model.safetensors").unlink()
     assert _checkpoint_to_fetch(Ctx()) > 0
+
+
+def test_the_budget_is_for_the_card_the_run_will_use():
+    """`--device cuda:1` on a host whose cards differ must not plan against cuda:0."""
+    from model_partition.hardware import GPUInfo, resolve_budget
+    from model_partition.loop.driver import _device_index
+
+    gpus = [GPUInfo(index=0, name="small", total_bytes=8 << 30, free_bytes=8 << 30),
+            GPUInfo(index=1, name="large", total_bytes=48 << 30, free_bytes=48 << 30)]
+    assert _device_index("cuda:1") == 1
+    assert _device_index("cuda") == 0 and _device_index("cpu") == 0
+    budget = resolve_budget(gpus, device_index=_device_index("cuda:1"))
+    assert budget.gpu is not None and budget.gpu.name == "large"
+
+
+def test_a_rerun_that_fails_does_not_stay_passed(tiny_run, tmp_path, monkeypatch):
+    """Publishing reads this flag as permission, so it has to describe this attempt."""
+    from model_partition.loop import stages
+
+    result = loop_for(tiny_run, tmp_path).run()
+    assert result.passed and result.state.passed
+
+    def broken(_ctx):
+        return stages.StageResult(ok=False, detail="planted failure")
+
+    monkeypatch.setitem(stages.STAGE_FUNCTIONS, "verify_modules",
+                        (broken, stages.STAGE_FUNCTIONS["verify_modules"][1]))
+    again = loop_for(tiny_run, tmp_path, force=True).run()
+    assert not again.passed
+    assert not again.state.passed
+    from model_partition.loop.state import LoopState
+    assert not LoopState.load(again.context.layout.state_file).passed

@@ -97,17 +97,22 @@ class LoopState:
         return bool(entry and entry.status == OK and entry.input_hash == input_hash)
 
     def invalidate_from(self, name: str) -> list[str]:
-        """Reset ``name`` and every later stage. Returns what was reset."""
+        """Reset ``name``. Returns what was reset.
+
+        Later stages are left alone on purpose: each one's input hash covers the
+        content its predecessors produced, so a stage whose inputs really changed
+        re-runs on its own and one whose inputs did not is still valid. Clearing
+        them here as well would discard work the hash says is current — re-tracing
+        hundreds of gigabytes because a plan edge moved, say.
+        """
         if name not in STAGES:
             raise ValueError(f"Unknown stage {name!r}")
-        cleared: list[str] = []
-        for stage in STAGES[STAGES.index(name):]:
-            entry = self.stages.get(stage)
-            if entry and entry.status != PENDING:
-                entry.status = PENDING
-                entry.input_hash = ""
-                cleared.append(stage)
-        return cleared
+        entry = self.stages.get(name)
+        if entry is None or entry.status == PENDING:
+            return []
+        entry.status = PENDING
+        entry.input_hash = ""
+        return [name]
 
     def first_incomplete(self) -> str | None:
         for stage in STAGES:

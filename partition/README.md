@@ -322,6 +322,12 @@ python inference.py --device cuda --repeat 50    # time it, check it, report met
 python verify.py --all-modules --all-samples     # gate it
 ```
 
+`inference.py` reads nothing outside the run: `calls.json` names its tensors by paths
+relative to the module directory, and the builder, the comparison and the model's own
+package travel with the artifacts under `runtime/` and `vendor/`. So it runs where the
+artifacts are unpacked, with `torch` and nothing else installed — which is what
+`publish` checks before uploading, by running it with this package off `sys.path`.
+
 ## Layout
 
 ```
@@ -352,6 +358,8 @@ Artifacts live **outside** the repo, at `~/transonic_artifacts/<slug>/` by defau
 ```
 run.yaml              resolved spec, pinned revision, model config, storage estimate
 compat/               agent-written patches for vendor code this GPU will not run
+vendor/               the model's own package, which source.py imports from
+runtime/              the builder and the comparison inference.py reads, copied in
 plan/                 partition_graph.yaml, valid_submodules.txt, rationale.md, history/
 trace/                manifest.yaml, records.yaml, weights/, activations/
 modules/              one directory per implementation group:
@@ -359,6 +367,7 @@ modules/              one directory per implementation group:
                         inference.py  launches source.py; run it for latency + error
                         verify.py     checks the implementation against the dumped output
                         config.json   the config this module's subtree was built from
+                        calls.json    which .bin holds each argument, weight and output
                         README.md     what it does, pre-conditions, post-conditions
                         meta.yaml     module ids, layers, shapes
 reports/              verify.json, chain.json, emulate.json, summary.md, tokens.txt,

@@ -111,6 +111,12 @@ def _must_stream(ctx: Any) -> bool:
     return bool(memory_shortfall(ctx))
 
 
+def _device_index(device: str) -> int:
+    """The card a device string names: ``cuda:1`` is 1, ``cuda`` and ``cpu`` are 0."""
+    _, _, index = str(device or "").partition(":")
+    return int(index) if index.isdigit() else 0
+
+
 def _stream_device(ctx: Any) -> str:
     """Where a streamed module's weights land: the accelerator, if there is one."""
     if ctx.budget and ctx.budget.gpu and ctx.options.device.startswith("cuda"):
@@ -135,6 +141,10 @@ class PartitionLoop:
         layout = RunLayout.create(self.spec.slug, self.options.artifact_root).ensure()
         budget = resolve_budget(
             headroom=self.options.headroom,
+            # The card the run will use, not whichever is first: `--device cuda:1` on a
+            # host whose cards differ would otherwise be planned against the wrong one,
+            # and every per-module ceiling would be for a GPU nothing runs on.
+            device_index=_device_index(self.options.device),
             fallback_bytes=int(self.options.gpu_memory_gib * 1024 ** 3)
             if self.options.gpu_memory_gib else None,
         )
@@ -243,6 +253,20 @@ class PartitionLoop:
 
         if (short_circuit := self._already_complete(ctx, state)) is not None:
             return short_circuit
+
+        # The recorded verdict describes this attempt, not the last one that went well.
+        # Left standing, a run that passed in the morning and fails now still reads as
+        # passed — and publishing takes that flag as permission to upload.
+        state.passed = False
+        state.finished = False
+        if self.options.force:
+            # And `--force` means check it again: the stage hashes would otherwise find
+            # every verification stage fresh and the run would report a pass without
+            # having run anything. The capture before them is left to its own hashes,
+            # because re-reading 69 GiB of activations is not what the flag is asking for.
+            for stage in ("verify_modules", "verify_chain", "emulate", "retain"):
+                state.invalidate_from(stage)
+        state.save(ctx.layout.state_file)
 
         last_failure: tuple[str, StageResult] | None = None
         for iteration in range(1, self.options.max_iterations + 1):

@@ -107,8 +107,16 @@ result still reproduces the reference.
 | `inference.py` | yours | the launcher: imports `source.py`, builds the class from the recorded config, loads the dumped weights |
 | `verify.py` | the harness | decides whether the implementation is correct; regenerated every run |
 | `config.json` | the harness | the config this module's subtree was built from, as recorded |
+| `calls.json` | the harness | which `.bin` holds each argument, weight and reference output, and how to read it |
 | `meta.yaml` | the harness | module ids, layers, shapes, byte counts |
 | `README.md` | the harness | this file |
 
 `source.py` and `inference.py` are written once and then left alone, so an edit here
 survives the next run of the loop.
+
+Everything `inference.py` needs is inside the artifact: `calls.json` names its tensors
+by a path relative to this directory, `../../runtime/` holds the builder and the
+comparison, `../../vendor/` holds the model's own package that `source.py` imports from,
+and `../../compat/` holds the kernel replacements the reference was taken with. Beyond
+that it imports `torch` and the standard library, so running this module needs neither
+the harness that produced the run nor the checkpoint it came from.

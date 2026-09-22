@@ -251,7 +251,7 @@ def plan_only(target: str, config: Path | None, **kwargs: Any) -> None:
 @click.option("--allow-overflow", is_flag=True, default=False,
               help="Warn instead of failing when projected artifacts exceed disk")
 @click.option("--force", is_flag=True, default=False,
-              help="Re-run even if this run already passed and was pruned")
+              help="Verify again from scratch, even if this run already passed")
 def run_loop(target: str, config: Path | None, iterations: int | None, no_agent: bool,
              no_retain: bool, allow_overflow: bool, force: bool, refine_plan: bool,
              **kwargs: Any) -> None:
@@ -332,11 +332,18 @@ def report(run_dir: str, as_json: bool) -> None:
               help="Publish only these modules, with their weights; repeatable")
 @click.option("--one-per-kind", is_flag=True,
               help="Publish one module of each kind, with their weights")
+@click.option("--upload-all", is_flag=True,
+              help="Send every file, not only the selection. The selection then says "
+                   "which modules carry their weights and can be verified standalone")
 @click.option("--skip-check", is_flag=True,
               help="Do not verify the published files on their own first")
+@click.option("--allow-unverified", is_flag=True,
+              help="Upload even though a stage of the run failed. The README records "
+                   "which stages passed, so the artifacts say so themselves")
 def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
            exclude: tuple[str, ...], dry_run: bool, modules: tuple[str, ...],
-           one_per_kind: bool, skip_check: bool) -> None:
+           one_per_kind: bool, upload_all: bool, skip_check: bool,
+           allow_unverified: bool) -> None:
     """Upload a run's artifacts, or a selection of its modules, to a dataset repo.
 
     A selection carries its own weights, so each module directory can be verified where
@@ -352,7 +359,9 @@ def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
         result = publish_run(run_dir, repo_id, private=private,
                              max_bytes=int(max_gib * GIB), exclude=exclude,
                              dry_run=dry_run, module_ids=selected or None,
-                             skip_check=skip_check, report=click.echo)
+                             upload_all=upload_all, skip_check=skip_check,
+                             allow_unverified=allow_unverified,
+                             report=click.echo)
     except PublishError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(result.summary())

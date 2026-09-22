@@ -6,6 +6,10 @@
 Elementwise closeness alone is a poor gate in bf16 — a handful of outliers in a
 large tensor is normal. Each comparison therefore reports a pass *fraction* and
 cosine similarity alongside max errors, and the verdict requires all three.
+
+Imports nothing else from the harness, so a published module directory reports the
+same verdict on the same numbers as the run that produced it: this file is vendored
+into the artifact by :func:`~model_partition.extract.vendor_runtime`.
 """
 
 from __future__ import annotations
@@ -183,20 +187,36 @@ def compare_outputs(actual: Any, reference: Any, label: str = "output",
     corrupted auxiliary output through — so every caller that compares a module's
     output uses this rather than reducing to one tensor.
     """
-    from model_partition.trace import is_tensor
-
     pairs = list(walk_pairs(actual, reference, label))
     if not pairs:
-        from model_partition.runtime.module_runner import first_tensor
-
         return [compare(first_tensor(actual), first_tensor(reference), label, tolerance)]
     return [compare(a, b, name, tolerance) for name, a, b in pairs if is_tensor(b)]
 
 
+def is_tensor(value: Any) -> bool:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(value, torch.Tensor)
+
+
+def first_tensor(value: Any) -> Any | None:
+    """The first tensor in a possibly nested output structure."""
+    if is_tensor(value):
+        return value
+    if isinstance(value, dict):
+        value = tuple(value.values())
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
 def walk_pairs(actual: Any, reference: Any, path: str = "output"):
     """Yield ``(path, actual, reference)`` for each tensor in the reference tree."""
-    from model_partition.trace import is_tensor
-
     if is_tensor(reference):
         yield path, actual, reference
         return

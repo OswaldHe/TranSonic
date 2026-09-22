@@ -414,8 +414,13 @@ def hash_plan(ctx: LoopContext) -> list[Any]:
     ]
 
 
-def _graph_fingerprint(path: Path) -> str:
+def _graph_fingerprint(path: Path, edges: bool = True) -> str:
     """What the later stages depend on in the plan, canonically.
+
+    ``edges`` covers which tensor each module consumes and produces. Tracing does not
+    depend on that — it hooks submodules and records what they were called with, whatever
+    the plan believes flows where — so correcting an edge should not cost a re-trace of
+    hundreds of gigabytes. Chaining and emulation do depend on it.
 
     The partition itself: which modules there are, what each is, which submodules it
     owns and how they relate. Hashing the file's bytes instead made a re-plan that
@@ -434,8 +439,8 @@ def _graph_fingerprint(path: Path) -> str:
         # claiming two broken plans are the same one.
         return content_hash(path.read_text())
     return content_hash(sorted(
-        [m.id, m.kind, m.composition, list(m.submodules), list(m.layer_indices),
-         list(m.inputs), list(m.outputs)]
+        [m.id, m.kind, m.composition, list(m.submodules), list(m.layer_indices)]
+        + ([list(m.inputs), list(m.outputs)] if edges else [])
         for m in graph.partitioned_modules
     ))
 
@@ -467,6 +472,7 @@ def stage_extract(ctx: LoopContext) -> StageResult:
         weight_tensors=ctx.bundle.weights if ctx.bundle else None,
         param_names=_param_names(ctx),
         config=_extraction_config(ctx),
+        bundle=ctx.bundle,
     )
     lines = sum(g.source_lines for g in groups)
     preserved = sum(1 for g in groups if g.preserved)
@@ -842,11 +848,16 @@ def hash_trace(ctx: LoopContext) -> list[Any]:
     # the same length, and reusing the old activations against a new prompt would
     # verify a computation nothing asked for.
     return [
-        _graph_fingerprint(ctx.layout.graph_path),
+        _graph_fingerprint(ctx.layout.graph_path, edges=False),
         [[s.id, s.token_ids] for s in ctx.samples],
         options.slice_long, options.cache_weights, options.decode_steps,
         # Which entry points get driven decides which modules have a reference at all.
         ctx.spec.trace.to_dict(),
+        # The checkpoint the numbers came out of, as resolved rather than as asked for: a
+        # spec that names no revision still traced one, and reusing those activations
+        # after the model was updated would verify modules against a model that no longer
+        # exists.
+        ctx.result.revision if ctx.result else "",
     ]
 
 
@@ -1167,8 +1178,14 @@ def hash_emulate(ctx: LoopContext) -> list[Any]:
     options = ctx.options
     return [
         _graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx),
+        # What emulation actually runs: the implementations installed into the model. A
+        # pass recorded before a module's `source.py` was edited says nothing about the
+        # tokens the edited one generates.
+        _impl_fingerprint(ctx),
         options.max_new_tokens, options.temperature, options.seed,
-        options.judge_kind, options.min_judge_score,
+        # Including which judge read the tokens, and which model it was: a verdict from
+        # the stub is not a verdict from an LLM.
+        options.judge_kind, options.judge_model, options.min_judge_score,
     ]
 
 

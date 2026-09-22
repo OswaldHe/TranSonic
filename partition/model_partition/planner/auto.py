@@ -397,6 +397,20 @@ def layer_parts(inventory: ModelInventory, index: int,
     return parts
 
 
+def _is_subtree(path: str) -> bool:
+    """Whether a layer's child is one of the named subtrees a spec can scope in or out.
+
+    Those are whole mechanisms of their own rather than a step of the layer — an n-gram
+    memory, a vision tower — and a model that has one runs it around the layer rather
+    than inside its attention/FFN sequence.
+    """
+    from model_partition.sizing import SUBTREE_MARKERS
+
+    padded = f".{path.rsplit('.', 1)[-1]}."
+    return any(marker.strip(".") in padded for markers in SUBTREE_MARKERS.values()
+               for marker in markers)
+
+
 def _names_a_side(path: str) -> bool:
     """Whether a component's name says which side of the layer it serves."""
     lowered = path.rsplit(".", 1)[-1].lower()
@@ -520,11 +534,35 @@ def _split_layer(
         unassigned.extend(parts.own_params)
 
     cursor = input_tensor
+    # A child that is a subtree of its own runs before the layer proper: DeepSeek's n-gram
+    # memory adds into the residual stream at the top of the layer (model.py:1262), so
+    # attention consumes *its* output, not the other way round. Ordering it after attention
+    # gave a plan whose chained drift diverged at the first engram layer while every module
+    # of it verified exactly — the edge was wrong, not the arithmetic.
+    for path in [p for p in parts.other if _is_subtree(p)]:
+        parts.other.remove(path)
+        component = path.rsplit(".", 1)[-1]
+        output = declare(f"{stack.boundary(index)}.{component}")
+        graph.modules.append(ModuleNode(
+            id=stack.module_id(index, component), kind="other",
+            inputs=[cursor], outputs=[output], layer_indices=[stack.layer_id(index)],
+            submodules=[path], param_bytes=parts.path_bytes.get(path, 0),
+            activation_bytes=activation,
+            code_signature=f"{signature}:{component}",
+            host_only=parts.path_bytes.get(path, 0) > budget_bytes,
+            notes=("larger than the per-module budget and indivisible: runs on the host"
+                   if parts.path_bytes.get(path, 0) > budget_bytes else ""),
+        ))
+        cursor = output
+
     if parts.attention:
+        # From the cursor, not the layer's input: a subtree placed above has already
+        # written into the residual stream, and attention consumes what it produced.
+        attention_in = cursor
         cursor = declare(f"{stack.boundary(index)}.attn")
         graph.modules.append(ModuleNode(
             id=stack.module_id(index, "attention"), kind="attention",
-            inputs=[input_tensor], outputs=[cursor], layer_indices=[stack.layer_id(index)],
+            inputs=[attention_in], outputs=[cursor], layer_indices=[stack.layer_id(index)],
             submodules=list(parts.attention),
             param_bytes=parts.bytes_for("attention"),
             activation_bytes=activation,

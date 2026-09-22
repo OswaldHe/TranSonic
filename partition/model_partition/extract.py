@@ -22,23 +22,33 @@ from model_partition import yamlio
 from model_partition.hardware import format_bytes
 from model_partition.planner.graph import PartitionGraph
 from model_partition.trace import _lookup
+# Named by the launcher, which is what reads them in a published artifact and must
+# import nothing from here: this module renders templates, and a downloaded module
+# directory should not need a template engine to run.
+#
+# ``VENDOR_DIR`` is where a run keeps the model's own sibling modules, at its root
+# beside ``modules/``: ``source.py`` is a slice of one file of the vendor's package and
+# keeps that file's imports — DeepSeek's attention needs ``kernel`` for its GEMMs and
+# ``engram`` for the n-gram layout — so without these a module directory needs the
+# model's repo present to import at all.
+#
+# ``COMPUTE_DTYPE_KEY`` is where the dtype the model's activations flow in is recorded.
+# Not a field of any framework config: a quantized checkpoint names its *storage* dtype
+# and computes in another, and a module built in the wrong one has its kernels reject
+# their own output buffers.
+from model_partition.runtime.launcher import (  # noqa: F401  (re-exported)
+    CALLS_FILENAME,
+    COMPUTE_DTYPE_KEY,
+    CONFIG_FILENAME,
+    RUNTIME_DIR,
+    SOURCE_FILENAME,
+    VENDOR_DIR,
+)
 
 #: The implementation and its launcher are the loop's to edit, so they are written
 #: once and then left alone — an optimization made to a module has to survive the
 #: next extraction. Everything else belongs to the harness and is regenerated.
 EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
-SOURCE_FILENAME = "source.py"
-
-#: The config the module's own subtree was built from, written beside it so the
-#: directory carries everything needed to construct the module.
-CONFIG_FILENAME = "config.json"
-
-#: Where a run keeps the model's own sibling modules, at its root beside ``modules/``.
-#: ``source.py`` is a slice of one file of the vendor's package and keeps that file's
-#: imports — DeepSeek's attention needs ``kernel`` for its GEMMs and ``engram`` for the
-#: n-gram layout — so without these a module directory needs the model's repo present to
-#: import at all, and the artifacts would only work on the machine that made them.
-VENDOR_DIR = "vendor"
 
 #: Config fields a framework keeps private and ``to_dict()`` leaves out, but which
 #: decide what a module computes. The attention implementation is the one that
@@ -46,12 +56,6 @@ VENDOR_DIR = "vendor"
 #: applied causality itself, and rebuilding the module as eager attention then lets
 #: every position see the future — a module that looks close and is wrong.
 PRIVATE_CONFIG_KEYS = ("_attn_implementation",)
-
-#: Where the dtype the model's activations flow in is recorded. Not a field of any
-#: framework config: a quantized checkpoint names its *storage* dtype and computes in
-#: another, and a module built in the wrong one has its kernels reject their own output
-#: buffers. Read by the launcher before it constructs anything.
-COMPUTE_DTYPE_KEY = "_compute_dtype"
 HARNESS_TEMPLATES = {
     "verify.py": "module_verify.py.tmpl",
     "README.md": "module_readme.md.tmpl",
@@ -253,6 +257,7 @@ def extract(
     param_names: dict[str, list[str]] | None = None,
     regenerate: bool = False,
     config: dict[str, Any] | None = None,
+    bundle: Any = None,
 ) -> list[ExtractedGroup]:
     """Write one implementation directory per signature group.
 
@@ -265,12 +270,17 @@ def extract(
     An existing ``source.py`` and ``inference.py`` are preserved: they are the loop's
     editable surface and may carry the agent's numerical fixes, or someone's kernel
     work. ``regenerate=True`` overwrites them.
+
+    ``bundle`` is the trace, and with it each directory also gets the recorded calls and
+    weight paths its ``inference.py`` reads. Without it the directories are written all
+    the same, so ``extract`` still works before anything has been traced.
     """
     param_names = param_names or {}
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     groups: list[ExtractedGroup] = []
     vendored: set[Path] = set()
+    vendor_runtime(run_root)
 
     for index, (signature, module_ids) in enumerate(sorted(graph.signature_groups().items())):
         modules = [graph.by_id(mid) for mid in module_ids]
@@ -359,6 +369,10 @@ def extract(
                 group.preserved = True
                 continue
             path.write_text(_render_template(template, context))
+        if bundle is not None:
+            write_calls(bundle, directory, list(module_ids),
+                        {m.id: list(m.submodules) for m in modules},
+                        class_names, {m.id: list(m.layer_indices) for m in modules})
         (directory / "meta.yaml").write_text(yamlio.dumps({
             **group.to_dict(),
             "kind": representative.kind,
@@ -460,6 +474,170 @@ def vendor_code(run_root: str | Path, origin_files: list[str]) -> set[Path]:
                 shutil.copy2(path, destination)
             copied.add(destination)
     return copied
+
+
+def write_calls(bundle: Any, directory: str | Path, module_ids: list[str],
+                submodules: dict[str, list[str]], classes: list[str],
+                layer_map: dict[str, list[int]]) -> Path:
+    """Write the recorded calls and weight paths for one group, as plain JSON.
+
+    This is what lets ``inference.py`` read its own inputs with nothing but ``json`` and
+    ``torch``: every tensor it needs — arguments, cross-module state, the reference
+    output, each weight — is named here by a path relative to this directory and by the
+    dtype and shape to read those bytes as. The run's ``records.yaml`` says the same
+    thing for the whole run at once, which is the harness's view; a module directory
+    needs only its own slice and gets it without a YAML parser or this package.
+
+    Written per group rather than per module because that is the unit that shares an
+    implementation, and a group's modules differ in the tensors they point at.
+    """
+    directory = Path(directory)
+    by_name = {entry.name: entry for entry in bundle.store.entries}
+
+    def reference(name: str) -> dict[str, Any] | None:
+        return _tensor_ref(bundle, directory, by_name.get(name))
+
+    def rewrite(value: Any) -> Any:
+        """The recorded tree with each tensor's store name replaced by its path."""
+        from model_partition.trace import LIST_KEY, TENSOR_KEY, TUPLE_KEY, UNSUPPORTED_KEY
+
+        if not isinstance(value, dict):
+            return value
+        if TENSOR_KEY in value:
+            found = reference(value[TENSOR_KEY])
+            # A tensor that was not dumped stays named: `inference.py` reports which one
+            # is missing, which is more use than a null that fails somewhere later.
+            return {TENSOR_KEY: found or value[TENSOR_KEY]}
+        if UNSUPPORTED_KEY in value:
+            return dict(value)
+        for key in (TUPLE_KEY, LIST_KEY):
+            if key in value:
+                return {key: [rewrite(item) for item in value[key]]}
+        return {key: rewrite(item) for key, item in value.items()}
+
+    modules: dict[str, Any] = {}
+    for module_id in module_ids:
+        weights = _weight_refs(bundle, directory, module_id)
+        steps: dict[str, list[dict[str, Any]]] = {}
+        for record in sorted(bundle.select(module_id=module_id), key=lambda r: r.order):
+            key = f"{record.sample_id}#{record.step}"
+            steps.setdefault(key, []).append({
+                "submodule": record.submodule,
+                "sample_id": record.sample_id,
+                "step": record.step,
+                "sliced": record.sliced,
+                "args": [rewrite(item) for item in record.args],
+                "kwargs": rewrite(record.kwargs),
+                "state": rewrite(record.state),
+                "output": rewrite(record.output),
+            })
+        modules[module_id] = {
+            "submodules": list(submodules.get(module_id) or []),
+            "classes": list(classes),
+            "layers": list(layer_map.get(module_id) or []),
+            "weights": weights,
+            # Parameters the run did not dump: read from the checkpoint during the run,
+            # and materialized into the artifact before it is published.
+            "weights_missing": [p for p in (bundle.weight_params.get(module_id) or [])
+                                if p not in weights],
+            "calls": steps,
+        }
+
+    path = directory / CALLS_FILENAME
+    path.write_text(json.dumps({"version": 1, "modules": modules}, indent=1) + "\n")
+    return path
+
+
+def _tensor_ref(bundle: Any, directory: Path, entry: Any) -> dict[str, Any] | None:
+    """Where one dumped tensor is, relative to a module directory, and how to read it."""
+    import os
+
+    if entry is None:
+        return None
+    return {
+        "bin": os.path.relpath(bundle.store.root / entry.path, directory),
+        "dtype": entry.dtype,
+        "shape": list(entry.shape),
+    }
+
+
+def _weight_refs(bundle: Any, directory: Path, module_id: str) -> dict[str, Any]:
+    """One module's dumped weights, keyed by original parameter name."""
+    by_name = {entry.name: entry for entry in bundle.store.entries}
+    weights: dict[str, Any] = {}
+    for name in bundle.weights.get(module_id) or []:
+        entry = by_name.get(name)
+        found = _tensor_ref(bundle, directory, entry)
+        if found is not None:
+            weights[(entry.extra or {}).get("param") or name] = found
+    return weights
+
+
+def refresh_calls(bundle: Any, directory: str | Path) -> int:
+    """Re-point one group's ``calls.json`` at the weights the run now holds.
+
+    Publishing a run that traced without caching weights materializes them first — reads
+    each one out of the checkpoint and dumps it beside the activations. Until this is
+    called the module directory still says it has none, which is the difference between
+    an artifact somebody can verify and one that needs the original 475 GiB checkpoint.
+    """
+    directory = Path(directory)
+    path = directory / CALLS_FILENAME
+    if not path.is_file():
+        return 0
+    payload = json.loads(path.read_text())
+    updated = 0
+    for module_id, entry in (payload.get("modules") or {}).items():
+        weights = _weight_refs(bundle, directory, module_id)
+        if weights == entry.get("weights"):
+            continue
+        entry["weights"] = weights
+        entry["weights_missing"] = [p for p in (bundle.weight_params.get(module_id) or [])
+                                    if p not in weights]
+        updated += 1
+    if updated:
+        path.write_text(json.dumps(payload, indent=1) + "\n")
+    return updated
+
+
+#: The harness files a module directory needs to build and check itself, by package
+#: path. The launcher constructs the module out of ``source.py``; ``compat`` applies the
+#: run's kernel replacements; ``hardware`` is how a patch learns which card it is on;
+#: ``numerics`` decides whether the result matches, and must be the same code the run
+#: judged by. Each of these imports only the others, which is the property that keeps
+#: this list short — see the note at the top of the launcher.
+RUNTIME_FILES = (
+    "__init__.py",
+    "hardware.py",
+    "runtime/__init__.py",
+    "runtime/launcher.py",
+    "runtime/compat.py",
+    "verify/__init__.py",
+    "verify/numerics.py",
+)
+
+
+def vendor_runtime(run_root: str | Path) -> Path:
+    """Copy the launcher and its neighbours into the run, and return the import root.
+
+    A module's ``inference.py`` builds from these. Copying them in is what makes the
+    claim on the tin true — the artifact is the deliverable, and running a module out of
+    it must not need this harness installed, only ``torch``. They are copied under their
+    own package path so their imports of each other resolve unchanged: putting a path
+    into ``sys.path`` is the whole of what ``inference.py`` has to do.
+    """
+    import shutil
+
+    root = Path(run_root) / RUNTIME_DIR
+    package = root / "model_partition"
+    here = Path(__file__).resolve().parent
+    for relative in RUNTIME_FILES:
+        source = here / relative
+        destination = package / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.is_file() or destination.stat().st_mtime < source.stat().st_mtime:
+            shutil.copy2(source, destination)
+    return root
 
 
 def _is_main_guard(node: Any) -> bool:

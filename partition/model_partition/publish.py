@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from model_partition.extract import refresh_calls
 from model_partition.hardware import format_bytes
 
 #: Left out by default: agent transcripts, which are large and say nothing about the
@@ -32,9 +33,11 @@ REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
 
 #: Directories a published subset always carries whole. ``vendor`` is the model's own
 #: package, which ``source.py`` imports from; ``compat`` is what made its kernels run on
-#: the card that produced the reference. Without either, a module directory is a
-#: description of a computation rather than something anyone can run.
-ALWAYS = ("vendor", "compat", "plan", "reports")
+#: the card that produced the reference; ``runtime`` is the builder and the comparison a
+#: module's ``inference.py`` reads, so running one needs only ``torch``. Without any of
+#: them a module directory is a description of a computation rather than something anyone
+#: can run.
+ALWAYS = ("vendor", "compat", "runtime", "plan", "reports")
 
 #: A token file an operator may leave beside the checkout, searched when the Hub's own
 #: sources (``HF_TOKEN``, a login) have nothing. Read, never written and never logged;
@@ -80,11 +83,13 @@ def materialize_weights(run_dir: str | Path, module_ids: list[str],
     checkpoint stores it — no second, bfloat16 copy of the checkpoint is needed for that.
     """
     from model_partition.runtime.module_runner import TraceBundle
-    from model_partition.tensorstore import TensorStore
 
     root = Path(run_dir)
-    store = TensorStore.load(root / "trace")
     bundle = TraceBundle.load(root / "trace")
+    # The bundle's own store, not a second one opened on the same directory: saving the
+    # bundle rewrites the manifest from the store it holds, so anything written through
+    # another handle is erased by the save that was meant to record it.
+    store = bundle.store
     if bundle.checkpoint is None:
         bundle.checkpoint = _weight_source(root)
     added = 0
@@ -110,6 +115,17 @@ def materialize_weights(run_dir: str | Path, module_ids: list[str],
                 del tensor
         report(f"  {module_id}: {written} tensor(s), {format_bytes(added)} so far")
     store.save_manifest(store.metadata)
+    # And say so in the record the module runner reads. Writing the blobs without listing
+    # them leaves a directory that has its weights on disk and reports that it has none.
+    for entry in store.entries:
+        if entry.role == "weight" and entry.module_id in set(module_ids):
+            names = bundle.weights.setdefault(entry.module_id, [])
+            if entry.name not in names:
+                names.append(entry.name)
+    bundle.save()
+    # And in each module directory's own record, which is what its `inference.py` reads.
+    for directory in sorted((root / "modules").glob("*/")):
+        refresh_calls(bundle, directory)
     return added
 
 
@@ -151,13 +167,16 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     """Verify the published files on their own; returns what failed.
 
     Not a scan for suspicious paths — an actual run. The published files are copied
-    somewhere else with nothing else of this machine in reach, and each selected group's
-    own ``verify.py`` is run there against its recorded reference. If a module needs a
-    weight that stayed in the checkpoint, or a sibling of the model's package that was not
-    carried along, it fails here rather than in somebody else's hands.
+    somewhere else with nothing else of this machine in reach, and each selected group is
+    run there against its recorded reference. If a module needs a weight that stayed in
+    the checkpoint, or a sibling of the model's package that was not carried along, it
+    fails here rather than in somebody else's hands.
 
-    The one thing the copy does need is this package installed, which is the tool being
-    run and not part of the model.
+    Each group is run twice, because the two runs answer different questions.
+    ``verify.py`` is the harness's gate and may use this package; ``inference.py`` is what
+    somebody who downloads the artifact runs, and it is launched with this package taken
+    off ``sys.path`` — so it passes only if the copies under ``runtime/`` and ``vendor/``
+    inside the artifact are enough on their own.
     """
     import shutil
     import subprocess
@@ -184,17 +203,39 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
         if not (directory / "verify.py").is_file():
             failures.append(f"{group}: no verify.py was published")
             continue
-        finished = subprocess.run(
-            [sys.executable, "verify.py", "--all-samples"], cwd=directory,
-            capture_output=True, text=True, timeout=3600,
-        )
-        tail = (finished.stdout + finished.stderr).strip().splitlines()
-        if finished.returncode == 0:
-            report(f"  {group}: verified on its own")
-        else:
-            failures.append(f"{group}: {tail[-1] if tail else 'verify.py failed'}")
+        for label, command in (("verify.py", [sys.executable, "verify.py", "--all-samples"]),
+                               ("inference.py", _isolated_command())):
+            finished = subprocess.run(command, cwd=directory, capture_output=True,
+                                      text=True, timeout=3600)
+            tail = (finished.stdout + finished.stderr).strip().splitlines()
+            if finished.returncode == 0:
+                report(f"  {group}: {label} passed on its own")
+            else:
+                failures.append(f"{group}/{label}: {tail[-1] if tail else 'failed'}")
+                break
     shutil.rmtree(elsewhere, ignore_errors=True)
     return failures
+
+
+def _isolated_command() -> list[str]:
+    """Run ``inference.py`` with this package out of reach.
+
+    An import that resolves to the installed harness would make the check pass for a
+    module directory that cannot be run by anybody who does not have it — which is the
+    failure this is here to catch. So the harness's own directory is dropped from
+    ``sys.path`` in the child before it runs the file.
+    """
+    import sys
+
+    harness = str(Path(__file__).resolve().parent.parent)
+    program = "\n".join([
+        "import pathlib, runpy, sys",
+        f"harness = pathlib.Path({harness!r})",
+        "sys.path = [p for p in sys.path if pathlib.Path(p or '.').resolve() != harness]",
+        "sys.argv = ['inference.py', '--repeat', '1', '--warmup', '0']",
+        "runpy.run_path('inference.py', run_name='__main__')",
+    ])
+    return [sys.executable, "-c", program]
 
 
 def representative_modules(run_dir: str | Path) -> list[str]:
@@ -256,6 +297,17 @@ def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE,
     return files, sum(p.stat().st_size for p in files)
 
 
+def _all_modules(root: Path) -> list[str]:
+    """Every module the plan partitions, for a whole-run upload."""
+    from model_partition.planner.graph import PartitionGraph
+
+    try:
+        graph = PartitionGraph.load(root / "plan" / "partition_graph.yaml")
+    except Exception:
+        return []
+    return [module.id for module in graph.partitioned_modules]
+
+
 def _published_groups(root: Path, module_ids: set[str]) -> set[str]:
     """Group directory names serving any of these modules.
 
@@ -298,19 +350,32 @@ def publish_run(
     dry_run: bool = False,
     allow_unverified: bool = False,
     module_ids: list[str] | None = None,
+    upload_all: bool = False,
     skip_check: bool = False,
     report: Callable[[str], None] = lambda _message: None,
 ) -> PublishResult:
     """Upload a run directory, or a selection of its modules, as a dataset repo."""
     root = Path(run_dir)
-    if module_ids:
+    if module_ids and not dry_run:
         # The weights first: a subset has to carry its own, or nothing in it can be
         # checked away from the checkpoint it was traced against.
         added = materialize_weights(root, module_ids, report=report)
         if added:
             report(f"materialized {format_bytes(added)} of weights for "
                    f"{len(module_ids)} module(s)")
-    files, total = collect(root, exclude, module_ids=module_ids)
+    elif module_ids:
+        # A dry run says what would happen and writes nothing. Copying a selection's
+        # weights out of a 475 GiB checkpoint is hours of reading and hundreds of
+        # gigabytes on disk, which is not something to do on the way to a size estimate.
+        report(f"would materialize the weights of {len(module_ids)} module(s) "
+               "(skipped: this is a dry run)")
+    # ``upload_all`` separates what is verified from what is sent: the weights of a
+    # 475 GiB model cannot all be published, but everything the run *does* hold can be —
+    # every module's code, plan, reports and recorded feature maps — and a reader is better
+    # served by all of it than by a subset. The selection then says which modules also
+    # carry their weights, and so which can be verified where they land.
+    files, total = collect(root, exclude,
+                           module_ids=None if upload_all else module_ids)
     result = PublishResult(repo_id=repo_id, files=len(files), total_bytes=total,
                            dry_run=dry_run,
                            largest=[(p.relative_to(root).as_posix(), p.stat().st_size)
@@ -332,9 +397,16 @@ def publish_run(
     report(f"{len(files)} file(s), {format_bytes(total)}")
     for name, size in result.largest:
         report(f"  {format_bytes(size):>10}  {name}")
-    if not skip_check:
+    if dry_run and not skip_check and module_ids:
+        # Nothing was materialized, so a check now would fail on weights that publishing
+        # for real would have put there. Saying so beats a misleading failure.
+        report("not checking: a selection's weights are materialized on the real run")
+    elif not skip_check:
         report("checking the published files verify on their own")
-        failures = check_self_contained(root, files, module_ids or [], report=report)
+        # No selection means the whole run, so every group is checked — passing an empty
+        # list would intersect to nothing and report success without running anything.
+        checked = module_ids or _all_modules(root)
+        failures = check_self_contained(root, files, checked, report=report)
         if failures:
             raise PublishError(
                 "the selection does not verify on its own, so it would not verify for "
@@ -353,6 +425,8 @@ def publish_run(
         api.upload_large_folder(
             repo_id=repo_id, repo_type="dataset", folder_path=str(root),
             ignore_patterns=list(exclude) + ["**/__pycache__/**"],
+            **({"allow_patterns": sorted({p.relative_to(root).as_posix() for p in files})}
+               if module_ids else {}),
         )
     finally:
         if wrote_readme:

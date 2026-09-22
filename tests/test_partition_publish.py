@@ -74,6 +74,21 @@ def test_a_dry_run_reports_the_size_without_credentials(tmp_path):
     assert any("big.bin" in line for line in lines)
 
 
+def test_a_dry_run_does_not_materialize_a_selection(tmp_path, monkeypatch):
+    """Copying a selection's weights out of a 475 GiB checkpoint is not a size estimate."""
+    from model_partition import publish
+
+    root = _run(tmp_path)
+    called: list[object] = []
+    monkeypatch.setattr(publish, "materialize_weights",
+                        lambda *a, **k: called.append(a) or 0)
+    lines: list[str] = []
+    publish_run(root, "org/artifacts", dry_run=True, module_ids=["layers.0"],
+                skip_check=True, report=lines.append)
+    assert not called
+    assert any("would materialize" in line for line in lines)
+
+
 def test_publishing_without_a_token_says_so(tmp_path, monkeypatch):
     """And it says so before contacting the Hub, not after."""
     from model_partition import publish
@@ -176,10 +191,13 @@ def test_publishing_a_subset_writes_its_weights_into_the_run(tiny_run, tmp_path)
     bundle.weights.pop(module_id, None)
     bundle.save()
     assert materialize_weights(root, [module_id]) > 0
+    filled = TraceBundle.load(root / "trace")
+    entries = len(filled.store.entries)
 
-    # And again is a no-op: what is already there is not re-read.
-    added = materialize_weights(root, [module_id])
-    assert added == 0
+    # And again adds nothing: a module's weights are not read twice, which for a 94 GiB
+    # table is the difference between a publish and an afternoon.
+    materialize_weights(root, [module_id])
+    assert len(TraceBundle.load(root / "trace").store.entries) == entries
     added = dropped
     assert added > 0
     again = TraceBundle.load(root / "trace")

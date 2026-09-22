@@ -13,6 +13,13 @@ Nothing here reads the checkpoint or instantiates the whole model. The one thing
 vendored is the framework: ``source.py`` is loaded under its original package name so
 its own imports resolve against the installed ``torch`` and ``transformers``. The
 class bodies that run are the artifact's.
+
+This module imports nothing else from the harness beyond its two small neighbours
+(:mod:`~model_partition.runtime.compat` and :mod:`~model_partition.hardware`), which is
+what lets :func:`~model_partition.extract.vendor_runtime` copy it into a run so a
+module's ``inference.py`` builds from the artifact alone. Keep it that way: the names
+below live here rather than in :mod:`~model_partition.extract` because that module
+renders templates and a published artifact must not need a template engine to run.
 """
 
 from __future__ import annotations
@@ -29,6 +36,19 @@ SOURCE_MODULE_PREFIX = "_model_partition_source_"
 
 #: The config the module's subtree was built from, recorded by extraction.
 CONFIG_FILENAME = "config.json"
+
+#: The model's own package, copied into the run beside ``modules/``.
+VENDOR_DIR = "vendor"
+
+#: This module and its neighbours, copied into the run so a module directory builds
+#: without the harness installed.
+RUNTIME_DIR = "runtime"
+
+#: Config key extraction records the model's activation dtype under.
+COMPUTE_DTYPE_KEY = "_compute_dtype"
+
+#: The recorded call and weight map a module's ``inference.py`` reads, written beside it.
+CALLS_FILENAME = "calls.json"
 
 #: Imported source per directory. Executing a modeling file is not cheap and every
 #: module of a group asks for the same one.
@@ -138,8 +158,6 @@ def _vendor_on_path(directory: Path) -> Path | None:
     build from: nothing outside the run has to be present.
     """
     import sys
-
-    from model_partition.extract import VENDOR_DIR
 
     for root in (directory.parent.parent, directory.parent, directory):
         candidate = root / VENDOR_DIR
@@ -435,17 +453,15 @@ def build(
 
 def _compute_dtype(config: dict[str, Any]) -> Any:
     """The dtype the model's activations flow in, as extraction recorded it."""
-    from model_partition.extract import COMPUTE_DTYPE_KEY
+    import torch
 
     name = config.get(COMPUTE_DTYPE_KEY)
     if not name:
         return None
-    try:
-        from model_partition.loaders.base import torch_dtype
-
-        return torch_dtype(str(name))
-    except Exception:
-        return None
+    short = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
+    name = str(name).removeprefix("torch.")
+    dtype = getattr(torch, short.get(name, name), None)
+    return dtype if isinstance(dtype, torch.dtype) else None
 
 
 def _weights_dtype(weights: dict[str, Any]) -> Any:

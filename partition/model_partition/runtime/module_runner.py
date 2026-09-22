@@ -19,6 +19,9 @@ from model_partition import yamlio
 
 from model_partition.trace import CallRecord, _lookup, decode_value
 from model_partition.tensorstore import TensorStore
+# Re-exported from where it belongs: beside the comparison that needs it, which a
+# published module directory carries and this module is not part of.
+from model_partition.verify.numerics import first_tensor  # noqa: F401  (re-export)
 
 RECORDS_NAME = "records.yaml"
 
@@ -259,20 +262,3 @@ def expected_output(record: CallRecord, store: TensorStore, device: str = "cpu")
     return decode_value(record.output, load)
 
 
-def first_tensor(value: Any) -> Any | None:
-    """The first tensor in a possibly nested output structure."""
-    from model_partition.trace import is_tensor
-
-    if is_tensor(value):
-        return value
-    if isinstance(value, dict):
-        for item in value.values():
-            found = first_tensor(item)
-            if found is not None:
-                return found
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            found = first_tensor(item)
-            if found is not None:
-                return found
-    return None

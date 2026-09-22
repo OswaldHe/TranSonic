@@ -108,9 +108,11 @@ def test_source_is_the_implementation_and_names_where_it_came_from(tiny_run, tmp
 
 
 def _extract(run, tmp_path):
-    return extract(run.graph, run.build_model(), tmp_path / "modules",
+    # Into the run's own ``modules/``, where a module directory sits two levels below the
+    # ``runtime/`` and ``vendor/`` copies it imports from — as it does in a real run.
+    return extract(run.graph, run.build_model(), run.layout.modules_dir,
                    run_root=run.layout.root, sample_ids=run.sample_ids,
-                   weight_tensors=run.bundle.weights)
+                   weight_tensors=run.bundle.weights, bundle=run.bundle)
 
 
 def _script(run, tmp_path, name, *args, group_class="TinyDecoderLayer"):
@@ -119,8 +121,12 @@ def _script(run, tmp_path, name, *args, group_class="TinyDecoderLayer"):
 
     groups = _extract(run, tmp_path)
     group = next(g for g in groups if g.class_name == group_class)
+    # `inference.py` takes no run directory: it reads the paths recorded beside it, so
+    # the module runs wherever the artifact was unpacked. `verify.py` is the harness's
+    # and still works over a whole run.
+    run_args = [] if name == "inference.py" else ["--run", str(run.layout.root)]
     return subprocess.run(
-        [sys.executable, str(group.directory / name), "--run", str(run.layout.root), *args],
+        [sys.executable, str(group.directory / name), *run_args, *args],
         capture_output=True, text=True, timeout=300,
     )
 
@@ -132,9 +138,12 @@ def test_generated_scripts_are_valid_python_and_name_their_modules(tiny_run, tmp
         for name in ("inference.py", "verify.py"):
             text = (group.directory / name).read_text()
             ast.parse(text)  # raises on a broken template render
-            assert str(tiny_run.layout.root) in text
             for module_id in group.module_ids:
                 assert module_id in text
+        # The harness's verifier works over a run and names it. The launcher must not:
+        # it reads the paths recorded beside it, so it runs wherever the artifact went.
+        assert str(tiny_run.layout.root) in (group.directory / "verify.py").read_text()
+        assert str(tiny_run.layout.root) not in (group.directory / "inference.py").read_text()
 
 
 def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
@@ -142,7 +151,7 @@ def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
     completed = _script(tiny_run, tmp_path, "inference.py")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "output shape=" in completed.stdout
-    assert "dumped tensors" in completed.stdout
+    assert "dumped tensor(s)" in completed.stdout
 
 
 def test_inference_reports_error_and_latency_as_autohelix_metrics(tiny_run, tmp_path):
@@ -173,6 +182,59 @@ def test_inference_exits_nonzero_when_the_output_no_longer_matches(tiny_run, tmp
     assert parse_structured_metrics(completed.stdout)["passed"] == 0
     # The latency is still reported: it is the reason someone made the change.
     assert "latency_ms" in parse_structured_metrics(completed.stdout)
+
+
+def test_inference_runs_with_the_harness_off_the_path(tiny_run, tmp_path):
+    """The artifact is the deliverable: running a module must not need this package.
+
+    So the launcher is run with the harness's own directory dropped from ``sys.path``,
+    which is what somebody who downloads the artifact has. It passes on the copies
+    extraction left under ``runtime/`` and ``vendor/`` inside the run, or not at all.
+    """
+    import subprocess
+    import sys
+
+    from autohelix.checks import parse_structured_metrics
+    from model_partition import publish
+
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    completed = subprocess.run(publish._isolated_command(), cwd=group.directory,
+                               capture_output=True, text=True, timeout=300)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert parse_structured_metrics(completed.stdout)["passed"] == 1
+
+
+def test_extraction_copies_the_runtime_into_the_run(tiny_run, tmp_path):
+    """What `inference.py` imports has to travel with the artifact."""
+    _extract(tiny_run, tmp_path)
+    vendored = tiny_run.layout.root / "runtime" / "model_partition"
+    assert (vendored / "runtime" / "launcher.py").is_file()
+    assert (vendored / "verify" / "numerics.py").is_file()
+    # And nothing that drags the rest of the harness in behind it: every module it
+    # imports has to be one of the copies beside it.
+    for path in vendored.rglob("*.py"):
+        for line in path.read_text().splitlines():
+            if line.startswith(("import model_partition", "from model_partition")):
+                dotted = line.split()[1].removeprefix("model_partition.")
+                assert (vendored / (dotted.replace(".", "/") + ".py")).is_file(), line
+
+
+def test_calls_json_names_every_tensor_a_module_needs(tiny_run, tmp_path):
+    """`calls.json` is how a module directory finds its own inputs without a YAML parser."""
+    import json
+
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    payload = json.loads((group.directory / "calls.json").read_text())
+    entry = payload["modules"][group.module_ids[0]]
+    assert entry["weights"] and entry["calls"]
+    call = next(iter(entry["calls"].values()))[0]
+    spec = call["args"][0]["__tensor__"]
+    assert set(spec) == {"bin", "dtype", "shape"}
+    # Relative to the module directory, so the artifact can be unpacked anywhere.
+    assert not spec["bin"].startswith("/")
+    assert (group.directory / spec["bin"]).resolve().is_file()
 
 
 def test_inference_script_can_save_its_output(tiny_run, tmp_path):
@@ -460,7 +522,7 @@ def test_an_optimized_source_survives_the_next_extraction(tiny_run, tmp_path):
     # Still launchable: the preserved file is the implementation, as recorded.
     assert next(g for g in again if g.directory == directory).launchable
 
-    extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+    extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
             run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
             weight_tensors=tiny_run.bundle.weights, regenerate=True)
     assert (directory / "source.py").read_text() != optimized
@@ -578,3 +640,24 @@ def test_the_principal_submodule_is_the_one_with_the_parameters():
     small, large = Fake(4), Fake(400)
     assert _principal([small, large]) is large
     assert _principal([large, small]) is large
+
+
+def test_a_copied_module_reads_its_own_run_not_the_one_that_made_it(tiny_run, tmp_path):
+    """The run path is recorded at extraction, and on somebody else's machine that path
+    does not exist. A module directory sits inside its run, so it finds it relative to
+    itself and falls back to the recorded path only when moved out of one."""
+    import shutil
+
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    text = (group.directory / "verify.py").read_text()
+    assert "RECORDED_RUN" in text and "__file__" in text
+
+    # The run copied whole, somewhere the original path does not reach.
+    elsewhere = tmp_path / "downloaded"
+    shutil.copytree(tiny_run.layout.modules_dir, elsewhere / "modules")
+    shutil.copytree(Path(tiny_run.layout.root) / "trace", elsewhere / "trace")
+    namespace: dict = {"__file__": str(elsewhere / "modules" / group.directory.name / "verify.py")}
+    exec(compile((group.directory / "verify.py").read_text(), "verify.py", "exec"),
+         namespace)
+    assert Path(namespace["DEFAULT_RUN"]) == elsewhere

@@ -27,7 +27,29 @@ from pathlib import Path
 MODULE_IDS = {{ module_ids | tojson }}
 SIGNATURE = {{ signature | tojson }}
 SAMPLE_IDS = {{ sample_ids | tojson }}
-DEFAULT_RUN = {{ run_root | tojson }}
+#: The run this module belongs to. Found relative to this file — modules/<group>/ sits
+#: inside the run — so a directory that has been copied or downloaded reads its own
+#: artifacts rather than a path on the machine that produced it. The recorded path is the
+#: fallback, for a module directory moved out of its run.
+RECORDED_RUN = {{ run_root | tojson }}
+DEFAULT_RUN = str(Path(__file__).resolve().parent.parent.parent
+                  if (Path(__file__).resolve().parent.parent.parent / "trace").is_dir()
+                  else RECORDED_RUN)
+
+
+def _default_device() -> str:
+    """The accelerator when there is one.
+
+    Not a preference: a quantized model's kernels are compiled for the GPU and refuse
+    their own inputs anywhere else, so defaulting to the host would report a device
+    mismatch rather than a number.
+    """
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,7 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Verify every module sharing this implementation")
     parser.add_argument("--sample", default=None, help="Sample id (default: first traced)")
     parser.add_argument("--all-samples", action="store_true", help="Verify every traced sample")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default=_default_device(),
+                        help="Default: cuda when there is one. A quantized model's "
+                             "kernels run nowhere else")
     parser.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
     parser.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     return parser

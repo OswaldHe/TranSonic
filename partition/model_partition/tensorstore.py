@@ -113,22 +113,49 @@ class TensorMeta:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def contiguous_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
-    """Extract (raw bytes, dtype name, shape) from a torch tensor or numpy array."""
+def contiguous_view(tensor: Any) -> tuple[Any, str, list[int]]:
+    """A zero-copy view of a tensor's bytes, its dtype name, and its shape.
+
+    A ``memoryview`` rather than ``bytes``: asking for the bytes copies the whole tensor,
+    so a tensor larger than half of memory could not be written at all — and DeepSeek
+    V4.1's n-gram table is 94.4 GiB on a 124 GiB host. A view can be hashed and written in
+    chunks with nothing duplicated.
+
+    For a dtype numpy has no name for — bfloat16, fp8, a packed fp4 pair — the bytes are
+    reinterpreted as ``uint8`` first, which loses nothing: :meth:`TensorStore.read_torch`
+    reads them back as what they are.
+    """
     if hasattr(tensor, "detach"):  # torch
         import torch
 
         t = tensor.detach().to("cpu").contiguous()
         name = dtype_name(t.dtype)
-        # A dtype numpy has no name for is written as its bytes: numpy cannot hold a
-        # bfloat16, an fp8 or a packed fp4 pair, and reinterpreting loses nothing.
-        raw = (t.view(torch.uint8).numpy().tobytes() if DTYPES[name][1] is None
-               else t.numpy().tobytes())
-        return raw, name, list(t.shape)
+        array = (t.view(torch.uint8) if DTYPES[name][1] is None else t).numpy()
+        return memoryview(array).cast("B"), name, list(t.shape)
     import numpy as np
 
     array = np.ascontiguousarray(tensor)
-    return array.tobytes(), dtype_name(array.dtype), list(array.shape)
+    return memoryview(array).cast("B"), dtype_name(array.dtype), list(array.shape)
+
+
+#: Bytes moved per read and per hash update. Large enough that a hundred-gigabyte
+#: tensor is not a hundred million calls, small enough to stay in cache.
+CHUNK = 32 << 20
+
+
+def _digest(view: memoryview) -> str:
+    """The sha256 of a tensor's bytes, without copying them."""
+    digest = hashlib.sha256()
+    for start in range(0, view.nbytes, CHUNK):
+        digest.update(view[start:start + CHUNK])
+    return digest.hexdigest()
+
+
+def _write(target: Path, view: memoryview) -> None:
+    """Write a tensor's bytes, streaming so nothing is held twice."""
+    with open(target, "wb") as handle:
+        for start in range(0, view.nbytes, CHUNK):
+            handle.write(view[start:start + CHUNK])
 
 
 class TensorStore:
@@ -156,8 +183,9 @@ class TensorStore:
         slice_info: SliceInfo | None = None,
         extra: dict[str, Any] | None = None,
     ) -> TensorMeta:
-        raw, dtype, shape = contiguous_bytes(tensor)
-        digest = hashlib.sha256(raw).hexdigest()
+        view, dtype, shape = contiguous_view(tensor)
+        digest = _digest(view)
+        nbytes = view.nbytes
         directory = self.root / subdir if subdir else self.root
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{name}.bin"
@@ -167,16 +195,16 @@ class TensorStore:
             try:
                 target.hardlink_to(existing)
             except OSError:
-                target.write_bytes(raw)
+                _write(target, view)
         else:
-            target.write_bytes(raw)
+            _write(target, view)
             self._by_hash.setdefault(digest, target)
 
         meta = TensorMeta(
             name=name,
             dtype=dtype,
             shape=shape,
-            nbytes=len(raw),
+            nbytes=nbytes,
             sha256=digest,
             path=str(target.relative_to(self.root)),
             role=role,

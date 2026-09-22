@@ -7,6 +7,21 @@ not editable: it decides whether this implementation is correct.
 Shared by {{ module_ids | length }} module(s):
 {% for module_id in module_ids %}  - {{ module_id }}{% if layer_map[module_id] %}  layers {{ layer_map[module_id] | join(', ') }}{% endif %}
 {% endfor %}
+## What this reads
+
+Everything comes out of the artifact directory this file sits in, and nothing else:
+
+    source.py       the implementation — {{ class_names | join(' then ') }}, verbatim from the model's own code
+    config.json     the config that subtree was constructed with
+    calls.json      the recorded call: which .bin holds each argument, weight and output
+    ../../runtime/  the builder and the comparison, copied in beside `modules/`
+    ../../trace/    the .bin data those paths point at
+    ../../vendor/   the model's sibling modules, for `source.py`'s own imports
+
+Beyond that it imports `torch` and the standard library. There is no dependency on
+the harness that produced the run, so this directory runs wherever the artifact is
+unpacked.
+
 ## The contract
 
     build_module(config, weights, device, submodule=None) -> callable
@@ -22,20 +37,10 @@ reference.
 set of MoE experts, where one recorded call exercises one expert. Drop it from the
 signature if this module has a single submodule.
 
-## What runs
-
-`source.py` beside this file **is** the implementation. This launcher imports it,
-constructs {{ class_names | join(' then ') }} from the recorded config, loads the
-dumped weights in, and returns the module. Nothing reads the checkpoint and nothing
-instantiates the rest of the model, so this directory is a unit you can optimize on
-its own.
-
-Optimize `source.py`. Then:
+## Running this file
 
     python inference.py                              # run it: error + latency
     python verify.py --all-modules --all-samples     # is it still correct?
-
-## Running this file
 
 It launches `source.py`, times it, and compares the result against the dumped
 reference. The metrics are printed in autohelix's capturable form:
@@ -49,9 +54,16 @@ reference. The metrics are printed in autohelix's capturable form:
 The exit code is 0 only when the output still matches, so a faster module that is
 wrong cannot read as an improvement. That makes this file usable directly as the
 benchmark command of an optimization loop over this one module.
+
+Optimize `source.py`.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 MODULE_IDS = {{ module_ids | tojson }}
 LAYER_MAP = {{ layer_map | tojson }}
@@ -61,6 +73,10 @@ CLASS_NAME = {{ class_name | tojson }}
 CLASS_NAMES = {{ class_names | tojson }}
 SUBMODULES = {{ submodules | tojson }}
 MODULE_SUBMODULES = {{ module_submodules | tojson }}
+#: The run's samples, in the order it took them: short prompts first. Which one this
+#: file runs by default, so a quick check is a quick check rather than the longest
+#: sequence in the run.
+SAMPLE_IDS = {{ sample_ids | tojson }}
 #: Dotted name source.py's classes were defined under, so its own imports resolve.
 SOURCE_MODULE = {{ source_module | tojson }}
 #: The config class these modules are constructed with, recorded rather than guessed.
@@ -68,20 +84,141 @@ CONFIG_CLASS = {{ config_class | tojson }}
 LAUNCHABLE = {{ 'True' if launchable else 'False' }}
 COMPOSITION = {{ composition | tojson }}
 WEIGHT_NAMES = {{ weight_names | tojson }}
-DEFAULT_RUN = {{ run_root | tojson }}
+
+
+def _vendor_on_path():
+    """Put the run's own copies of the code this file needs onto `sys.path`.
+
+    `../../runtime` holds the builder and the comparison; `../../vendor` holds the
+    model's package, which `source.py` imports from — it is a slice of one file of that
+    package and keeps that file's imports. Both are inside the artifact, so nothing
+    outside it has to be installed.
+    """
+    import sys
+
+    for relative in ("runtime", "vendor"):
+        for root in (HERE.parent.parent, HERE.parent, HERE):
+            candidate = root / relative
+            if candidate.is_dir():
+                entry = str(candidate.resolve())
+                if entry not in sys.path:
+                    sys.path.insert(0, entry)
+                break
 
 
 def load_implementation():
     """Import `source.py` beside this file. That file is the implementation.
 
     It is loaded under its original package name so its own relative imports resolve,
-    without taking the installed module's place.
+    without taking the installed module's place. The run's `compat/` patches are applied
+    to it as they were during tracing.
     """
-    from pathlib import Path
-
+    _vendor_on_path()
     from model_partition.runtime.launcher import load_source
 
-    return load_source(Path(__file__).resolve().parent, SOURCE_MODULE)
+    return load_source(HERE, SOURCE_MODULE)
+
+
+def module_config():
+    """The config this module's subtree was constructed with."""
+    path = HERE / "config.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def recorded_calls():
+    """`calls.json`: the tensors this group's modules were called with."""
+    path = HERE / "calls.json"
+    if not path.is_file():
+        raise SystemExit(f"error: {path} is missing; re-run extraction over the trace")
+    return json.loads(path.read_text())["modules"]
+
+
+def read_tensor(spec, device="cpu"):
+    """One dumped tensor, from the `.bin` its recorded path points at.
+
+    The bytes are read as `uint8` and reinterpreted, which is how they were written and
+    the only way that works for every dtype in play: `torch.frombuffer` does not take
+    bfloat16, fp8, a packed fp4 pair or a complex rotary table, and all four are here.
+    """
+    import torch
+
+    path = (HERE / spec["bin"]).resolve()
+    if not path.is_file():
+        raise SystemExit(f"error: {path} is missing from the artifact")
+    dtype = getattr(torch, spec["dtype"], None)
+    if not isinstance(dtype, torch.dtype):
+        raise SystemExit(f"error: this torch has no dtype {spec['dtype']!r}")
+    flat = torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8)
+    if dtype is not torch.uint8:
+        flat = flat.view(dtype)
+    return flat.reshape(spec["shape"]).to(device)
+
+
+def decode(value, device="cpu"):
+    """Rebuild a recorded argument tree, reading each tensor it names."""
+    if isinstance(value, dict):
+        if "__tensor__" in value:
+            spec = value["__tensor__"]
+            if not isinstance(spec, dict):  # a tensor the run chose not to dump
+                raise SystemExit(f"error: tensor {spec!r} was not dumped; "
+                                 "re-run the trace with weight caching on")
+            return read_tensor(spec, device)
+        if "__unsupported__" in value:
+            return None
+        if "__tuple__" in value:
+            return tuple(decode(item, device) for item in value["__tuple__"])
+        if "__list__" in value:
+            return [decode(item, device) for item in value["__list__"]]
+        return {key: decode(item, device) for key, item in value.items()}
+    return value
+
+
+def group_call(calls, device="cpu"):
+    """Arguments for the whole group, not just its first submodule.
+
+    A group can be heterogeneous — a normalization followed by attention — and then the
+    first submodule's recorded call says nothing about the positions and shared state the
+    attention needs. The value flowing in comes from the group's entry point; everything
+    beyond it is the union over the group, so whatever the module does internally, it was
+    given everything. First occurrence wins, so a keyword that changes down the group
+    keeps the value the entry point saw.
+    """
+    args = [decode(item, device) for item in calls[0]["args"]]
+    kwargs = {k: decode(v, device) for k, v in (calls[0].get("kwargs") or {}).items()}
+    extras = tuple(args[1:])
+    for call in calls[1:]:
+        for key, value in (call.get("kwargs") or {}).items():
+            kwargs.setdefault(key, decode(value, device))
+        other = [decode(item, device) for item in call["args"]]
+        if len(other) - 1 > len(extras):
+            extras = tuple(other[1:])
+    return (tuple(args[:1]) + extras if args else extras), kwargs
+
+
+def apply_state(source, calls, device="cpu"):
+    """Put back the cross-module state the recorded call ran on.
+
+    A model that passes tensors between modules through a module-level object — the
+    compressed KV DeepSeek's attention layers share — leaves a consumer with no argument
+    naming the largest thing it reads. Restoring it on this module's own `source.py` is
+    what makes the check one of this module against its reference, rather than of this
+    module against another having run first.
+    """
+    applied = 0
+    for call in calls:
+        for dotted, encoded in (call.get("state") or {}).items():
+            holder_name, _, attribute = dotted.rpartition(".")
+            holder = getattr(source, holder_name, None)
+            if holder is None:
+                continue
+            setattr(holder, attribute, decode(encoded, device))
+            applied += 1
+    return applied
+
+
+def load_weights(entry, device="cpu"):
+    """This module's dumped weights, keyed by original parameter name."""
+    return {name: read_tensor(spec, device) for name, spec in (entry["weights"]).items()}
 
 
 def build_module(config, weights, device="cpu", submodule=None):
@@ -93,13 +230,12 @@ def build_module(config, weights, device="cpu", submodule=None):
     which expert of a parallel group, or which submodule when these are installed into
     a model.
     """
-    from pathlib import Path
-
+    _vendor_on_path()
     from model_partition.runtime.launcher import build_group
 
     source = load_implementation()
     return build_group(
-        Path(__file__).resolve().parent, config, weights, device=device,
+        HERE, config, weights, device=device,
         source=source, source_module=SOURCE_MODULE, class_names=CLASS_NAMES,
         config_class=CONFIG_CLASS, submodules=MODULE_SUBMODULES,
         layer_map=LAYER_MAP, submodule=submodule,
@@ -121,58 +257,82 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(
         description="Launch this module's implementation, then time it and check it.")
-    parser.add_argument("--run", default=DEFAULT_RUN, help="Run directory")
     parser.add_argument("--module", default=MODULE_IDS[0], choices=MODULE_IDS)
-    parser.add_argument("--sample", default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--sample", default=None, help="Recorded sample id")
+    parser.add_argument("--step", type=int, default=None,
+                        help="Decode step; the prefill pass by default")
+    parser.add_argument("--device", default=None, help="cuda when there is one")
     parser.add_argument("--repeat", type=int, default=10, help="Timed forward passes")
     parser.add_argument("--warmup", type=int, default=2, help="Untimed passes first")
     parser.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
     parser.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     parser.add_argument("--save", default=None, help="Write the output as a raw .bin")
+    parser.add_argument("--list", action="store_true", help="List what was recorded, and stop")
     args = parser.parse_args(argv)
 
-    from model_partition.runtime.module_runner import (
-        decode_group_call, expected_output, first_tensor, load_named_weights,
-    )
-    from model_partition.runtime.standalone import StandaloneError, load_run
-    from model_partition.verify.numerics import Tolerance, compare_outputs
+    _vendor_on_path()
+    import torch
 
-    parallel = COMPOSITION == "parallel"
-    try:
-        run = load_run(args.run)
-        sample = args.sample or (run.bundle.sample_ids() or [None])[0]
-        records = run.bundle.select(module_id=args.module, sample_id=sample)
-        if not records:
-            raise StandaloneError(f"No records for {args.module} sample {sample}")
-        weights = load_named_weights(run.bundle, args.module, device=args.device)
-        args_, kwargs_ = decode_group_call(records, run.bundle.store, args.device)
-        # A parallel group's calls are independent — one expert each — so the first
-        # call's own output is the reference. A sequential group is one computation
-        # from the first submodule's input to the last submodule's output.
-        reference = expected_output(records[0] if parallel else records[-1],
-                                    run.bundle.store, device=args.device)
-    except StandaloneError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    from model_partition.verify.numerics import Tolerance, compare_outputs, first_tensor
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    modules = recorded_calls()
+    entry = modules.get(args.module)
+    if entry is None:
+        print(f"error: {args.module} is not in calls.json", file=sys.stderr)
         return 2
+    # The prefill pass of the first sample unless something else is asked for: it is the
+    # pass every module has, and a group's submodules all appear in it.
+    def order(key):
+        sample, _, step = key.rpartition("#")
+        known = SAMPLE_IDS.index(sample) if sample in SAMPLE_IDS else len(SAMPLE_IDS)
+        return (int(step), known, sample)
+
+    keys = sorted(entry["calls"], key=order)
+    if args.list:
+        for key in keys:
+            print(f"  {key}  {len(entry['calls'][key])} call(s)")
+        return 0
+    wanted = [k for k in keys
+              if (args.sample is None or k.rsplit("#", 1)[0] == args.sample)
+              and (args.step is None or int(k.rsplit("#", 1)[1]) == args.step)]
+    if not wanted:
+        print(f"error: nothing recorded for sample {args.sample!r} step {args.step!r}; "
+              f"have {keys}", file=sys.stderr)
+        return 2
+    calls = entry["calls"][wanted[0]]
+    parallel = COMPOSITION == "parallel"
 
     print(f"group    : {SIGNATURE}")
     print(f"module   : {args.module}  layers={LAYER_MAP.get(args.module) or '-'}")
-    print(f"weights  : {len(weights)} dumped tensors")
+    print(f"recorded : {wanted[0]}  {len(calls)} call(s) on {device}")
+    missing = entry.get("weights_missing") or []
+    print(f"weights  : {len(entry['weights'])} dumped tensor(s)"
+          + (f", {len(missing)} not in the artifact" if missing else ""))
+    if missing:
+        print(f"  first missing: {missing[0]}")
 
-    import torch
+    weights = load_weights(entry, device)
+    call_args, call_kwargs = group_call(calls, device)
+    # A parallel group's calls are independent — one expert each — so the first call's
+    # own output is the reference. A sequential group is one computation from the first
+    # submodule's input to the last submodule's output.
+    reference = decode((calls[0] if parallel else calls[-1])["output"], device)
 
-    module = build_module(run.bundle.config, weights, device=args.device,
-                          submodule=records[0].submodule if parallel else None)
+    module = build_module(module_config(), weights, device=device,
+                          submodule=calls[0]["submodule"] if parallel else None)
+    applied = apply_state(load_implementation(), calls, device)
+    if applied:
+        print(f"state    : {applied} cross-module tensor(s) restored")
 
     def once():
         with torch.no_grad():
-            return module(*args_, **kwargs_)
+            return module(*call_args, **call_kwargs)
 
     def settle():
         # An accelerator call queues rather than completes, so nothing timed around
         # it means anything until the device has caught up.
-        if args.device.startswith("cuda"):
+        if str(device).startswith("cuda"):
             torch.cuda.synchronize()
 
     for _ in range(max(args.warmup, 0)):
@@ -191,7 +351,7 @@ def main(argv=None):
     print(f"  output shape={tuple(tensor.shape) if tensor is not None else None} "
           f"dtype={getattr(tensor, 'dtype', None)}")
     print(f"  latency {latency:.3f} ms  (median of {len(timings)}, "
-          f"{timings[0]:.3f}-{timings[-1]:.3f} ms on {args.device})")
+          f"{timings[0]:.3f}-{timings[-1]:.3f} ms on {device})")
 
     tolerance = None
     if args.rtol is not None or args.atol is not None:
@@ -218,12 +378,10 @@ def main(argv=None):
     print(f"##autohelix[passed={1 if passed else 0}]")
 
     if args.save and tensor is not None:
-        from model_partition.tensorstore import contiguous_bytes
-
-        raw, dtype, shape = contiguous_bytes(tensor)
+        raw = tensor.detach().to("cpu").contiguous()
         with open(args.save, "wb") as handle:
-            handle.write(raw)
-        print(f"wrote {args.save}  ({dtype} {tuple(shape)}, {len(raw)} bytes)")
+            handle.write(memoryview(raw.view(torch.uint8).numpy()).cast("B"))
+        print(f"wrote {args.save}  ({raw.dtype} {tuple(raw.shape)})")
 
     verdict = "PASS" if passed else "FAIL"
     print(f"{verdict}: {args.module} in {latency:.3f} ms, "
