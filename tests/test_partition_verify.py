@@ -500,6 +500,27 @@ def test_a_derived_buffer_the_recording_lacks_is_not_missing(tmp_path):
     assert missing == ["scale"]
 
 
+def test_a_class_gets_the_config_value_under_the_name_the_config_uses():
+    """A class names its argument for what it does with it and a config names it for what
+    it configures. DeepSeek's config says `norm_eps: 1e-20` and `RMSNorm.__init__`
+    defaults `eps` to 1e-6, so taking the default built a normalization that ran, looked
+    built, and was wrong by 0.4% — enough to fail every module downstream of one."""
+    from torch import nn
+
+    from model_partition.runtime.launcher import _config_kwargs
+
+    class Norm(nn.Module):
+        def __init__(self, dim: int, eps: float = 1e-6):
+            super().__init__()
+            self.dim, self.eps = dim, eps
+
+    for key in ("norm_eps", "rms_norm_eps", "layer_norm_eps"):
+        kwargs = _config_kwargs(Norm, {"hidden_size": 5120, key: 1e-20}, None)
+        assert kwargs == {"dim": 5120, "eps": 1e-20}, key
+    # The class's own name still wins where the config uses it.
+    assert _config_kwargs(Norm, {"dim": 8, "eps": 0.5}, None) == {"dim": 8, "eps": 0.5}
+
+
 def test_a_recorded_tensor_that_already_fits_becomes_the_parameter():
     """Copying into a freshly allocated parameter holds the module twice, which a 94.4
     GiB n-gram table does not allow — and fp4-packed expert weights have no `copy_` at

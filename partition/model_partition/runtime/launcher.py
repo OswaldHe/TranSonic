@@ -112,6 +112,7 @@ def load_source(directory: str | Path, source_module: str | None = None,
         raise LauncherError(f"Could not import {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
+    _vendor_on_path(Path(directory))
     # No `__pycache__` in the module directory: it is a deliverable someone reads and
     # copies, and a stale cache of a file they are editing is worse than no cache.
     written = sys.dont_write_bytecode
@@ -126,6 +127,28 @@ def load_source(directory: str | Path, source_module: str | None = None,
     _apply_compat(module, Path(directory), device)
     _SOURCE_CACHE[key] = module
     return module
+
+
+def _vendor_on_path(directory: Path) -> Path | None:
+    """Put the run's copy of the model's package where ``source.py``'s imports find it.
+
+    ``source.py`` is a slice of one file of that package and keeps its imports, so it
+    needs its siblings — ``from kernel import fp8_gemm``. They travel with the run under
+    ``vendor/``, which is what makes a module directory something you can take away and
+    build from: nothing outside the run has to be present.
+    """
+    import sys
+
+    from model_partition.extract import VENDOR_DIR
+
+    for root in (directory.parent.parent, directory.parent, directory):
+        candidate = root / VENDOR_DIR
+        if candidate.is_dir():
+            entry = str(candidate.resolve())
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+            return candidate
+    return None
 
 
 def _apply_compat(module: Any, directory: Path, device: Any) -> None:
@@ -822,6 +845,17 @@ SHAPE_CONSTRUCTORS: dict[str, Any] = {
 #: Parameter names that mean "which repetition of the stack is this".
 INDEX_PARAMETERS = ("layer_idx", "layer_index", "layer_id", "layer")
 
+#: Constructor parameter -> the names a config might hold its value under. A class names
+#: its own argument for what it does with it and a config names it for what it configures,
+#: so the two rarely agree on an epsilon or a width. Getting this wrong builds a module
+#: that runs, which is worse than one that does not.
+CONFIG_ALIASES: dict[str, tuple[str, ...]] = {
+    "eps": ("norm_eps", "rms_norm_eps", "layer_norm_eps", "layernorm_epsilon", "epsilon"),
+    "dim": ("hidden_size", "d_model", "n_embd"),
+    "hidden_size": ("dim", "d_model", "n_embd"),
+    "vocab_size": ("padded_vocab_size",),
+}
+
 #: Classmethods that build a helper object from the model's config alone.
 FROM_CONFIG = ("from_args", "from_config")
 
@@ -984,9 +1018,11 @@ def _named_kwargs(parameters: list[str], config: dict[str, Any],
     """Every constructor parameter after the first that the config can fill by name."""
     values: dict[str, Any] = {}
     for name in parameters[1:]:
-        if name in config:
-            values[name] = config[name]
-        elif layer_index is not None and name in ("layer_idx", "layer_index", "layer"):
+        alias = next((key for key in (name, *CONFIG_ALIASES.get(name, ())) if key in config),
+                     None)
+        if alias is not None:
+            values[name] = config[alias]
+        elif layer_index is not None and name in INDEX_PARAMETERS:
             values[name] = layer_index
     return values
 
@@ -997,6 +1033,13 @@ def _config_kwargs(cls: Any, config: dict[str, Any],
 
     Returns None unless every parameter without a default is satisfied, so this is
     tried as a real possibility rather than a guess that half-builds something.
+
+    A parameter the config names differently is taken through :data:`CONFIG_ALIASES`,
+    and a parameter left at its class default is the thing to be most careful about: it
+    looks like a successful build. DeepSeek's config says ``norm_eps: 1e-20`` and
+    ``RMSNorm.__init__`` defaults ``eps`` to ``1e-6``, so every normalization came out
+    quietly wrong — by 0.4% on its own output, and by enough after the attention it feeds
+    to fail 87 checks while still reading as cosine 0.9999.
     """
     import inspect
 
@@ -1007,9 +1050,11 @@ def _config_kwargs(cls: Any, config: dict[str, Any],
 
     kwargs: dict[str, Any] = {}
     for name, parameter in parameters.items():
-        if name in config:
-            kwargs[name] = config[name]
-        elif name in ("layer_idx", "layer_index", "layer") and layer_index is not None:
+        alias = next((key for key in (name, *CONFIG_ALIASES.get(name, ())) if key in config),
+                     None)
+        if alias is not None:
+            kwargs[name] = config[alias]
+        elif name in INDEX_PARAMETERS and layer_index is not None:
             kwargs[name] = layer_index
         elif parameter.default is inspect.Parameter.empty:
             return None

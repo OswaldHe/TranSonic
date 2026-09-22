@@ -466,6 +466,32 @@ def test_an_optimized_source_survives_the_next_extraction(tiny_run, tmp_path):
     assert (directory / "source.py").read_text() != optimized
 
 
+def test_a_module_directory_builds_with_nothing_of_the_model_repo_present(tiny_run, tmp_path):
+    """`source.py` is a slice of one file of the model's package and keeps that file's
+    imports, so the siblings travel with the run. Without them the artifacts would only
+    work on the machine that made them."""
+    import shutil
+
+    from model_partition.extract import VENDOR_DIR
+    from model_partition.runtime.launcher import clear_source_cache, load_source
+
+    groups = _extract(tiny_run, tmp_path)
+    vendor = Path(tiny_run.layout.root) / VENDOR_DIR
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    for origin in group.source_files:
+        assert (vendor / Path(origin).name).is_file(), f"{origin} was not carried along"
+
+    # A copy with the repo nowhere near it: the run's vendor directory and one group.
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "modules").mkdir(parents=True)
+    shutil.copytree(vendor, elsewhere / VENDOR_DIR)
+    shutil.copytree(group.directory, elsewhere / "modules" / group.directory.name)
+
+    clear_source_cache()
+    source = load_source(elsewhere / "modules" / group.directory.name)
+    assert hasattr(source, "TinyDecoderLayer")
+
+
 def test_a_launcher_beside_no_implementation_is_not_preserved(tiny_run, tmp_path):
     """What an agent leaves in a directory the harness has not written yet. Preserving it
     would let a file written against nothing survive every later extraction."""

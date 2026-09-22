@@ -33,6 +33,13 @@ SOURCE_FILENAME = "source.py"
 #: directory carries everything needed to construct the module.
 CONFIG_FILENAME = "config.json"
 
+#: Where a run keeps the model's own sibling modules, at its root beside ``modules/``.
+#: ``source.py`` is a slice of one file of the vendor's package and keeps that file's
+#: imports — DeepSeek's attention needs ``kernel`` for its GEMMs and ``engram`` for the
+#: n-gram layout — so without these a module directory needs the model's repo present to
+#: import at all, and the artifacts would only work on the machine that made them.
+VENDOR_DIR = "vendor"
+
 #: Config fields a framework keeps private and ``to_dict()`` leaves out, but which
 #: decide what a module computes. The attention implementation is the one that
 #: matters: a recorded call carries ``attention_mask=None`` when the traced kernel
@@ -78,7 +85,8 @@ SOURCE_BANNER = """\
 # here is what changes what runs, and `verify.py` tells you whether the result still
 # reproduces the dumped reference. Nothing here reads the checkpoint.
 #
-# Its own imports resolve against the installed framework; the class bodies are this
+# Its imports resolve against the installed framework and against `vendor/` at the root
+# of this run, which holds the model's own sibling modules. The class bodies are this
 # file's.
 
 """
@@ -262,6 +270,7 @@ def extract(
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     groups: list[ExtractedGroup] = []
+    vendored: set[Path] = set()
 
     for index, (signature, module_ids) in enumerate(sorted(graph.signature_groups().items())):
         modules = [graph.by_id(mid) for mid in module_ids]
@@ -280,6 +289,7 @@ def extract(
         else:
             sources, names, files = collect_group_sources(targets)
             group.class_name = type(_principal(targets)).__name__
+            vendored |= vendor_code(run_root, files)
         group.classes = names
         group.source_files = files
 
@@ -426,6 +436,44 @@ def _wanted_classes(principal: Any, classes: list[str]) -> list[str]:
     return wanted
 
 
+def vendor_code(run_root: str | Path, origin_files: list[str]) -> set[Path]:
+    """Copy the model's own package into the run, beside ``modules/``.
+
+    Returns the files copied. ``source.py`` is a slice of one file of that package and
+    keeps its imports, so the sibling modules have to travel with it: DeepSeek's
+    attention imports its GEMMs from ``kernel`` and its n-gram layout from ``engram``,
+    and neither is anything this loop could vendor by slicing. Only the ``.py`` files
+    beside each originating file are taken — not the weights, not the examples.
+    """
+    import shutil
+
+    target = Path(run_root) / VENDOR_DIR
+    copied: set[Path] = set()
+    for origin in origin_files:
+        source_dir = Path(origin).parent
+        if not source_dir.is_dir():
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        for path in sorted(source_dir.glob("*.py")):
+            destination = target / path.name
+            if not destination.is_file() or destination.stat().st_mtime < path.stat().st_mtime:
+                shutil.copy2(path, destination)
+            copied.add(destination)
+    return copied
+
+
+def _is_main_guard(node: Any) -> bool:
+    """True for a ``if __name__ == "__main__":`` block."""
+    import ast
+
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+        return False
+    left = node.test.left
+    return (isinstance(left, ast.Name) and left.id == "__name__"
+            and any(isinstance(c, ast.Constant) and c.value == "__main__"
+                    for c in node.test.comparators))
+
+
 def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | None:
     """The part of ``origin`` this module needs: its classes, and what they reference.
 
@@ -454,7 +502,14 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
     definitions: dict[str, Any] = {}
     order: list[tuple[int, int, str]] = []
     preamble: list[tuple[int, int]] = []
+    kept_statements: list[Any] = []
     for node in tree.body:
+        if _is_main_guard(node):
+            # A demo, not part of the module. Left out both ways: keeping it would put
+            # the vendor's whole-model script in a one-module directory, and seeding the
+            # dependency closure from it drags in every class it touches — for DeepSeek
+            # that is the entire file, which is how 31 of 31 definitions came along.
+            continue
         start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
         end = node.end_lineno or start
         if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -464,6 +519,7 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
             # Imports, constants, logger setup, `if TYPE_CHECKING` — cheap to keep and
             # the file does not import without them.
             preamble.append((start, end))
+            kept_statements.append(node)
 
     missing = [name for name in wanted if name not in definitions]
     if not wanted or missing:
@@ -488,9 +544,8 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
     # module-level `shared_attn = SharedAttentionRuntime()` is the case that found this:
     # keeping the statement without the class gives a file that will not import.
     frontier = list(wanted)
-    for node in tree.body:
-        if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            frontier.extend(referenced(node) - needed)
+    for node in kept_statements:
+        frontier.extend(referenced(node) - needed)
     needed.update(frontier)
     while frontier:
         for name in referenced(definitions[frontier.pop()]) - needed:
