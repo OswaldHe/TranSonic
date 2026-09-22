@@ -31,6 +31,11 @@ Read before starting:
   compared, and the shape your inference.py has to take
 - reference_numerics.py — how the reference was judged: where the four tolerance constants
   come from and how they are applied
+- vendor_kernel.py — the primitives reference_torch.py imports but does not contain
+  (act_quant, fp8_gemm, sparse_attn); read these rather than inferring them
+- vendor_model.py — the complete model the slice came from
+- compat_*.py — kernel replacements the reference was recorded with; where one replaces a
+  function it, not vendor_kernel.py, is the semantics the reference has
 {% if has_hints %}
 - .autohelix/hints.md
 {% endif %}

@@ -242,18 +242,25 @@ class BootstrapLoop(Harness):
         from autohelix.prompt_template import build_prompt_variables, render_template
 
         variables = build_prompt_variables(self.config, self.history, iteration, worktree_dir)
-        prompt = render_template(load_prompt_template(), variables)
+        variables["history_summary"] = self._history_summary()
+        return render_template(load_prompt_template(), variables)
+
+    def _history_summary(self) -> str:
+        """Recent iterations, by gate state.
+
+        Replaces upstream's summary rather than prefixing it: upstream reports metrics for an
+        accepted iteration, here every iteration is accepted and there are no metrics, so
+        keeping both would list each iteration twice — once as its gate state and once as a
+        bare `checks_passing=N (accepted)`, with iteration 0 appearing under two names.
+        """
         lines = []
         for result in self.history.get_recent(5):
             verdict = self._verdicts.get(result.iteration)
             state = verdict.summary() if verdict else self._stored_summary(result)
             label = "baseline" if result.iteration == 0 else f"iter {result.iteration}"
-            lines.append(f"- {label}: {state}")
-        if lines:
-            prompt = prompt.replace(
-                "Recent history:", "Recent history:\n" + "\n".join(lines), 1,
-            )
-        return prompt
+            review = self._reviews.get(result.iteration)
+            lines.append(f"- {label}: {state}" + (f"; review: {review}" if review else ""))
+        return "\n".join(lines)
 
     @staticmethod
     def _stored_summary(result: IterationResult) -> str:

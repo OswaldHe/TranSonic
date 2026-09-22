@@ -193,13 +193,56 @@ def test_the_preset_satisfies_autohelixs_own_validator() -> None:
 
 
 def test_the_goal_points_at_every_frozen_reference() -> None:
-    """`init` writes three; a reference the goal never mentions will not be read."""
+    """A reference `init` writes and the goal never mentions will not be read.
+
+    Iteration 1 of the first real run spent half an hour deriving the fp8 scale rule from
+    recorded tensors because `vendor_kernel.py`, which states it, was not carried in. The
+    inverse — carried in but unmentioned — costs the same.
+    """
     from bootstrap import materialize as mat
 
     goal = preset.render_goal()
     for _, target, _ in mat.FROZEN_REFERENCES:
         assert target in goal, target
     assert mat.NUMERICS_TARGET in goal
+    for name in mat.VENDOR_FILES:
+        assert f"{mat.VENDOR_PREFIX}{name}" in goal, name
+    assert mat.COMPAT_PREFIX in goal
+
+
+def test_the_reviewer_is_given_the_same_reference_hierarchy() -> None:
+    """The reviewer's "what is left" should name the file that settles a failing check.
+
+    Told to work it out instead, the next iteration re-derives what a carried-in reference
+    states — which is how the first real run lost an iteration.
+    """
+    from bootstrap import materialize as mat
+
+    prompt = preset.load_preset()["reviewer"]["prompt"]
+    for _, target, _ in mat.FROZEN_REFERENCES:
+        assert target in prompt, target
+    assert mat.NUMERICS_TARGET in prompt
+    for name in mat.VENDOR_FILES:
+        assert f"{mat.VENDOR_PREFIX}{name}" in prompt, name
+    assert prompt.index(mat.COMPAT_PREFIX) < prompt.index(f"{mat.VENDOR_PREFIX}kernel.py")
+
+
+def test_compat_outranks_vendor_in_the_goal() -> None:
+    """A compat patch replaced a vendor kernel *before* tracing, so for any name it rebinds
+    it is what the reference did. The goal has to say which to trust, and in which order."""
+    goal = preset.render_goal()
+    assert goal.index("compat_") < goal.index("vendor_kernel.py")
+    assert "before `vendor_kernel.py`" in goal
+
+
+def test_the_goal_gives_a_reading_order_starting_at_the_module() -> None:
+    goal = preset.render_goal()
+    for earlier, later in (
+        ("reference_torch.py", "reference_inference.py"),
+        ("reference_inference.py", "reference_numerics.py"),
+        ("reference_numerics.py", "compat_"),
+    ):
+        assert goal.index(earlier) < goal.index(later), (earlier, later)
 
 
 def test_the_frozen_references_cannot_be_opened_at_runtime() -> None:

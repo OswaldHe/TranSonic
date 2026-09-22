@@ -13,22 +13,32 @@ goal: |
   Read `README.md` first — it names the computation, every tensor in `tensors/`, and each
   one's dtype and shape.
 
-  Three frozen references are carried in from the artifact that recorded this module. Read
-  all three. You may not import, call or edit any of them.
+  Frozen references are carried in from the artifact that recorded this module. You may not
+  import, call, open or edit any of them — they are the specification, not code this
+  repository runs.
 
-    `reference_torch.py`      what to compute — the original PyTorch implementation. Your
-                              specification. Do not copy torch out of it into your kernel.
-    `reference_inference.py`  how it was run — the artifact's own launcher: it loads the
-                              weights and recorded inputs, runs the module, times it,
-                              compares against the dumped output and prints the
-                              `##autohelix[...]` metrics. This is the shape your own
-                              `inference.py` has to take. It will not run here — it needs a
-                              harness runtime and a `calls.json` that are not in this
-                              repository — so take its structure, not its imports.
-    `reference_numerics.py`   how it was judged — `Tolerance.for_dtype` is where
-                              the four tolerance constants below come from, and
-                              `compare_outputs` is how they are applied. Reimplement that
-                              comparison self-contained in your `inference.py`.
+  Read them in this order, and stop as soon as your question is answered:
+
+    1. `reference_torch.py`      what this module computes. Always start here.
+    2. `reference_inference.py`  how it was run and compared. The shape of your validator.
+    3. `reference_numerics.py`   what counts as matching.
+
+  Those three answer most questions. When one of them bottoms out in something it does not
+  define — a quantization rule, a masking rule, an accumulation dtype — do not infer it from
+  the recorded tensors. It is written down. Look further, in this order of authority:
+
+    4. `compat_*.py`             **check here first, and before `vendor_kernel.py`.** These
+                                 replaced vendor kernels before tracing, so for any name a
+                                 `compat` file rebinds, that file is what the reference
+                                 actually did and the vendor's version is not.
+    5. `vendor_kernel.py`        the primitives `reference_torch.py` imports but does not
+                                 contain, for the ones no `compat` file replaced.
+    6. `vendor_model.py`         the complete model the slice was taken from, for when the
+                                 slice does not say how a value reaching it was produced.
+
+  The code above is the authority on *semantics*. The `.bin` files in `tensors/` are the
+  authority on *results*: where your reading of the code and the recorded numbers disagree,
+  the numbers are right and your reading is wrong.
 
   You write two files and nothing else:
 
@@ -78,8 +88,8 @@ goal: |
       reaching back to a checkpoint or an artifact tree.
 
   `source.py` and `inference.py` are the only files you may change. Everything else —
-  `tensors/*.bin`, the three `reference_*.py`, `README.md`, `MODULE.md`, `config.json` — is
-  frozen, and any edit to it is reverted before your work is judged.
+  `tensors/*.bin`, every `reference_*.py`, `vendor_*.py` and `compat_*.py`, `README.md`,
+  `MODULE.md`, `config.json` — is frozen, and any edit is reverted before your work is judged.
 
   You are expected to need several iterations. Each iteration's work is kept whether or not
   the gate passes, so build on what is already in the repository instead of restarting, and
@@ -117,12 +127,37 @@ agent:
 # its work, but a `circumventing` verdict does stop a passing gate ending the run.
 reviewer:
   auto_memory: false
+  # Reviewing is reading two short files against a checklist, which does not need the main
+  # agent's model, and a cheaper reviewer means it can run on every iteration without the
+  # review dominating the run's cost.
+  model: claude-sonnet-5
   prompt: |
     You are reviewing one iteration of a loop that is bootstrapping a Trainium NKI kernel.
     You change nothing: you read, and you write one review.
 
     A machine-readable verdict from this iteration's gate is at the path named below. It
     lists six checks, each passed or failed, with findings. Read it first.
+
+    The repository carries frozen references, and you need the same ones the agent does.
+    In order of authority:
+
+      1. `reference_torch.py`      what this module computes
+      2. `reference_inference.py`  how it was run and compared
+      3. `reference_numerics.py`   what counts as matching
+      4. `compat_*.py`             **outranks `vendor_kernel.py`.** These replaced vendor
+                                   kernels before tracing, so for any name a `compat` file
+                                   rebinds, that file is what the reference actually did
+      5. `vendor_kernel.py`        the primitives `reference_torch.py` imports but does not
+                                   contain, for those no `compat` file replaced
+      6. `vendor_model.py`         the complete model the slice came from
+
+    Use them both ways. When a check fails because the kernel computes the wrong thing, name
+    the reference file and the function that settles it — the agent should read the semantics,
+    not infer them from the recorded tensors, and a review that says "work out the
+    quantization rule" where `vendor_kernel.py` states it has wasted the next iteration. And
+    when judging whether the kernel is real, compare it against those semantics: a kernel
+    that reproduces the reference's algorithm is right even if it is slow, and one that
+    reproduces its *numbers* by carrying them around is not.
 
     Write two sections.
 
@@ -165,5 +200,10 @@ reviewer:
     failure mode.
 
 # A failing gate never ends the run; only these do.
+#
+# `iteration_time` is a hard per-iteration deadline *and* a signal: it installs the hooks
+# that inject the remaining time into the agent's context, so it can stop, write notes and
+# exit cleanly instead of being cut off mid-investigation with its findings in /tmp.
 budget:
   iterations: 10
+  iteration_time: 2h

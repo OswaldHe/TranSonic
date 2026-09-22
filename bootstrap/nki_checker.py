@@ -84,11 +84,12 @@ FORBIDDEN_PATH_MARKERS = (
     "partition-artifact",
     "model_partition",
     "safetensors",
-    # Covers every frozen reference — reference_torch.py, reference_inference.py,
-    # reference_numerics.py. They are there to be read, not opened at runtime.
+    # Every frozen reference: reference_*.py, vendor_*.py, compat_*.py. They are carried in
+    # to be read, not opened at runtime. `vendor` also catches the artifact's own directory.
     "reference_",
-    "/trace/",
     "vendor",
+    "compat",
+    "/trace/",
     "/hf/",
 )
 
