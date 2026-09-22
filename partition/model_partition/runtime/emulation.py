@@ -298,8 +298,15 @@ def install_implementations(
     bundle: Any,
     impl_dirs: dict[str, Any],
     device: str = "cpu",
+    lazy: bool = False,
 ) -> InstallReport:
     """Replace every partitioned submodule with its implementation.
+
+    ``lazy`` builds each implementation when it is first called, from the weights the
+    model holds at that moment, and drops it afterwards. That is the only way to install
+    into a model too large to be resident: its weights arrive one module at a time, so
+    there is no instant at which all 96 implementations could be built, and the instant a
+    submodule is called is exactly when its own weights are real.
 
     One wrapper per submodule rather than one per module: a wrapper installed at a
     submodule is called with exactly the arguments that submodule received, so the
@@ -308,11 +315,12 @@ def install_implementations(
     ``verify_modules`` and ``verify_chain``; here each of its submodules runs the
     group's code for its own part.
     """
-    return _install_all(model, graph, bundle, impl_dirs, device, InstallReport())
+    return _install_all(model, graph, bundle, impl_dirs, device, InstallReport(),
+                        lazy=lazy)
 
 
 def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
-                 device: str, report: InstallReport) -> InstallReport:
+                 device: str, report: InstallReport, lazy: bool = False) -> InstallReport:
     import torch
 
     from model_partition.runtime.module_impl import load_impl
@@ -330,8 +338,8 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
             continue
         try:
             impl = load_impl(impl_dir)
-            weights = load_named_weights(bundle, module.id, device=device)
-            if not weights:
+            weights = {} if lazy else load_named_weights(bundle, module.id, device=device)
+            if not lazy and not weights:
                 raise EmulationError("no weights available")
         except Exception as exc:
             report.skipped[module.id] = str(exc)
@@ -341,6 +349,12 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
             original = _lookup(model, submodule_name)
             if original is None:
                 report.skipped[submodule_name] = "not present in the model"
+                continue
+            if lazy:
+                pending.append((submodule_name, _wrapper_class()(
+                    None, original,
+                    factory=_live_factory(impl, bundle.config, submodule_name, original,
+                                          device))))
                 continue
             try:
                 built = impl.build(bundle.config, weights, device, submodule=submodule_name)
@@ -360,6 +374,31 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
     return report
 
 
+def _live_factory(impl: Any, config: dict[str, Any], submodule_name: str,
+                  original: Any, device: str):
+    """Build this submodule's implementation from the weights the model holds now.
+
+    The names are the ones the recording uses, so the implementation is handed exactly
+    what it would have been handed from the dumps — only these tensors are the model's
+    own, already materialized for the call about to happen, so nothing is read twice.
+    """
+    def build() -> Any:
+        weights = {
+            f"{submodule_name}.{name}": tensor
+            for name, tensor in (list(original.named_parameters())
+                                 + list(original.named_buffers()))
+            if tensor is not None and not getattr(tensor, "is_meta", False)
+        }
+        if not weights:
+            raise EmulationError(
+                f"{submodule_name} holds no materialized weights at call time, so its "
+                f"implementation cannot be built from the model"
+            )
+        return impl.build(config, weights, device, submodule=submodule_name)
+
+    return build
+
+
 #: Defined on first use so importing this module does not require torch.
 _WRAPPER: Any = None
 
@@ -375,15 +414,24 @@ def _wrapper_class() -> Any:
         import torch
 
         class Implemented(torch.nn.Module):
-            def __init__(self, built: Any, original: Any):
+            def __init__(self, built: Any, original: Any, factory: Any = None):
                 super().__init__()
                 self._built = built
+                self._factory = factory
                 #: Kept so the original parameters stay reachable from the model tree
                 #: rather than being freed while the wrapper is in their place.
                 self.original = original
 
             def forward(self, *args: Any, **kwargs: Any) -> Any:
-                return self._built(*args, **kwargs)
+                if self._built is not None:
+                    return self._built(*args, **kwargs)
+                # Built for this call and dropped after it: the weights it is built from
+                # are the model's, which are released again once the call returns.
+                built = self._factory()
+                try:
+                    return built(*args, **kwargs)
+                finally:
+                    del built
 
             def extra_repr(self) -> str:
                 return "extracted implementation"

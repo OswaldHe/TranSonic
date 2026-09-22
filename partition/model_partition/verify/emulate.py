@@ -219,24 +219,35 @@ def emulate(
     impl_dirs: dict[str, Any] | None = None,
     run_dir: Any = None,
     out_of_scope: tuple[str, ...] = (),
+    streamed: bool = False,
 ) -> EmulationReport:
     """Assemble from dumps, install the implementations, generate, and judge.
 
     ``place_max_memory`` spreads the assembled model across GPU and host for the
     generation pass, for a model too large to hold on the GPU whole.
+
+    ``streamed`` is for a model too large to hold at all. Its weights arrive one module
+    at a time as it runs, so there is nothing to fill from dumps and nothing to poison —
+    a placeholder raises on any read, which is the stronger guarantee — and each
+    implementation is built at the moment its submodule is called. What is being read out
+    of the generated text is the same thing either way: whether the loop's own code, in
+    place of the model's, still writes what the model writes.
     """
     judge = judge or StubJudge()
     report = EmulationReport(min_score=min_score)
 
-    model, device = move_to_device(build_model(), device)
-    poison_parameters(model, only=plan_owned_parameters(model, graph))
-    report.fill = fill_from_dumps(model, bundle, graph, device=device, strict=strict_fill,
-                                  out_of_scope=out_of_scope)
+    if streamed:
+        model = build_model(placed=True)
+    else:
+        model, device = move_to_device(build_model(), device)
+        poison_parameters(model, only=plan_owned_parameters(model, graph))
+        report.fill = fill_from_dumps(model, bundle, graph, device=device,
+                                      strict=strict_fill, out_of_scope=out_of_scope)
     if impl_dirs:
         from model_partition.runtime.emulation import install_implementations
 
         report.install = install_implementations(model, graph, bundle, impl_dirs,
-                                                 device=device)
+                                                 device=device, lazy=streamed)
     if place_max_memory:
         model, device = place_across_devices(model, place_max_memory)
 

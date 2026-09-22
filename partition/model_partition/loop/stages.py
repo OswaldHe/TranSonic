@@ -1054,6 +1054,21 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
     # host so generation still uses the accelerator.
     device = _host_device(ctx)
     _, place_max_memory = ctx.placement() if device == "cpu" else (None, None)
+    # A model whose weights cannot all be resident is generated from the way it was
+    # traced: streamed, one module's weights at a time, with the implementations built at
+    # the moment each submodule is called and dropped after. There is no instant at which
+    # 96 rebuilt modules of a 475 GiB model could all exist, so the alternative to this is
+    # no generation at all — and the point of the stage is to read what the loop's own
+    # code writes. The report says the weights came from the checkpoint, not from dumps.
+    streamed = bool(memory_shortfall(ctx)) and _can_stream(ctx)
+    if streamed:
+        device = ctx.options.trace_device or _accelerator(ctx)
+        place_max_memory = None
+        ctx.notes.append(
+            "generated from the streamed model with the implementations built per call: "
+            "its weights do not fit anywhere at once, so they were read from the "
+            "checkpoint rather than filled from dumps"
+        )
     impl_dirs = _impl_dirs(ctx)
     if not impl_dirs:
         # Generating through the model's own modules would print tokens the deliverable
@@ -1070,7 +1085,7 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
         judge=judge, max_new_tokens=ctx.options.max_new_tokens,
         temperature=ctx.options.temperature, seed=ctx.options.seed,
         eos_token_id=eos, device=device, min_score=ctx.options.min_judge_score,
-        strict_fill=True, place_max_memory=place_max_memory,
+        strict_fill=not streamed, place_max_memory=place_max_memory, streamed=streamed,
         # Generation runs the loop's own implementations, not the model's modules:
         # these tokens are the deliverable's tokens or they are worth nothing.
         impl_dirs=impl_dirs, run_dir=ctx.layout.root,

@@ -32,6 +32,11 @@ DTYPES: dict[str, tuple[int, str | None]] = {
     "float64": (8, "<f8"),
     "float8_e4m3fn": (1, None),
     "float8_e5m2": (1, None),
+    # A block scale's dtype and a pair of fp4 values packed into a byte. Both are what a
+    # quantized checkpoint stores, so both appear the moment a module's weights are
+    # dumped rather than read back out of the checkpoint.
+    "float8_e8m0fnu": (1, None),
+    "float4_e2m1fn_x2": (1, None),
     "int8": (1, "<i1"),
     "uint8": (1, "|u1"),
     "int16": (2, "<i2"),
@@ -115,8 +120,10 @@ def contiguous_bytes(tensor: Any) -> tuple[bytes, str, list[int]]:
 
         t = tensor.detach().to("cpu").contiguous()
         name = dtype_name(t.dtype)
-        raw = t.view(torch.uint8).numpy().tobytes() if name in ("bfloat16", "float8_e4m3fn", "float8_e5m2") \
-            else t.numpy().tobytes()
+        # A dtype numpy has no name for is written as its bytes: numpy cannot hold a
+        # bfloat16, an fp8 or a packed fp4 pair, and reinterpreting loses nothing.
+        raw = (t.view(torch.uint8).numpy().tobytes() if DTYPES[name][1] is None
+               else t.numpy().tobytes())
         return raw, name, list(t.shape)
     import numpy as np
 
@@ -216,7 +223,12 @@ class TensorStore:
 
         raw = bytearray(self.blob_path(meta).read_bytes())
         torch_dtype = getattr(torch, meta.dtype) if hasattr(torch, meta.dtype) else torch.uint8
-        flat = torch.frombuffer(raw, dtype=torch_dtype)
+        if DTYPES.get(meta.dtype, (0, ""))[1] is None:
+            # Read the bytes and reinterpret: `frombuffer` does not take every dtype
+            # torch has, and these are the ones it does not.
+            flat = torch.frombuffer(raw, dtype=torch.uint8).view(torch_dtype)
+        else:
+            flat = torch.frombuffer(raw, dtype=torch_dtype)
         return flat.reshape(meta.shape).to(device)
 
     # -- manifest --------------------------------------------------------------

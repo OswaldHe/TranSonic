@@ -474,3 +474,31 @@ def test_generation_still_works_when_the_model_takes_no_such_argument(tiny_run):
     finally:
         emulation._last_logits_argument = real
     assert with_flag == without
+
+
+def test_implementations_can_be_built_at_the_moment_they_are_called(tiny_run, tmp_path):
+    """For a model whose weights arrive one module at a time there is no instant when all
+    of them could be built, and the instant a submodule is called is when its own weights
+    are real. So the wrapper builds then, from the model's own tensors, and drops it."""
+    from model_partition.extract import extract
+    from model_partition.runtime.emulation import install_implementations
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tmp_path / "modules",
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
+                     weight_tensors=tiny_run.bundle.weights)
+    impl_dirs = {mid: g.directory for g in groups for mid in g.module_ids}
+    model = tiny_run.build_model()
+    report = install_implementations(model, tiny_run.graph, tiny_run.bundle, impl_dirs,
+                                    device="cpu", lazy=True)
+    assert report.installed, report.skipped
+    # Nothing is built until something calls it.
+    wrapper = next(m for m in model.modules() if type(m).__name__ == "Implemented")
+    assert wrapper._built is None and wrapper._factory is not None
+
+    from tests.fixtures.tiny_llm import sample_inputs
+
+    with torch.no_grad():
+        logits = model(sample_inputs(1, 8))
+    assert torch.isfinite(logits).all()
+    # And still not held afterwards: the weights it used are the model's.
+    assert wrapper._built is None

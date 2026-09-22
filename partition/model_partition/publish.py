@@ -97,12 +97,18 @@ def materialize_weights(run_dir: str | Path, module_ids: list[str],
         wanted = [name for name in wanted if name not in already]
         if not wanted:
             continue
-        values = bundle.checkpoint.load(wanted, device="cpu")
-        for name, tensor in values.items():
-            meta = store.write(_safe(name), tensor, role="weight", module_id=module_id,
-                               subdir=f"weights/{module_id}", extra={"param": name})
-            added += meta.nbytes
-        report(f"  {module_id}: {len(values)} tensor(s), {format_bytes(added)} so far")
+        # One tensor at a time. A single n-gram table is 94.4 GiB, and reading a module's
+        # weights as one batch would ask for all of them at once — which is the thing this
+        # whole run is arranged to avoid.
+        written = 0
+        for name in wanted:
+            for key, tensor in bundle.checkpoint.load([name], device="cpu").items():
+                meta = store.write(_safe(key), tensor, role="weight", module_id=module_id,
+                                   subdir=f"weights/{module_id}", extra={"param": key})
+                added += meta.nbytes
+                written += 1
+                del tensor
+        report(f"  {module_id}: {written} tensor(s), {format_bytes(added)} so far")
     store.save_manifest(store.metadata)
     return added
 
@@ -159,11 +165,17 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     import tempfile
 
     root = Path(run_dir)
-    elsewhere = Path(tempfile.mkdtemp(prefix="published-"))
+    # Beside the run, so the published files can be hardlinked rather than copied: the
+    # check is about which paths are reachable, not about having a second hundred
+    # gigabytes of the same bytes.
+    elsewhere = Path(tempfile.mkdtemp(prefix="published-", dir=root.parent))
     for path in files:
         target = elsewhere / path.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
+        try:
+            target.hardlink_to(path)
+        except OSError:
+            shutil.copy2(path, target)
 
     groups = _published_groups(root, set(module_ids))
     failures: list[str] = []
