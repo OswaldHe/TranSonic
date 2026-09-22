@@ -847,17 +847,18 @@ def hash_trace(ctx: LoopContext) -> list[Any]:
     # The token ids, not just their count: two different prompts can tokenize to
     # the same length, and reusing the old activations against a new prompt would
     # verify a computation nothing asked for.
+    #
+    # The checkpoint the numbers came out of is not here: it is recorded in the trace's
+    # own manifest, and `_trace_is_whole` refuses a trace taken from another revision.
+    # Provenance belongs with the artifacts — a spec that names no revision still traced
+    # one, and hashing the resolved value would re-take a perfectly good 69 GiB trace
+    # every time the published checkpoint moved, including when it moved back.
     return [
         _graph_fingerprint(ctx.layout.graph_path, edges=False),
         [[s.id, s.token_ids] for s in ctx.samples],
         options.slice_long, options.cache_weights, options.decode_steps,
         # Which entry points get driven decides which modules have a reference at all.
         ctx.spec.trace.to_dict(),
-        # The checkpoint the numbers came out of, as resolved rather than as asked for: a
-        # spec that names no revision still traced one, and reusing those activations
-        # after the model was updated would verify modules against a model that no longer
-        # exists.
-        ctx.result.revision if ctx.result else "",
     ]
 
 

@@ -255,6 +255,11 @@ def representative_modules(run_dir: str | Path) -> list[str]:
     deduplicating by structural signature means — so one module from each covers them
     all: a dense attention and a sparse one, an MoE, the n-gram memory, the draft
     stack's attention and its heads, the embedding, the norms, the output head.
+
+    Within a group, a module the trace still holds wins over plan order. Retention keeps
+    a few representative layers and deletes the rest, so the first module of a group is
+    often one whose feature maps are gone — and publishing that one would upload a
+    directory whose weights are materialized and whose reference output is not there.
     """
     from model_partition import yamlio
     from model_partition.planner.graph import PartitionGraph
@@ -262,13 +267,27 @@ def representative_modules(run_dir: str | Path) -> list[str]:
     root = Path(run_dir)
     graph = PartitionGraph.load(root / "plan" / "partition_graph.yaml")
     order = {module.id: index for index, module in enumerate(graph.partitioned_modules)}
+    traced = _traced_modules(root)
     chosen: list[str] = []
     for meta in sorted((root / "modules").glob("*/meta.yaml")):
         listed = (yamlio.load_path(meta) or {}).get("module_ids") or []
         known = [m for m in listed if m in order]
-        if known:
-            chosen.append(min(known, key=lambda m: order[m]))
+        # A group with nothing traced still gets a module: its code is worth publishing,
+        # and the missing reference is reported rather than hidden.
+        preferred = [m for m in known if m in traced] or known
+        if preferred:
+            chosen.append(min(preferred, key=lambda m: order[m]))
     return sorted(set(chosen), key=lambda m: order.get(m, 0))
+
+
+def _traced_modules(root: Path) -> set[str]:
+    """Modules the trace on disk still has a recorded call for."""
+    from model_partition.runtime.module_runner import TraceBundle
+
+    try:
+        return {record.module_id for record in TraceBundle.load(root / "trace").records}
+    except Exception:
+        return set()
 
 
 def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE,

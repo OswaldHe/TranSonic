@@ -169,6 +169,35 @@ def test_a_selection_carries_only_its_own_modules(tiny_run, tmp_path):
     assert "modules/index.yaml" in names
 
 
+def test_the_selection_prefers_a_module_the_trace_still_holds(tiny_deep_run):
+    """Retention deletes all but a few layers, and the group's first module is often one
+    of the ones it dropped. Publishing that one materializes weights for a module whose
+    reference output is no longer there."""
+    from model_partition.extract import extract
+    from model_partition.publish import representative_modules
+
+    run = tiny_deep_run
+    extract(run.graph, run.build_model(), run.layout.modules_dir,
+            run_root=run.layout.root, sample_ids=run.sample_ids,
+            weight_tensors=run.bundle.weights, bundle=run.bundle)
+    root = run.layout.root
+    chosen = representative_modules(root)
+    assert chosen
+
+    # The decoder group holds 12 modules. Drop the chosen one's records, as retention
+    # would, and a sibling of the same group is picked in its place.
+    group = next(ids for ids in run.graph.signature_groups().values() if len(ids) > 1)
+    dropped = next(m for m in chosen if m in group)
+    bundle = run.bundle
+    bundle.records = [r for r in bundle.records if r.module_id != dropped]
+    bundle.save()
+
+    again = representative_modules(root)
+    assert dropped not in again
+    assert len(again) == len(chosen)
+    assert set(again) & set(group)
+
+
 def test_publishing_a_subset_writes_its_weights_into_the_run(tiny_run, tmp_path):
     """A run that read its weights from the checkpoint cannot be verified away from it,
     so the selection's weights are dumped beside the activations they are checked

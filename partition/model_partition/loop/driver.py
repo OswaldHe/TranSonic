@@ -104,6 +104,22 @@ def _trace_is_whole(layout: RunLayout) -> bool:
     return not (payload.get("metadata") or {}).get("retention")
 
 
+def _traced_revision(layout: RunLayout) -> str:
+    """The checkpoint revision the trace on disk was taken from, or "".
+
+    Empty for a manifest written before this was recorded, which is not the same as a
+    mismatch: an old trace cannot say what it came from, and refusing it would re-take
+    every trace once rather than only the ones taken from another model.
+    """
+    from model_partition import yamlio
+
+    manifest = layout.trace_dir / "manifest.yaml"
+    if not manifest.is_file():
+        return ""
+    payload = yamlio.load_path(manifest) or {}
+    return str((payload.get("metadata") or {}).get("revision") or "")
+
+
 def _must_stream(ctx: Any) -> bool:
     """Whether this model is too large to be resident on GPU and host together."""
     from model_partition.loop.stages import memory_shortfall
@@ -521,6 +537,15 @@ class PartitionLoop:
         present = STAGE_OUTPUTS.get(name)
         if present is not None and not present(ctx.layout):
             return False
+        if name == "trace" and (taken := _traced_revision(ctx.layout)):
+            resolved = ctx.result.revision if ctx.result else ""
+            if resolved and taken != resolved:
+                # Activations from another checkpoint verify modules of a model that is
+                # not the one being partitioned. The manifest is where this is knowable:
+                # the spec may name no revision at all and still have traced one.
+                self.report(f"  the trace on disk was taken from {taken[:12]}, and this "
+                            f"run resolves to {resolved[:12]}: re-tracing")
+                return False
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)
