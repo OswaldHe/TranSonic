@@ -12,10 +12,14 @@
   every iteration is merged whether or not the constraint passes, the reviewer
   runs on every iteration, a failing constraint never ends the run, and a passing
   one does. See `bootstrap/README.md`.
-- The constraint is hidden from the agent: the preset goal states all six
-  requirements in prose, and the config carrying the command lives under
-  `.autohelix/`, which is not copied into the iteration worktree. The reviewer
-  additionally performs an anti-reward-hacking read of each iteration.
+- `bootstrap/preset.yaml` is the loop's config: one fixed, reviewable file read
+  directly for every module repo, with nothing generated and no copy written into
+  the repo. `bootstrap/prompt.md` is the agent's prompt template on the same
+  terms.
+- The constraint is hidden from the agent: the preset's `goal` states all six
+  requirements in prose, and because the preset never lands in the repo, the
+  command naming the checker is never in the worktree. The reviewer additionally
+  performs an anti-reward-hacking read of each iteration.
 
 ## 0.1.1 — 2026-09-02
 

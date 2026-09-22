@@ -45,11 +45,28 @@ all of which must pass:
 | e | pass-test | `inference.py` exits 0 and matches the reference, at the pinned tolerance and not a looser one |
 | f | data provenance | the tensors fed to the kernel are the recorded ones, byte for byte |
 
-**The agent never sees the checker.** `bootstrap/preset.py` states all six requirements in
-prose as the goal, and the config carrying the constraint command lives in `.autohelix/`,
-which `Sandbox.prepare_worktree` does not copy into the iteration worktree. That makes
-`preset.py` and `nki_checker.py` a pair: anything the checker enforces and the goal does
-not say is a trap rather than a requirement, and they must be changed together.
+**The agent never sees the checker.** `bootstrap/preset.yaml` states all six requirements in
+prose as its `goal`, and that file stays in the package — the loop reads it directly and no
+copy is written into the module repo, so the constraint command that names the checker is
+never in the worktree. That makes `preset.yaml` and `nki_checker.py` a pair: anything the
+checker enforces and the goal does not say is a trap rather than a requirement, and they
+must be changed together. `tests/test_bootstrap_driver.py` fails if they drift on the
+tolerances, the markers or the banned constructs.
+
+## The config is a fixed file
+
+`bootstrap/preset.yaml` is the config, for every module repo, unmodified. Nothing generates
+it, nothing substitutes into it, and `init` writes no config at all — so the preset you read
+in the diff is exactly the preset that runs, and editing it changes the next run with no
+re-init. `--config` on `bootstrap run` points at an alternative if you want to try a variant
+without touching the reviewed one.
+
+Two consequences of being fixed. The gate's command cannot name a per-repo path, so the
+checker finds its own manifest by walking up from `--repo` — an iteration worktree lives at
+`<repo>/.autohelix/worktrees/iter-N`, inside the repo, so `.autohelix/bootstrap/manifest.json`
+is always above it. And the command says `python` rather than an absolute interpreter, so
+`bootstrap run` probes up front that `python` on PATH can import `bootstrap`, `torch` and
+`torch_neuronx`, and refuses to start rather than failing mid-iteration.
 
 Latency is measured but not targeted. Check (d) exists to prove the profiling path works;
 no gate and no ranking depends on the number. (Declaring it as a metric would also make
@@ -83,7 +100,7 @@ survives check (b).
 | `tensors/*.bin` | frozen — input, reference output, and every weight, as raw little-endian bytes. No header and no sidecar: the dtype and shape are in `README.md`. |
 | `reference_torch.py` | frozen — the original PyTorch implementation, verbatim. The specification, unimportable. |
 | `README.md`, `MODULE.md`, `config.json` | frozen — the computation, the tensor table, the module's own pre- and post-conditions. |
-| `.autohelix/` | gitignored — the preset config, the tensor manifest, notes, reviews, per-iteration verdicts. |
+| `.autohelix/` | gitignored — the tensor manifest (the only thing `init` writes here), plus notes, reviews and per-iteration verdicts once the loop runs. |
 
 `scope.editable` is `[source.py, inference.py]`, so an edit to anything else is reverted
 before the gate runs.

@@ -705,6 +705,29 @@ def format_report(results: list[CheckResult], run: RunOutcome) -> str:
     return "\n".join(lines)
 
 
+#: Where `bootstrap init` writes the manifest, relative to the module repo.
+MANIFEST_REL = ".autohelix/bootstrap/manifest.json"
+
+
+def find_manifest(repo: Path) -> Path:
+    """The manifest for this repo, searched for rather than passed in.
+
+    The gate's command line is a fixed string shared by every module repo, so it cannot
+    name a per-repo path. It does not have to: an iteration worktree lives at
+    ``<repo>/.autohelix/worktrees/iter-N``, inside the repo it was cut from, so walking up
+    from the candidate reaches the manifest whether ``--repo`` is the repo itself or one of
+    its worktrees.
+    """
+    for directory in (repo, *repo.parents):
+        candidate = directory / MANIFEST_REL
+        if candidate.is_file():
+            return candidate
+    raise CheckerError(
+        f"no {MANIFEST_REL} at or above {repo}; this repo was not created by "
+        f"`autohelix bootstrap init`"
+    )
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     """The record `autohelix bootstrap init` wrote of what it put in the repo."""
     try:
@@ -751,7 +774,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Gate a module repo against the six Trainium NKI bootstrap checks.")
     parser.add_argument("--repo", default=".", help="The module repo to check")
-    parser.add_argument("--manifest", required=True, help="The manifest init wrote for this repo")
+    parser.add_argument("--manifest", default=None,
+                        help=f"The manifest init wrote (default: {MANIFEST_REL} at or above --repo)")
     parser.add_argument("--json", dest="json_out", default=None,
                         help="Write the machine-readable verdict here")
     parser.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT,
@@ -760,7 +784,8 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = Path(args.repo).resolve()
     try:
-        manifest = load_manifest(Path(args.manifest))
+        path = Path(args.manifest) if args.manifest else find_manifest(repo)
+        manifest = load_manifest(path)
         results, run = evaluate(repo, manifest, args.timeout)
     except CheckerError as exc:
         # Unusable input is not a verdict. Report every check as failing with the one

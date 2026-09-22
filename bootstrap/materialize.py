@@ -29,18 +29,19 @@ from pathlib import Path
 from typing import Any
 
 from bootstrap import templates
-from bootstrap.preset import build_config, dump_manifest
+from bootstrap.preset import dump_manifest
 
 #: Where the tensors go inside the repo, and where the gate expects to find them.
 TENSOR_DIR = "tensors"
 
-#: Run state lives here, outside git and outside the agent's worktree. The manifest in
-#: particular must not be reachable from the worktree: it is what the gate compares
-#: against, and `Sandbox.prepare_worktree` copies only notes, logs and observations.
+#: Run state lives here: gitignored, outside the agent's editable scope, and not copied into
+#: the iteration worktree by `Sandbox.prepare_worktree` (which carries only notes, logs and
+#: observations). The manifest is the only thing `init` writes here — the config and the
+#: prompt template are fixed files in the package, read directly.
+#:
+#: Must agree with `nki_checker.MANIFEST_REL`, which is what the gate searches for.
 STATE_DIR = ".autohelix"
 MANIFEST_REL = f"{STATE_DIR}/bootstrap/manifest.json"
-CONFIG_REL = f"{STATE_DIR}/bootstrap.yaml"
-PROMPT_REL = f"{STATE_DIR}/prompt.md"
 
 #: Where the gate drops its verdict inside the iteration worktree. The reviewer runs in
 #: that same worktree and reads it there; it dies with the worktree, so one iteration's
@@ -401,26 +402,20 @@ def _write_frozen_files(artifact: Path, directory: Path, repo: Path, result: Mat
         (repo / "MODULE.md").write_text(readme.read_text())
 
 
-def install_run_state(
-    result: Materialized,
-    *,
-    python: str,
-    iterations: int,
-    iteration_time: str | None,
-    run_timeout: int,
-    constraint_timeout: int,
-    agent_type: str,
-    model: str | None,
-) -> Path:
-    """Write the manifest, the preset config and the prompt template into the repo.
+def write_manifest(result: Materialized) -> Path:
+    """Record what was put in the repo, for the gate to check it against.
 
-    All three live under `.autohelix/`, which is gitignored and — apart from `prompt.md`,
-    which the agent is meant to read — is not carried into the iteration worktree. That is
-    what keeps the gate's command line and the tensor hashes out of the agent's reach
-    without hiding them from whoever is running the loop.
+    This is the only per-repo state `init` writes. The config and the prompt template are
+    fixed files in the package that the loop reads directly, so there is nothing else to
+    install and nothing that can drift between a repo and the preset it runs under.
+
+    The manifest lands under `.autohelix/`, which is gitignored and outside the agent's
+    editable scope. It is not a secret — an iteration worktree is nested inside the repo, so
+    it is reachable from there — but it is not handed to the agent either, and check (f)
+    compares the tensors against it, so a repo whose data was edited is caught whether or
+    not the edit was noticed.
     """
-    repo = result.repo
-    manifest_path = repo / MANIFEST_REL
+    manifest_path = result.repo / MANIFEST_REL
     dump_manifest(manifest_path, {
         "artifact_group": result.group,
         "module_id": result.module_id,
@@ -431,52 +426,7 @@ def install_run_state(
         "scalar_args": result.scalar_args,
         "tensors": [t.to_dict() for t in result.tensors],
     })
-
-    config = build_config(
-        manifest_path=manifest_path,
-        checks_path=CHECKS_REL,
-        python=python,
-        iterations=iterations,
-        iteration_time=iteration_time,
-        run_timeout=run_timeout,
-        constraint_timeout=constraint_timeout,
-        agent_type=agent_type,
-        model=model,
-    )
-    config_path = repo / CONFIG_REL
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(_dump_yaml(config))
-
-    from bootstrap.preset import PROMPT_TEMPLATE
-
-    (repo / PROMPT_REL).write_text(PROMPT_TEMPLATE)
-    return config_path
-
-
-def _dump_yaml(config: dict[str, Any]) -> str:
-    """The config as YAML, with the long prose readable.
-
-    The goal and the reviewer prompt are paragraphs, and safe_dump renders a paragraph as
-    one folded line of escapes — valid, and unreadable. Whoever runs this loop needs to be
-    able to read the goal in the config, because the goal *is* the specification the agent
-    works from; a block scalar is the difference between a reviewable preset and a blob.
-    """
-    import yaml
-
-    class _BlockDumper(yaml.SafeDumper):
-        pass
-
-    def represent_str(dumper: yaml.SafeDumper, data: str):
-        if "\n" in data:
-            # Trailing whitespace on a line makes a literal block illegal, so it is
-            # stripped rather than silently falling back to the folded form.
-            cleaned = "\n".join(line.rstrip() for line in data.splitlines()) + "\n"
-            return dumper.represent_scalar("tag:yaml.org,2002:str", cleaned, style="|")
-        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
-
-    _BlockDumper.add_representer(str, represent_str)
-    return yaml.dump(config, Dumper=_BlockDumper, sort_keys=False, width=92,
-                     default_flow_style=False, allow_unicode=True)
+    return manifest_path
 
 
 def git_init(repo: Path) -> str:

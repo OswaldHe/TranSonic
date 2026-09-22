@@ -19,17 +19,16 @@ from pathlib import Path
 import click
 
 from bootstrap import materialize as mat
+from bootstrap.preset import PRESET_PATH
 
 #: The test target: layer 0's attention is the one pure sliding-window attention in its
 #: group (compress_ratio 0 — no compressor, no indexer, no compressed-KV concatenation), so
 #: it is the smallest correct kernel the group admits.
 DEFAULT_MODULE = "layers.0.attention"
 
-#: Seconds `inference.py` gets inside the gate, and seconds the gate gets inside the loop.
-#: The outer number is the one the preset was specified with; the inner is smaller so a
-#: hung device run comes back as a failing check.
+#: Seconds `inference.py` gets when the gate is run by hand with `bootstrap check`. Inside
+#: the loop this comes from `preset.yaml`'s own `--timeout`, not from here.
 DEFAULT_RUN_TIMEOUT = 900
-DEFAULT_CONSTRAINT_TIMEOUT = 1200
 
 
 @click.group(name="bootstrap")
@@ -49,22 +48,17 @@ def bootstrap() -> None:
 @click.option("--step", type=int, default=None, help="Decode step (prefill by default)")
 @click.option("--call", "call_index", type=int, default=0, show_default=True,
               help="Which invocation, when the pass called the group more than once")
-@click.option("--iterations", type=int, default=10, show_default=True, help="Iteration budget")
-@click.option("--iteration-time", default=None, help="Per-iteration deadline, e.g. 45m")
-@click.option("--agent", "agent_type", default="claude", show_default=True,
-              help="Agent backend: claude, codex, opencode, mock")
-@click.option("--model", default=None, help="Override the agent's model")
-@click.option("--run-timeout", type=int, default=DEFAULT_RUN_TIMEOUT, show_default=True,
-              help="Seconds inference.py gets inside the gate")
-@click.option("--constraint-timeout", type=int, default=DEFAULT_CONSTRAINT_TIMEOUT,
-              show_default=True, help="Seconds the gate gets")
 @click.option("--force", is_flag=True, help="Overwrite a non-empty target directory")
 def init(
     repo: Path, artifact: Path, module_id: str, group: str | None, sample: str | None,
-    step: int | None, call_index: int, iterations: int, iteration_time: str | None,
-    agent_type: str, model: str | None, run_timeout: int, constraint_timeout: int, force: bool,
+    step: int | None, call_index: int, force: bool,
 ) -> None:
-    """Materialize a module of ARTIFACT into REPO as a git repo to bootstrap in."""
+    """Materialize a module of ARTIFACT into REPO as a git repo to bootstrap in.
+
+    Writes no config: `bootstrap/preset.yaml` is a fixed file the loop reads directly, so
+    every module repo runs under the same reviewed preset. Only the tensor manifest is
+    per-repo.
+    """
     repo = repo.resolve()
     if repo.exists() and any(repo.iterdir()) and not force:
         raise click.ClickException(f"{repo} is not empty; pass --force to overwrite")
@@ -85,16 +79,7 @@ def init(
             artifact=artifact.resolve(), group=resolved_group, module_id=module_id, repo=repo,
             sample_id=sample, step=step, call_index=call_index,
         )
-        config_path = mat.install_run_state(
-            result,
-            python=sys.executable,
-            iterations=iterations,
-            iteration_time=iteration_time,
-            run_timeout=run_timeout,
-            constraint_timeout=constraint_timeout,
-            agent_type=agent_type,
-            model=model,
-        )
+        manifest_path = mat.write_manifest(result)
         head = mat.git_init(repo)
     except mat.MaterializeError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -104,7 +89,8 @@ def init(
     click.echo(f"  chain    : {' -> '.join(s for s in result.submodules if s)}")
     click.echo(f"  tensors  : {len(result.tensors)} file(s), "
                f"{result.total_bytes / (1 << 20):.1f} MiB")
-    click.echo(f"  config   : {config_path.relative_to(repo)}")
+    click.echo(f"  manifest : {manifest_path.relative_to(repo)}")
+    click.echo(f"  config   : {PRESET_PATH} (fixed, read directly)")
     click.echo(f"  baseline : {head}")
     click.echo("")
     click.echo(f"Next: autohelix bootstrap run --path {repo}")
@@ -114,17 +100,24 @@ def init(
 @click.option("--path", "-p", type=click.Path(exists=True, path_type=Path), default=".",
               show_default=True, help="The module repo")
 @click.option("--iterations", "-n", type=int, default=None, help="Override the iteration budget")
+@click.option("--config", "-c", "config_file", default=None,
+              type=click.Path(exists=True, path_type=Path),
+              help=f"An alternative preset [default: {PRESET_PATH}]")
 @click.option("--verbose", is_flag=True, help="Show the agent prompt and per-phase detail")
-def run(path: Path, iterations: int | None, verbose: bool) -> None:
-    """Loop on a bootstrap repo until the gate passes or the budget runs out."""
+def run(path: Path, iterations: int | None, config_file: Path | None, verbose: bool) -> None:
+    """Loop on a bootstrap repo until the gate passes or the budget runs out.
+
+    Reads `bootstrap/preset.yaml` directly unless `--config` points elsewhere. Pass an
+    alternative to try a variant preset without editing the reviewed one.
+    """
     from bootstrap.driver import BootstrapLoop
 
     repo = path.resolve()
-    if not (repo / mat.CONFIG_REL).is_file():
+    if not (repo / mat.MANIFEST_REL).is_file():
         raise click.ClickException(
-            f"{repo} has no bootstrap config; run `autohelix bootstrap init` first"
+            f"{repo} has no bootstrap manifest; run `autohelix bootstrap init` first"
         )
-    loop = BootstrapLoop(repo, verbose=verbose)
+    loop = BootstrapLoop(repo, verbose=verbose, config_file=config_file)
     passed = loop.run(max_iterations=iterations)
     raise SystemExit(0 if passed else 1)
 
@@ -144,7 +137,7 @@ def check(path: Path, timeout: int) -> None:
         )
     completed = subprocess.run(
         [sys.executable, "-m", "bootstrap.nki_checker", "--repo", str(repo),
-         "--manifest", str(manifest), "--timeout", str(timeout)],
+         "--timeout", str(timeout)],
         cwd=repo,
     )
     raise SystemExit(completed.returncode)

@@ -104,17 +104,49 @@ def test_the_goal_forbids_what_the_gate_refuses() -> None:
         assert token in goal, token
 
 
-def test_the_config_declares_no_metric() -> None:
+def test_the_preset_declares_no_metric() -> None:
     """A declared metric makes baseline capture raise at iteration 0, before a kernel exists."""
-    config = preset.build_config(
-        manifest_path=Path("/m.json"), checks_path=".autohelix/c.json", python="python",
-        iterations=5, iteration_time=None, run_timeout=900, constraint_timeout=1200,
-        agent_type="claude", model=None,
-    )
+    config = preset.load_preset()
     assert config["metrics"] == []
     assert config["scope"]["editable"] == ["source.py", "inference.py"]
-    assert config["constraints"][0]["timeout"] == 1200
     assert config["reviewer"]["prompt"]
+
+
+def test_the_preset_declares_what_the_loop_needs() -> None:
+    data = preset.load_preset()
+    for key in ("goal", "constraints", "metrics", "scope", "agent", "reviewer", "budget"):
+        assert key in data, key
+
+
+def test_the_preset_is_fixed_with_nothing_left_to_substitute() -> None:
+    """The loop reads this file directly, so a leftover placeholder would reach the shell."""
+    command = preset.load_preset()["constraints"][0]["command"]
+    assert "${" not in command
+    assert "{{" not in command
+    # An absolute path would pin the preset to one machine, which a fixed file cannot be.
+    for token in command.split():
+        assert not token.startswith("/"), token
+    assert "nki_checker" in command
+
+
+def test_the_gate_gets_longer_than_the_run_it_supervises() -> None:
+    """Otherwise a hung inference.py kills the constraint instead of failing a check."""
+    constraint = preset.load_preset()["constraints"][0]
+    inner = int(constraint["command"].split("--timeout")[1].split()[0])
+    assert constraint["timeout"] > inner
+
+
+def test_the_preset_satisfies_autohelixs_own_validator() -> None:
+    """The loop hands this file straight to `load_config`, with no preprocessing."""
+    from autohelix.config import load_config
+
+    config, raw = load_config(preset.PRESET_PATH.parent, config_file=preset.PRESET_PATH)
+    errors = [i for i in config.validate(raw_data=raw) if i.level == "error"]
+    assert not errors, [e.message for e in errors]
+    assert config.editable == ["source.py", "inference.py"]
+    assert config.observables == []
+    assert config.reviewer is not None
+    assert len(config.constraints) == 1
 
 
 def test_the_reviewer_is_asked_for_both_sections() -> None:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +47,8 @@ from autohelix.harness import AutoHelixRunError, Harness, _IterationSpinner
 from autohelix.history import IterationResult
 from autohelix.sandbox import Worktree
 
-from bootstrap.materialize import CHECKS_REL, CONFIG_REL
+from bootstrap.materialize import CHECKS_REL, MANIFEST_REL
+from bootstrap.preset import PRESET_PATH, load_prompt_template
 
 #: Where verdicts are kept for the operator, outside the agent's worktree.
 REPORT_DIR = "bootstrap"
@@ -113,11 +115,15 @@ class BootstrapLoop(Harness):
         config_file: Path | None = None,
     ) -> None:
         repo = Path(repo).resolve()
+        # The preset is read from the package, not from the repo. Every module repo runs
+        # under the same fixed config, so there is nothing per-repo to install and nothing
+        # that can drift; and because the file never lands in the repo, the gate's command
+        # line is not in the worktree for the agent to read.
         super().__init__(
             repo,
             verbose=verbose,
             heartbeat_seconds=heartbeat_seconds,
-            config_file=config_file or repo / CONFIG_REL,
+            config_file=config_file or PRESET_PATH,
         )
         self.reports_dir = self.project_path / ".autohelix" / REPORT_DIR
         self.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -189,12 +195,21 @@ class BootstrapLoop(Harness):
     # -- prompt -------------------------------------------------------------------
 
     def build_prompt(self, iteration: int, worktree_dir: Path) -> str:
-        """The stock prompt, with a history summary that says how the gate is doing.
+        """The bootstrap prompt, with a history summary that says how the gate is doing.
 
-        Upstream's summary reports metrics for an accepted iteration, and here every
-        iteration is accepted and there are no metrics — so it would say nothing at all.
+        Two departures from upstream. The template comes from the package rather than from
+        `.autohelix/prompt.md` in the repo — it is fixed, like the preset, and the stock
+        template would not do because it renders the constraint commands and the constraint
+        command names the checker the agent must not see.
+
+        And the history summary is rebuilt: upstream reports metrics for an accepted
+        iteration, and here every iteration is accepted and there are no metrics, so it
+        would say nothing at all.
         """
-        prompt = super().build_prompt(iteration, worktree_dir)
+        from autohelix.prompt_template import build_prompt_variables, render_template
+
+        variables = build_prompt_variables(self.config, self.history, iteration, worktree_dir)
+        prompt = render_template(load_prompt_template(), variables)
         lines = []
         for result in self.history.get_recent(5):
             verdict = self._verdicts.get(result.iteration)
@@ -384,6 +399,40 @@ class BootstrapLoop(Harness):
         finally:
             self.sandbox.discard_worktree(worktree)
 
+    # -- preflight ----------------------------------------------------------------
+
+    def _validate_environment(self) -> bool:
+        """Check the fixed constraint command can actually run, before spending an agent on it.
+
+        The command in `preset.yaml` says `python`, because a fixed file cannot name this
+        machine's interpreter. That is fine and it is also the one thing about the preset that
+        can be wrong at runtime: an unactivated venv gives a `python` that either cannot
+        import `bootstrap` or — worse, because it fails later and less legibly — cannot import
+        torch, which the gate needs to run `inference.py`. Both are cheap to detect here and
+        expensive to discover after an iteration's work.
+        """
+        if not (self.project_path / MANIFEST_REL).is_file():
+            self.console.print(
+                f"[red]Error:[/red] {self.project_path} has no {MANIFEST_REL}. "
+                f"Run `autohelix bootstrap init` first."
+            )
+            return False
+
+        probe = subprocess.run(
+            ["python", "-c",
+             "import bootstrap.nki_checker, torch, torch_neuronx; print('ok')"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            missing = probe.stderr.strip().splitlines()[-1:] or ["unknown import error"]
+            self.console.print(
+                f"[red]Error:[/red] the gate runs `python -m bootstrap.nki_checker`, but "
+                f"`python` on this PATH cannot import what it needs:\n  {missing[0]}\n"
+                f"Activate the environment autohelix is installed in and try again."
+            )
+            return False
+        return True
+
     # -- the run ------------------------------------------------------------------
 
     def run(self, max_iterations: int | None = None) -> bool:
@@ -402,6 +451,9 @@ class BootstrapLoop(Harness):
             self.sandbox.ensure_editable_files_ready(self.config.editable)
         except RuntimeError as exc:
             self.console.print(f"[red]Error:[/red] {exc}")
+            return False
+
+        if not self._validate_environment():
             return False
 
         self._print_header(max_iter, start_iter)
