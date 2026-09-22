@@ -10,5 +10,3 @@ NKI requirements rather than a metric. See `bootstrap/README.md`.
 Nothing is imported here: the CLI is loaded lazily so `autohelix` stays fast for everyone
 who is not bootstrapping a kernel, and the checker depends on the standard library alone.
 """
-
-__all__ = ["cli", "driver", "materialize", "nki_checker", "preset", "templates"]

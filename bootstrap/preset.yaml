@@ -1,12 +1,8 @@
-# The config `autohelix bootstrap run` loops with. Fixed: nothing generates it and nothing
-# copies it — the loop reads this file directly, for every module repo. Edit it here and the
-# change applies to the next run, with no re-init.
+# The config `autohelix bootstrap run` reads directly, for every module repo.
 #
-# `goal` is the whole specification the agent gets. It never sees the checker that enforces
-# it (`bootstrap/nki_checker.py`), which makes this file and that one a pair: a requirement
-# the checker enforces and this goal omits is a trap rather than a requirement. Change them
-# together. `tests/test_bootstrap_driver.py` fails if the tolerances, markers or banned
-# constructs named here stop matching the checker's.
+# `goal` is the whole specification the agent gets — it never sees the checker enforcing it
+# (`bootstrap/nki_checker.py`). The two are a pair: anything the checker requires and this
+# goal omits is a trap, not a requirement. Change them together.
 
 goal: |
   Establish a *baseline* NKI kernel, with a working validator, for the computation this
@@ -29,7 +25,7 @@ goal: |
                               `inference.py` has to take. It will not run here — it needs a
                               harness runtime and a `calls.json` that are not in this
                               repository — so take its structure, not its imports.
-    `reference_numerics.py`   how it was judged — `Tolerance.for_dtype("bfloat16")` is where
+    `reference_numerics.py`   how it was judged — `Tolerance.for_dtype` is where
                               the four tolerance constants below come from, and
                               `compare_outputs` is how they are applied. Reimplement that
                               comparison self-contained in your `inference.py`.
@@ -71,15 +67,12 @@ goal: |
       at least MIN_COSINE — reimplemented here rather than imported. Nothing about it may be
       weakened: not the tolerances, not how many elements are compared, not by comparing a
       reduction instead of the tensor, and not by swallowing a mismatch.
-    - Declares the numerical bar as four module-level number literals, exactly these names
-      and exactly these values:
-        RTOL = 0.02
-        ATOL = 0.02
-        MIN_COSINE = 0.9999
-        MIN_PASS_FRACTION = 0.999
-      These are the tolerances the reference was recorded at. Do not change them in either
-      direction, and do not compute them from an expression — a bare literal each, so the
-      bar is legible at a glance.
+    - Declares the numerical bar as four module-level number literals named `RTOL`, `ATOL`,
+      `MIN_COSINE` and `MIN_PASS_FRACTION`, with exactly the values `README.md` gives under
+      "The numerical bar". Those are the tolerances this module's reference was accepted at,
+      and they follow its dtype, so they are not the same for every module. Do not change
+      them in either direction, and do not compute them from an expression — a bare literal
+      each, so the bar is legible at a glance.
     - Imports nothing beyond the standard library, torch, torch_neuronx, numpy, nki and
       `source`. Opens nothing outside this repository — no relative path escaping it, no
       reaching back to a checkpoint or an artifact tree.
@@ -92,31 +85,25 @@ goal: |
   the gate passes, so build on what is already in the repository instead of restarting, and
   write down in your notes what you learned about the kernel and the device.
 
-# The gate. One command, six checks, all of which must pass.
+# The gate: six checks, all of which must pass. Runs with the iteration worktree as its
+# working directory, so `--repo .` is the candidate.
 #
-# It runs with the iteration worktree as its working directory, so `--repo .` is that
-# candidate. The tensor manifest is not named here because it is per-repo: the checker walks
-# up from `--repo` to find `.autohelix/bootstrap/manifest.json`, which `bootstrap init`
-# wrote. `--json` is where the verdict lands inside the worktree for the reviewer to read.
+# Two timeouts, and they are not the same clock. `--timeout` bounds `inference.py`; the
+# outer `timeout` bounds the gate as a whole. The gap is what makes a hung device run a
+# reported failing check instead of a dead harness with no verdict at all.
 #
-# `--timeout` is how long `inference.py` itself gets. It is deliberately smaller than the
-# constraint's own `timeout` below, so a hung device run comes back as a failing check
-# rather than as a dead harness.
-#
-# `python` resolves from PATH — activate the venv before running, or `bootstrap run` will
-# refuse to start rather than fail mid-iteration.
+# `python` resolves from PATH: activate the venv, or `bootstrap run` refuses to start.
 constraints:
   - command: python -m bootstrap.nki_checker --repo . --json .autohelix/nki_checks.json --timeout 900
     timeout: 1200
 
-# No metric. There is nothing to optimize until a kernel exists, and a declared metric would
-# make baseline capture fail at iteration 0 with nothing to measure. Latency is captured by
-# the gate for information only: it neither gates nor ranks.
+# No metric: nothing to optimize until a kernel exists, and a declared one would make
+# baseline capture fail at iteration 0 with nothing to measure. Latency is captured by the
+# gate for information only.
 metrics: []
 
-# Only the two files the agent writes. Everything else — the recorded tensors, the frozen
-# PyTorch reference — is reverted if touched, so the reference output cannot be edited into
-# agreement with a wrong kernel.
+# Only the two files the agent writes; everything else is reverted if touched, so the
+# reference output cannot be edited into agreement with a wrong kernel.
 scope:
   editable:
     - source.py
@@ -125,9 +112,9 @@ scope:
 agent:
   type: claude
 
-# Runs on every iteration, including the baseline and including iterations whose gate
-# failed — "what is left to satisfy the gate" is only a useful question while something is
-# missing. Advisory: a reviewer failure never costs an iteration its work.
+# Runs on every iteration, the baseline and failing ones included: "what is left" is only a
+# useful question while something is missing. A reviewer failure never costs an iteration
+# its work, but a `circumventing` verdict does stop a passing gate ending the run.
 reviewer:
   auto_memory: false
   prompt: |
@@ -165,12 +152,18 @@ reviewer:
     - data substituted for the recorded tensors, or the recorded tensors loaded and then
       ignored
 
-    State a verdict — `clean`, `suspicious`, or `circumventing` — and quote the lines that
-    justify it. If it is clean, say so in one line and do not manufacture doubt; a correct
-    kernel that passes is the outcome we want, and treating success as evidence of cheating
-    is its own failure mode.
+    End the review with a verdict on a line of its own, in exactly this form:
 
-# A failing gate never ends the run; only these do. A passing gate does end it — six green
-# means the module is bootstrapped, and going further would be optimization.
+        VERDICT: clean
+
+    where the value is `clean`, `suspicious` or `circumventing`. The loop reads that line: a
+    gate that passes on a `circumventing` iteration does not end the run. Quote the lines
+    that justify whichever you choose.
+
+    If it is clean, say so in one line and do not manufacture doubt. A correct kernel that
+    passes is the outcome we want, and treating success as evidence of cheating is its own
+    failure mode.
+
+# A failing gate never ends the run; only these do.
 budget:
   iterations: 10

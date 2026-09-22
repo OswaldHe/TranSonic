@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,9 @@ class Materialized:
     scalar_args: list[dict[str, Any]] = field(default_factory=list)
     submodules: list[str] = field(default_factory=list)
     total_bytes: int = 0
+    tolerance: dict[str, float] = field(default_factory=dict)
+    model: str = ""
+    composition: str = "sequential"
 
 
 class MaterializeError(RuntimeError):
@@ -110,9 +114,8 @@ def _safe_name(name: str) -> str:
 def _raw_bytes(tensor: Any) -> tuple[bytes, str, list[int], str]:
     """A tensor's little-endian payload, plus the dtype and shape to read it back with.
 
-    Flattening before the uint8 view is what makes this work for every dtype the
-    checkpoint holds: fp8 and bfloat16 have no numpy equivalent, but a 1-D tensor of any
-    dtype reinterprets as bytes, and that is all the file needs to be.
+    Flattened before the uint8 view because fp8 and bfloat16 have no numpy equivalent, and a
+    1-D tensor of any dtype reinterprets as bytes.
     """
     import torch
 
@@ -192,8 +195,15 @@ def _artifact_reader(artifact: Path):
 
     candidate = artifact / "runtime" / "model_partition" / "runtime" / "artifact.py"
     if not candidate.is_file():
-        from model_partition.runtime import artifact as installed
-        return installed
+        # No fallback to the installed reader. The two versions differ in the API used here
+        # — `ModuleCalls.runs`, `checkpoint_weights` — so falling back would either raise
+        # AttributeError halfway through or, worse, silently read only the dumped weights and
+        # produce a repo missing most of its parameters.
+        raise MaterializeError(
+            f"{artifact} ships no runtime/model_partition/runtime/artifact.py. A published "
+            f"run carries the reader it was written with, and reading it with another "
+            f"version is not safe; re-download the artifact."
+        )
 
     import sys
 
@@ -255,22 +265,33 @@ def materialize(
     repo.mkdir(parents=True, exist_ok=True)
     records: list[TensorRecord] = []
 
-    # The group's boundary: the first submodule's first argument in, the last submodule's
-    # output out. Anything in between is internal to the kernel being written.
-    group_input = _decode(reader, directory, chain[0]["args"][0])
-    if group_input is None:
-        raise MaterializeError(f"{module_id} records no tensor as its first argument")
-    records.append(_write_tensor(
-        directory=repo, name="input", role="input", tensor=group_input, required=True,
-        source=_bin_of(chain[0]["args"][0]),
-    ))
-    group_output = _decode(reader, directory, chain[-1]["output"])
-    if group_output is None:
+    # The group's boundary: everything the first submodule was called with going in, and
+    # everything the last one returned coming out. Anything between is internal to the kernel.
+    #
+    # Both sides can hold more than one tensor. A module is handed a mask, a rotary
+    # embedding, a position alongside its hidden state, and can return a tuple or a dict —
+    # taking only the first of each would drop inputs the kernel needs and check only part of
+    # what it produced, and both would go unnoticed on a module where the first happens to be
+    # the only one.
+    inputs = _flatten_tensors(reader, directory, chain[0].get("args") or [], "input")
+    inputs += _flatten_tensors(reader, directory, chain[0].get("kwargs") or {}, "input")
+    if not inputs:
+        raise MaterializeError(f"{module_id} records no tensor among its arguments")
+    outputs = _flatten_tensors(reader, directory, chain[-1].get("output"), "reference")
+    if not outputs:
         raise MaterializeError(f"{module_id} records no tensor as its output")
-    records.append(_write_tensor(
-        directory=repo, name="reference", role="golden", tensor=group_output, required=True,
-        source=_bin_of(chain[-1]["output"]),
-    ))
+
+    for name, tensor, origin in inputs:
+        records.append(_write_tensor(
+            directory=repo, name=name, role="input", tensor=tensor, required=True,
+            source=origin,
+        ))
+    for name, tensor, origin in outputs:
+        records.append(_write_tensor(
+            directory=repo, name=name, role="golden", tensor=tensor, required=True,
+            source=origin,
+        ))
+    tolerance = _tolerance_for(artifact, [t for _, t, _ in outputs])
 
     # Every weight the module needs, dumped ones and checkpoint-backed ones alike. The
     # reader resolves both, so this is where the fetched shards are paid for.
@@ -313,6 +334,9 @@ def materialize(
         scalar_args=scalars,
         submodules=[c.get("submodule", "") for c in chain],
         total_bytes=sum(r.nbytes for r in records),
+        tolerance=tolerance,
+        model=_model_name(artifact),
+        composition=_composition(directory),
     )
 
     _write_frozen_files(artifact, directory, repo, result)
@@ -323,35 +347,38 @@ def materialize(
     return result
 
 
-def _sample_order(directory: Path) -> list[str]:
-    """Sample ids in the order the run took them.
+def _literal_from_inference(directory: Path, name: str, fallback: Any) -> Any:
+    """A module-level constant out of the group's own `inference.py`.
 
-    Read out of the group's own `inference.py`, which records them as `SAMPLE_IDS` for
-    exactly this purpose — short prompts first, so selecting the default selects the cheap
-    one. Taken by AST rather than by import: that file bootstraps the harness runtime onto
-    `sys.path` when imported, which is precisely what this is trying to avoid.
+    By AST rather than by import: that file puts the harness runtime on `sys.path` when
+    imported, which is the coupling this whole materialization exists to avoid.
     """
     import ast
 
     path = directory / "inference.py"
     if not path.is_file():
-        return []
+        return fallback
     try:
         tree = ast.parse(path.read_text())
     except SyntaxError:
-        return []
+        return fallback
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if not any(isinstance(t, ast.Name) and t.id == "SAMPLE_IDS" for t in node.targets):
+        if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
             continue
         try:
-            value = ast.literal_eval(node.value)
+            return ast.literal_eval(node.value)
         except (ValueError, SyntaxError):
-            return []
-        if isinstance(value, (list, tuple)):
-            return [str(v) for v in value]
-    return []
+            return fallback
+    return fallback
+
+
+def _sample_order(directory: Path) -> list[str]:
+    """Sample ids in the order the run took them — short prompts first, so the default
+    selection is the cheap one."""
+    value = _literal_from_inference(directory, "SAMPLE_IDS", [])
+    return [str(v) for v in value] if isinstance(value, (list, tuple)) else []
 
 
 def _is_tensor(value: Any) -> bool:
@@ -372,6 +399,106 @@ def _decode(reader: Any, directory: Path, value: Any) -> Any:
     if not _is_tensor(value):
         return None
     return reader.decode(directory, value, "cpu")
+
+
+def _flatten_tensors(
+    reader: Any, directory: Path, value: Any, prefix: str,
+) -> list[tuple[str, Any, str]]:
+    """Every recorded tensor inside a value, named for where it sat.
+
+    A boundary is not always one tensor: a list of arguments, a returned tuple, a dict of
+    outputs. Names follow the shape — `reference`, or `reference_0`/`reference_1` for a
+    tuple, or `reference_logits` for a dict — so a reader of the manifest can see which
+    position each file came from.
+    """
+    found: list[tuple[str, Any, str]] = []
+
+    def walk(node: Any, name: str) -> None:
+        if _is_tensor(node):
+            found.append((name, _decode(reader, directory, node), _bin_of(node)))
+        elif isinstance(node, (list, tuple)):
+            for index, item in enumerate(node):
+                walk(item, f"{name}_{index}")
+        elif isinstance(node, dict):
+            for key, item in node.items():
+                walk(item, f"{name}_{key}")
+
+    walk(value, prefix)
+    # One tensor at the boundary is the common case and reads better unsuffixed.
+    if len(found) == 1 and found[0][0] != prefix:
+        found = [(prefix, found[0][1], found[0][2])]
+    return found
+
+
+def _tolerance_for(artifact: Path, outputs: list[Any]) -> dict[str, float]:
+    """The bar this module's reference was accepted at, from the artifact's own table.
+
+    Read out of the artifact's `numerics.py` rather than retyped, and keyed on the dtype of
+    what is actually being compared: an fp8 boundary is not held to a float32 bar, and a
+    float32 one is not let off with bfloat16's. Where a module returns several tensors the
+    loosest applicable row wins, since one bar has to cover all of them.
+    """
+    import importlib.util
+
+    path = artifact / "runtime" / "model_partition" / "verify" / "numerics.py"
+    table: dict[str, tuple[float, float]] = {}
+    default = (2e-2, 2e-2)
+    fractions = {"MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999}
+    if path.is_file():
+        spec = importlib.util.spec_from_file_location("_bootstrap_numerics", path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["_bootstrap_numerics"] = module
+            try:
+                spec.loader.exec_module(module)
+                table = dict(getattr(module, "TOLERANCES", {}))
+                default = getattr(module, "DEFAULT_TOLERANCE", default)
+                bar = getattr(module, "Tolerance", None)
+                if bar is not None:
+                    fractions = {
+                        "MIN_COSINE": float(bar.min_cosine),
+                        "MIN_PASS_FRACTION": float(bar.min_pass_fraction),
+                    }
+            finally:
+                sys.modules.pop("_bootstrap_numerics", None)
+
+    rtol, atol = 0.0, 0.0
+    for tensor in outputs:
+        dtype = str(tensor.dtype).removeprefix("torch.")
+        candidate = table.get(dtype, default)
+        rtol, atol = max(rtol, candidate[0]), max(atol, candidate[1])
+    return {"RTOL": rtol or default[0], "ATOL": atol or default[1], **fractions}
+
+
+def _model_name(artifact: Path) -> str:
+    """What the artifact says it was traced from, for the generated README.
+
+    Empty rather than guessed when the artifact says nothing: a wrong model name in a file
+    the agent reads as its specification is worse than no model name.
+    """
+    import yaml
+
+    run = artifact / "run.yaml"
+    if run.is_file():
+        try:
+            spec = (yaml.safe_load(run.read_text()) or {}).get("spec") or {}
+        except yaml.YAMLError:
+            spec = {}
+        for key in ("source", "name"):
+            value = spec.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _composition(directory: Path) -> str:
+    """Whether the group's submodules run in sequence or in parallel.
+
+    From the group's own `inference.py`, which records it as `COMPOSITION` — the same reason
+    `SAMPLE_IDS` is read there, and again by AST so importing it cannot drag the harness
+    runtime onto `sys.path`.
+    """
+    return _literal_from_inference(directory, "COMPOSITION", "sequential")
 
 
 #: The artifact files carried in verbatim as frozen references, and why each is here.
@@ -401,7 +528,7 @@ NUMERICS_SOURCE = ("runtime", "model_partition", "verify", "numerics.py")
 NUMERICS_TARGET = "reference_numerics.py"
 NUMERICS_WHY = (
     "the exact definition of the numerical bar this module was accepted at.\n"
-    "`Tolerance.for_dtype(\"bfloat16\")` is where RTOL/ATOL/MIN_COSINE/MIN_PASS_FRACTION come\n"
+    "`Tolerance.for_dtype` is where RTOL/ATOL/MIN_COSINE/MIN_PASS_FRACTION come\n"
     "from, and `compare_outputs` is how they are applied — elementwise closeness over a\n"
     "minimum fraction of elements, plus cosine similarity. Your inference.py has to reach the\n"
     "same verdict on the same numbers without importing this: reimplement it, self-contained,\n"
@@ -477,10 +604,29 @@ def write_manifest(result: Materialized) -> Path:
         "step": result.step,
         "call_index": result.call_index,
         "submodules": result.submodules,
+        "composition": result.composition,
         "scalar_args": result.scalar_args,
+        # The bar check (e) holds this repo to, derived from the reference's dtype rather
+        # than fixed globally: an fp8 boundary and a float32 one are not the same question.
+        "tolerance": result.tolerance,
         "tensors": [t.to_dict() for t in result.tensors],
     })
     return manifest_path
+
+
+def clear(repo: Path) -> None:
+    """Empty a directory so `init --force` starts clean.
+
+    Overwriting file by file would leave whatever the previous init wrote and this one does
+    not — another module's tensors, a stale manifest — and the repo would then be a mix of
+    two modules that nothing detects. Removing git history is part of that: the baseline
+    commit has to be this module's stub.
+    """
+    for entry in repo.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
 
 
 def git_init(repo: Path) -> str:

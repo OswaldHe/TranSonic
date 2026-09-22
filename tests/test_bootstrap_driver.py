@@ -17,7 +17,7 @@ import pytest
 from autohelix.checks import ConstraintResult
 from bootstrap import nki_checker as chk
 from bootstrap import preset
-from bootstrap.driver import read_verdict
+from bootstrap.driver import read_review_verdict, read_verdict
 
 pytestmark = pytest.mark.bootstrap
 
@@ -82,11 +82,54 @@ def test_no_constraint_result_is_not_a_pass(tmp_path: Path) -> None:
 # -- the preset and the gate have to agree --------------------------------------------
 
 
-def test_the_goal_states_every_pinned_tolerance() -> None:
-    """The agent is told the bar only by the goal, so the goal must carry all four."""
+def test_the_goal_names_every_tolerance_constant() -> None:
+    """The agent learns the bar only from the goal and the README the goal points at.
+
+    The goal names the four constants but not their values: those are per-module, derived
+    from the reference's dtype, so a fixed preset cannot state them. It has to send the agent
+    to the generated README instead, and say so.
+    """
     goal = preset.render_goal()
-    for name, value in chk.PINNED_TOLERANCE.items():
-        assert f"{name} = {value:g}" in goal, name
+    for name in chk.TOLERANCE_NAMES:
+        assert name in goal, name
+    assert "README.md" in goal
+    assert "numerical bar" in goal
+
+
+def test_the_readme_carries_the_values_the_goal_defers_to() -> None:
+    """Whatever the goal points at has to actually be there, with this repo's numbers."""
+    from bootstrap import templates
+    from bootstrap.materialize import Materialized, TensorRecord
+
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999}
+    result = Materialized(
+        repo=Path("/repo"), group="g", module_id="m", sample_id="s", step=0, call_index=0,
+        tensors=[
+            TensorRecord("input", "input", "tensors/input.bin", "float8_e4m3fn", [4], 4, "h",
+                         required=True),
+            TensorRecord("reference", "golden", "tensors/reference.bin", "float8_e4m3fn", [4],
+                         4, "h", required=True),
+        ],
+        submodules=["a"], tolerance=bar, model="hf:some/model",
+    )
+    readme = templates.render_readme(result)
+    assert "## The numerical bar" in readme
+    for name, value in bar.items():
+        assert f"{name} = {value:g}" in readme, name
+    # The summary reports what the artifact said, not a hardcoded model or composition.
+    assert "hf:some/model" in readme
+    assert "DeepSeek" not in readme
+
+
+def test_the_bar_follows_the_reference_dtype() -> None:
+    """A global bfloat16 tolerance would hold an fp8 boundary to a bar it cannot meet."""
+    assert chk.expected_tolerance({}) == chk.PINNED_TOLERANCE
+    recorded = {"tolerance": {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.99,
+                              "MIN_PASS_FRACTION": 0.9}}
+    assert chk.expected_tolerance(recorded)["RTOL"] == 0.1
+    # A partial record still fills in the rest rather than dropping a constant.
+    assert chk.expected_tolerance({"tolerance": {"RTOL": 0.5}})["ATOL"] == \
+        chk.PINNED_TOLERANCE["ATOL"]
 
 
 def test_the_goal_names_what_the_gate_looks_for() -> None:
@@ -172,8 +215,64 @@ def test_the_frozen_references_cannot_be_opened_at_runtime() -> None:
         assert any(m in name for m in chk.FORBIDDEN_PATH_MARKERS), name
 
 
+# -- the reviewer's verdict gates success ---------------------------------------------
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("VERDICT: clean", "clean"),
+    ("VERDICT: suspicious", "suspicious"),
+    ("VERDICT: circumventing", "circumventing"),
+    ("verdict:   CIRCUMVENTING", "circumventing"),
+    ("  VERDICT: clean  ", "clean"),
+])
+def test_a_stated_verdict_is_read(tmp_path: Path, line: str, expected: str) -> None:
+    path = tmp_path / "review.md"
+    path.write_text(f"# Review\n\nsome analysis\n\n{line}\n")
+    assert read_review_verdict(path) == expected
+
+
+def test_the_words_in_prose_are_not_the_verdict(tmp_path: Path) -> None:
+    """The reviewer's own instructions list all three words; only the line counts."""
+    path = tmp_path / "review.md"
+    path.write_text(
+        "I considered whether this is circumventing the check or merely suspicious.\n"
+        "It is neither.\n\nVERDICT: clean\n"
+    )
+    assert read_review_verdict(path) == "clean"
+
+
+def test_the_last_verdict_wins(tmp_path: Path) -> None:
+    path = tmp_path / "review.md"
+    path.write_text("VERDICT: suspicious\n\non reflection:\n\nVERDICT: circumventing\n")
+    assert read_review_verdict(path) == "circumventing"
+
+
+def test_no_verdict_and_no_review_are_both_none(tmp_path: Path) -> None:
+    path = tmp_path / "review.md"
+    path.write_text("# Review\n\nno verdict here\n")
+    assert read_review_verdict(path) is None
+    assert read_review_verdict(tmp_path / "absent.md") is None
+
+
+def test_the_reviewer_is_told_to_state_the_verdict_the_loop_parses() -> None:
+    """The loop acts on this line, so the prompt has to ask for exactly this line."""
+    prompt = preset.load_preset()["reviewer"]["prompt"]
+    assert "VERDICT:" in prompt
+    for value in ("clean", "suspicious", "circumventing"):
+        assert value in prompt, value
+    # The example in the prompt has to be a line the parser accepts.
+    assert read_review_verdict_from_text(prompt) is not None
+
+
+def read_review_verdict_from_text(text: str) -> str | None:
+    from bootstrap.driver import REVIEW_VERDICT
+
+    found = REVIEW_VERDICT.findall(text)
+    return found[-1].lower() if found else None
+
+
 def test_the_reviewer_is_asked_for_both_sections() -> None:
-    prompt = preset.REVIEWER_PROMPT.lower()
+    prompt = preset.load_preset()["reviewer"]["prompt"].lower()
     assert "what is left" in prompt
     assert "reward-hacking" in prompt
     for verdict in ("clean", "suspicious", "circumventing"):
@@ -186,5 +285,6 @@ def test_the_agent_prompt_never_renders_the_constraint() -> None:
     The stock template renders `constraints`; this preset's does not, and that is the only
     thing keeping the checker's location out of the agent's context.
     """
-    assert "constraints" not in preset.PROMPT_TEMPLATE
-    assert "nki_checker" not in preset.PROMPT_TEMPLATE
+    template = preset.load_prompt_template()
+    assert "constraints" not in template
+    assert "nki_checker" not in template

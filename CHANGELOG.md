@@ -17,6 +17,10 @@
   directly for every module repo, with nothing generated and no copy written into
   the repo. `bootstrap/prompt.md` is the agent's prompt template on the same
   terms.
+- The numerical bar is derived from the reference tensor's dtype and recorded in the
+  repo's manifest, rather than fixed at bfloat16 globally, so a module whose
+  boundary is fp8 or float32 is held to the tolerance its reference was actually
+  accepted at.
 - The constraint is hidden from the agent: the preset's `goal` states all six
   requirements in prose, and because the preset never lands in the repo, the
   command naming the checker is never in the worktree. The reviewer additionally

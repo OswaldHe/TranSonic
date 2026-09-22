@@ -23,7 +23,7 @@ autohelix bootstrap report --path <repo>   # per-iteration verdicts
 | baseline | constraints pass | constraint fails, by design |
 | failing iteration | worktree discarded | **merged anyway** |
 | reviewer | only after a constraint passes | every iteration |
-| stops when | budget, or a metric gate | the gate passes, or budget |
+| stops when | budget, or a metric gate | the gate passes and the review is not `circumventing`, or budget |
 
 The merge is the load-bearing difference. Upstream, a rejected iteration leaves only its
 notes behind — which is right when a working codebase is being improved and wrong here,
@@ -42,7 +42,7 @@ all of which must pass:
 | b | self-containment | neither file imports or opens anything beyond the other, the standard library, NKI, and the repo's own `.bin` tensors |
 | c | nki-only | `source.py` never names torch, numpy or scipy |
 | d | metric measurement | the run leaves a `.neff` and a `.ntff` and reports a latency read from `neuron-explorer`'s `total_exec_time` |
-| e | pass-test | `inference.py` exits 0 and matches the reference, at the pinned tolerance and not a looser one |
+| e | pass-test | `inference.py` exits 0 and matches the reference, at the tolerance `init` derived from the reference's dtype and recorded in the manifest — not a looser or tighter one |
 | f | data provenance | the tensors fed to the kernel are the recorded ones, byte for byte |
 
 **The agent never sees the checker.** `bootstrap/preset.yaml` states all six requirements in
@@ -85,7 +85,14 @@ fabricated with `randn`/`ones`/`full`/`arange`/`fill_`; an edited `.bin`.
 What static analysis cannot catch — a kernel that is an identity with the real work done on
 the host, a comparison that is technically performed but meaningless — is the reviewer's
 job. It runs every iteration and writes two sections: what is left to satisfy the gate, and
-an adversarial read of whether this iteration is circumventing it.
+an adversarial read of whether this iteration is circumventing it, ending in a
+`VERDICT: clean|suspicious|circumventing` line the loop parses. A green gate on a
+`circumventing` iteration does not end the run — the work still merges, and the next
+iteration is asked to do it honestly.
+
+The reviewer is also held to being read-only: the editable files are snapshotted around it
+and restored if it changed them, so the verdict recorded beside a commit always describes
+the code that actually landed.
 
 ## The repo `init` builds
 

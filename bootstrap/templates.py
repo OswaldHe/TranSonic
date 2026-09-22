@@ -14,7 +14,7 @@ Everything raised as `NotImplementedError` is the agent's work.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from bootstrap.nki_checker import PINNED_TOLERANCE
 
@@ -32,7 +32,6 @@ GITIGNORE = """\
 *.ntff.json
 neuron_profile/
 log-neuron-cc.txt
-/tmp/
 __pycache__/
 *.pyc
 """
@@ -64,7 +63,7 @@ def kernel({params}):
     Inputs, in order:
 {param_docs}
 
-    Returns the group's output: {out_dtype}{out_shape}.
+    Returns the group's output: {returns}.
     """
     raise NotImplementedError(
         "the kernel is not implemented yet: compute {module_id} in NKI"
@@ -186,7 +185,7 @@ edit any of them, and an edit is reverted before your work is judged.
 |---|---|
 | `reference_torch.py` | **what to compute** — the original PyTorch implementation of this module. The specification. |
 | `reference_inference.py` | **how it was run** — the artifact's own launcher: load weights and inputs, run, time, compare against the dumped output, report `##autohelix[...]` metrics. The shape your `inference.py` has to take. It cannot run here (it needs the harness runtime and the artifact's `calls.json`), so take the structure, not the imports. |
-| `reference_numerics.py` | **how it was judged** — `Tolerance.for_dtype("bfloat16")` is where the four tolerance constants come from and `compare_outputs` is how they are applied. Reimplement this self-contained in `inference.py`; do not import it. |
+| `reference_numerics.py` | **how it was judged** — `Tolerance.for_dtype` is where the four tolerance constants come from and `compare_outputs` is how they are applied. Reimplement this self-contained in `inference.py`; do not import it. |
 
 `config.json` is the config the module was built from; `MODULE.md` is the artifact's own
 description of its pre- and post-conditions.
@@ -207,6 +206,20 @@ Total: {total_mib:.1f} MiB across {tensor_count} file(s).
 produced and what your result is compared against. `weight` entries are parameters;
 `buffer` entries are non-persistent state the module registered.
 {notes_section}
+## The numerical bar
+
+Declare these four in `inference.py` as module-level number literals, under exactly these
+names and with exactly these values. They are the tolerance this module's reference was
+accepted at — derived from its dtype, so they are these numbers for this module and not
+for every module. Do not change them in either direction, and do not compute them from an
+expression.
+
+```python
+{tolerance_block}
+```
+
+`reference_numerics.py` is where they come from and how they are applied.
+
 ## Your job
 
 Write `source.py` (the NKI kernel) and `inference.py` (the validator that loads these
@@ -228,11 +241,30 @@ def _one_line(result: "Materialized") -> str:
 
 
 def _summary(result: "Materialized") -> str:
-    names = " -> ".join(s for s in result.submodules if s)
+    """One sentence naming the module, read from the artifact rather than assumed.
+
+    The model and the composition both come from what was published: hardcoding either
+    would put a false statement in the file the agent reads as its specification, and
+    "sequential" in particular is wrong for a parallel group — an expert shard runs beside
+    its siblings, not after them.
+    """
+    names = (" -> " if result.composition == "sequential" else " | ").join(
+        s for s in result.submodules if s
+    )
+    model = f" of {result.model}" if result.model else ""
     return (
-        f"One partition module of DeepSeek V4.1 Flash: `{result.module_id}`, a sequential "
+        f"One partition module{model}: `{result.module_id}`, a {result.composition} "
         f"group over {len(result.submodules)} submodule(s) ({names})."
     )
+
+
+def _bar(result: "Materialized", name: str) -> float:
+    """One of the four tolerance constants for this repo.
+
+    The stub, the README and the gate all read it from the same place, so they cannot
+    disagree about the bar.
+    """
+    return result.tolerance.get(name, PINNED_TOLERANCE[name])
 
 
 def _kernel_params(result: "Materialized") -> list["TensorRecord"]:
@@ -241,27 +273,35 @@ def _kernel_params(result: "Materialized") -> list["TensorRecord"]:
 
 
 def _param_name(record: "TensorRecord") -> str:
+    """The kernel parameter this tensor arrives as.
+
+    A lone input reads better as `hidden_states`; where a module takes several — a mask, a
+    rotary embedding alongside the hidden state — each keeps its recorded name, because
+    collapsing them all to one label would produce a signature with repeated parameters.
+    """
     from bootstrap.materialize import _safe_name
 
-    return _safe_name(record.name) if record.role != "input" else "hidden_states"
+    return "hidden_states" if record.name == "input" else _safe_name(record.name)
 
 
 def render_source_stub(result: "Materialized") -> str:
     params = _kernel_params(result)
-    reference = next((t for t in result.tensors if t.role == "golden"), None)
+    references = [t for t in result.tensors if t.role == "golden"]
     param_docs = "\n".join(
         f"      {_param_name(p)}: {p.dtype}{p.shape}"
         + (f"  # {p.note}" if p.note else "")
         for p in params
     )
+    returns = ", ".join(f"{r.dtype}{r.shape}" for r in references) or "unknown"
+    if len(references) > 1:
+        returns = f"{len(references)} tensors, in order: {returns}"
     return SOURCE_STUB.format(
         module_id=result.module_id,
         summary=_summary(result),
         one_line=_one_line(result),
         params=", ".join(_param_name(p) for p in params),
         param_docs=param_docs or "      (none recorded)",
-        out_dtype=reference.dtype if reference else "unknown",
-        out_shape=reference.shape if reference else "",
+        returns=returns,
     )
 
 
@@ -275,10 +315,10 @@ def render_inference_stub(result: "Materialized") -> str:
         module_id=result.module_id,
         tensor_rows=rows,
         scalar_args=result.scalar_args,
-        rtol=PINNED_TOLERANCE["RTOL"],
-        atol=PINNED_TOLERANCE["ATOL"],
-        min_cosine=PINNED_TOLERANCE["MIN_COSINE"],
-        min_pass_fraction=PINNED_TOLERANCE["MIN_PASS_FRACTION"],
+        rtol=_bar(result, "RTOL"),
+        atol=_bar(result, "ATOL"),
+        min_cosine=_bar(result, "MIN_COSINE"),
+        min_pass_fraction=_bar(result, "MIN_PASS_FRACTION"),
     )
 
 
@@ -308,7 +348,11 @@ def render_readme(result: "Materialized") -> str:
             f"`SCALAR_ARGS`:\n\n{lines}\n\n"
         )
 
+    tolerance_block = "\n".join(
+        f"{name} = {_bar(result, name):g}" for name in PINNED_TOLERANCE
+    )
     return README.format(
+        tolerance_block=tolerance_block,
         module_id=result.module_id,
         summary=_summary(result),
         group=result.group,

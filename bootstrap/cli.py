@@ -48,7 +48,8 @@ def bootstrap() -> None:
 @click.option("--step", type=int, default=None, help="Decode step (prefill by default)")
 @click.option("--call", "call_index", type=int, default=0, show_default=True,
               help="Which invocation, when the pass called the group more than once")
-@click.option("--force", is_flag=True, help="Overwrite a non-empty target directory")
+@click.option("--force", is_flag=True,
+              help="Clear a non-empty target directory first, git history included")
 def init(
     repo: Path, artifact: Path, module_id: str, group: str | None, sample: str | None,
     step: int | None, call_index: int, force: bool,
@@ -60,8 +61,13 @@ def init(
     per-repo.
     """
     repo = repo.resolve()
-    if repo.exists() and any(repo.iterdir()) and not force:
-        raise click.ClickException(f"{repo} is not empty; pass --force to overwrite")
+    existing = list(repo.iterdir()) if repo.is_dir() else []
+    if existing and not force:
+        raise click.ClickException(f"{repo} is not empty; pass --force to clear it")
+    if existing:
+        click.echo(f"clearing {len(existing)} existing entr{'y' if len(existing) == 1 else 'ies'} "
+                   f"from {repo}")
+        mat.clear(repo)
 
     try:
         resolved_group = group or mat.find_group(artifact, module_id)

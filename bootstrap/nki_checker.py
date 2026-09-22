@@ -3,35 +3,21 @@
 
 """The Trainium NKI bootstrap constraint: six checks, one exit code.
 
-This is the gate `autohelix bootstrap` runs after every iteration. It answers one
-question — *is this module repo a real NKI kernel with a real validator yet* — and it
-answers it in six parts:
+The gate `autohelix bootstrap` runs after every iteration, answering one question — is this
+repo a real NKI kernel with a real validator yet — in six parts: (a) kernel formalization,
+(b) self-containment, (c) NKI-only source, (d) metric measurement, (e) pass-test,
+(f) data provenance. `bootstrap/README.md` spells each out.
 
-    a  kernel formalization  source.py defines a top-level `kernel` under @nki.jit,
-                             and inference.py calls it through torch_neuronx.trace
-    b  self-containment      neither file imports or opens anything beyond the other,
-                             the standard library, NKI, and the repo's own .bin tensors
-    c  nki-only              source.py never mentions torch, numpy or scipy
-    d  metric measurement    inference.py leaves a .neff and a .ntff behind and reports
-                             a latency read out of neuron-explorer's total_exec_time
-    e  pass-test             inference.py exits 0 and clears the numerical bar, at the
-                             tolerance it was given and not a looser one
-    f  data provenance       the tensors it feeds the kernel are the ones the original
-                             artifact recorded, byte for byte, not something generated
+**The agent never sees this file**; `preset.yaml`'s goal states all six requirements in
+prose. So if the two drift the goal is wrong, not the agent, and every message here has to
+be actionable by someone who has only read the goal.
 
-**The agent never sees this file.** That is deliberate: the preset goal text states all
-six requirements in prose, and if the two ever drift the goal is wrong, not the agent.
-Every message this file emits therefore has to stand on its own — a finding is written
-to be actionable by someone who has only read the goal.
+Exits 0 only when all six pass. Per-check verdicts go to stdout as a table and to `--json`
+as a record, so a failing run says what is left rather than only that something is wrong.
+Standard library only, so whatever the repo's own inference.py needs installed cannot
+perturb it.
 
-Exit code is 0 only when all six pass; the per-check verdicts go to stdout as a table
-and to `--json` as a machine-readable record, so a failing run still says precisely what
-is left rather than only that something is wrong.
-
-Runs on the standard library alone, so it is not perturbed by whatever the repo's own
-inference.py needs installed.
-
-    python -m bootstrap.nki_checker --repo . --manifest /path/to/manifest.json
+    python -m bootstrap.nki_checker --repo .
 """
 
 from __future__ import annotations
@@ -55,10 +41,11 @@ INFERENCE_FILE = "inference.py"
 #: question rather than a guess about which function is "the" kernel.
 KERNEL_FUNCTION = "kernel"
 
-#: The numerical bar, pinned. These are the artifact's own bfloat16 tolerances
-#: (partition/model_partition/verify/numerics.py), and inference.py must declare them as
-#: module-level literals under exactly these names. Check (e) compares the literals it
-#: finds against these values, so "pass the test" cannot be reached by widening the test.
+#: The four constants inference.py must declare, and the fallback for a manifest recording
+#: no bar of its own. The real one is per-repo — the tolerance the artifact accepted *this*
+#: reference at, which follows its dtype — so `bootstrap init` derives it into the manifest.
+#: These defaults are the bfloat16 row.
+TOLERANCE_NAMES = ("RTOL", "ATOL", "MIN_COSINE", "MIN_PASS_FRACTION")
 PINNED_TOLERANCE: dict[str, float] = {
     "RTOL": 2e-2,
     "ATOL": 2e-2,
@@ -79,11 +66,14 @@ BANNED_IN_SOURCE = frozenset({"torch", "numpy", "np", "scipy", "sp", "torch_neur
 #: Escape hatches that would let either file reach outside its declared imports.
 DYNAMIC_IMPORT_NAMES = frozenset({"__import__", "importlib", "exec", "eval", "compile"})
 
-#: Ways to read a file. Banned in source.py: a kernel is handed its tensors as arguments,
-#: and one that opens files can open `tensors/reference.bin` and return the answer. Those
-#: bytes are legitimately in the manifest, so the .bin allowlist alone would permit it.
+#: Ways to open a file, banned in source.py: a kernel that can open files can open
+#: `tensors/reference.bin` and return the answer, which the .bin allowlist alone permits.
+#:
+#: Narrow on purpose. `nl.load` moves a tensor into on-chip memory and is in every kernel,
+#: and `frombuffer` reinterprets bytes already in hand; flagging either would fail correct
+#: work, which is worse than missing a trick the reviewer also looks for.
 FILE_IO_NAMES = frozenset({
-    "open", "fromfile", "frombuffer", "read_bytes", "read_text", "load", "loadtxt", "memmap",
+    "open", "fromfile", "read_bytes", "read_text", "loadtxt", "memmap",
 })
 
 #: Substrings that mean a path is reaching back into the artifact or the checkpoint
@@ -141,6 +131,14 @@ CHECK_TITLES: dict[str, str] = {
     "e": "pass-test",
     "f": "data provenance",
 }
+
+
+def expected_tolerance(manifest: dict[str, Any]) -> dict[str, float]:
+    """The bar this repo is held to: the manifest's, or the bfloat16 default."""
+    recorded = manifest.get("tolerance") or {}
+    return {
+        name: float(recorded.get(name, PINNED_TOLERANCE[name])) for name in TOLERANCE_NAMES
+    }
 
 
 @dataclass
@@ -512,12 +510,14 @@ def check_measurement(inference: ast.Module, repo: Path, run: "RunOutcome") -> C
     )
 
 
-def check_pass_test(inference: ast.Module, run: "RunOutcome") -> CheckResult:
+def check_pass_test(
+    inference: ast.Module, run: "RunOutcome", tolerance: dict[str, float] | None = None,
+) -> CheckResult:
     """(e) It runs, it passes, and it passes at the tolerance it was given."""
     findings: list[str] = []
 
     constants = _module_level_numbers(inference)
-    for name, expected in PINNED_TOLERANCE.items():
+    for name, expected in (tolerance or PINNED_TOLERANCE).items():
         if name not in constants:
             findings.append(
                 f"{INFERENCE_FILE} does not declare {name} as a module-level number literal "
@@ -629,6 +629,17 @@ class RunOutcome:
     duration_s: float = 0.0
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the whole session the run was started in, tolerating an already-dead one."""
+    import os
+    import signal
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
 def run_inference(repo: Path, timeout: int) -> RunOutcome:
     """Execute the repo's own inference.py once, and keep everything it said.
 
@@ -638,28 +649,32 @@ def run_inference(repo: Path, timeout: int) -> RunOutcome:
     """
     started = time.time()
     try:
-        proc = subprocess.run(
+        # Its own session, so a timeout can kill the whole tree. Tracing a kernel spawns a
+        # compiler and a profiler; killing only the direct child leaves those holding the
+        # Neuron device, and the next iteration then fails for a reason that has nothing to
+        # do with its own work.
+        proc = subprocess.Popen(
             [sys.executable, INFERENCE_FILE],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = (exc.stdout or "") + (exc.stderr or "")
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", "replace")
-        return RunOutcome(
-            ran=True, return_code=-1, output=partial,
-            detail=f"timed out after {timeout}s",
-            started_at=started, duration_s=time.time() - started,
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
     except OSError as exc:
         return RunOutcome(ran=False, detail=str(exc), started_at=started)
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        stdout, stderr = proc.communicate()
+        return RunOutcome(
+            ran=True, return_code=-1, output=(stdout or "") + (stderr or ""),
+            detail=f"timed out after {timeout}s",
+            started_at=started, duration_s=time.time() - started,
+        )
     return RunOutcome(
         ran=True,
         return_code=proc.returncode,
-        output=proc.stdout + proc.stderr,
+        output=stdout + stderr,
         started_at=started,
         duration_s=time.time() - started,
     )
@@ -714,11 +729,9 @@ MANIFEST_REL = ".autohelix/bootstrap/manifest.json"
 def find_manifest(repo: Path) -> Path:
     """The manifest for this repo, searched for rather than passed in.
 
-    The gate's command line is a fixed string shared by every module repo, so it cannot
-    name a per-repo path. It does not have to: an iteration worktree lives at
-    ``<repo>/.autohelix/worktrees/iter-N``, inside the repo it was cut from, so walking up
-    from the candidate reaches the manifest whether ``--repo`` is the repo itself or one of
-    its worktrees.
+    The gate's command is one fixed string shared by every repo, so it cannot name a
+    per-repo path — and need not: a worktree lives at ``<repo>/.autohelix/worktrees/iter-N``,
+    so walking up reaches the manifest from either.
     """
     for directory in (repo, *repo.parents):
         candidate = directory / MANIFEST_REL
@@ -766,7 +779,7 @@ def evaluate(repo: Path, manifest: dict[str, Any], timeout: int) -> tuple[list[C
     return (
         [static[0], static[1], static[2],
          check_measurement(inference, repo, run),
-         check_pass_test(inference, run),
+         check_pass_test(inference, run, expected_tolerance(manifest)),
          check_provenance(inference, repo, manifest)],
         run,
     )

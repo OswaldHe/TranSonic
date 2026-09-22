@@ -3,17 +3,13 @@
 
 """Locate the bootstrap preset. It is data, not something this module builds.
 
-`bootstrap/preset.yaml` is the config the loop runs with and `bootstrap/prompt.md` is the
-agent's prompt template. Both are fixed files, read straight from the package: nothing
-generates them, nothing substitutes into them, and no copy is written into a module repo.
-Editing `preset.yaml` changes the next run, with no re-init.
+`preset.yaml` is the config the loop runs with and `prompt.md` is the agent's prompt
+template. Both are fixed files read straight from the package — nothing generates them and
+no copy is written into a module repo, so editing `preset.yaml` changes the next run.
 
-Keeping the preset as one reviewable file matters more here than in an ordinary loop. The
-agent never sees `nki_checker.py`; the `goal` in `preset.yaml` is the entire specification
-it works from. So the preset and the checker are a pair, and the preset has to be readable
-in a diff for that pairing to be checkable at all. `tests/test_bootstrap_driver.py` fails if
-they drift on the tolerances, the markers or the banned constructs, but only a human reading
-the goal can tell whether a requirement is stated *clearly*.
+That matters because the agent never sees `nki_checker.py`: the `goal` in `preset.yaml` is
+the entire specification it works from, and a specification has to be readable in a diff to
+be reviewable at all.
 """
 
 from __future__ import annotations
@@ -67,12 +63,6 @@ def load_prompt_template() -> str:
 def render_goal() -> str:
     """Just the goal, for callers that want the specification without the config."""
     return str(load_preset()["goal"])
-
-
-#: Read once at import: the tests and the reviewer plumbing refer to these by name.
-GOAL = render_goal()
-REVIEWER_PROMPT = str(load_preset()["reviewer"]["prompt"])
-PROMPT_TEMPLATE = load_prompt_template()
 
 
 def dump_manifest(path: Path, payload: dict[str, Any]) -> None:

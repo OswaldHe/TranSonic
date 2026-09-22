@@ -3,32 +3,21 @@
 
 """The bootstrap loop: AutoHelix's iteration cycle, re-aimed at a gate that starts red.
 
-AutoHelix's loop assumes a working codebase being made better: constraints pass at the
-baseline, a metric is measured, and an iteration that breaks a constraint is thrown away.
-Bootstrapping a kernel inverts all three. There is no metric — there is nothing to measure
-until a kernel exists. The gate fails at the baseline by construction. And discarding a
-failing iteration would discard every iteration, so the loop could never accumulate the
-thing it is trying to build.
+Upstream assumes a working codebase being improved — constraints pass at the baseline, a
+metric is measured, a failing iteration is discarded. Bootstrapping inverts all three, so
+this subclasses :class:`~autohelix.harness.Harness` and changes four things, reusing its
+agent plumbing, worktrees, scope enforcement, display and logging: every iteration merges
+whether or not the gate passes, the reviewer runs on all of them, a failing gate never ends
+the run, and a passing one does unless the reviewer calls it circumventing.
 
-So this subclasses :class:`~autohelix.harness.Harness` and changes exactly four things,
-reusing its agent plumbing, worktrees, scope enforcement, display and logging:
-
-* **every iteration is merged.** Work ratchets forward whether or not the gate passes;
-  the verdict is recorded beside the commit instead of deciding its fate.
-* **the reviewer runs every iteration.** Upstream runs it only after a constraint passes,
-  which here would be never — and "what is left to satisfy the gate" is only a useful
-  question while something is still missing.
-* **a failing gate never stops the run.** Only the budgets do.
-* **a passing gate does.** All six checks green means the module is bootstrapped; further
-  iterations would be optimization, which is a different loop with a metric in it.
-
-The baseline is gated too, so iteration 1 opens with a review of what the stub is missing
-rather than with nothing.
+The reasoning behind each is in `bootstrap/README.md`; what is here is why the code looks
+the way it does.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -77,6 +66,27 @@ class Verdict:
         )
 
 
+#: The reviewer's anti-reward-hacking judgment, as `preset.yaml` asks it to be written.
+#: Matched on a line of its own so the word appearing in prose — or in the instructions the
+#: reviewer was given — cannot be mistaken for the verdict.
+REVIEW_VERDICT = re.compile(r"^\s*VERDICT:\s*(clean|suspicious|circumventing)\b", re.I | re.M)
+
+#: The one that blocks declaring success.
+CIRCUMVENTING = "circumventing"
+
+
+def read_review_verdict(path: Path) -> str | None:
+    """The reviewer's verdict, or None if it did not state one.
+
+    The last line wins: a review that discusses the options before settling on one ends with
+    its answer.
+    """
+    if not path.is_file():
+        return None
+    found = REVIEW_VERDICT.findall(path.read_text())
+    return found[-1].lower() if found else None
+
+
 def read_verdict(results: list[ConstraintResult], checks_path: Path) -> Verdict:
     """Turn the gate's output into a verdict.
 
@@ -115,10 +125,8 @@ class BootstrapLoop(Harness):
         config_file: Path | None = None,
     ) -> None:
         repo = Path(repo).resolve()
-        # The preset is read from the package, not from the repo. Every module repo runs
-        # under the same fixed config, so there is nothing per-repo to install and nothing
-        # that can drift; and because the file never lands in the repo, the gate's command
-        # line is not in the worktree for the agent to read.
+        # From the package, not the repo: the gate's command line is then never in the
+        # worktree for the agent to read.
         super().__init__(
             repo,
             verbose=verbose,
@@ -128,15 +136,34 @@ class BootstrapLoop(Harness):
         self.reports_dir = self.project_path / ".autohelix" / REPORT_DIR
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self._verdicts: dict[int, Verdict] = {}
+        self._reviews: dict[int, str | None] = {}
 
     # -- reviewer -----------------------------------------------------------------
 
-    def _build_reviewer_prompt(self, worktree_path: Path) -> str:
-        """The stock reviewer prompt, plus where this iteration's verdict is.
+    @staticmethod
+    def _snapshot(worktree: Worktree, editable: list[str] | None) -> dict[Path, str]:
+        """The candidate files as they stand, so a read-only step can be held to read-only."""
+        paths = [worktree.working_dir / name for name in (editable or [])]
+        return {p: p.read_text() for p in paths if p.is_file()}
 
-        The reviewer runs in the same worktree the gate just ran in, so the verdict is
-        beside it. Handing over the path rather than the contents keeps the prompt short
-        and lets the reviewer read the findings it cares about.
+    @staticmethod
+    def _restore(snapshot: dict[Path, str]) -> list[str]:
+        """Put back anything that changed. Returns the names that had to be restored."""
+        changed: list[str] = []
+        for path, original in snapshot.items():
+            if not path.is_file() or path.read_text() != original:
+                path.write_text(original)
+                changed.append(path.name)
+        return changed
+
+    def _show_review_verdict(self, review: str) -> None:
+        colour = {"clean": "green", "suspicious": "yellow"}.get(review, "red")
+        self.console.print(f"  [{colour}]review: {review}[/{colour}]")
+
+    def _build_reviewer_prompt(self, worktree_path: Path) -> str:
+        """The preset's reviewer prompt, plus where this iteration's verdict is.
+
+        The reviewer runs in the worktree the gate just ran in, so the verdict is beside it.
         """
         if not self.config.reviewer:
             return ""
@@ -158,10 +185,16 @@ class BootstrapLoop(Harness):
         self.log.info(f"iter {iteration} {verdict.summary()}")
 
         (self.reports_dir / f"iter-{iteration}.txt").write_text(verdict.report)
-        if verdict.payload:
-            (self.reports_dir / f"iter-{iteration}.json").write_text(
-                json.dumps(verdict.payload, indent=2)
-            )
+        # Always a json, even when the gate crashed or timed out and wrote none itself.
+        # `bootstrap report` enumerates these, and an iteration missing from the record looks
+        # like it never ran rather than like the gate died on it.
+        payload = verdict.payload or {
+            "passed": verdict.passed,
+            "checks": [],
+            "report": verdict.report,
+            "synthesized": "the gate wrote no verdict; reconstructed from its exit code",
+        }
+        (self.reports_dir / f"iter-{iteration}.json").write_text(json.dumps(payload, indent=2))
         return verdict
 
     def _print_header(self, max_iter: int, start_iter: int = 1) -> None:
@@ -283,11 +316,33 @@ class BootstrapLoop(Harness):
                 verdict = self._run_gate(worktree.working_dir, iteration)
             self._show_verdict(verdict)
 
-            if self.config.reviewer and not self.run_reviewer(worktree, iteration):
-                # Advisory, as upstream: a reviewer failure must not cost the iteration
-                # its work. Recorded so a persistent failure is visible in the reports.
-                self.console.print("  [yellow]![/yellow] Reviewer failed")
-                (self.reports_dir / f"iter-{iteration}-review-failed").write_text("")
+            review = None
+            if self.config.reviewer:
+                # The reviewer is told to change nothing, and the verdict about to be
+                # committed was measured on the files as they are now. Snapshotting them
+                # across the review makes that true rather than merely asked for: an edit it
+                # made would otherwise be merged un-gated, so the recorded verdict would
+                # describe code that is not what landed.
+                snapshot = self._snapshot(worktree, effective_editable)
+                if self.run_reviewer(worktree, iteration):
+                    review = read_review_verdict(
+                        self.reports_dir.parent / "reviews" / f"iter-{iteration}.md"
+                    )
+                else:
+                    # Advisory, as upstream: a reviewer failure must not cost the iteration
+                    # its work. Recorded so a persistent failure is visible in the reports.
+                    self.console.print("  [yellow]![/yellow] Reviewer failed")
+                    (self.reports_dir / f"iter-{iteration}-review-failed").write_text("")
+                restored = self._restore(snapshot)
+                if restored:
+                    self.console.print(
+                        f"  [yellow]![/yellow] Reverted {len(restored)} file(s) the reviewer "
+                        f"changed: {', '.join(restored)}"
+                    )
+                    self.log.info(f"iter {iteration} reverted reviewer edits to {restored}")
+                if review:
+                    self._show_review_verdict(review)
+                self._reviews[iteration] = review
 
             commit = self.sandbox.merge_worktree(
                 worktree,
@@ -433,6 +488,20 @@ class BootstrapLoop(Harness):
             return False
         return True
 
+    def _spent_so_far(self, start_iter: int) -> tuple[float, float]:
+        """Cost and wall-clock already charged to this run, from history.
+
+        A resumed run starting both at zero would hand itself the whole budget again, so
+        `budget.cost` and `budget.time` would cap one invocation rather than the run.
+        """
+        if start_iter <= 1:
+            return 0.0, 0.0
+        prior = [r for r in self.history.load() if r.iteration > 0]
+        cost = sum(r.usage.get("cost_usd", 0) for r in prior)
+        # wall_clock_ms covers the gate and the review too; duration_ms is agent time alone.
+        millis = sum(r.usage.get("wall_clock_ms", r.usage.get("duration_ms", 0)) for r in prior)
+        return cost, millis / 1000.0
+
     # -- the run ------------------------------------------------------------------
 
     def run(self, max_iterations: int | None = None) -> bool:
@@ -470,8 +539,9 @@ class BootstrapLoop(Harness):
         if start_iter == 1 and not any(r.iteration == 0 for r in self.history.load()):
             self._capture_baseline()
 
-        cumulative_cost = 0.0
-        loop_start = time.monotonic()
+        # Carried over from history, so resuming does not hand the run its budget again.
+        cumulative_cost, prior_seconds = self._spent_so_far(start_iter)
+        loop_start = time.monotonic() - prior_seconds
         passed = False
         iteration = start_iter - 1
         try:
@@ -481,12 +551,27 @@ class BootstrapLoop(Harness):
 
                 verdict = self._verdicts.get(iteration)
                 if verdict and verdict.passed:
-                    passed = True
-                    self.console.print(
-                        f"\n[green]Bootstrapped.[/green] All checks pass at iteration "
-                        f"{iteration}; the module has a kernel and a validator."
-                    )
-                    break
+                    # A green gate is necessary but not sufficient. The gate is a program and
+                    # can be satisfied without the work being done, which is the reviewer's
+                    # whole brief — so an iteration it judges to be circumventing the check
+                    # does not get to end the run, however many checks it turned green.
+                    if self._reviews.get(iteration) == CIRCUMVENTING:
+                        self.console.print(
+                            f"\n[red]Gate passes, but the review says {CIRCUMVENTING}.[/red] "
+                            f"Not treating iteration {iteration} as bootstrapped; continuing so "
+                            f"the next one can do the work honestly. See "
+                            f".autohelix/reviews/iter-{iteration}.md."
+                        )
+                        self.log.info(
+                            f"iter {iteration} gate passed but review said {CIRCUMVENTING}"
+                        )
+                    else:
+                        passed = True
+                        self.console.print(
+                            f"\n[green]Bootstrapped.[/green] All checks pass at iteration "
+                            f"{iteration}; the module has a kernel and a validator."
+                        )
+                        break
 
                 cumulative_cost += (result.usage or {}).get("cost_usd", 0)
                 if self.config.max_cost_usd is not None and cumulative_cost >= self.config.max_cost_usd:

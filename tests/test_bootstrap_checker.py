@@ -159,6 +159,20 @@ def test_source_importing_the_frozen_reference_fails(repo: Path) -> None:
     assert not _static(repo)["b"].passed
 
 
+def test_nki_load_is_not_file_io(repo: Path) -> None:
+    """`nl.load` moves a tensor into on-chip memory and is in essentially every kernel.
+
+    Flagging it as file I/O would fail every correct kernel, which is a far worse failure
+    than missing a trick the reviewer is also looking for.
+    """
+    (repo / "source.py").write_text(GOOD_SOURCE.replace(
+        "return nl.add(hidden_states, weight)",
+        "a = nl.load(hidden_states)\n    b = nl.load(weight)\n    return nl.add(a, b)",
+    ))
+    result = _static(repo)["b"]
+    assert result.passed, result.findings
+
+
 def test_source_reading_the_reference_tensor_fails(repo: Path) -> None:
     """The kernel returning the answer it was meant to compute.
 
