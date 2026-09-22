@@ -1,0 +1,317 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The files `autohelix bootstrap init` writes into a module repo.
+
+The stubs are deliberately incomplete: the first iteration must fail the gate, because a
+loop that starts green has nothing to bootstrap. What they *do* carry is the shape of the
+answer — the kernel's name and decorator, the pinned tolerance constants, and the table of
+which `.bin` holds which tensor at which dtype and shape. That information is mechanical,
+error-prone to rediscover, and not what the loop is for; the kernel and the validator are.
+
+Everything raised as `NotImplementedError` is the agent's work.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from bootstrap.nki_checker import PINNED_TOLERANCE
+
+if TYPE_CHECKING:
+    from bootstrap.materialize import Materialized, TensorRecord
+
+
+GITIGNORE = """\
+# Run state: config, manifest, notes, logs. Never committed.
+.autohelix/
+
+# Profiling output, produced by inference.py on every run.
+*.neff
+*.ntff
+*.ntff.json
+neuron_profile/
+log-neuron-cc.txt
+/tmp/
+__pycache__/
+*.pyc
+"""
+
+
+SOURCE_STUB = '''\
+"""The NKI kernel for {module_id}.
+
+{summary}
+
+This is a stub: `kernel` has the shape the loop requires — a single top-level function
+under `@nki.jit` — and computes nothing. Implementing it is the task.
+
+NKI only. torch, numpy and scipy may not appear in this file, not even in a comment;
+`reference_torch.py` holds the PyTorch specification to read instead, and it may not be
+imported from here.
+
+Reference: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html
+"""
+
+import nki
+import nki.language as nl
+
+
+@nki.jit
+def kernel({params}):
+    """{one_line}
+
+    Inputs, in order:
+{param_docs}
+
+    Returns the group's output: {out_dtype}{out_shape}.
+    """
+    raise NotImplementedError(
+        "the kernel is not implemented yet: compute {module_id} in NKI"
+    )
+'''
+
+
+INFERENCE_STUB = '''\
+"""Run and validate the NKI kernel for {module_id}.
+
+Loads the recorded tensors out of `tensors/`, runs `source.kernel` on the device through
+`torch_neuronx.trace`, profiles it, and compares the result against the recorded
+reference.
+
+Four things this file must end up doing, none of which it does yet:
+
+1. load every tensor in TENSORS from its `.bin`, at the dtype and shape given there
+2. trace and run `kernel` with `torch_neuronx.trace`, leaving a `.neff` and a `.ntff`
+3. run `neuron-explorer` on those, read `total_exec_time`, and print it as
+   `##autohelix[latency_ms=...]`
+4. compare against the reference at the tolerance below and print
+   `##autohelix[passed=1]`, exiting 0 only when it matches
+
+The tolerances are the ones the reference was recorded at. They are the bar, not a
+suggestion, and raising any of them is not an available way to pass.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+import torch_neuronx
+
+from source import kernel
+
+HERE = Path(__file__).resolve().parent
+
+# The numerical bar. Do not change these values.
+RTOL = {rtol:g}
+ATOL = {atol:g}
+MIN_COSINE = {min_cosine:g}
+MIN_PASS_FRACTION = {min_pass_fraction:g}
+
+#: The profiler this reads its latency from, and the field it reads.
+NEURON_EXPLORER = "neuron-explorer"
+LATENCY_FIELD = "total_exec_time"
+
+#: Every recorded tensor: (name, file, dtype, shape). The bytes are raw little-endian,
+#: C-contiguous, with no header — dtype and shape here are the whole description.
+TENSORS = [
+{tensor_rows}
+]
+
+#: Non-tensor arguments the recorded forward was called with.
+SCALAR_ARGS = {scalar_args!r}
+
+
+def load(name):
+    """The named tensor, from its `.bin`.
+
+    Read the file listed for `name` in TENSORS and reinterpret its bytes at the recorded
+    dtype and shape. These files are the ground truth: nothing here may generate,
+    randomize or substitute data.
+    """
+    raise NotImplementedError("load the recorded tensors from tensors/*.bin")
+
+
+def run_on_device(inputs):
+    """Trace `kernel` with torch_neuronx and run it, leaving a .neff and a .ntff behind."""
+    raise NotImplementedError("trace and run the kernel with torch_neuronx.trace")
+
+
+def measure_latency(neff, ntff):
+    """Milliseconds, from neuron-explorer's total_exec_time for this run."""
+    raise NotImplementedError("read total_exec_time out of neuron-explorer")
+
+
+def compare(actual, expected):
+    """Whether `actual` matches the recorded reference at the pinned bar.
+
+    All four constants apply: elementwise closeness at RTOL/ATOL over at least
+    MIN_PASS_FRACTION of elements, and cosine similarity of at least MIN_COSINE.
+    """
+    raise NotImplementedError("compare against the reference at RTOL/ATOL/MIN_COSINE")
+
+
+def main():
+    raise NotImplementedError("wire load -> run_on_device -> measure_latency -> compare")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+README = """\
+# Bootstrap repo: `{module_id}`
+
+{summary}
+
+Generated by `autohelix bootstrap init` from partition artifact group
+`{group}`, recorded pass `{sample_id}#{step}` (invocation {call_index}).
+
+## The computation
+
+The kernel must reproduce this whole group, end to end — every submodule in the chain,
+not just the last one:
+
+{chain}
+
+`reference_torch.py` is the original PyTorch implementation, verbatim and frozen. It is
+the specification: read it. You may not import it, and you may not copy torch into
+`source.py`.
+
+`config.json` is the config the module was built from; `MODULE.md` is the artifact's own
+description of its pre- and post-conditions.
+
+{scalar_section}
+## Tensors
+
+Raw little-endian bytes, C-contiguous, no header. The dtype and shape below are the
+complete description of each file; there is no sidecar to read.
+
+| tensor | role | file | dtype | shape | bytes |
+|---|---|---|---|---|---|
+{tensor_table}
+
+Total: {total_mib:.1f} MiB across {tensor_count} file(s).
+
+`input` is what flows into the group; `reference` is the output the recorded forward
+produced and what your result is compared against. `weight` entries are parameters;
+`buffer` entries are non-persistent state the module registered.
+{notes_section}
+## Your job
+
+Write `source.py` (the NKI kernel) and `inference.py` (the validator that loads these
+tensors, runs the kernel on the device, profiles it, and checks it against `reference`).
+Both start as stubs that fail on purpose.
+
+Only those two files are yours. Everything else here is frozen and edits to it are
+reverted.
+
+```bash
+python inference.py        # what the gate runs
+```
+"""
+
+
+def _one_line(result: "Materialized") -> str:
+    kind = result.module_id.rsplit(".", 1)[-1]
+    return f"Compute {result.module_id} ({kind}) in NKI."
+
+
+def _summary(result: "Materialized") -> str:
+    names = " -> ".join(s for s in result.submodules if s)
+    return (
+        f"One partition module of DeepSeek V4.1 Flash: `{result.module_id}`, a sequential "
+        f"group over {len(result.submodules)} submodule(s) ({names})."
+    )
+
+
+def _kernel_params(result: "Materialized") -> list["TensorRecord"]:
+    """The tensors the kernel takes: the input and every weight, reference excluded."""
+    return [t for t in result.tensors if t.role != "golden"]
+
+
+def _param_name(record: "TensorRecord") -> str:
+    from bootstrap.materialize import _safe_name
+
+    return _safe_name(record.name) if record.role != "input" else "hidden_states"
+
+
+def render_source_stub(result: "Materialized") -> str:
+    params = _kernel_params(result)
+    reference = next((t for t in result.tensors if t.role == "golden"), None)
+    param_docs = "\n".join(
+        f"      {_param_name(p)}: {p.dtype}{p.shape}"
+        + (f"  # {p.note}" if p.note else "")
+        for p in params
+    )
+    return SOURCE_STUB.format(
+        module_id=result.module_id,
+        summary=_summary(result),
+        one_line=_one_line(result),
+        params=", ".join(_param_name(p) for p in params),
+        param_docs=param_docs or "      (none recorded)",
+        out_dtype=reference.dtype if reference else "unknown",
+        out_shape=reference.shape if reference else "",
+    )
+
+
+def render_inference_stub(result: "Materialized") -> str:
+    rows = "\n".join(
+        f'    ("{t.name}", "{t.file}", "{t.dtype}", {tuple(t.shape)!r}),'
+        + (f"  # {t.note}" if t.note else "")
+        for t in result.tensors
+    )
+    return INFERENCE_STUB.format(
+        module_id=result.module_id,
+        tensor_rows=rows,
+        scalar_args=result.scalar_args,
+        rtol=PINNED_TOLERANCE["RTOL"],
+        atol=PINNED_TOLERANCE["ATOL"],
+        min_cosine=PINNED_TOLERANCE["MIN_COSINE"],
+        min_pass_fraction=PINNED_TOLERANCE["MIN_PASS_FRACTION"],
+    )
+
+
+def render_readme(result: "Materialized") -> str:
+    table = "\n".join(
+        f"| `{t.name}` | {t.role} | `{t.file}` | {t.dtype} | {tuple(t.shape)} | {t.nbytes:,} |"
+        for t in result.tensors
+    )
+    chain = "\n".join(f"{n}. `{s}`" for n, s in enumerate(result.submodules, start=1) if s)
+
+    notes = {t.note for t in result.tensors if t.note}
+    notes_section = ""
+    if notes:
+        notes_section = "\n" + "\n".join(f"Note: {n}." for n in sorted(notes)) + "\n"
+
+    scalar_section = ""
+    if result.scalar_args:
+        lines = "\n".join(
+            f"- `{s.get('submodule')}` "
+            + (f"keyword `{s['keyword']}`" if "keyword" in s else f"positional {s['position']}")
+            + f" = `{s['value']!r}`"
+            for s in result.scalar_args
+        )
+        scalar_section = (
+            "## Non-tensor arguments\n\n"
+            "Values the recorded forward was called with, reproduced in `inference.py` as\n"
+            f"`SCALAR_ARGS`:\n\n{lines}\n\n"
+        )
+
+    return README.format(
+        module_id=result.module_id,
+        summary=_summary(result),
+        group=result.group,
+        sample_id=result.sample_id,
+        step=result.step,
+        call_index=result.call_index,
+        chain=chain or "(none recorded)",
+        scalar_section=scalar_section,
+        tensor_table=table,
+        total_mib=result.total_bytes / (1 << 20),
+        tensor_count=len(result.tensors),
+        notes_section=notes_section,
+    )

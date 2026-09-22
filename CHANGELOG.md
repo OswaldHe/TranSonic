@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `autohelix bootstrap`: a loop for bootstrapping a Trainium NKI kernel for one
+  module of a partition artifact. `init` materializes the module into a
+  self-contained git repo (raw `.bin` tensors, a frozen PyTorch reference, and
+  failing `source.py`/`inference.py` stubs); `run` loops an agent on it against a
+  fixed six-part NKI constraint rather than a metric. Unlike `autohelix run`,
+  every iteration is merged whether or not the constraint passes, the reviewer
+  runs on every iteration, a failing constraint never ends the run, and a passing
+  one does. See `bootstrap/README.md`.
+- The constraint is hidden from the agent: the preset goal states all six
+  requirements in prose, and the config carrying the command lives under
+  `.autohelix/`, which is not copied into the iteration worktree. The reviewer
+  additionally performs an anti-reward-hacking read of each iteration.
+
 ## 0.1.1 — 2026-09-02
 
 ### Added

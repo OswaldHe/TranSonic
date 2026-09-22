@@ -60,7 +60,7 @@ partition = [
 autohelix = "autohelix.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/autohelix", "partition/model_partition"]
+packages = ["src/autohelix", "partition/model_partition", "bootstrap"]
 
 # The bundled model specs, loop defaults and sample inputs are data the CLI reads
 # at runtime (`autohelix partition list/run`), and the specs reference the input
@@ -77,7 +77,7 @@ packages = ["src/autohelix", "partition/model_partition"]
 # sdist stays as clean as the wheel. The PyPI readme/LICENSE/NOTICE are added
 # via force-include since they live outside the only-included paths.
 [tool.hatch.build.targets.sdist]
-only-include = ["src/autohelix", "partition/model_partition", "partition/config", "partition/inputs"]
+only-include = ["src/autohelix", "partition/model_partition", "partition/config", "partition/inputs", "bootstrap"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "assets/README-pypi.md" = "assets/README-pypi.md"
@@ -88,4 +88,5 @@ only-include = ["src/autohelix", "partition/model_partition", "partition/config"
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests as slow (run with: pytest -m slow)",
+    "bootstrap: the NKI bootstrap gate and repo materialization (no device, no network)",
 ]

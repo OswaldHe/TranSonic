@@ -736,7 +736,38 @@ class _PartitionGroup(click.Group):
         return self._delegate().get_command(ctx, name)
 
 
+class _BootstrapGroup(click.Group):
+    """Lazy proxy for the `bootstrap` CLI.
+
+    Same reasoning as the partition proxy: bootstrapping needs torch and the artifact
+    reader, and no other `autohelix` invocation should pay for importing them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="bootstrap",
+            help="Bootstrap a Trainium NKI kernel for one partition-artifact module.",
+        )
+
+    def _delegate(self) -> click.Group:
+        try:
+            from bootstrap.cli import bootstrap
+        except ImportError as exc:
+            raise click.ClickException(
+                f"The bootstrap subsystem is unavailable ({exc}). It needs the extras "
+                'in partition/: pip install -e ".[partition]"'
+            ) from exc
+        return bootstrap
+
+    def list_commands(self, ctx):
+        return self._delegate().list_commands(ctx)
+
+    def get_command(self, ctx, name):
+        return self._delegate().get_command(ctx, name)
+
+
 main.add_command(_PartitionGroup())
+main.add_command(_BootstrapGroup())
 
 
 if __name__ == "__main__":
