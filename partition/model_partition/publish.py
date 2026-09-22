@@ -30,6 +30,12 @@ DEFAULT_EXCLUDE = ("logs/**",)
 #: What a run has to contain before uploading it means anything.
 REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
 
+#: Directories a published subset always carries whole. ``vendor`` is the model's own
+#: package, which ``source.py`` imports from; ``compat`` is what made its kernels run on
+#: the card that produced the reference. Without either, a module directory is a
+#: description of a computation rather than something anyone can run.
+ALWAYS = ("vendor", "compat", "plan", "reports")
+
 #: A token file an operator may leave beside the checkout, searched when the Hub's own
 #: sources (``HF_TOKEN``, a login) have nothing. Read, never written and never logged;
 #: it is in ``.gitignore`` so it cannot be committed by accident.
@@ -58,9 +64,162 @@ class PublishResult:
         return f"{text}\n{self.url}" if self.url else text
 
 
-def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE
-            ) -> tuple[list[Path], int]:
-    """Files to upload and their total size, in descending size order."""
+def materialize_weights(run_dir: str | Path, module_ids: list[str],
+                        report: Callable[[str], None] = lambda _m: None) -> int:
+    """Write the selected modules' weights into the run; returns the bytes added.
+
+    A run traced with ``cache_weights: false`` keeps only the *index* of which tensors
+    each module owns and reads their values from the checkpoint — which is what makes a
+    475 GiB model traceable on a 1 TB disk, and what makes the artifacts unusable to
+    anybody else: a module directory alone cannot be verified, because the numbers it
+    needs are in a repo that is not being published.
+
+    So before publishing a subset, those tensors are read once and dumped beside the
+    activations they are checked against. Block scales come with the weights they scale,
+    which is what lets the launcher dequantize a weight the class declares wider than the
+    checkpoint stores it — no second, bfloat16 copy of the checkpoint is needed for that.
+    """
+    from model_partition.runtime.module_runner import TraceBundle
+    from model_partition.tensorstore import TensorStore
+
+    root = Path(run_dir)
+    store = TensorStore.load(root / "trace")
+    bundle = TraceBundle.load(root / "trace")
+    if bundle.checkpoint is None:
+        bundle.checkpoint = _weight_source(root)
+    added = 0
+    for module_id in module_ids:
+        wanted = [name for name in (bundle.weight_params.get(module_id) or [])]
+        if not wanted:
+            continue
+        already = {(entry.extra or {}).get("param") for entry in store.entries
+                   if entry.module_id == module_id}
+        wanted = [name for name in wanted if name not in already]
+        if not wanted:
+            continue
+        values = bundle.checkpoint.load(wanted, device="cpu")
+        for name, tensor in values.items():
+            meta = store.write(_safe(name), tensor, role="weight", module_id=module_id,
+                               subdir=f"weights/{module_id}", extra={"param": name})
+            added += meta.nbytes
+        report(f"  {module_id}: {len(values)} tensor(s), {format_bytes(added)} so far")
+    store.save_manifest(store.metadata)
+    return added
+
+
+def _weight_source(root: Path):
+    """The checkpoint this run read its weights from, resolved from its own manifest.
+
+    A published run is read back from disk, where the source that fed it is not recorded
+    as an object. The manifest names the model, so it can be found again — and if it
+    cannot, saying so here is better than uploading a module directory whose numbers are
+    somewhere else.
+    """
+    from model_partition import yamlio
+    from model_partition.ingest import ingest
+    from model_partition.spec import parse_spec
+    from model_partition.weights_index import CheckpointWeights
+
+    manifest = yamlio.load_path(root / "run.yaml") or {}
+    payload = manifest.get("spec")
+    if not payload:
+        raise PublishError(f"{root / 'run.yaml'} does not record the model it partitioned")
+    try:
+        result = ingest(parse_spec(payload))
+    except Exception as exc:
+        raise PublishError(
+            f"this run read its weights from the checkpoint rather than dumping them, and "
+            f"the checkpoint cannot be reached to copy them in: {exc}"
+        ) from exc
+    return CheckpointWeights.from_ingest(result)
+
+
+def _safe(name: str) -> str:
+    from model_partition.trace import _safe_name
+
+    return _safe_name(name)
+
+
+def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: list[str],
+                         report: Callable[[str], None] = lambda _m: None) -> list[str]:
+    """Verify the published files on their own; returns what failed.
+
+    Not a scan for suspicious paths — an actual run. The published files are copied
+    somewhere else with nothing else of this machine in reach, and each selected group's
+    own ``verify.py`` is run there against its recorded reference. If a module needs a
+    weight that stayed in the checkpoint, or a sibling of the model's package that was not
+    carried along, it fails here rather than in somebody else's hands.
+
+    The one thing the copy does need is this package installed, which is the tool being
+    run and not part of the model.
+    """
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(run_dir)
+    elsewhere = Path(tempfile.mkdtemp(prefix="published-"))
+    for path in files:
+        target = elsewhere / path.relative_to(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+
+    groups = _published_groups(root, set(module_ids))
+    failures: list[str] = []
+    for group in sorted(groups):
+        directory = elsewhere / "modules" / group
+        if not (directory / "verify.py").is_file():
+            failures.append(f"{group}: no verify.py was published")
+            continue
+        finished = subprocess.run(
+            [sys.executable, "verify.py", "--all-samples"], cwd=directory,
+            capture_output=True, text=True, timeout=3600,
+        )
+        tail = (finished.stdout + finished.stderr).strip().splitlines()
+        if finished.returncode == 0:
+            report(f"  {group}: verified on its own")
+        else:
+            failures.append(f"{group}: {tail[-1] if tail else 'verify.py failed'}")
+    shutil.rmtree(elsewhere, ignore_errors=True)
+    return failures
+
+
+def representative_modules(run_dir: str | Path) -> list[str]:
+    """One module per implementation group, in plan order.
+
+    What makes a useful set to hand somebody: every *kind* of layer the model has, each
+    with its own weights and its recorded reference, rather than 40 copies of the same
+    attention. The groups are already the model's distinct kinds — that is what
+    deduplicating by structural signature means — so one module from each covers them
+    all: a dense attention and a sparse one, an MoE, the n-gram memory, the draft
+    stack's attention and its heads, the embedding, the norms, the output head.
+    """
+    from model_partition import yamlio
+    from model_partition.planner.graph import PartitionGraph
+
+    root = Path(run_dir)
+    graph = PartitionGraph.load(root / "plan" / "partition_graph.yaml")
+    order = {module.id: index for index, module in enumerate(graph.partitioned_modules)}
+    chosen: list[str] = []
+    for meta in sorted((root / "modules").glob("*/meta.yaml")):
+        listed = (yamlio.load_path(meta) or {}).get("module_ids") or []
+        known = [m for m in listed if m in order]
+        if known:
+            chosen.append(min(known, key=lambda m: order[m]))
+    return sorted(set(chosen), key=lambda m: order.get(m, 0))
+
+
+def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE,
+            module_ids: list[str] | None = None) -> tuple[list[Path], int]:
+    """Files to upload and their total size, in descending size order.
+
+    ``module_ids`` publishes a subset: those module directories, the activations and
+    weights recorded for them, and everything a module needs whatever it is — the
+    model's own package, the compatibility patches, the plan, the reports. A whole run
+    of a 475 GiB model is not a useful thing to hand anybody; a few modules of each kind,
+    each verifiable on its own, is.
+    """
     root = Path(run_dir)
     if not root.is_dir():
         raise PublishError(f"No such run directory: {root}")
@@ -69,6 +228,8 @@ def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE
         raise PublishError(
             f"{root} does not look like a finished run: missing {', '.join(missing)}"
         )
+    wanted = set(module_ids or ())
+    groups = _published_groups(root, wanted) if wanted else set()
     files: list[Path] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts:
@@ -76,9 +237,44 @@ def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE
         relative = path.relative_to(root).as_posix()
         if any(fnmatch.fnmatch(relative, pattern) for pattern in exclude):
             continue
+        if wanted and not _selected(relative, wanted, groups):
+            continue
         files.append(path)
     files.sort(key=lambda p: p.stat().st_size, reverse=True)
     return files, sum(p.stat().st_size for p in files)
+
+
+def _published_groups(root: Path, module_ids: set[str]) -> set[str]:
+    """Group directory names serving any of these modules.
+
+    Read from each group's ``meta.yaml``, which lists the modules it serves: one
+    implementation covers 31 attention layers, so publishing it for one publishes it for
+    all of them — and the directory is the same bytes either way.
+    """
+    from model_partition import yamlio
+
+    names: set[str] = set()
+    for meta in sorted((root / "modules").glob("*/meta.yaml")):
+        listed = (yamlio.load_path(meta) or {}).get("module_ids") or []
+        if set(listed) & module_ids:
+            names.add(meta.parent.name)
+    return names
+
+
+def _selected(relative: str, module_ids: set[str], groups: set[str]) -> bool:
+    """Whether one path belongs to a published subset."""
+    head, _, rest = relative.partition("/")
+    if "/" not in relative or head in ALWAYS:
+        return True
+    if head == "modules":
+        first = rest.split("/")[0]
+        return first == "index.yaml" or first in groups
+    if head == "trace":
+        kind, _, tail = rest.partition("/")
+        if kind not in ("activations", "weights"):
+            return True          # records.yaml and manifest.yaml index both
+        return tail.split("/")[0] in module_ids
+    return True
 
 
 def publish_run(
@@ -89,11 +285,20 @@ def publish_run(
     exclude: tuple[str, ...] = DEFAULT_EXCLUDE,
     dry_run: bool = False,
     allow_unverified: bool = False,
+    module_ids: list[str] | None = None,
+    skip_check: bool = False,
     report: Callable[[str], None] = lambda _message: None,
 ) -> PublishResult:
-    """Upload a run directory as a HuggingFace dataset repo."""
+    """Upload a run directory, or a selection of its modules, as a dataset repo."""
     root = Path(run_dir)
-    files, total = collect(root, exclude)
+    if module_ids:
+        # The weights first: a subset has to carry its own, or nothing in it can be
+        # checked away from the checkpoint it was traced against.
+        added = materialize_weights(root, module_ids, report=report)
+        if added:
+            report(f"materialized {format_bytes(added)} of weights for "
+                   f"{len(module_ids)} module(s)")
+    files, total = collect(root, exclude, module_ids=module_ids)
     result = PublishResult(repo_id=repo_id, files=len(files), total_bytes=total,
                            dry_run=dry_run,
                            largest=[(p.relative_to(root).as_posix(), p.stat().st_size)
@@ -115,6 +320,14 @@ def publish_run(
     report(f"{len(files)} file(s), {format_bytes(total)}")
     for name, size in result.largest:
         report(f"  {format_bytes(size):>10}  {name}")
+    if not skip_check:
+        report("checking the published files verify on their own")
+        failures = check_self_contained(root, files, module_ids or [], report=report)
+        if failures:
+            raise PublishError(
+                "the selection does not verify on its own, so it would not verify for "
+                "anybody else:\n  " + "\n  ".join(failures)
+            )
     if dry_run:
         return result
 

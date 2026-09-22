@@ -99,6 +99,13 @@ class Stack:
 
     prefix: str
     layers: list[LayerProfile]
+    #: What this stack's first layer is numbered in the model. A draft stack is indexed
+    #: from zero under its own name and continues the backbone's numbering inside the
+    #: model — DeepSeek builds ``DSparkBlock(args.n_layers + i, args)`` — and the model
+    #: reads per-layer config by that number: ``get_moe_config`` gives a draft block 128
+    #: experts and a backbone layer 384, on exactly that comparison. So the plan records
+    #: the model's number and the paths keep the stack's own.
+    offset: int = 0
 
     @property
     def label(self) -> str:
@@ -108,6 +115,10 @@ class Stack:
     def path(self, index: int) -> str:
         """Module path of one layer, e.g. ``model.layers.3``."""
         return f"{self.prefix}{index}"
+
+    def layer_id(self, index: int) -> int:
+        """What the model numbers this layer, which is what its config is keyed by."""
+        return self.offset + index
 
     def module_id(self, index: int, part: str = "") -> str:
         return f"{self.label}.{index}.{part}" if part else f"{self.label}.{index}"
@@ -250,7 +261,7 @@ def plan(
     for prefix, layers in sorted(inventory.aux_layers.items()):
         if not layers:
             continue
-        stack = Stack(prefix=prefix, layers=layers)
+        stack = Stack(prefix=prefix, layers=layers, offset=len(inventory.layers))
         groups = _group_layers(
             stack,
             options.max_layers_per_module or cost.max_layers_per_module(
@@ -366,6 +377,17 @@ def layer_parts(inventory: ModelInventory, index: int,
         if path not in seen:
             seen.add(path)
             buckets[role].append(path)
+    # A norm goes with what it is named for, and one that names nothing is the layer's
+    # pre-attention norm — unless the layer already has that. DeepSeek's draft block has
+    # `attn_norm` for its attention and `main_norm` for the projected backbone hidden
+    # state, which is a different tensor of a different length; chaining the second into
+    # the attention computes neither, and the check reports a shape instead of a number.
+    # Such a norm gets its own module.
+    if any(_names_a_side(path) for path in parts.attention if _is_norm(path)):
+        for path in [p for p in parts.attention if _is_norm(p) and not _names_a_side(p)]:
+            parts.attention.remove(path)
+            parts.other.append(path)
+
     # A module's submodules are run in listed order, and tensor order in a
     # checkpoint says nothing about execution order. Norms first is right for the
     # pre-norm family every current LLM belongs to; if a model normalizes after
@@ -373,6 +395,13 @@ def layer_parts(inventory: ModelInventory, index: int,
     for paths in buckets.values():
         paths.sort(key=_is_norm, reverse=True)
     return parts
+
+
+def _names_a_side(path: str) -> bool:
+    """Whether a component's name says which side of the layer it serves."""
+    lowered = path.rsplit(".", 1)[-1].lower()
+    return any(fragment in lowered for fragment in
+               ATTENTION_COMPONENTS + FFN_COMPONENTS + FFN_SIDE_NORMS)
 
 
 def _is_norm(path: str) -> bool:
@@ -453,7 +482,7 @@ def _add_layer_group(
         id=stack.module_id(first) if first == last else f"{stack.label}.{first}-{last}",
         kind="decoder_layers",
         inputs=[input_tensor], outputs=[output],
-        layer_indices=list(group),
+        layer_indices=[stack.layer_id(i) for i in group],
         submodules=[stack.path(i) for i in group],
         param_bytes=group_bytes,
         activation_bytes=cost.activation_bytes(options.seq_len),
@@ -495,7 +524,7 @@ def _split_layer(
         cursor = declare(f"{stack.boundary(index)}.attn")
         graph.modules.append(ModuleNode(
             id=stack.module_id(index, "attention"), kind="attention",
-            inputs=[input_tensor], outputs=[cursor], layer_indices=[index],
+            inputs=[input_tensor], outputs=[cursor], layer_indices=[stack.layer_id(index)],
             submodules=list(parts.attention),
             param_bytes=parts.bytes_for("attention"),
             activation_bytes=activation,
@@ -508,7 +537,7 @@ def _split_layer(
         output = declare(f"{stack.boundary(index)}.{component}")
         node = ModuleNode(
             id=stack.module_id(index, component), kind="other",
-            inputs=[cursor], outputs=[output], layer_indices=[index],
+            inputs=[cursor], outputs=[output], layer_indices=[stack.layer_id(index)],
             submodules=[path], param_bytes=parts.path_bytes.get(path, 0),
             activation_bytes=activation,
             code_signature=f"{signature}:{component}",
@@ -535,7 +564,7 @@ def _split_layer(
         output = declare(stack.boundary(index + 1))
         graph.modules.append(ModuleNode(
             id=stack.module_id(index, "ffn"), kind="mlp",
-            inputs=[cursor], outputs=[output], layer_indices=[index],
+            inputs=[cursor], outputs=[output], layer_indices=[stack.layer_id(index)],
             submodules=list(parts.ffn), param_bytes=ffn_bytes,
             activation_bytes=activation,
             code_signature=f"{signature}:ffn",
@@ -574,7 +603,7 @@ def _split_ffn(
     route = declare(f"{stack.boundary(index)}.route", kind="routing")
     graph.modules.append(ModuleNode(
         id=stack.module_id(index, "router"), kind="moe_router",
-        inputs=[input_tensor], outputs=[route], layer_indices=[index],
+        inputs=[input_tensor], outputs=[route], layer_indices=[stack.layer_id(index)],
         submodules=norms + router,
         param_bytes=parts.bytes_of(norms) + nbytes.get("router", 0),
         activation_bytes=activation,
@@ -589,7 +618,7 @@ def _split_ffn(
         partials.append(shared_out)
         graph.modules.append(ModuleNode(
             id=stack.module_id(index, "shared_experts"), kind="mlp",
-            inputs=[input_tensor], outputs=[shared_out], layer_indices=[index],
+            inputs=[input_tensor], outputs=[shared_out], layer_indices=[stack.layer_id(index)],
             submodules=shared, param_bytes=nbytes.get("shared", 0),
             activation_bytes=activation,
             code_signature=f"{signature}:shared_experts",
@@ -606,7 +635,7 @@ def _split_ffn(
         partials.append(partial)
         graph.modules.append(ModuleNode(
             id=stack.module_id(index, f"experts.{start}-{end - 1}"), kind="moe_experts",
-            inputs=[input_tensor, route], outputs=[partial], layer_indices=[index],
+            inputs=[input_tensor, route], outputs=[partial], layer_indices=[stack.layer_id(index)],
             submodules=ordered[start:end],
             param_bytes=per_expert * (end - start),
             activation_bytes=activation,
@@ -620,7 +649,7 @@ def _split_ffn(
     output = declare(stack.boundary(index + 1))
     graph.modules.append(ModuleNode(
         id=stack.module_id(index, "combine"), kind="mlp",
-        inputs=[input_tensor, *partials], outputs=[output], layer_indices=[index],
+        inputs=[input_tensor, *partials], outputs=[output], layer_indices=[stack.layer_id(index)],
         activation_bytes=activation,
         code_signature=f"{signature}:combine",
         notes=("functional: sums expert-group partials into the residual stream. "

@@ -124,3 +124,65 @@ def test_the_upload_carries_a_readme_describing_the_artifacts(tmp_path, monkeypa
     assert result.url.endswith("org/artifacts")
     # Written for the upload and not left behind in the run.
     assert not (root / "README.md").exists()
+
+
+def test_a_selection_carries_only_its_own_modules(tiny_run, tmp_path):
+    """A whole run of a 475 GiB model is not a useful thing to hand anybody. A few
+    modules of each kind, each verifiable on its own, is."""
+    from model_partition.extract import extract
+    from model_partition.publish import collect, representative_modules
+
+    extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
+            run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids,
+            weight_tensors=tiny_run.bundle.weights)
+    root = tiny_run.layout.root
+
+    every, _ = collect(root)
+    chosen = representative_modules(root)
+    assert chosen, "no representative modules found"
+    some, _ = collect(root, module_ids=chosen[:1])
+    assert len(some) < len(every)
+
+    names = {p.relative_to(root).as_posix() for p in some}
+    # Its own activations, and nobody else's.
+    assert any(f"trace/activations/{chosen[0]}/" in n for n in names)
+    others = [m for m in representative_modules(root) if m != chosen[0]]
+    for other in others:
+        assert not any(f"trace/activations/{other}/" in n for n in names), other
+    # And the things a module needs whatever it is.
+    assert "plan/partition_graph.yaml" in names
+    assert "modules/index.yaml" in names
+
+
+def test_publishing_a_subset_writes_its_weights_into_the_run(tiny_run, tmp_path):
+    """A run that read its weights from the checkpoint cannot be verified away from it,
+    so the selection's weights are dumped beside the activations they are checked
+    against before anything is uploaded."""
+    from model_partition.publish import materialize_weights
+    from model_partition.runtime.module_runner import TraceBundle
+
+    root = tiny_run.layout.root
+    bundle = TraceBundle.load(root / "trace")
+    module_id = next(m.id for m in tiny_run.graph.partitioned_modules
+                     if bundle.weight_params.get(m.id))
+
+    # Leave the store as `cache_weights: false` leaves it: activations and an index of
+    # which tensors each module owns, with the values still in the checkpoint.
+    kept = [e for e in bundle.store.entries
+            if not (e.role == "weight" and e.module_id == module_id)]
+    dropped = len(bundle.store.entries) - len(kept)
+    assert dropped, "the fixture dumped no weights for this module"
+    bundle.store.entries = kept
+    bundle.weights.pop(module_id, None)
+    bundle.save()
+    assert materialize_weights(root, [module_id]) > 0
+
+    # And again is a no-op: what is already there is not re-read.
+    added = materialize_weights(root, [module_id])
+    assert added == 0
+    added = dropped
+    assert added > 0
+    again = TraceBundle.load(root / "trace")
+    names = {(e.extra or {}).get("param") for e in again.store.entries
+             if e.module_id == module_id}
+    assert set(bundle.weight_params[module_id]) <= names

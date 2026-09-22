@@ -328,15 +328,31 @@ def report(run_dir: str, as_json: bool) -> None:
 @click.option("--exclude", multiple=True, default=("logs/**",),
               help="Glob of paths to leave out; repeatable")
 @click.option("--dry-run", is_flag=True, help="Report what would be uploaded and stop")
+@click.option("--module", "modules", multiple=True,
+              help="Publish only these modules, with their weights; repeatable")
+@click.option("--one-per-kind", is_flag=True,
+              help="Publish one module of each kind, with their weights")
+@click.option("--skip-check", is_flag=True,
+              help="Do not verify the published files on their own first")
 def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
-           exclude: tuple[str, ...], dry_run: bool) -> None:
-    """Upload a run's artifacts to a HuggingFace dataset repo."""
-    from model_partition.publish import PublishError, publish_run
+           exclude: tuple[str, ...], dry_run: bool, modules: tuple[str, ...],
+           one_per_kind: bool, skip_check: bool) -> None:
+    """Upload a run's artifacts, or a selection of its modules, to a dataset repo.
 
+    A selection carries its own weights, so each module directory can be verified where
+    it lands rather than only beside the checkpoint it was traced against.
+    """
+    from model_partition.publish import PublishError, publish_run, representative_modules
+
+    selected = list(modules)
+    if one_per_kind:
+        selected = representative_modules(run_dir)
+        click.echo(f"one of each kind: {', '.join(selected)}")
     try:
         result = publish_run(run_dir, repo_id, private=private,
                              max_bytes=int(max_gib * GIB), exclude=exclude,
-                             dry_run=dry_run, report=click.echo)
+                             dry_run=dry_run, module_ids=selected or None,
+                             skip_check=skip_check, report=click.echo)
     except PublishError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(result.summary())
