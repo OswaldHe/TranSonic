@@ -98,8 +98,19 @@ survives check (b).
 | `source.py` | **editable** — the kernel. Starts as a `@nki.jit` stub that raises. |
 | `inference.py` | **editable** — the validator. Starts as a skeleton with the tolerance constants and the tensor table filled in. |
 | `tensors/*.bin` | frozen — input, reference output, and every weight, as raw little-endian bytes. No header and no sidecar: the dtype and shape are in `README.md`. |
-| `reference_torch.py` | frozen — the original PyTorch implementation, verbatim. The specification, unimportable. |
+| `reference_torch.py` | frozen — **what to compute**: the original PyTorch implementation, verbatim. |
+| `reference_inference.py` | frozen — **how it was run**: the artifact's own launcher (load, run, time, compare, report `##autohelix[...]`). The shape the new `inference.py` has to take. Cannot run here — it needs the harness runtime and `calls.json`. |
+| `reference_numerics.py` | frozen — **how it was judged**: where the four tolerance constants come from and how they are applied. |
 | `README.md`, `MODULE.md`, `config.json` | frozen — the computation, the tensor table, the module's own pre- and post-conditions. |
+
+All three references are read-only in the strongest sense available: outside
+`scope.editable` so an edit is reverted, absent from the import allowlist so importing one
+fails check (b), and matched by check (b)'s forbidden-path markers so opening one as a file
+fails too. Three of them rather than one because the implementation says what the answer is
+but not what a validator looks like, and neither says what *passing* means — which matters
+more here than usual, since check (e) takes the candidate's own comparison at its word
+rather than recomputing it. An ambiguous bar would leave the agent guessing at what to meet
+and the reviewer guessing at what to audit.
 | `.autohelix/` | gitignored — the tensor manifest (the only thing `init` writes here), plus notes, reviews and per-iteration verdicts once the loop runs. |
 
 `scope.editable` is `[source.py, inference.py]`, so an edit to anything else is reverted

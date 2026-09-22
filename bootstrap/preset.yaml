@@ -15,9 +15,24 @@ goal: |
   one that does not is worth nothing.
 
   Read `README.md` first — it names the computation, every tensor in `tensors/`, and each
-  one's dtype and shape. `reference_torch.py` is the original PyTorch implementation,
-  frozen, and it is your specification: read it to learn what to compute. You may not
-  import it, call it, or copy torch into your kernel.
+  one's dtype and shape.
+
+  Three frozen references are carried in from the artifact that recorded this module. Read
+  all three. You may not import, call or edit any of them.
+
+    `reference_torch.py`      what to compute — the original PyTorch implementation. Your
+                              specification. Do not copy torch out of it into your kernel.
+    `reference_inference.py`  how it was run — the artifact's own launcher: it loads the
+                              weights and recorded inputs, runs the module, times it,
+                              compares against the dumped output and prints the
+                              `##autohelix[...]` metrics. This is the shape your own
+                              `inference.py` has to take. It will not run here — it needs a
+                              harness runtime and a `calls.json` that are not in this
+                              repository — so take its structure, not its imports.
+    `reference_numerics.py`   how it was judged — `Tolerance.for_dtype("bfloat16")` is where
+                              the four tolerance constants below come from, and
+                              `compare_outputs` is how they are applied. Reimplement that
+                              comparison self-contained in your `inference.py`.
 
   You write two files and nothing else:
 
@@ -50,7 +65,12 @@ goal: |
       simply has to work and the number has to be real, produced by this run rather than
       left over from an earlier one.
     - Compares the kernel's output against the reference tensor and prints
-      `##autohelix[passed=1]` when it matches, exiting 0. Exit non-zero on a mismatch.
+      `##autohelix[passed=1]` when it matches, exiting 0. Exit non-zero on a mismatch. The
+      comparison is the one `reference_numerics.py` defines — elementwise closeness at
+      RTOL/ATOL over at least MIN_PASS_FRACTION of the elements, *and* cosine similarity of
+      at least MIN_COSINE — reimplemented here rather than imported. Nothing about it may be
+      weakened: not the tolerances, not how many elements are compared, not by comparing a
+      reduction instead of the tensor, and not by swallowing a mismatch.
     - Declares the numerical bar as four module-level number literals, exactly these names
       and exactly these values:
         RTOL = 0.02
@@ -65,8 +85,8 @@ goal: |
       reaching back to a checkpoint or an artifact tree.
 
   `source.py` and `inference.py` are the only files you may change. Everything else —
-  `tensors/*.bin`, `reference_torch.py`, `README.md`, `config.json` — is frozen and any
-  edit to it is reverted before your work is judged.
+  `tensors/*.bin`, the three `reference_*.py`, `README.md`, `MODULE.md`, `config.json` — is
+  frozen, and any edit to it is reverted before your work is judged.
 
   You are expected to need several iterations. Each iteration's work is kept whether or not
   the gate passes, so build on what is already in the repository instead of restarting, and

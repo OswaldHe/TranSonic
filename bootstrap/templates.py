@@ -177,9 +177,16 @@ not just the last one:
 
 {chain}
 
-`reference_torch.py` is the original PyTorch implementation, verbatim and frozen. It is
-the specification: read it. You may not import it, and you may not copy torch into
-`source.py`.
+## Frozen references
+
+Three files carried in from the artifact, verbatim. Read them; you may not import, call or
+edit any of them, and an edit is reverted before your work is judged.
+
+| file | what it tells you |
+|---|---|
+| `reference_torch.py` | **what to compute** — the original PyTorch implementation of this module. The specification. |
+| `reference_inference.py` | **how it was run** — the artifact's own launcher: load weights and inputs, run, time, compare against the dumped output, report `##autohelix[...]` metrics. The shape your `inference.py` has to take. It cannot run here (it needs the harness runtime and the artifact's `calls.json`), so take the structure, not the imports. |
+| `reference_numerics.py` | **how it was judged** — `Tolerance.for_dtype("bfloat16")` is where the four tolerance constants come from and `compare_outputs` is how they are applied. Reimplement this self-contained in `inference.py`; do not import it. |
 
 `config.json` is the config the module was built from; `MODULE.md` is the artifact's own
 description of its pre- and post-conditions.

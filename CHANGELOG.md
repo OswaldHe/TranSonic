@@ -6,8 +6,9 @@
 
 - `autohelix bootstrap`: a loop for bootstrapping a Trainium NKI kernel for one
   module of a partition artifact. `init` materializes the module into a
-  self-contained git repo (raw `.bin` tensors, a frozen PyTorch reference, and
-  failing `source.py`/`inference.py` stubs); `run` loops an agent on it against a
+  self-contained git repo (raw `.bin` tensors, three frozen references — what to
+  compute, how the reference was run, how it was judged — and failing
+  `source.py`/`inference.py` stubs); `run` loops an agent on it against a
   fixed six-part NKI constraint rather than a metric. Unlike `autohelix run`,
   every iteration is merged whether or not the constraint passes, the reviewer
   runs on every iteration, a failing constraint never ends the run, and a passing

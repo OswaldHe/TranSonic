@@ -26,7 +26,11 @@ Read before starting:
 {% endif %}
 - .autohelix/notes/iter-*.md — your own notes from past iterations
 - README.md — the computation and the tensor table
-- reference_torch.py — the frozen PyTorch specification
+- reference_torch.py — the frozen PyTorch specification: what to compute
+- reference_inference.py — the artifact's own launcher: how the reference was run and
+  compared, and the shape your inference.py has to take
+- reference_numerics.py — how the reference was judged: where the four tolerance constants
+  come from and how they are applied
 {% if has_hints %}
 - .autohelix/hints.md
 {% endif %}

@@ -374,24 +374,78 @@ def _decode(reader: Any, directory: Path, value: Any) -> Any:
     return reader.decode(directory, value, "cpu")
 
 
-def _write_frozen_files(artifact: Path, directory: Path, repo: Path, result: Materialized) -> None:
-    """The specification the agent reads: the original implementation and its config.
+#: The artifact files carried in verbatim as frozen references, and why each is here.
+#: Renaming is the point: left under their original names, the first thing the agent would
+#: have to do is delete the only description of the job it has.
+FROZEN_REFERENCES: tuple[tuple[str, str, str], ...] = (
+    (
+        "source.py", "reference_torch.py",
+        "the original PyTorch implementation of this module — what to compute.\n"
+        "Read it as the specification. Do not import it, call it, or copy torch out of it:\n"
+        "the kernel in source.py must be NKI only.",
+    ),
+    (
+        "inference.py", "reference_inference.py",
+        "the artifact's own launcher — how the recorded reference was produced.\n"
+        "It loads the module's weights and recorded inputs, runs it, times it, compares the\n"
+        "result against the dumped output and reports the `##autohelix[...]` metrics. Read it\n"
+        "to see the shape your own inference.py has to take. It cannot run here: it needs the\n"
+        "harness runtime and the artifact's calls.json, neither of which is in this repo, and\n"
+        "importing it would fail self-containment. Take the structure, not the imports.",
+    ),
+)
 
-    `reference_torch.py` keeps the vendor's code verbatim below a header that says it is
-    frozen and unimportable. Renaming it is the point — leaving it as `source.py` would
-    mean the first thing the agent must do is delete the only description of the
-    computation it has.
+#: The comparison the reference was judged by, vendored from the artifact's runtime. Its
+#: path inside an artifact, and the name it gets here.
+NUMERICS_SOURCE = ("runtime", "model_partition", "verify", "numerics.py")
+NUMERICS_TARGET = "reference_numerics.py"
+NUMERICS_WHY = (
+    "the exact definition of the numerical bar this module was accepted at.\n"
+    "`Tolerance.for_dtype(\"bfloat16\")` is where RTOL/ATOL/MIN_COSINE/MIN_PASS_FRACTION come\n"
+    "from, and `compare_outputs` is how they are applied — elementwise closeness over a\n"
+    "minimum fraction of elements, plus cosine similarity. Your inference.py has to reach the\n"
+    "same verdict on the same numbers without importing this: reimplement it, self-contained,\n"
+    "with the four constants as literals."
+)
+
+
+def _frozen_header(why: str, origin: str) -> str:
+    """The banner every frozen reference carries.
+
+    Each one says what it is *for*, because a file the agent may read but not import, call
+    or edit is an unusual thing to be handed and the reason has to travel with it.
     """
-    original = directory / "source.py"
-    header = (
-        '"""FROZEN REFERENCE — the original PyTorch implementation of this module.\n\n'
-        "Read this to learn what to compute. Do not import it, call it, or copy torch out\n"
-        "of it: the kernel in source.py must be NKI only, and any edit to this file is\n"
-        f"reverted. Copied verbatim from the artifact's modules/{result.group}/source.py.\n"
+    return (
+        f'"""FROZEN REFERENCE — {why}\n\n'
+        f"Frozen: any edit to this file is reverted before your work is judged. Copied\n"
+        f"verbatim from the artifact's {origin}.\n"
         '"""\n\n'
     )
-    body = original.read_text() if original.is_file() else "# (the artifact published no source.py)\n"
-    (repo / "reference_torch.py").write_text(header + body)
+
+
+def _write_frozen_files(artifact: Path, directory: Path, repo: Path, result: Materialized) -> None:
+    """The specification the agent reads: what to compute, how it was run, how it was judged.
+
+    Three files rather than one. The implementation alone says what the answer is but not
+    what a validator looks like, and neither says what "passes" means — which matters here
+    more than usual, because the gate takes the candidate's own comparison at its word
+    rather than recomputing it. An ambiguous bar would leave both the agent and the reviewer
+    guessing at the thing they are respectively meeting and auditing.
+    """
+    for original_name, target_name, why in FROZEN_REFERENCES:
+        original = directory / original_name
+        body = (
+            original.read_text() if original.is_file()
+            else f"# (the artifact published no {original_name})\n"
+        )
+        origin = f"modules/{result.group}/{original_name}"
+        (repo / target_name).write_text(_frozen_header(why, origin) + body)
+
+    numerics = artifact.joinpath(*NUMERICS_SOURCE)
+    if numerics.is_file():
+        (repo / NUMERICS_TARGET).write_text(
+            _frozen_header(NUMERICS_WHY, "/".join(NUMERICS_SOURCE)) + numerics.read_text()
+        )
 
     config = directory / "config.json"
     if config.is_file():

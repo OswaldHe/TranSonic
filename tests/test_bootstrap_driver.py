@@ -149,6 +149,29 @@ def test_the_preset_satisfies_autohelixs_own_validator() -> None:
     assert len(config.constraints) == 1
 
 
+def test_the_goal_points_at_every_frozen_reference() -> None:
+    """`init` writes three; a reference the goal never mentions will not be read."""
+    from bootstrap import materialize as mat
+
+    goal = preset.render_goal()
+    for _, target, _ in mat.FROZEN_REFERENCES:
+        assert target in goal, target
+    assert mat.NUMERICS_TARGET in goal
+
+
+def test_the_frozen_references_cannot_be_opened_at_runtime() -> None:
+    """They are there to be read by the agent, not loaded by the candidate.
+
+    Importing one already fails (b) on the import allowlist; this covers the other route,
+    reading it as a file.
+    """
+    from bootstrap import materialize as mat
+
+    names = [t for _, t, _ in mat.FROZEN_REFERENCES] + [mat.NUMERICS_TARGET]
+    for name in names:
+        assert any(m in name for m in chk.FORBIDDEN_PATH_MARKERS), name
+
+
 def test_the_reviewer_is_asked_for_both_sections() -> None:
     prompt = preset.REVIEWER_PROMPT.lower()
     assert "what is left" in prompt
