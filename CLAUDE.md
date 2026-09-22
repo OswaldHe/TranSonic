@@ -29,6 +29,9 @@ uv pip install -e ".[dev]"
 - `src/autohelix/history.py` - iteration history (JSONL)
 - `src/autohelix/display.py` - live Rich display
 - `src/autohelix/prompt_template.py` - agent prompt rendering
+- `partition/model_partition/` - model partitioning, tracing and verification
+  (`autohelix partition`); its own specialized loop in `loop/driver.py`. See
+  `partition/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -46,12 +49,14 @@ autohelix clear        # Archive state, start fresh
 autohelix watch        # Live-tail agent output (second terminal)
 autohelix hint         # Send a hint to the running agent (picked up next iteration)
 autohelix report       # Agent-written analysis of the run
+autohelix partition    # Model partitioning / tracing / verification (see partition/)
 ```
 
 ## Testing
 
 ```bash
 pytest                    # run all fast tests
+pytest -k partition       # just the model-partitioning suite (no network, no GPU)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers

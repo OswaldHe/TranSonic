@@ -1,0 +1,170 @@
+# The deployment target. 510.3 GB across 48 shards, 96 085 tensors: fp8_e4m3
+# weights (32x32 blocks, ue8m0 scales) with int8-packed fp4 experts.
+#
+# Architecture, from inference/config.json: 40 text layers + 3 MTP, hidden 5120,
+# MLA-style attention (q_lora_rank 1280, o_lora_rank 1024, o_groups 8, head_dim
+# 512, qk_rope_head_dim 64, num_key_value_heads 1), MoE with 384 routed fp4
+# experts plus 1 shared at top-6 (noaux_tc / sqrtsoftplus), a second "DSpark" MoE
+# of 128 experts at top-3, sparse attention driven by per-layer compress_ratios
+# with cross-layer KV reuse (kv_source_layer_ids) and a lightning indexer
+# (index_source_layer_ids, index_topk, candidate_topk_blocks), engram n-gram
+# memory layers, sliding_window 128, 1 M context via YaRN, and a 32-layer vision
+# tower. Each layer also carries Hyper-Connections scalars (hc_*) directly.
+#
+# Those cross-layer edges are why the partition graph is a DAG: a module consumes
+# tensors produced far upstream, which a linear pipeline cannot express.
+name: deepseek-v4.1-flash
+source: hf:deepseek-ai/DeepSeek-V4.1-Flash
+loader: repo_code
+entry: inference/model.py
+code_paths: [inference, encoding]
+config_file: inference/config.json
+# The checkpoint's own dtypes: fp8 weights with int8-packed fp4 experts, which is what
+# the vendor's kernels take. Casting to bfloat16 would quadruple 278 GiB of in-scope
+# weights, and the fp8/fp4 GEMMs are the thing a kernel author is here to optimize.
+dtype: checkpoint
+trust_remote_code: true     # required: importing inference/model.py runs repo code
+
+checkpoint:
+  # The published weights are in HuggingFace names; the vendor's inference code uses
+  # its own. `inference/convert.py` reconciles them by rewriting the checkpoint into a
+  # second copy — 475 GiB we do not have — so the same mapping is applied on read.
+  rename:
+    - ['^model\.', '']
+    - ['self_attn', 'attn']
+    - ['^(?!vision\.)(.*?)mlp', '\1ffn']
+    - ['weight_scale_inv', 'scale']
+    - ['e_score_correction_bias', 'bias']
+
+scope:
+  # The n-gram memory writes into the residual stream at layers 1 and 14
+  # (model.py:1262), so a partition without it does not reproduce the model. Its two
+  # tables are 94.4 GiB each: streamed for the trace and verified on the host, since
+  # no partition of one embedding table fits a 44 GiB card.
+  #
+  # The draft stack is the deployed decoding path, so it gets modules too: the seed
+  # planner cuts `mtp.*` as a second repeating stack hanging off the backbone's last
+  # hidden state, and `trace.extra_passes` below drives it, since the model's own
+  # `forward` runs the backbone alone.
+  #
+  # Vision stays out: these runs are text-only and the tower is another 32 layers
+  # nothing in them exercises.
+  vision: false
+  mtp: true
+  engram: true
+
+config_overrides:
+  # `ModelArgs.max_seq_len` defaults to 4096 and this checkpoint's config does not set
+  # it, while the vendor's own entry script raises it to 64K before loading the weights
+  # (generate.py:126). Every cache is sized from it — the n-gram hash cache, the
+  # compressed KV, the rotary table — so an 8192-token prompt against the default
+  # overruns them. 16384 covers this run's longest prompt and its generated tokens; the
+  # caches it sizes come to a few hundred megabytes, none of it on the critical path.
+  max_seq_len: 16384
+
+trace:
+  # `Transformer.forward` runs the backbone alone, so hooks never fire inside the
+  # draft stack and nothing in `mtp.*` would have a reference. `forward_spec`
+  # (model.py:1275) is what drives it, taking the ids, the `main_hidden` the forward
+  # returns third, and the position. It needs a decode step: at start_pos 0 a
+  # DSparkBlock only seeds its window KV cache and returns its input (model.py:1124).
+  # Inert while `scope.mtp` is false — no module is unreached, so no pass runs.
+  # Compressed KV and the top-k indices over it pass between layers through a module-level
+  # singleton, not through arguments: layers 2, 8, 14 and 20 compress their own KV and
+  # publish it, and the layers after each of them attend over it (`kv_source_layers`,
+  # `_compress_kv` at model.py:739). So a consumer's recorded call carries no trace of the
+  # largest thing it reads, and without this its module can be neither checked nor
+  # optimized on its own.
+  state: [shared_attn]
+  returns: [output_ids, logits, main_hidden]
+  extra_passes:
+    - entry: forward_spec
+      args: [input_ids, main_hidden, start_pos]
+      decode: true
+
+partition:
+  # Attention and the FFN/MoE of a layer are separate pieces of work: different
+  # shapes, different kernels, verified separately. Splitting them is a structural
+  # rule, so the seed planner applies it directly rather than depending on an agent.
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules. Keep each of those as one module where it is one piece of
+    work -- do not split a projection away from the attention it feeds, and do not
+    separate a normalization from the operation it normalizes for, since that
+    forecloses fusing them later. Split further only when a module does not fit the
+    per-module budget, or when two computations inside it would genuinely be
+    developed and tuned separately.
+
+    These are the pieces of this model a kernel author tunes separately, and each
+    wants its own module:
+
+    - the sparse attention (CSA v2): sparse, reading KV from other layers, with a
+      lightning indexer fed from elsewhere again. Express those as tensor edges in
+      the graph rather than duplicating the computation.
+    - the MoE FFN: two independent MoEs plus a shared expert, which are three
+      separate pieces of work, not one.
+    - the hyper-connections (mHC): the per-layer hc_* mix before and after each
+      layer. It is small but it is its own arithmetic, and it sits on every
+      layer boundary.
+    - the engram n-gram memory at layers 1 and 14: a hash lookup into a 94.4 GiB
+      fp8 table, gated against the residual stream. Nothing else in the model looks
+      like it.
+    - the draft stack (mtp.*): the speculative decoding path, which is attention and
+      FFN again at a different shape.
+
+    If you find another computation that would be developed and tuned on its own,
+    give it a module too and say why in the rationale.
+
+inputs:
+  # max_short / max_long cap how many prompts of each set this run uses. Cost is
+  # per sample: one full traced forward, one set of dumped feature maps per module,
+  # and one generation pass during emulation. Omit for no cap.
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  max_short: 2
+  max_long: 1
+  # 8192 tokens, because that is where the lightning indexer's selection starts to mean
+  # something: the compressed axis is the sequence over `compress_ratio` 2, so 8192 tokens
+  # give 4096 compressed positions against an `index_topk` of 512 — one in eight kept.
+  # At 2048 it would keep half, and a top-k that discards almost nothing tests almost
+  # nothing. 16384 doubles the cost again for the same conclusion.
+  long_token_budgets: [8192]
+
+overrides:
+  cache_dequant: false      # a bf16 mirror of 510 GB of fp8/fp4 would not fit
+  cache_weights: false      # nor would a second copy; read them from the shards
+  # Emulation re-runs the prefill per step, and a step here streams the whole checkpoint.
+  # Sixteen tokens is enough for a human to read whether the partition still writes the
+  # model's text; thirty-two would double the longest stage of the run to show the same.
+  max_new_tokens: 16
+
+notes: |
+  `inspect` and `plan` work from metadata alone and need no weights, and the rest runs
+  on a machine far smaller than the checkpoint.
+
+  What it takes, all of it verified here on one 44 GiB L40S with 119 GiB of host RAM:
+
+  - `dtype: checkpoint`, so the fp8 weights and int8-packed fp4 experts stay as stored.
+    Casting to bfloat16 turns 278 GiB of in-scope weights into 1.0 TiB.
+  - `checkpoint.rename`, because the published weights use HuggingFace names and the
+    vendor's code its own. `inference/convert.py` reconciles them by writing a second
+    475 GiB copy, and it holds the whole state dict in memory to do it; the same
+    mapping applied on read costs nothing. All 96 042 of the model's parameters resolve.
+  - Streamed weights: the model is built with its weight tensors as placeholders and
+    each module reads its own for its forward, 1 GiB resident instead of 478. The two
+    n-gram memory tables are 94.4 GiB each, which no card here takes, so those two
+    modules run on the host.
+  - A CUDA toolkit for the vendor's TileLang kernels, self-consistent with its own
+    runtime headers. Both the fp8 and the fp4 GEMM compile and run on sm_89.
+  - The tokenizer at construction: an n-gram layer builds its token map from the
+    vocabulary, so no config can stand in for it.
+  - A ported `sparse_attn`. The vendor's kernel asks for 141 312 bytes of dynamic
+    shared memory per block and this card allows 101 376, so the launch fails before
+    the kernel runs. The loop hands that to the agent, which writes a replacement
+    under `compat/` computing the same thing at the same precision — bf16 operands,
+    fp32 accumulation — and the trace is taken again with it in place. `compat/` is
+    part of the artifacts, so a reader sees exactly what ran.
+
+  encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
+  tokenizer ground truth and are worth checking before anything else.

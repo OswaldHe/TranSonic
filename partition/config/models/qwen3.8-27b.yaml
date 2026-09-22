@@ -1,0 +1,45 @@
+# Primary development target: 27.8 B params, ~51.7 GiB bf16 — larger than one
+# L40S (46 GiB), so partitioning is mandatory. 64 layers with two distinct layer
+# signatures (linear attention 3:1 with full attention), which the seed planner
+# resolves into ~32 modules sharing 5 implementations. Same hidden size (5120)
+# as DeepSeek V4.1, so module shapes rehearse the real target.
+name: qwen3.8-27b
+source: hf:Qwen/Qwen3.8-27B
+loader: auto
+dtype: bfloat16
+trust_remote_code: false
+
+scope:
+  vision: false     # 878 MiB vision tower, recorded but out of scope
+  mtp: false
+  engram: false
+
+partition:
+  # Attention and the FFN/MoE of a layer are separate pieces of work: different
+  # shapes, different kernels, verified separately. Splitting them is a structural
+  # rule, so the seed planner applies it directly rather than depending on an agent.
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules. Keep each of those as one module where it is one piece of
+    work -- do not split a projection away from the attention it feeds, and do not
+    separate a normalization from the operation it normalizes for, since that
+    forecloses fusing them later. Split further only when a module does not fit the
+    per-module budget, or when two computations inside it would genuinely be
+    developed and tuned separately.
+
+inputs:
+  # max_short / max_long cap how many prompts of each set this run uses. Cost is
+  # per sample: one full traced forward, one set of dumped feature maps per module,
+  # and one generation pass during emulation. Omit for no cap.
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  long_token_budgets: [2048, 8192, 16384]
+  max_short: 2
+  max_long: 1
+
+overrides:
+  # 64 layers split into attention and FFN is ~131 modules, and emulation re-runs the
+  # whole prefill per generated token with layers on the host. Both scale with the
+  # sample set, so this model asks for fewer tokens than the shared default.
+  max_new_tokens: 8

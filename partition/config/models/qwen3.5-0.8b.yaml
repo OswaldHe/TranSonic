@@ -1,0 +1,41 @@
+# Smoke-test model: small enough to run the whole loop in minutes on one L40S.
+# Hybrid stack (linear attention 3:1 with full attention), MTP layer, tied
+# embeddings, and a vision tower that stays out of scope.
+name: qwen3.5-0.8b
+source: hf:Qwen/Qwen3.5-0.8B
+loader: auto            # no vendor inference code in this repo -> transformers
+dtype: bfloat16
+trust_remote_code: false
+
+scope:
+  vision: false
+  mtp: false
+  engram: false
+
+partition:
+  # Attention and the FFN/MoE of a layer are separate pieces of work: different
+  # shapes, different kernels, verified separately. Splitting them is a structural
+  # rule, so the seed planner applies it directly rather than depending on an agent.
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules. Keep each of those as one module where it is one piece of
+    work -- do not split a projection away from the attention it feeds, and do not
+    separate a normalization from the operation it normalizes for, since that
+    forecloses fusing them later. Split further only when a module does not fit the
+    per-module budget, or when two computations inside it would genuinely be
+    developed and tuned separately.
+
+inputs:
+  # max_short / max_long cap how many prompts of each set this run uses. Cost is
+  # per sample: one full traced forward, one set of dumped feature maps per module,
+  # and one generation pass during emulation. Omit for no cap.
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  long_token_budgets: [2048, 8192, 16384]
+  max_short: 4
+  max_long: 3
+
+notes: |
+  0.87 B parameters, ~1.7 GiB bf16 — fits entirely on one L40S, so the partition
+  here is driven by kernel-development convenience rather than capacity.

@@ -25,3 +25,6 @@ notes/
 # Local/personal
 env.sh
 TODO.md
+
+# A write token an operator leaves beside the checkout for 'partition upload'.
+hf_token.txt

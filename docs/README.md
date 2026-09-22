@@ -15,3 +15,6 @@ See the [main README](../README.md) for an overview, quick start, and the config
 - **[Concepts](concepts.md)** — how iteration, isolation, and verified improvement
   work, and how to design a loop
 - **[ML Experiments](ml-experiments.md)** — patterns for training/eval loops (post-training, benchmarks)
+- **[Model Partitioning](../partition/README.md)** — `autohelix partition`: split a model
+  into locally-runnable modules, trace real per-module IO, verify each module, and
+  emulate end-to-end inference for accelerator bring-up

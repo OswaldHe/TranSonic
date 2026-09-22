@@ -706,5 +706,38 @@ def _build_report_prompt(config, history: History, project_path: Path) -> str:
     return "\n".join(lines)
 
 
+class _PartitionGroup(click.Group):
+    """Lazy proxy for the `model_partition` CLI.
+
+    Deferring the import keeps torch and transformers out of every other
+    `autohelix` invocation.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="partition",
+            help="Partition, trace and verify a large language model for deployment.",
+        )
+
+    def _delegate(self) -> click.Group:
+        try:
+            from model_partition.cli import partition
+        except ImportError as exc:
+            raise click.ClickException(
+                f"The partition subsystem is unavailable ({exc}). It needs the extras "
+                'in partition/: pip install -e ".[partition]"'
+            ) from exc
+        return partition
+
+    def list_commands(self, ctx):
+        return self._delegate().list_commands(ctx)
+
+    def get_command(self, ctx, name):
+        return self._delegate().get_command(ctx, name)
+
+
+main.add_command(_PartitionGroup())
+
+
 if __name__ == "__main__":
     main()

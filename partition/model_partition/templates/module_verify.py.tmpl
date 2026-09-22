@@ -1,0 +1,169 @@
+"""Verifier for partition module group `{{ signature }}`.
+
+NOT EDITABLE — this file belongs to the harness. It decides whether the
+implementation beside it is correct: `inference.py` launches `source.py` on the
+dumped weights and input feature map, and the result is compared against the dumped
+output feature map. Loosening the check here would defeat its purpose; fix
+`source.py` or `inference.py` instead.
+
+Exits 0 when every tensor matches within tolerance, 1 when it does not, 2 when the
+artifacts are unusable. That makes it usable directly as a gate while porting the
+module to another backend — swap in your implementation and this tells you whether it
+still reproduces the reference.
+
+    python verify.py                                      # first module, first sample
+    python verify.py --module {{ module_ids[-1] }} --all-samples
+    python verify.py --all-modules --all-samples --rtol 5e-2
+
+Everything it reads is inside the artifact: `calls.json` beside it names each argument,
+weight and reference output by a path relative to this directory, and `../../runtime/`
+holds the reader, the builder and the comparison. It needs `torch` and nothing else
+installed — the same as `inference.py`, and for the same reason: an artifact that can
+only be checked on the machine that produced it has not been checked.
+
+Modules covered: {{ module_ids | join(', ') }}
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+MODULE_IDS = {{ module_ids | tojson }}
+SIGNATURE = {{ signature | tojson }}
+SAMPLE_IDS = {{ sample_ids | tojson }}
+COMPOSITION = {{ composition | tojson }}
+
+
+def _bootstrap() -> None:
+    """Put the artifact's own copies of the code this file needs onto `sys.path`.
+
+    `../../runtime` holds the reader, the builder and the comparison; `../../vendor`
+    holds the model's package, which `source.py` imports from. Both are inside the
+    artifact, so nothing here may import them before this has run.
+    """
+    for relative in ("runtime", "vendor"):
+        for root in (HERE.parent.parent, HERE.parent, HERE):
+            candidate = root / relative
+            if candidate.is_dir():
+                entry = str(candidate.resolve())
+                if entry not in sys.path:
+                    sys.path.insert(0, entry)
+                break
+
+
+def _default_device() -> str:
+    """The accelerator when there is one.
+
+    Not a preference: a quantized model's kernels are compiled for the GPU and refuse
+    their own inputs anywhere else, so defaulting to the host would report a device
+    mismatch rather than a number.
+    """
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Verify this partition module's inference.")
+    parser.add_argument("--module", default=None, choices=MODULE_IDS,
+                        help="Default: the first module of this group")
+    parser.add_argument("--all-modules", action="store_true",
+                        help="Verify every module sharing this implementation")
+    parser.add_argument("--sample", default=None, help="Sample id (default: first traced)")
+    parser.add_argument("--all-samples", action="store_true", help="Verify every traced sample")
+    parser.add_argument("--device", default=_default_device(),
+                        help="Default: cuda when there is one. A quantized model's "
+                             "kernels run nowhere else")
+    parser.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
+    parser.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _bootstrap()
+
+    import torch
+
+    from model_partition.runtime.artifact import ArtifactError, load_calls, load_config
+    from model_partition.verify.numerics import Tolerance, compare_outputs
+
+    # This directory's implementation, not whichever one the run's index names: a copy
+    # taken elsewhere has to check its own code.
+    sys.path.insert(0, str(HERE))
+    import inference
+
+    tolerance = None
+    if args.rtol is not None or args.atol is not None:
+        base = Tolerance.for_dtype("bfloat16")
+        tolerance = Tolerance(rtol=args.rtol if args.rtol is not None else base.rtol,
+                              atol=args.atol if args.atol is not None else base.atol)
+
+    parallel = COMPOSITION == "parallel"
+    config = load_config(HERE)
+    try:
+        recorded = load_calls(HERE)
+    except ArtifactError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"group  : {SIGNATURE}")
+    print(f"module dir: {HERE}")
+    failures, checks = 0, 0
+    for module_id in (MODULE_IDS if args.all_modules else [args.module or MODULE_IDS[0]]):
+        module = recorded.get(module_id)
+        if module is None:
+            print(f"error: {module_id} is not in calls.json", file=sys.stderr)
+            return 2
+        keys = module.keys(SAMPLE_IDS)
+        if not args.all_samples:
+            wanted = [k for k in keys if args.sample is None
+                      or k.rpartition("#")[0] == args.sample][:1]
+        else:
+            wanted = [k for k in keys if args.sample is None
+                      or k.rpartition("#")[0] == args.sample]
+        if not wanted:
+            print(f"error: nothing recorded for {module_id} sample {args.sample!r}; "
+                  f"have {keys}", file=sys.stderr)
+            return 2
+        for key in wanted:
+            sample, _, step = key.rpartition("#")
+            try:
+                _, calls = module.select(sample, int(step), SAMPLE_IDS)
+                weights = module.weights(args.device)
+                call_args, call_kwargs = module.arguments(calls, args.device)
+                reference = module.reference(calls, parallel, args.device)
+                built = inference.build_module(
+                    config, weights, device=args.device,
+                    submodule=calls[0]["submodule"] if parallel else None)
+                module.apply_state(inference.load_implementation(), calls, args.device)
+                with torch.no_grad():
+                    output = built(*call_args, **call_kwargs)
+            except ArtifactError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            except Exception as exc:  # the implementation's own failure is a failure
+                print(f"  {module_id}@{sample}: FAIL {type(exc).__name__}: {exc}")
+                failures += 1
+                checks += 1
+                continue
+            label = f"{module_id}@{sample}" + (f"#{step}" if int(step) else "")
+            for comparison in compare_outputs(output, reference, label, tolerance):
+                checks += 1
+                failures += 0 if comparison.passed else 1
+                print("  " + comparison.summary())
+
+    verdict = "PASS" if not failures else "FAIL"
+    print(f"{verdict}: {checks - failures}/{checks} tensor(s) match the dumped reference")
+    return 0 if not failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

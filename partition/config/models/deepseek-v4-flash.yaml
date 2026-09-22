@@ -1,0 +1,75 @@
+# fp8 weights with fp4-packed experts, text-only: 159.6 GB across 46 shards,
+# 43 layers, 256 routed experts plus 1 shared at top-6, hidden 4096, MLA-style
+# attention with a lightning indexer and cross-layer KV reuse.
+#
+# The vendor code under inference/ is the only implementation whose module names
+# match this checkpoint: transformers recognizes `deepseek_v4` but names its modules
+# the HF way (`self_attn`, `mlp`, `q_proj`) with no conversion mapping for these
+# tensors, so it would load nothing.
+name: deepseek-v4-flash
+source: hf:deepseek-ai/DeepSeek-V4-Flash
+loader: repo_code
+entry: inference/model.py
+code_paths: [inference]
+config_file: inference/config.json
+dtype: bfloat16
+trust_remote_code: true     # required: importing inference/model.py runs repo code
+
+scope:
+  # `n_mtp_layers` defaults to 1 and this config does not override it, so the model
+  # builds one MTP block and the checkpoint carries its weights. It is not part of
+  # `Transformer.forward` — `trace.extra_passes` below drives it. This model has no
+  # engram layers and no vision tower.
+  vision: false
+  mtp: true
+  engram: false
+
+trace:
+  # The MTP block takes the backbone's last hidden state, the position, and the ids.
+  # Nothing in the repo calls it in anger — `generate.py` decodes one token at a time
+  # — so the convention is the one the model file's own demo uses (model.py:825-827).
+  extra_passes:
+    - entry: mtp.0
+      args: [hidden, start_pos, input_ids]
+      decode: true
+
+partition:
+  # Attention and the FFN/MoE of a layer are separate pieces of work: different
+  # shapes, different kernels, verified separately. Splitting them is a structural
+  # rule, so the seed planner applies it directly rather than depending on an agent.
+  split_attention_ffn: true
+  prompt: |
+    Partition every decoder layer so that attention and the FFN/MoE block are
+    separate modules. Keep each of those as one module where it is one piece of
+    work -- do not split a projection away from the attention it feeds, and do not
+    separate a normalization from the operation it normalizes for, since that
+    forecloses fusing them later. Split further only when a module does not fit the
+    per-module budget, or when two computations inside it would genuinely be
+    developed and tuned separately.
+
+    This model routes across layers: attention reads KV from an earlier layer and
+    an indexer is fed from another. Express those as tensor edges rather than
+    duplicating the computation.
+
+inputs:
+  # max_short / max_long cap how many prompts of each set this run uses. Cost is
+  # per sample: one full traced forward, one set of dumped feature maps per module,
+  # and one generation pass during emulation. Omit for no cap.
+  short: ../../inputs/short.jsonl
+  long: ../../inputs/long.jsonl
+  max_short: 1
+  max_long: 0
+
+overrides:
+  cache_dequant: false      # a bf16 mirror of 160 GB of fp8/fp4 would not fit
+  cache_weights: false      # nor would a second copy; read them from the shards
+
+notes: |
+  Larger than this machine's memory (46 GiB GPU + 124 GiB host), so `inspect` and
+  `plan` work from metadata alone while `trace` onward needs either more memory or
+  disk offload. Run `autohelix partition inspect deepseek-v4-flash` first: it
+  reports the checkpoint's shape and the projected artifact size without fetching
+  a single shard.
+
+  encoding/tests/test_input_*.json -> test_output_*.txt in the repo give free
+  tokenizer ground truth and are worth checking before anything else.
