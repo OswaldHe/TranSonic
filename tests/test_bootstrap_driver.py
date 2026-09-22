@@ -205,9 +205,9 @@ def test_the_goal_points_at_every_frozen_reference() -> None:
     for _, target, _ in mat.FROZEN_REFERENCES:
         assert target in goal, target
     assert mat.NUMERICS_TARGET in goal
-    for name in mat.VENDOR_FILES:
-        assert f"{mat.VENDOR_PREFIX}{name}" in goal, name
-    assert mat.COMPAT_PREFIX in goal
+    assert f"{mat.VENDOR_DIR}/kernel.py" in goal
+    assert f"{mat.VENDOR_DIR}/model.py" in goal
+    assert f"{mat.COMPAT_DIR}/" in goal
 
 
 def test_the_reviewer_is_given_the_same_reference_hierarchy() -> None:
@@ -222,17 +222,29 @@ def test_the_reviewer_is_given_the_same_reference_hierarchy() -> None:
     for _, target, _ in mat.FROZEN_REFERENCES:
         assert target in prompt, target
     assert mat.NUMERICS_TARGET in prompt
-    for name in mat.VENDOR_FILES:
-        assert f"{mat.VENDOR_PREFIX}{name}" in prompt, name
-    assert prompt.index(mat.COMPAT_PREFIX) < prompt.index(f"{mat.VENDOR_PREFIX}kernel.py")
+    assert f"{mat.VENDOR_DIR}/kernel.py" in prompt
+    assert f"{mat.VENDOR_DIR}/model.py" in prompt
+    assert prompt.index(f"{mat.COMPAT_DIR}/") < prompt.index(f"{mat.VENDOR_DIR}/kernel.py")
 
 
 def test_compat_outranks_vendor_in_the_goal() -> None:
     """A compat patch replaced a vendor kernel *before* tracing, so for any name it rebinds
     it is what the reference did. The goal has to say which to trust, and in which order."""
     goal = preset.render_goal()
-    assert goal.index("compat_") < goal.index("vendor_kernel.py")
-    assert "before `vendor_kernel.py`" in goal
+    assert goal.index("compat/") < goal.index("vendor/kernel.py")
+    assert "before `vendor/kernel.py`" in goal
+
+
+def test_the_goal_says_the_reference_can_be_run() -> None:
+    """Reading it is not the same as running it, and the second is what localizes an error.
+
+    The first real run's agent had to build its own host reference from scratch because
+    nothing told it `vendor/` was importable — or that the fp8 primitives in it are not.
+    """
+    goal = preset.render_goal()
+    assert 'sys.path.insert(0, "vendor")' in goal
+    assert "apply(" in goal
+    assert "No registered target detector" in goal
 
 
 def test_the_goal_gives_a_reading_order_starting_at_the_module() -> None:
@@ -240,7 +252,7 @@ def test_the_goal_gives_a_reading_order_starting_at_the_module() -> None:
     for earlier, later in (
         ("reference_torch.py", "reference_inference.py"),
         ("reference_inference.py", "reference_numerics.py"),
-        ("reference_numerics.py", "compat_"),
+        ("reference_numerics.py", "compat/"),
     ):
         assert goal.index(earlier) < goal.index(later), (earlier, later)
 

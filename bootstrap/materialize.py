@@ -522,33 +522,19 @@ FROZEN_REFERENCES: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-#: Prefixes for the vendor modules and compatibility patches carried in beside the three
-#: references above. `nki_checker.FORBIDDEN_PATH_MARKERS` must match both, so the
-#: deliverables cannot open them at runtime.
-VENDOR_PREFIX = "vendor_"
-COMPAT_PREFIX = "compat_"
-
-#: Vendor modules carried in for every module repo. `reference_torch.py` is only a slice of
-#: `model.py` and imports from `kernel.py` without containing it, so on their own the
-#: references stop short of the arithmetic that is hardest to guess — the fp8 quantization,
-#: the GEMMs, the sparse attention. `model.py` additionally shows how the slice sits in the
-#: whole model, which the slice cannot.
-VENDOR_FILES = ("model.py", "kernel.py")
-
-VENDOR_WHY = (
-    "the vendor's own implementation, in full.\n"
-    "`model.py` is the complete model this module was sliced out of; `kernel.py` holds the\n"
-    "primitives that slice imports but does not contain — the fp8 quantization, the GEMMs,\n"
-    "the sparse attention. The specification stops short of the hardest parts without them."
-)
-
-COMPAT_WHY = (
-    "a kernel replacement the reference was recorded *with*.\n"
-    "The GPU that produced these feature maps could not run the vendor's version, so this was\n"
-    "substituted before tracing. Where it replaces a function, **this file is the semantics\n"
-    "the reference actually has** and the vendor's is not; `apply()` at the bottom says which\n"
-    "names it rebinds."
-)
+#: The artifact's own code, copied in as directories under their original names rather than
+#: flattened and renamed. That is what makes the reference *runnable*: `reference_torch.py`
+#: does `from kernel import act_quant, ...`, which resolves once `vendor/` is on `sys.path`,
+#: and each `compat/*.py` exposes `apply(vendor, device)` to rebind what it replaced.
+#:
+#: Being able to execute it matters as much as reading it. The first real run watched an
+#: agent spend an iteration reconstructing quantization semantics by hand because it had
+#: neither the source nor anything to run.
+#:
+#: `nki_checker.FORBIDDEN_PATH_MARKERS` matches both names, so the deliverables still cannot
+#: import or open them — they are for the agent's own experiments, not for `inference.py`.
+VENDOR_DIR = "vendor"
+COMPAT_DIR = "compat"
 
 #: The comparison the reference was judged by, vendored from the artifact's runtime. Its
 #: path inside an artifact, and the name it gets here.
@@ -602,19 +588,13 @@ def _write_frozen_files(artifact: Path, directory: Path, repo: Path, result: Mat
             _frozen_header(NUMERICS_WHY, "/".join(NUMERICS_SOURCE)) + numerics.read_text()
         )
 
-    for name in VENDOR_FILES:
-        source = artifact / "vendor" / name
-        if source.is_file():
-            (repo / f"{VENDOR_PREFIX}{name}").write_text(
-                _frozen_header(VENDOR_WHY, f"vendor/{name}") + source.read_text()
-            )
-
-    compat = artifact / "compat"
-    if compat.is_dir():
-        for patch in sorted(compat.glob("*.py")):
-            (repo / f"{COMPAT_PREFIX}{patch.name}").write_text(
-                _frozen_header(COMPAT_WHY, f"compat/{patch.name}") + patch.read_text()
-            )
+    # Verbatim, original filenames, no injected header: the point is that these import and
+    # run, and rewriting them would be rewriting the specification.
+    for name in (VENDOR_DIR, COMPAT_DIR):
+        source = artifact / name
+        if source.is_dir():
+            shutil.copytree(source, repo / name, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__"))
 
     config = directory / "config.json"
     if config.is_file():

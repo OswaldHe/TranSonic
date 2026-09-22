@@ -31,11 +31,16 @@ Read before starting:
   compared, and the shape your inference.py has to take
 - reference_numerics.py — how the reference was judged: where the four tolerance constants
   come from and how they are applied
-- vendor_kernel.py — the primitives reference_torch.py imports but does not contain
+- compat/*.py — kernel replacements the reference was recorded with; for any name one of
+  these rebinds it, not vendor/kernel.py, is the semantics the reference has. Check first.
+- vendor/kernel.py — the primitives reference_torch.py imports but does not contain
   (act_quant, fp8_gemm, sparse_attn); read these rather than inferring them
-- vendor_model.py — the complete model the slice came from
-- compat_*.py — kernel replacements the reference was recorded with; where one replaces a
-  function it, not vendor_kernel.py, is the semantics the reference has
+- vendor/model.py — the complete model the slice came from
+
+vendor/ is importable (`sys.path.insert(0, "vendor")`), so you can run the torch reference to
+localize an error instead of guessing. The compat sparse_attn runs on CPU; the tilelang fp8
+and fp4 primitives need a GPU this machine does not have. source.py and inference.py may not
+import any of it.
 {% if has_hints %}
 - .autohelix/hints.md
 {% endif %}

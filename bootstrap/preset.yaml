@@ -27,18 +27,46 @@ goal: |
   define — a quantization rule, a masking rule, an accumulation dtype — do not infer it from
   the recorded tensors. It is written down. Look further, in this order of authority:
 
-    4. `compat_*.py`             **check here first, and before `vendor_kernel.py`.** These
+    4. `compat/*.py`             **check here first, and before `vendor/kernel.py`.** These
                                  replaced vendor kernels before tracing, so for any name a
                                  `compat` file rebinds, that file is what the reference
                                  actually did and the vendor's version is not.
-    5. `vendor_kernel.py`        the primitives `reference_torch.py` imports but does not
-                                 contain, for the ones no `compat` file replaced.
-    6. `vendor_model.py`         the complete model the slice was taken from, for when the
+    5. `vendor/kernel.py`        the primitives `reference_torch.py` imports but does not
+                                 contain — `act_quant`, `fp8_gemm`, `fp4_act_quant`,
+                                 `fp4_gemm`, `sparse_attn` — for those no `compat` file
+                                 replaced.
+    6. `vendor/model.py`         the complete model the slice was taken from, for when the
                                  slice does not say how a value reaching it was produced.
 
   The code above is the authority on *semantics*. The `.bin` files in `tensors/` are the
   authority on *results*: where your reading of the code and the recorded numbers disagree,
   the numbers are right and your reading is wrong.
+
+  **You can run the reference, not just read it.** `vendor/` is the artifact's own package
+  and imports cleanly:
+
+      import sys; sys.path.insert(0, "vendor")
+      import model, kernel
+
+  To match the reference you must apply the compat patches first — each exposes
+  `apply(vendor_module, device)` and returns the names it rebound:
+
+      import importlib.util
+      spec = importlib.util.spec_from_file_location("patch", "compat/sparse_attn_sm89.py")
+      patch = importlib.util.module_from_spec(spec); spec.loader.exec_module(patch)
+      patch.apply(model, None)          # -> ['sparse_attn']
+
+  What executes here and what does not: the compat `sparse_attn` is plain torch and **runs on
+  CPU**. The primitives compat did *not* replace — `act_quant`, `fp8_gemm`, `fp4_act_quant`,
+  `fp4_gemm` — are tilelang CUDA kernels and there is no NVIDIA GPU on this machine, so they
+  raise `No registered target detector found an available target`. Read those and reimplement
+  them in torch yourself if you want to execute that part.
+
+  Building a host-side torch reference this way is the recommended first move: it lets you
+  check an intermediate against the recorded tensors before committing to NKI, and it turns
+  "my kernel is wrong somewhere" into "my kernel is wrong here". Put it in a scratch file —
+  it is not `source.py` and it is not `inference.py`, and neither of those may import
+  `vendor/`, `compat/` or your scratch.
 
   You write two files and nothing else:
 
@@ -88,7 +116,7 @@ goal: |
       reaching back to a checkpoint or an artifact tree.
 
   `source.py` and `inference.py` are the only files you may change. Everything else —
-  `tensors/*.bin`, every `reference_*.py`, `vendor_*.py` and `compat_*.py`, `README.md`,
+  `tensors/*.bin`, every `reference_*.py`, `vendor/`, `compat/`, `README.md`,
   `MODULE.md`, `config.json` — is frozen, and any edit is reverted before your work is judged.
 
   You are expected to need several iterations. Each iteration's work is kept whether or not
@@ -144,17 +172,17 @@ reviewer:
       1. `reference_torch.py`      what this module computes
       2. `reference_inference.py`  how it was run and compared
       3. `reference_numerics.py`   what counts as matching
-      4. `compat_*.py`             **outranks `vendor_kernel.py`.** These replaced vendor
+      4. `compat/*.py`             **outranks `vendor/kernel.py`.** These replaced vendor
                                    kernels before tracing, so for any name a `compat` file
                                    rebinds, that file is what the reference actually did
-      5. `vendor_kernel.py`        the primitives `reference_torch.py` imports but does not
+      5. `vendor/kernel.py`        the primitives `reference_torch.py` imports but does not
                                    contain, for those no `compat` file replaced
-      6. `vendor_model.py`         the complete model the slice came from
+      6. `vendor/model.py`         the complete model the slice came from
 
     Use them both ways. When a check fails because the kernel computes the wrong thing, name
     the reference file and the function that settles it — the agent should read the semantics,
     not infer them from the recorded tensors, and a review that says "work out the
-    quantization rule" where `vendor_kernel.py` states it has wasted the next iteration. And
+    quantization rule" where `vendor/kernel.py` states it has wasted the next iteration. And
     when judging whether the kernel is real, compare it against those semantics: a kernel
     that reproduces the reference's algorithm is right even if it is slow, and one that
     reproduces its *numbers* by carrying them around is not.

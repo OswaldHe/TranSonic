@@ -186,9 +186,19 @@ any of them, and an edit is reverted before your work is judged.
 | `reference_torch.py` | **what to compute** — the original PyTorch implementation of this module. The specification. |
 | `reference_inference.py` | **how it was run** — the artifact's own launcher: load weights and inputs, run, time, compare against the dumped output, report `##autohelix[...]` metrics. The shape your `inference.py` has to take. It cannot run here (it needs the harness runtime and the artifact's `calls.json`), so take the structure, not the imports. |
 | `reference_numerics.py` | **how it was judged** — `Tolerance.for_dtype` is where the four tolerance constants come from and `compare_outputs` is how they are applied. Reimplement this self-contained in `inference.py`; do not import it. |
-| `vendor_kernel.py` | **the primitives** `reference_torch.py` imports but does not contain — `act_quant`, `fp8_gemm`, `fp4_act_quant`, `fp4_gemm`, `sparse_attn`. The arithmetic bottoms out here; read it rather than inferring quantization or masking from the tensors. |
-| `vendor_model.py` | **the whole model** the slice came from, for when the slice does not say how a value reaching it was produced. |
-| `compat_*.py` | **what the reference was actually recorded with.** The GPU that produced these feature maps could not run the vendor's version of some kernel, so this replaced it before tracing. Where one of these replaces a function, it — not `vendor_kernel.py` — is the semantics the reference has. Check here first. |
+| `compat/*.py` | **what the reference was actually recorded with.** The GPU that produced these feature maps could not run the vendor's version of some kernel, so this replaced it before tracing. For any name one of these rebinds, it — not `vendor/kernel.py` — is the semantics the reference has. Check here first. |
+| `vendor/kernel.py` | **the primitives** `reference_torch.py` imports but does not contain — `act_quant`, `fp8_gemm`, `fp4_act_quant`, `fp4_gemm`, `sparse_attn`. The arithmetic bottoms out here; read it rather than inferring quantization or masking from the tensors. |
+| `vendor/model.py` | **the whole model** the slice came from, for when the slice does not say how a value reaching it was produced. |
+
+`vendor/` is the artifact's own package and imports cleanly with
+`sys.path.insert(0, "vendor")`; each `compat/*.py` exposes `apply(vendor_module, device)` to
+rebind what it replaced. So the reference can be *run*, not just read — build a host-side
+torch version in a scratch file and check intermediates against `tensors/` before committing
+to NKI. The compat `sparse_attn` runs on CPU; the tilelang fp8/fp4 primitives need an NVIDIA
+GPU this machine does not have and raise `No registered target detector found an available
+target`, so reimplement those in torch if you want to execute that part.
+
+Neither `source.py` nor `inference.py` may import or open any of it.
 
 `config.json` is the config the module was built from; `MODULE.md` is the artifact's own
 description of its pre- and post-conditions.
