@@ -121,12 +121,10 @@ def _script(run, tmp_path, name, *args, group_class="TinyDecoderLayer"):
 
     groups = _extract(run, tmp_path)
     group = next(g for g in groups if g.class_name == group_class)
-    # `inference.py` takes no run directory: it reads the paths recorded beside it, so
-    # the module runs wherever the artifact was unpacked. `verify.py` is the harness's
-    # and still works over a whole run.
-    run_args = [] if name == "inference.py" else ["--run", str(run.layout.root)]
+    # Neither script takes a run directory: both read the paths recorded beside them, so
+    # a module runs wherever the artifact was unpacked.
     return subprocess.run(
-        [sys.executable, str(group.directory / name), *run_args, *args],
+        [sys.executable, str(group.directory / name), *args],
         capture_output=True, text=True, timeout=300,
     )
 
@@ -140,10 +138,10 @@ def test_generated_scripts_are_valid_python_and_name_their_modules(tiny_run, tmp
             ast.parse(text)  # raises on a broken template render
             for module_id in group.module_ids:
                 assert module_id in text
-        # The harness's verifier works over a run and names it. The launcher must not:
-        # it reads the paths recorded beside it, so it runs wherever the artifact went.
-        assert str(tiny_run.layout.root) in (group.directory / "verify.py").read_text()
-        assert str(tiny_run.layout.root) not in (group.directory / "inference.py").read_text()
+        # Neither names the run it was made in: both read the paths recorded beside
+        # them, so they run wherever the artifact went.
+        for name in ("inference.py", "verify.py"):
+            assert str(tiny_run.layout.root) not in (group.directory / name).read_text()
 
 
 def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
@@ -270,7 +268,7 @@ def test_verify_script_fails_when_the_reference_disagrees(tiny_run, tmp_path):
 def test_verify_script_reports_unusable_artifacts(tiny_run, tmp_path):
     completed = _script(tiny_run, tmp_path, "verify.py", "--sample", "no-such-sample")
     assert completed.returncode == 2
-    assert "No trace records" in completed.stdout + completed.stderr
+    assert "nothing recorded" in completed.stdout + completed.stderr
 
 
 def test_verify_script_covers_every_module_and_sample(tiny_run, tmp_path):
@@ -642,22 +640,29 @@ def test_the_principal_submodule_is_the_one_with_the_parameters():
     assert _principal([large, small]) is large
 
 
-def test_a_copied_module_reads_its_own_run_not_the_one_that_made_it(tiny_run, tmp_path):
-    """The run path is recorded at extraction, and on somebody else's machine that path
-    does not exist. A module directory sits inside its run, so it finds it relative to
-    itself and falls back to the recorded path only when moved out of one."""
+def test_a_copied_run_checks_itself_where_it_landed(tiny_run, tmp_path):
+    """On somebody else's machine the path this run was made at does not exist.
+
+    So a module reads its artifacts relative to itself, and everything it needs travels
+    with them. Copied whole to a new path, with the harness off `sys.path`, it still
+    verifies — which is what publishing an artifact set claims.
+    """
     import shutil
+    import subprocess
+
+    from model_partition import publish
 
     groups = _extract(tiny_run, tmp_path)
     group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
-    text = (group.directory / "verify.py").read_text()
-    assert "RECORDED_RUN" in text and "__file__" in text
-
-    # The run copied whole, somewhere the original path does not reach.
     elsewhere = tmp_path / "downloaded"
-    shutil.copytree(tiny_run.layout.modules_dir, elsewhere / "modules")
-    shutil.copytree(Path(tiny_run.layout.root) / "trace", elsewhere / "trace")
-    namespace: dict = {"__file__": str(elsewhere / "modules" / group.directory.name / "verify.py")}
-    exec(compile((group.directory / "verify.py").read_text(), "verify.py", "exec"),
-         namespace)
-    assert Path(namespace["DEFAULT_RUN"]) == elsewhere
+    for name in ("modules", "trace", "runtime", "vendor", "compat"):
+        source = Path(tiny_run.layout.root) / name
+        if source.is_dir():
+            shutil.copytree(source, elsewhere / name)
+    copied = elsewhere / "modules" / group.directory.name
+    for name in ("inference.py", "verify.py"):
+        command = (publish._isolated_command() if name == "inference.py"
+                   else [__import__("sys").executable, "verify.py", "--all-modules"])
+        completed = subprocess.run(command, cwd=copied, capture_output=True,
+                                   text=True, timeout=300)
+        assert completed.returncode == 0, name + ": " + completed.stdout + completed.stderr

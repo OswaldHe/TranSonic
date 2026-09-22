@@ -196,15 +196,20 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
         except OSError:
             shutil.copy2(path, target)
 
-    groups = _published_groups(root, set(module_ids))
     failures: list[str] = []
-    for group in sorted(groups):
+    for group, selected in sorted(_published_groups(root, set(module_ids)).items()):
         directory = elsewhere / "modules" / group
         if not (directory / "verify.py").is_file():
             failures.append(f"{group}: no verify.py was published")
             continue
-        for label, command in (("verify.py", [sys.executable, "verify.py", "--all-samples"]),
-                               ("inference.py", _isolated_command())):
+        # The module whose weights were published, not whichever the group lists first:
+        # the others are in the artifact for their code and cannot be built from it.
+        module = sorted(selected)[0] if selected else None
+        for label, command in (
+            ("verify.py", [sys.executable, "verify.py", "--all-samples"]
+                          + (["--module", module] if module else [])),
+            ("inference.py", _isolated_command(module)),
+        ):
             finished = subprocess.run(command, cwd=directory, capture_output=True,
                                       text=True, timeout=3600)
             tail = (finished.stdout + finished.stderr).strip().splitlines()
@@ -217,7 +222,7 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     return failures
 
 
-def _isolated_command() -> list[str]:
+def _isolated_command(module_id: str | None = None) -> list[str]:
     """Run ``inference.py`` with this package out of reach.
 
     An import that resolves to the installed harness would make the check pass for a
@@ -228,11 +233,14 @@ def _isolated_command() -> list[str]:
     import sys
 
     harness = str(Path(__file__).resolve().parent.parent)
+    argv = ["inference.py", "--repeat", "1", "--warmup", "0"]
+    if module_id:
+        argv += ["--module", module_id]
     program = "\n".join([
         "import pathlib, runpy, sys",
         f"harness = pathlib.Path({harness!r})",
         "sys.path = [p for p in sys.path if pathlib.Path(p or '.').resolve() != harness]",
-        "sys.argv = ['inference.py', '--repeat', '1', '--warmup', '0']",
+        f"sys.argv = {argv!r}",
         "runpy.run_path('inference.py', run_name='__main__')",
     ])
     return [sys.executable, "-c", program]
@@ -282,7 +290,7 @@ def collect(run_dir: str | Path, exclude: tuple[str, ...] = DEFAULT_EXCLUDE,
             f"{root} does not look like a finished run: missing {', '.join(missing)}"
         )
     wanted = set(module_ids or ())
-    groups = _published_groups(root, wanted) if wanted else set()
+    groups = set(_published_groups(root, wanted)) if wanted else set()
     files: list[Path] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts:
@@ -308,21 +316,23 @@ def _all_modules(root: Path) -> list[str]:
     return [module.id for module in graph.partitioned_modules]
 
 
-def _published_groups(root: Path, module_ids: set[str]) -> set[str]:
-    """Group directory names serving any of these modules.
+def _published_groups(root: Path, module_ids: set[str]) -> dict[str, set[str]]:
+    """Group directory name -> which of these modules it serves.
 
     Read from each group's ``meta.yaml``, which lists the modules it serves: one
     implementation covers 31 attention layers, so publishing it for one publishes it for
-    all of them — and the directory is the same bytes either way.
+    all of them — and the directory is the same bytes either way. Which of them was
+    selected still matters, because that is the one whose weights are in the artifact.
     """
     from model_partition import yamlio
 
-    names: set[str] = set()
+    found: dict[str, set[str]] = {}
     for meta in sorted((root / "modules").glob("*/meta.yaml")):
         listed = (yamlio.load_path(meta) or {}).get("module_ids") or []
-        if set(listed) & module_ids:
-            names.add(meta.parent.name)
-    return names
+        shared = set(listed) & module_ids
+        if shared:
+            found[meta.parent.name] = shared
+    return found
 
 
 def _selected(relative: str, module_ids: set[str], groups: set[str]) -> bool:

@@ -9,18 +9,18 @@ Shared by {{ module_ids | length }} module(s):
 {% endfor %}
 ## What this reads
 
-Everything comes out of the artifact directory this file sits in, and nothing else:
+Everything comes out of the artifact this file sits in, and nothing else:
 
     source.py       the implementation — {{ class_names | join(' then ') }}, verbatim from the model's own code
     config.json     the config that subtree was constructed with
     calls.json      the recorded call: which .bin holds each argument, weight and output
-    ../../runtime/  the builder and the comparison, copied in beside `modules/`
     ../../trace/    the .bin data those paths point at
-    ../../vendor/   the model's sibling modules, for `source.py`'s own imports
+    ../../runtime/  the builder, the reader and the comparison, copied in beside modules/
+    ../../vendor/   the model's sibling modules, for source.py's own imports
+    ../../compat/   the kernel replacements the reference was taken with
 
-Beyond that it imports `torch` and the standard library. There is no dependency on
-the harness that produced the run, so this directory runs wherever the artifact is
-unpacked.
+Beyond that it imports `torch` and the standard library. There is no dependency on the
+harness that produced the run, so this directory runs wherever the artifact is unpacked.
 
 ## The contract
 
@@ -60,7 +60,6 @@ Optimize `source.py`.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -74,7 +73,7 @@ CLASS_NAMES = {{ class_names | tojson }}
 SUBMODULES = {{ submodules | tojson }}
 MODULE_SUBMODULES = {{ module_submodules | tojson }}
 #: The run's samples, in the order it took them: short prompts first. Which one this
-#: file runs by default, so a quick check is a quick check rather than the longest
+#: file runs by default, so a quick check stays quick rather than taking the longest
 #: sequence in the run.
 SAMPLE_IDS = {{ sample_ids | tojson }}
 #: Dotted name source.py's classes were defined under, so its own imports resolve.
@@ -86,13 +85,14 @@ COMPOSITION = {{ composition | tojson }}
 WEIGHT_NAMES = {{ weight_names | tojson }}
 
 
-def _vendor_on_path():
-    """Put the run's own copies of the code this file needs onto `sys.path`.
+def _bootstrap():
+    """Put the artifact's own copies of the code this file needs onto `sys.path`.
 
-    `../../runtime` holds the builder and the comparison; `../../vendor` holds the
-    model's package, which `source.py` imports from — it is a slice of one file of that
-    package and keeps that file's imports. Both are inside the artifact, so nothing
-    outside it has to be installed.
+    `../../runtime` holds the builder, the reader and the comparison; `../../vendor`
+    holds the model's package, which `source.py` imports from — it is a slice of one file
+    of that package and keeps that file's imports. Both are inside the artifact, so this
+    runs where it was unpacked and not only where it was made, and nothing here may
+    import them before this has run.
     """
     import sys
 
@@ -113,112 +113,10 @@ def load_implementation():
     without taking the installed module's place. The run's `compat/` patches are applied
     to it as they were during tracing.
     """
-    _vendor_on_path()
+    _bootstrap()
     from model_partition.runtime.launcher import load_source
 
     return load_source(HERE, SOURCE_MODULE)
-
-
-def module_config():
-    """The config this module's subtree was constructed with."""
-    path = HERE / "config.json"
-    return json.loads(path.read_text()) if path.is_file() else {}
-
-
-def recorded_calls():
-    """`calls.json`: the tensors this group's modules were called with."""
-    path = HERE / "calls.json"
-    if not path.is_file():
-        raise SystemExit(f"error: {path} is missing; re-run extraction over the trace")
-    return json.loads(path.read_text())["modules"]
-
-
-def read_tensor(spec, device="cpu"):
-    """One dumped tensor, from the `.bin` its recorded path points at.
-
-    The bytes are read as `uint8` and reinterpreted, which is how they were written and
-    the only way that works for every dtype in play: `torch.frombuffer` does not take
-    bfloat16, fp8, a packed fp4 pair or a complex rotary table, and all four are here.
-    """
-    import torch
-
-    path = (HERE / spec["bin"]).resolve()
-    if not path.is_file():
-        raise SystemExit(f"error: {path} is missing from the artifact")
-    dtype = getattr(torch, spec["dtype"], None)
-    if not isinstance(dtype, torch.dtype):
-        raise SystemExit(f"error: this torch has no dtype {spec['dtype']!r}")
-    flat = torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8)
-    if dtype is not torch.uint8:
-        flat = flat.view(dtype)
-    return flat.reshape(spec["shape"]).to(device)
-
-
-def decode(value, device="cpu"):
-    """Rebuild a recorded argument tree, reading each tensor it names."""
-    if isinstance(value, dict):
-        if "__tensor__" in value:
-            spec = value["__tensor__"]
-            if not isinstance(spec, dict):  # a tensor the run chose not to dump
-                raise SystemExit(f"error: tensor {spec!r} was not dumped; "
-                                 "re-run the trace with weight caching on")
-            return read_tensor(spec, device)
-        if "__unsupported__" in value:
-            return None
-        if "__tuple__" in value:
-            return tuple(decode(item, device) for item in value["__tuple__"])
-        if "__list__" in value:
-            return [decode(item, device) for item in value["__list__"]]
-        return {key: decode(item, device) for key, item in value.items()}
-    return value
-
-
-def group_call(calls, device="cpu"):
-    """Arguments for the whole group, not just its first submodule.
-
-    A group can be heterogeneous — a normalization followed by attention — and then the
-    first submodule's recorded call says nothing about the positions and shared state the
-    attention needs. The value flowing in comes from the group's entry point; everything
-    beyond it is the union over the group, so whatever the module does internally, it was
-    given everything. First occurrence wins, so a keyword that changes down the group
-    keeps the value the entry point saw.
-    """
-    args = [decode(item, device) for item in calls[0]["args"]]
-    kwargs = {k: decode(v, device) for k, v in (calls[0].get("kwargs") or {}).items()}
-    extras = tuple(args[1:])
-    for call in calls[1:]:
-        for key, value in (call.get("kwargs") or {}).items():
-            kwargs.setdefault(key, decode(value, device))
-        other = [decode(item, device) for item in call["args"]]
-        if len(other) - 1 > len(extras):
-            extras = tuple(other[1:])
-    return (tuple(args[:1]) + extras if args else extras), kwargs
-
-
-def apply_state(source, calls, device="cpu"):
-    """Put back the cross-module state the recorded call ran on.
-
-    A model that passes tensors between modules through a module-level object — the
-    compressed KV DeepSeek's attention layers share — leaves a consumer with no argument
-    naming the largest thing it reads. Restoring it on this module's own `source.py` is
-    what makes the check one of this module against its reference, rather than of this
-    module against another having run first.
-    """
-    applied = 0
-    for call in calls:
-        for dotted, encoded in (call.get("state") or {}).items():
-            holder_name, _, attribute = dotted.rpartition(".")
-            holder = getattr(source, holder_name, None)
-            if holder is None:
-                continue
-            setattr(holder, attribute, decode(encoded, device))
-            applied += 1
-    return applied
-
-
-def load_weights(entry, device="cpu"):
-    """This module's dumped weights, keyed by original parameter name."""
-    return {name: read_tensor(spec, device) for name, spec in (entry["weights"]).items()}
 
 
 def build_module(config, weights, device="cpu", submodule=None):
@@ -230,7 +128,6 @@ def build_module(config, weights, device="cpu", submodule=None):
     which expert of a parallel group, or which submodule when these are installed into
     a model.
     """
-    _vendor_on_path()
     from model_partition.runtime.launcher import build_group
 
     source = load_implementation()
@@ -270,64 +167,47 @@ def main(argv=None):
     parser.add_argument("--list", action="store_true", help="List what was recorded, and stop")
     args = parser.parse_args(argv)
 
-    _vendor_on_path()
+    _bootstrap()
     import torch
 
+    from model_partition.runtime.artifact import ArtifactError, load_calls, load_config
     from model_partition.verify.numerics import Tolerance, compare_outputs, first_tensor
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    modules = recorded_calls()
-    entry = modules.get(args.module)
-    if entry is None:
-        print(f"error: {args.module} is not in calls.json", file=sys.stderr)
+    try:
+        recorded = load_calls(HERE)
+        module = recorded.get(args.module)
+        if module is None:
+            raise ArtifactError(f"{args.module} is not in calls.json")
+        if args.list:
+            for key in module.keys(SAMPLE_IDS):
+                print(f"  {key}")
+            return 0
+        key, calls = module.select(args.sample, args.step, SAMPLE_IDS)
+        weights = module.weights(device)
+        call_args, call_kwargs = module.arguments(calls, device)
+        parallel = COMPOSITION == "parallel"
+        reference = module.reference(calls, parallel, device)
+    except ArtifactError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    # The prefill pass of the first sample unless something else is asked for: it is the
-    # pass every module has, and a group's submodules all appear in it.
-    def order(key):
-        sample, _, step = key.rpartition("#")
-        known = SAMPLE_IDS.index(sample) if sample in SAMPLE_IDS else len(SAMPLE_IDS)
-        return (int(step), known, sample)
-
-    keys = sorted(entry["calls"], key=order)
-    if args.list:
-        for key in keys:
-            print(f"  {key}  {len(entry['calls'][key])} call(s)")
-        return 0
-    wanted = [k for k in keys
-              if (args.sample is None or k.rsplit("#", 1)[0] == args.sample)
-              and (args.step is None or int(k.rsplit("#", 1)[1]) == args.step)]
-    if not wanted:
-        print(f"error: nothing recorded for sample {args.sample!r} step {args.step!r}; "
-              f"have {keys}", file=sys.stderr)
-        return 2
-    calls = entry["calls"][wanted[0]]
-    parallel = COMPOSITION == "parallel"
 
     print(f"group    : {SIGNATURE}")
     print(f"module   : {args.module}  layers={LAYER_MAP.get(args.module) or '-'}")
-    print(f"recorded : {wanted[0]}  {len(calls)} call(s) on {device}")
-    missing = entry.get("weights_missing") or []
-    print(f"weights  : {len(entry['weights'])} dumped tensor(s)"
-          + (f", {len(missing)} not in the artifact" if missing else ""))
-    if missing:
-        print(f"  first missing: {missing[0]}")
+    print(f"recorded : {key}  {len(calls)} call(s) on {device}")
+    print(f"weights  : {len(weights)} dumped tensor(s)"
+          + (f", {len(module.missing_weights)} not in the artifact"
+             if module.missing_weights else ""))
 
-    weights = load_weights(entry, device)
-    call_args, call_kwargs = group_call(calls, device)
-    # A parallel group's calls are independent — one expert each — so the first call's
-    # own output is the reference. A sequential group is one computation from the first
-    # submodule's input to the last submodule's output.
-    reference = decode((calls[0] if parallel else calls[-1])["output"], device)
-
-    module = build_module(module_config(), weights, device=device,
-                          submodule=calls[0]["submodule"] if parallel else None)
-    applied = apply_state(load_implementation(), calls, device)
+    launched = build_module(load_config(HERE), weights, device=device,
+                            submodule=calls[0]["submodule"] if parallel else None)
+    applied = module.apply_state(load_implementation(), calls, device)
     if applied:
         print(f"state    : {applied} cross-module tensor(s) restored")
 
     def once():
         with torch.no_grad():
-            return module(*call_args, **call_kwargs)
+            return launched(*call_args, **call_kwargs)
 
     def settle():
         # An accelerator call queues rather than completes, so nothing timed around

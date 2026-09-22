@@ -601,15 +601,16 @@ def refresh_calls(bundle: Any, directory: str | Path) -> int:
 
 
 #: The harness files a module directory needs to build and check itself, by package
-#: path. The launcher constructs the module out of ``source.py``; ``compat`` applies the
-#: run's kernel replacements; ``hardware`` is how a patch learns which card it is on;
-#: ``numerics`` decides whether the result matches, and must be the same code the run
-#: judged by. Each of these imports only the others, which is the property that keeps
+#: path. ``artifact`` reads the recorded calls beside it; the launcher constructs the
+#: module out of ``source.py``; ``compat`` applies the run's kernel replacements;
+#: ``hardware`` is how a patch learns which card it is on; ``numerics`` decides whether
+#: the result matches, and must be the same code the run judged by. Each of these imports only the others, which is the property that keeps
 #: this list short — see the note at the top of the launcher.
 RUNTIME_FILES = (
     "__init__.py",
     "hardware.py",
     "runtime/__init__.py",
+    "runtime/artifact.py",
     "runtime/launcher.py",
     "runtime/compat.py",
     "verify/__init__.py",
