@@ -340,6 +340,24 @@ def read_review_verdict_from_text(text: str) -> str | None:
     return found[-1].lower() if found else None
 
 
+def test_the_reviewer_knows_the_bar_is_not_the_agents_to_choose() -> None:
+    """Otherwise a retune reads to the reviewer as exactly the cheating it hunts for.
+
+    `bootstrap retune` loosened 00-Attention's rtol from 0.02 to 0.1 mid-run, so the next
+    iteration had to raise it — and "a looser tolerance" was on the reviewer's circumvention
+    list. A `circumventing` verdict blocks the loop declaring success, so an uninformed
+    reviewer could refuse to let a finished module finish.
+    """
+    prompt = preset.load_preset()["reviewer"]["prompt"]
+    assert "README.md" in prompt
+    assert "not the agent's to choose" in prompt
+    # The list must no longer treat a loose constant as a signal in itself.
+    assert "a looser tolerance," not in prompt
+    # But the comparison's logic is still fair game.
+    for still in ("comparing fewer elements", "swallowing a mismatch", "MAX_ABS_ERR"):
+        assert still in prompt, still
+
+
 def test_the_reviewer_is_asked_for_both_sections() -> None:
     prompt = preset.load_preset()["reviewer"]["prompt"].lower()
     assert "what is left" in prompt
