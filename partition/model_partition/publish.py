@@ -23,10 +23,15 @@ from typing import Any, Callable
 
 from model_partition.extract import refresh_calls
 from model_partition.hardware import format_bytes
+from model_partition.runtime.artifact import CHECKPOINT_DIR
 
-#: Left out by default: agent transcripts, which are large and say nothing about the
-#: artifacts themselves.
-DEFAULT_EXCLUDE = ("logs/**",)
+#: Left out by default. Agent transcripts are large and say nothing about the artifacts.
+#: ``hf/`` is what ``fetch_weights.py`` downloads on the *reader's* machine —
+#: republishing it would upload a copy of the model, which is the one thing an artifact
+#: set exists to avoid, and the shards are a pinned revision of a repo anyone can reach.
+#: ``.cache/`` is the Hub client's own resume bookkeeping, which it writes *into* the
+#: folder it is uploading: 13562 files on the first run here, none of them content.
+DEFAULT_EXCLUDE = ("logs/**", "hf/**", ".cache/**")
 
 #: What a run has to contain before uploading it means anything.
 REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
@@ -38,6 +43,15 @@ REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
 #: them a module directory is a description of a computation rather than something anyone
 #: can run.
 ALWAYS = ("vendor", "compat", "runtime", "plan", "reports")
+
+#: Concurrent uploaders. The Hub's own default scales with the core count, and each
+#: worker asks the API about the files it is sending: on 16 cores that burst straight
+#: through a free account's 1000 requests per 5 minutes, and the upload aborted a third
+#: of the way through a 16 000-file artifact set. A published run is thousands of small
+#: feature maps rather than a few big shards, so the request count is the limit that
+#: binds, not the bandwidth. Two workers stay under it; raise it with ``--workers`` on an
+#: account whose limit is higher.
+UPLOAD_WORKERS = 2
 
 #: A token file an operator may leave beside the checkout, searched when the Hub's own
 #: sources (``HF_TOKEN``, a login) have nothing. Read, never written and never logged;
@@ -146,14 +160,22 @@ def _weight_source(root: Path):
     payload = manifest.get("spec")
     if not payload:
         raise PublishError(f"{root / 'run.yaml'} does not record the model it partitioned")
+    # The revision the trace was actually taken from, which is not always the one the
+    # spec asked for: a spec may name a moving branch or name nothing at all, and ingest
+    # pins whatever that resolved to. Re-ingesting the spec alone would read weights from
+    # whatever the branch points at now, and those do not belong beside these activations.
+    payload = dict(payload)
+    if resolved := str(manifest.get("revision") or ""):
+        payload["revision"] = resolved
     try:
-        result = ingest(parse_spec(payload))
+        spec = parse_spec(payload)
+        result = ingest(spec)
     except Exception as exc:
         raise PublishError(
             f"this run read its weights from the checkpoint rather than dumping them, and "
             f"the checkpoint cannot be reached to copy them in: {exc}"
         ) from exc
-    return CheckpointWeights.from_ingest(result)
+    return CheckpointWeights.from_ingest(result, rename=spec.checkpoint.rename)
 
 
 def _safe(name: str) -> str:
@@ -177,6 +199,13 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     somebody who downloads the artifact runs, and it is launched with this package taken
     off ``sys.path`` — so it passes only if the copies under ``runtime/`` and ``vendor/``
     inside the artifact are enough on their own.
+
+    The fetched checkpoint comes too, when the run has one. It is deliberately *not*
+    uploaded — republishing a copy of the model is the one thing an artifact set exists to
+    avoid — but a reader runs ``fetch_weights.py`` and has it, so a check without it asks
+    whether the modules work having skipped a documented step. Without this, a run that
+    traced with weight caching off failed here for every group and the only way to publish
+    was to turn the check off.
     """
     import shutil
     import subprocess
@@ -188,7 +217,13 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     # check is about which paths are reachable, not about having a second hundred
     # gigabytes of the same bytes.
     elsewhere = Path(tempfile.mkdtemp(prefix="published-", dir=root.parent))
-    for path in files:
+    checkpoint = root / CHECKPOINT_DIR
+    # Files only, and at any depth: the Hub client leaves its own resume bookkeeping in a
+    # `.cache/` directory inside the folder it downloads into, and asking to hardlink a
+    # directory raises where the copy fallback cannot help either.
+    fetched = sorted(p for p in checkpoint.rglob("*") if p.is_file()) \
+        if checkpoint.is_dir() else []
+    for path in list(files) + fetched:
         target = elsewhere / path.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -206,7 +241,10 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
         # the others are in the artifact for their code and cannot be built from it.
         module = sorted(selected)[0] if selected else None
         for label, command in (
-            ("verify.py", [sys.executable, "verify.py", "--all-samples"]
+            # The first recorded pass, not every sample: `verify_modules` already
+            # checked every module against every sample, and what is being asked here is
+            # whether the published files can answer the question at all.
+            ("verify.py", [sys.executable, "verify.py"]
                           + (["--module", module] if module else [])),
             ("inference.py", _isolated_command(module)),
         ):
@@ -354,6 +392,22 @@ def _published_groups(root: Path, module_ids: set[str]) -> dict[str, set[str]]:
     return found
 
 
+def _largest(root: Path, files: list[Path], count: int = 5) -> list[tuple[str, int]]:
+    """The biggest published files, named relative to the run, for a size report."""
+    return [(path.relative_to(root).as_posix(), path.stat().st_size)
+            for path in files[:count]]
+
+
+def _ceiling_error(total: int, max_bytes: int,
+                   largest: list[tuple[str, int]]) -> PublishError:
+    """The refusal when a set is larger than the operator allowed."""
+    return PublishError(
+        f"{format_bytes(total)} exceeds the {format_bytes(max_bytes)} ceiling. Largest: "
+        + "; ".join(f"{name} {format_bytes(size)}" for name, size in largest)
+        + ". Exclude what you do not need with --exclude, or raise --max-gib."
+    )
+
+
 def _selected(relative: str, module_ids: set[str], groups: set[str]) -> bool:
     """Whether one path belongs to a published subset."""
     head, _, rest = relative.partition("/")
@@ -381,10 +435,29 @@ def publish_run(
     module_ids: list[str] | None = None,
     upload_all: bool = False,
     skip_check: bool = False,
+    workers: int | None = None,
     report: Callable[[str], None] = lambda _message: None,
 ) -> PublishResult:
     """Upload a run directory, or a selection of its modules, as a dataset repo."""
     root = Path(run_dir)
+    selection = None if upload_all else module_ids
+    # Both refusals before anything is written. Materializing a subset's weights reads
+    # tens or hundreds of gigabytes out of the checkpoint, so reaching "this run did not
+    # pass" or "this is over the ceiling" afterwards costs hours and a disk for nothing.
+    verdict = _verdict(root)
+    if not verdict.get("passed") and not allow_unverified:
+        raise PublishError(
+            f"this run did not pass ({verdict.get('detail', 'no state recorded')}); "
+            "an unverified artifact set is worse than none. Pass allow_unverified to "
+            "upload it anyway."
+        )
+    if max_bytes is not None:
+        # What is on disk already is a floor for what will be there once the weights are
+        # in, so a set over the ceiling now is over it then. The exact total is checked
+        # again below, because a subset's final size is not knowable until then.
+        present, floor = collect(root, exclude, module_ids=selection)
+        if floor > max_bytes:
+            raise _ceiling_error(floor, max_bytes, _largest(root, present))
     if module_ids and not dry_run:
         # The weights first: a subset has to carry its own, or nothing in it can be
         # checked away from the checkpoint it was traced against.
@@ -403,26 +476,11 @@ def publish_run(
     # every module's code, plan, reports and recorded feature maps — and a reader is better
     # served by all of it than by a subset. The selection then says which modules also
     # carry their weights, and so which can be verified where they land.
-    files, total = collect(root, exclude,
-                           module_ids=None if upload_all else module_ids)
+    files, total = collect(root, exclude, module_ids=selection)
     result = PublishResult(repo_id=repo_id, files=len(files), total_bytes=total,
-                           dry_run=dry_run,
-                           largest=[(p.relative_to(root).as_posix(), p.stat().st_size)
-                                    for p in files[:5]])
+                           dry_run=dry_run, largest=_largest(root, files))
     if max_bytes is not None and total > max_bytes:
-        raise PublishError(
-            f"{format_bytes(total)} exceeds the {format_bytes(max_bytes)} ceiling. "
-            f"Largest: "
-            + "; ".join(f"{name} {format_bytes(size)}" for name, size in result.largest)
-            + ". Exclude what you do not need with --exclude, or raise --max-gib."
-        )
-    verdict = _verdict(root)
-    if not verdict.get("passed") and not allow_unverified:
-        raise PublishError(
-            f"this run did not pass ({verdict.get('detail', 'no state recorded')}); "
-            "an unverified artifact set is worse than none. Pass allow_unverified to "
-            "upload it anyway."
-        )
+        raise _ceiling_error(total, max_bytes, result.largest)
     report(f"{len(files)} file(s), {format_bytes(total)}")
     for name, size in result.largest:
         report(f"  {format_bytes(size):>10}  {name}")
@@ -454,6 +512,7 @@ def publish_run(
         api.upload_large_folder(
             repo_id=repo_id, repo_type="dataset", folder_path=str(root),
             ignore_patterns=list(exclude) + ["**/__pycache__/**"],
+            num_workers=workers or UPLOAD_WORKERS,
             **({"allow_patterns": sorted({p.relative_to(root).as_posix() for p in files})}
                if module_ids else {}),
         )
@@ -558,6 +617,25 @@ artifacts alone and compared against the recorded reference.
 - `reports/` — per-module verification, chained drift, emulated generation, tokens.
 - `compat/` — patches that made the model's own code run on the GPU used here, if any
   were needed. The reference was produced with them applied.
+- `runtime/` — the harness a module directory builds itself with, so running one needs
+  `torch` and nothing installed from the tool that produced this.
+- `fetch_weights.py` — present when the run read weights from the checkpoint rather than
+  copying them in here. See below.
+
+## Weights
+
+A module's recorded inputs and outputs are all in `trace/`. Its *parameters* may not be:
+this set is published without a second copy of the checkpoint, so each module records the
+shard and key each weight lives in instead. `fetch_weights.py` downloads only those shards,
+pinned to the revision above, into `hf/`, which is where the modules look:
+
+```bash
+python fetch_weights.py --list                 # what it would fetch, and how big
+python fetch_weights.py --group <group>        # just one group's shards
+```
+
+A module short of a weight says so and names the script, rather than reporting numbers it
+computed from values it does not have.
 
 ## Checking a module
 

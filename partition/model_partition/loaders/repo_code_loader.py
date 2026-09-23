@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from model_partition.loaders.base import LoadedModel, LoaderError, torch_dtype
+from model_partition.runtime import private_module_name
 from model_partition.loaders.streamed import rename as rename_key
 
 #: Factory names tried in order, called as ``fn(config)`` or ``fn(config, state_dict)``.
@@ -94,7 +95,7 @@ class RepoCodeLoader:
                 "trust_remote_code: true in the spec to allow it."
             )
         path = self._entry_path()
-        module_name = f"_model_partition_repo_{abs(hash(str(path)))}"
+        module_name = private_module_name("_model_partition_repo_", path)
         if module_name in sys.modules:
             # Patches are re-applied: the set can change between iterations, and what
             # runs must be what the run directory currently says.

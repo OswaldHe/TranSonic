@@ -22,10 +22,10 @@ context the logits alone are gigabytes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from model_partition.planner.graph import PartitionGraph
-from model_partition.runtime.module_runner import TraceBundle, load_named_weights
+from model_partition.runtime.module_runner import TraceBundle, load_named_weights, owns_weights
 from model_partition.trace import _lookup
 
 
@@ -159,11 +159,19 @@ def _first_param_device(model: Any) -> str:
         return "cpu"
 
 
-def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[str, Any]]:
+def capture_boundaries(model: Any, graph: PartitionGraph,
+                       on_output: Callable[[str, Any], Any] | None = None,
+                       ) -> tuple[list, dict[str, Any]]:
     """Hook every partitioned module to record its output on the *first* forward.
 
     Generation re-runs the forward on a growing sequence, so only the first pass
     is comparable with a trace taken at the prompt's length.
+
+    ``on_output(module_id, output)``, when given, is recorded in the output's place. A
+    boundary check needs a comparison from each output, not the output, and keeping the
+    outputs until the forward ends keeps one per module: at 8192 tokens DeepSeek V4.1's
+    rank-4 residual stream is 320 MiB a boundary, 247 boundaries are more than the card,
+    and the check ran out of memory on a forward that generated fine.
     """
     sink: dict[str, Any] = {}
     handles = []
@@ -175,7 +183,9 @@ def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[st
     def make_hook(module_ids: list[str]):
         def hook(_module, _args, output):
             for module_id in module_ids:
-                sink.setdefault(module_id, output)
+                if module_id not in sink:
+                    sink[module_id] = (output if on_output is None
+                                       else on_output(module_id, output))
         return hook
 
     for submodule_name, module_ids in owners.items():
@@ -215,6 +225,36 @@ def _last_logits_argument(model: Any) -> str | None:
     return next((name for name in LAST_LOGITS_ARGUMENTS if name in parameters), None)
 
 
+def logits_extractor(returns: tuple[str, ...] = ()) -> Any:
+    """How to find the logits in whatever this model's forward returns.
+
+    A forward that returns a bare tuple says nothing about which element is which, so
+    the spec names them positionally — DeepSeek V4.1's is
+    ``(output_ids, logits, main_hidden)``. Treating the tuple itself as the logits fails
+    on ``.dim()`` one frame later, which reads as a generation bug rather than as a
+    model whose output was never unpacked.
+
+    A model whose output carries ``.logits`` needs no help, and one that returns the
+    tensor itself is already the answer.
+    """
+    index = list(returns).index("logits") if "logits" in tuple(returns or ()) else None
+
+    def extract(output: Any) -> Any:
+        if hasattr(output, "logits"):
+            return output.logits
+        if index is not None and isinstance(output, (tuple, list)):
+            if index >= len(output):
+                raise ValueError(
+                    f"trace.returns names logits at position {index} of "
+                    f"{len(tuple(returns))}, and this forward returned {len(output)} "
+                    "value(s)"
+                )
+            return output[index]
+        return output
+
+    return extract
+
+
 def generate(
     model: Any,
     input_ids: Any,
@@ -242,7 +282,7 @@ def generate(
 
     from model_partition.trace import forward_no_cache
 
-    extract = logits_of or (lambda out: out.logits if hasattr(out, "logits") else out)
+    extract = logits_of or logits_extractor()
     keep_last = _last_logits_argument(model)
     sequence = input_ids
     produced: list[int] = []
@@ -272,6 +312,9 @@ class InstallReport:
 
     installed: list[str] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)
+    #: Cross-module state holders rebound to the model's own object, and how many
+    #: implementations each rebinding covered. Empty when the model has no such state.
+    shared_state: dict[str, int] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -279,6 +322,10 @@ class InstallReport:
 
     def summary(self) -> str:
         text = f"{len(self.installed)} submodule(s) running the extracted implementation"
+        if self.shared_state:
+            shared = ", ".join(f"{name} across {n + 1}" for name, n in
+                               sorted(self.shared_state.items()))
+            text += f"; cross-module state shared ({shared})"
         if self.skipped:
             first = ", ".join(list(self.skipped)[:3])
             text += f"; {len(self.skipped)} left as the model's own ({first})"
@@ -288,6 +335,7 @@ class InstallReport:
         return {
             "installed": list(self.installed),
             "skipped": dict(self.skipped),
+            "shared_state": dict(self.shared_state),
             "complete": self.complete,
         }
 
@@ -324,10 +372,15 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
     import torch
 
     from model_partition.runtime.module_impl import load_impl
-    from model_partition.runtime.module_runner import load_named_weights
     from model_partition.trace import _lookup
 
     pending: list[tuple[str, Any]] = []
+    #: One module's weights at a time, shared across the lazily built
+    #: implementations so a module called twice in a forward reads once.
+    lazy_weights: dict[str, Any] = {}
+    #: Every implementation loaded here, so their cross-module state can be made one
+    #: object before anything runs. See :func:`_share_state_holders`.
+    loaded: list[Any] = []
     for module in graph.partitioned_modules:
         impl_dir = impl_dirs.get(module.id)
         if impl_dir is None:
@@ -338,12 +391,18 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
             continue
         try:
             impl = load_impl(impl_dir)
+            # The run-wide config, which `build_group` then narrows to the one recorded
+            # beside the module. Passing the narrow one here instead loses it as a
+            # fallback, and with it the class's own config dataclass — which is what a
+            # constructor wanting more than a dict is built from.
+            config = bundle.config
             weights = {} if lazy else load_named_weights(bundle, module.id, device=device)
-            if not lazy and not weights:
+            if not lazy and not weights and owns_weights(bundle, module.id):
                 raise EmulationError("no weights available")
         except Exception as exc:
             report.skipped[module.id] = str(exc)
             continue
+        loaded.append(impl)
 
         for submodule_name in module.submodules:
             original = _lookup(model, submodule_name)
@@ -353,11 +412,12 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
             if lazy:
                 pending.append((submodule_name, _wrapper_class()(
                     None, original,
-                    factory=_live_factory(impl, bundle.config, submodule_name, original,
-                                          device))))
+                    factory=_bundle_factory(impl, config, module.id, submodule_name,
+                                            bundle, device, lazy_weights))))
                 continue
             try:
-                built = impl.build(bundle.config, weights, device, submodule=submodule_name)
+                built = impl.build(config, weights, device, submodule=submodule_name,
+                                   module_id=module.id)
             except Exception as exc:
                 report.skipped[submodule_name] = f"build failed: {exc}"
                 continue
@@ -366,6 +426,7 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
                 continue
             pending.append((submodule_name, _wrapper_class()(built, original)))
 
+    report.shared_state = _share_state_holders(model, loaded, _state_holders(bundle))
     for submodule_name, wrapper in pending:
         _install(model, submodule_name, wrapper)
         report.installed.append(submodule_name)
@@ -374,27 +435,113 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
     return report
 
 
-def _live_factory(impl: Any, config: dict[str, Any], submodule_name: str,
-                  original: Any, device: str):
-    """Build this submodule's implementation from the weights the model holds now.
+def _state_holders(bundle: Any) -> set[str]:
+    """Names of the objects a model passes tensors between modules through.
 
-    The names are the ones the recording uses, so the implementation is handed exactly
-    what it would have been handed from the dumps — only these tensors are the model's
-    own, already materialized for the call about to happen, so nothing is read twice.
+    Taken from the recording, which names them because the trace had to capture them:
+    a key like ``shared_attn.compress_kv`` says the holder is ``shared_attn``.
+    """
+    names: set[str] = set()
+    for record in getattr(bundle, "records", None) or []:
+        for key in (getattr(record, "state", None) or {}):
+            holder, _, leaf = str(key).rpartition(".")
+            if holder and leaf:
+                names.add(holder.split(".")[0])
+    return names
+
+
+def _share_state_holders(model: Any, impls: list[Any], names: set[str]) -> dict[str, int]:
+    """Make every implementation's cross-module state the *same* object as the model's.
+
+    This is the one thing a per-module artifact cannot get right on its own. A model that
+    passes tensors between layers through a module-level singleton — DeepSeek's compressed
+    KV and top-k indices live on ``shared_attn`` — has that singleton *copied into every
+    extracted group's* ``source.py``, because the slice keeps the module-level statements
+    its classes reference. Each group is then imported as its own python module, so four
+    attention groups mean four ``shared_attn`` objects.
+
+    Layers 2, 8, 14 and 20 publish the compressed KV; the layers after each of them read
+    it. Producer and consumer are in different groups whenever their structures differ, so
+    the consumer read an object nobody had written and got ``None`` — surfacing as
+    ``'NoneType' object is not subscriptable`` from inside otherwise-correct code. Module
+    verification never sees this because it restores each call's recorded state instead;
+    emulation is where the state is supposed to actually flow.
+
+    The model's own object is canonical: everything the plan does not partition still runs
+    the vendor's code against it. Returns how many bindings were made per holder.
+    """
+    import sys
+
+    if not names or not impls:
+        return {}
+    vendor = sys.modules.get(getattr(type(model), "__module__", "") or "")
+    sources = []
+    for impl in impls:
+        loader = getattr(getattr(impl, "module", None), "load_implementation", None)
+        if loader is None:
+            continue
+        try:
+            sources.append(loader())
+        except Exception:
+            continue
+
+    bound: dict[str, int] = {}
+    for name in sorted(names):
+        canonical = getattr(vendor, name, None) if vendor is not None else None
+        if canonical is None:
+            canonical = next((getattr(s, name) for s in sources if hasattr(s, name)), None)
+        if canonical is None:
+            continue
+        count = 0
+        for source in sources:
+            if hasattr(source, name) and getattr(source, name) is not canonical:
+                setattr(source, name, canonical)
+                count += 1
+        if vendor is not None and hasattr(vendor, name):
+            setattr(vendor, name, canonical)
+        bound[name] = count
+    return bound
+
+
+def _module_config(impl_dir: Any) -> dict[str, Any]:
+    """The config recorded beside an implementation, or ``{}`` when there is none."""
+    from model_partition.runtime.artifact import load_config
+
+    try:
+        return load_config(impl_dir) or {}
+    except Exception:
+        return {}
+
+
+def _bundle_factory(impl: Any, config: dict[str, Any], module_id: str,
+                    submodule_name: str, bundle: Any, device: str, cache: dict):
+    """Build this submodule's implementation from the *artifacts*, one module at a time.
+
+    The streamed path holds a model of placeholders, so there are no live weights to
+    borrow: the loader materializes a module's tensors in a forward-pre-hook on whatever
+    unit it chose to place, and an implementation installed in a submodule's place is not
+    that unit. Reading from the recording instead is what every other check already does —
+    `verify_modules`, `verify_chain` and a module directory's own `inference.py` — so the
+    weights here are the same weights those compared against, and nothing depends on where
+    a hook happened to land.
+
+    Onto the host, and one module's worth at a time. A 94.6 GiB n-gram table cannot be
+    asked of the card, and holding two of them is more than the host has; `build_group`
+    places what fits once it knows the size, which it can only know from real tensors.
     """
     def build() -> Any:
-        weights = {
-            f"{submodule_name}.{name}": tensor
-            for name, tensor in (list(original.named_parameters())
-                                 + list(original.named_buffers()))
-            if tensor is not None and not getattr(tensor, "is_meta", False)
-        }
-        if not weights:
-            raise EmulationError(
-                f"{submodule_name} holds no materialized weights at call time, so its "
-                f"implementation cannot be built from the model"
-            )
-        return impl.build(config, weights, device, submodule=submodule_name)
+        weights = cache.get(module_id)
+        if weights is None:
+            # The previous module's first, or the two of them do not fit together.
+            cache.clear()
+            weights = load_named_weights(bundle, module_id, device="cpu")
+            if not weights and owns_weights(bundle, module_id):
+                raise EmulationError(
+                    f"{module_id} has no recorded weights, so its implementation cannot be "
+                    f"built from the artifacts")
+            cache[module_id] = weights
+        return impl.build(config, weights, device, submodule=submodule_name,
+                          module_id=module_id)
 
     return build
 
@@ -432,6 +579,24 @@ def _wrapper_class() -> Any:
                     return built(*args, **kwargs)
                 finally:
                     del built
+
+            def __getattr__(self, name: str) -> Any:
+                """Anything the wrapper does not have, the module it stands in for might.
+
+                A model reads attributes off its own submodules, not just calls them:
+                DeepSeek's `Transformer.forward` asks each layer for
+                `layer.engram.layer_hash_index` to index the n-gram hashes. A stand-in that
+                answered only `forward` would break the very code it is standing in for.
+                """
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    # Reached through `__dict__` rather than `self.original`, which would
+                    # come back through here and recurse.
+                    original = self.__dict__.get("_modules", {}).get("original")
+                    if original is not None and name != "original":
+                        return getattr(original, name)
+                    raise
 
             def extra_repr(self) -> str:
                 return "extracted implementation"

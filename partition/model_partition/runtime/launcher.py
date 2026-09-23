@@ -15,9 +15,10 @@ its own imports resolve against the installed ``torch`` and ``transformers``. Th
 class bodies that run are the artifact's.
 
 This module imports nothing else from the harness beyond its two small neighbours
-(:mod:`~model_partition.runtime.compat` and :mod:`~model_partition.hardware`), which is
-what lets :func:`~model_partition.extract.vendor_runtime` copy it into a run so a
-module's ``inference.py`` builds from the artifact alone. Keep it that way: the names
+(:mod:`~model_partition.runtime.compat` and :mod:`~model_partition.hardware`) and the
+naming helper in its own package's ``__init__``, which is what lets
+:func:`~model_partition.extract.vendor_runtime` copy it into a run so a module's
+``inference.py`` builds from the artifact alone. Keep it that way: the names
 below live here rather than in :mod:`~model_partition.extract` because that module
 renders templates and a published artifact must not need a template engine to run.
 """
@@ -27,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from model_partition.runtime import private_module_name
 
 SOURCE_FILENAME = "source.py"
 
@@ -50,9 +53,12 @@ COMPUTE_DTYPE_KEY = "_compute_dtype"
 #: The recorded call and weight map a module's ``inference.py`` reads, written beside it.
 CALLS_FILENAME = "calls.json"
 
-#: Imported source per directory. Executing a modeling file is not cheap and every
-#: module of a group asks for the same one.
-_SOURCE_CACHE: dict[str, Any] = {}
+#: Imported source per directory, keyed by the file's own mtime and size as well as its
+#: path. Executing a modeling file is not cheap and every module of a group asks for the
+#: same one — but the repair agent edits ``source.py`` between iterations, and a cache
+#: keyed by path alone would hand back the module the iteration was meant to replace, so
+#: the loop could spend every repair it has on code that never ran.
+_SOURCE_CACHE: dict[tuple[str, int, int], Any] = {}
 
 #: Total weight bytes above which a module is constructed on the meta device and handed
 #: its recorded tensors by reference instead of copying into freshly allocated ones.
@@ -114,17 +120,24 @@ def load_source(directory: str | Path, source_module: str | None = None,
     if not path.is_file():
         raise LauncherError(f"No {SOURCE_FILENAME} in {directory}")
 
-    key = str(path.resolve())
+    stamp = path.stat()
+    key = (str(path.resolve()), stamp.st_mtime_ns, stamp.st_size)
     cached = _SOURCE_CACHE.get(key)
     if cached is not None:
         return cached
+    # An earlier revision of this same file is of no further use, and an imported
+    # modeling module is not small.
+    for stale in [k for k in _SOURCE_CACHE if k[0] == key[0]]:
+        _SOURCE_CACHE.pop(stale, None)
 
     # A private leaf name inside the original package: registering the artifact's copy
     # as `transformers...modeling_x` would shadow the installed module for everything
     # else in the process, while a bare private name would break the `from . import ...`
     # the file does. Naming it `<package>.<private>` gives it the right parent for
     # relative imports without taking the real module's place.
-    leaf = f"{SOURCE_MODULE_PREFIX}{abs(hash(key))}"
+    # Named from the path alone, so re-importing an edited file takes the place of the
+    # revision it replaces in ``sys.modules`` instead of accumulating beside it.
+    leaf = private_module_name(SOURCE_MODULE_PREFIX, key[0])
     package = source_module.rsplit(".", 1)[0] if source_module and "." in source_module else ""
     name = f"{package}.{leaf}" if package else leaf
     spec = importlib.util.spec_from_file_location(name, path)
@@ -259,6 +272,7 @@ def build_group(
     layer_map: dict[str, list[int]] | None = None,
     submodule: str | None = None,
     source: Any = None,
+    module_id: str | None = None,
 ) -> Any:
     """Build a whole partition module out of ``source.py`` and return it callable.
 
@@ -272,9 +286,12 @@ def build_group(
 
     ``config`` is what the caller has; the ``config.json`` in the directory wins when
     it is there, because that is the config this module's subtree was built from.
+
+    ``module_id`` says which of the group's modules this is. Without it the weight names
+    decide, which is all they can do for a module that owns none.
     """
     config = module_config(directory, config)
-    paths = _module_paths(submodules or {}, weights)
+    paths = _module_paths(submodules or {}, weights, module_id)
     if not paths:
         raise LauncherError(
             "could not tell which module these weights belong to; keys look like "
@@ -303,14 +320,18 @@ def build_group(
     return built[0] if len(built) == 1 else _chain(built)
 
 
-def _module_paths(submodules: dict[str, list[str]],
-                  weights: dict[str, Any]) -> tuple[str, list[str]] | None:
+def _module_paths(submodules: dict[str, list[str]], weights: dict[str, Any],
+                  module_id: str | None = None) -> tuple[str, list[str]] | None:
     """Which module of the group these weights belong to, and its submodule paths.
 
     One implementation serves every module sharing a signature, so the group alone
     does not say which instance is running; the weight names do, because they are the
-    original parameter names.
+    original parameter names. A caller that knows says so, and has to for a module that
+    owns no weights: DeepSeek's hyper-connection output half is one of 86 identical
+    instances with nothing to tell them apart but the layer it sits in.
     """
+    if module_id is not None and module_id in submodules:
+        return module_id, submodules[module_id]
     best: tuple[int, str, list[str]] | None = None
     for module_id, paths in submodules.items():
         matches = sum(1 for key in weights
@@ -1017,6 +1038,14 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
             attempts.append(((width, eps), {}))
         attempts.append(((width,), {}))
 
+    # A class that names no parameter is built with nothing: DeepSeek's hyper-connection
+    # output half is arithmetic on its inputs, described by no config field and no weight.
+    # Never a class that names parameters and defaults them all — that builds just as
+    # readily, from the defaults, which is the quietly wrong module `_config_kwargs` warns
+    # about.
+    if _names_no_parameter(cls):
+        attempts.append(((), {}))
+
     errors: list[str] = []
     for args, kwargs in attempts:
         try:
@@ -1027,6 +1056,18 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
         f"could not construct {cls.__name__} from the recorded config and weights. "
         "Tried:\n  " + "\n  ".join(errors[:5])
     )
+
+
+def _names_no_parameter(cls: Any) -> bool:
+    """Whether a constructor takes nothing, bar the pass-through ``*args, **kwargs`` of
+    ``nn.Module.__init__`` that a class without an ``__init__`` of its own inherits."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(cls).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return all(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in parameters)
 
 
 def _named_kwargs(parameters: list[str], config: dict[str, Any],

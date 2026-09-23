@@ -41,9 +41,12 @@ from typing import Any
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import (
     TraceBundle,
+    apply_state,
     decode_group_call,
     expected_output,
     first_tensor,
+    load_named_weights,
+    owns_weights,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare, top1_agreement
 
@@ -173,8 +176,14 @@ class ChainReport:
         return self.tokens_agree if self.unbroken else True
 
     def first_divergence(self) -> ChainStep | None:
-        """The earliest boundary outside tolerance — where to start looking."""
-        return next((s for s in self.steps if not s.passed), None)
+        """The earliest carried boundary outside tolerance — where to start looking.
+
+        An edge the recording did not bear out is not a divergence: nothing was carried
+        into that module, so nothing of anyone's can have drifted. Naming it here sent
+        the repair agent after an implementation that reproduces its reference exactly.
+        """
+        return next((s for s in self.steps if not s.passed and (s.chained or s.error)),
+                    None)
 
     def drift_curve(self) -> list[tuple[str, float]]:
         """Cosine against the trace at each boundary, in dependency order."""
@@ -245,6 +254,22 @@ class ChainSuite:
             if step and step.module_id not in seen:
                 seen.append(step.module_id)
         return seen
+
+    def most_drifted(self, limit: int = 4) -> list[str]:
+        """Where the failed chains' carried outputs moved furthest from the trace.
+
+        A chain can fail with every boundary inside tolerance: two nearly tied logits
+        swap after drift too small for any one boundary to flag. There is no first
+        divergence to name then, but there is still somewhere to start.
+        """
+        steps = [s for r in self.failures for s in r.steps if s.chained and s.comparison]
+        ranked: list[str] = []
+        for step in sorted(steps, key=lambda s: s.cosine):
+            if step.module_id not in ranked:
+                ranked.append(step.module_id)
+            if len(ranked) == limit:
+                break
+        return ranked
 
     def worst_cosine(self) -> float:
         values = [r.worst_cosine() for r in self.reports]
@@ -323,6 +348,10 @@ def _chain_sample(
         return report
 
     by_id = {module.id: module for module in graph.partitioned_modules}
+    # Which plan node declares each tensor, partitioned or not. A tensor nothing here
+    # produces is an entry point; one produced by a node the walk skips is a hole.
+    produced_by = {tensor: module.id for module in graph.modules
+                   for tensor in module.outputs}
     #: Graph tensor name -> the value this chain computed for it.
     carried: dict[str, Any] = {}
     #: Graph tensor name -> what the trace recorded for it. What makes an edge check a
@@ -334,7 +363,7 @@ def _chain_sample(
     #: How many modules still ahead of us consume each tensor, so a feature map can
     #: be released the moment nothing wants it. One per module is gigabytes at long
     #: context, and holding them all to the end reserves memory for nothing.
-    waiting = _consumer_counts(graph, order, by_id)
+    waiting = _consumer_counts(order, by_id)
     logits_tensor = graph.output_tensors[0] if graph.output_tensors else None
     reference_logits = None
 
@@ -354,6 +383,20 @@ def _chain_sample(
         upstream = next((t for t in module.inputs if t in carried), None)
         produced = module.outputs[0] if module.outputs else module_id
         step = ChainStep(module_id=module_id, tensor=produced)
+        if upstream is None:
+            # Nothing of this module's input was carried. Two very different reasons, and
+            # only one of them is fine: the chain has to start somewhere, and `embed` reads
+            # the token ids, which no module produces. But an input some *other plan node*
+            # produces and that never ran — an expert-combine step is unpartitioned, so the
+            # walk skips it — means this module quietly restarts from the recording with
+            # the whole expert path bypassed. Unsaid, that read as an unbroken chain and
+            # credited the tokens it predicted.
+            skipped = sorted({t for t in module.inputs if t in produced_by})
+            if skipped:
+                step.unchained_reason = (
+                    f"{', '.join(skipped)} is produced by "
+                    f"{', '.join(produced_by[t] for t in skipped)}, which the chain does "
+                    "not run, so this module restarts from the recording")
         try:
             args, kwargs = decode_group_call(records, bundle.store, device)
             # What the trace gave this module, before anything is substituted for it.
@@ -374,8 +417,13 @@ def _chain_sample(
                 carried[name] = args[0]
                 recent.append(name)
             impl = load_impl(impl_dir)
-            weights = _weights_for(bundle, module_id, device)
-            built = impl.build(bundle.config, weights, device)
+            weights = _weights_for(bundle, module_id)
+            built = impl.build(bundle.config, weights, device, module_id=module_id)
+            # The cross-module state this call read, put back where the module reads it.
+            # DeepSeek's attention layers share their compressed KV through a module-level
+            # object, so a consumer of it has no argument naming the largest thing it
+            # reads — and without it the module subscripts a None rather than computing.
+            _restore_state(impl, records, bundle, device)
             with torch.no_grad():
                 output = built(*args, **kwargs)
             actual = first_tensor(output)
@@ -418,8 +466,7 @@ def _release(device: str) -> None:
             pass
 
 
-def _consumer_counts(graph: PartitionGraph, order: list[str],
-                     by_id: dict[str, Any]) -> dict[str, int]:
+def _consumer_counts(order: list[str], by_id: dict[str, Any]) -> dict[str, int]:
     """How many modules consume each tensor, so it can be freed once none remain."""
     counts: dict[str, int] = {}
     for module_id in order:
@@ -490,11 +537,36 @@ def _releasable(recent: list[str], waiting: dict[str, int], keep: str | None) ->
     return [name for name in stale if waiting.get(name, 0) <= 0 and name != keep]
 
 
-def _weights_for(bundle: TraceBundle, module_id: str, device: str) -> dict[str, Any]:
-    from model_partition.runtime.module_runner import load_named_weights
+def _restore_state(impl: Any, records: list, bundle: TraceBundle, device: str) -> int:
+    """Put each recorded call's cross-module state back on the implementation's source.
 
-    weights = load_named_weights(bundle, module_id, device=device)
-    if not weights:
+    Per-module verification does the same thing, and for the same reason: the check is
+    of this module against its reference, not of this module against another module
+    having run first. What the chain carries is the residual stream; a tensor passed
+    between modules through a module-level object is state, and it comes from the
+    recording either way.
+    """
+    source = getattr(impl.module, "load_implementation", None)
+    if source is None:
+        return 0
+    applied = 0
+    for record in records:
+        if getattr(record, "state", None):
+            applied += apply_state(source(), record, bundle.store, device)
+    return applied
+
+
+def _weights_for(bundle: TraceBundle, module_id: str) -> dict[str, Any]:
+    """One module's weights, read onto the host whatever the chain runs on.
+
+    Reading them straight onto the accelerator asks it for the whole module at once, and
+    DeepSeek V4.1's n-gram table is 94.6 GiB — the chain died trying to allocate it on a
+    44 GiB card. The launcher places what it builds: a submodule too large for the device
+    stays on the host with its inputs moved across the boundary, which is how the table's
+    lookup runs beside an fp8 GEMM that runs nowhere but the GPU.
+    """
+    weights = load_named_weights(bundle, module_id, device="cpu")
+    if not weights and owns_weights(bundle, module_id):
         raise RuntimeError(f"no weights available for {module_id!r}")
     return weights
 

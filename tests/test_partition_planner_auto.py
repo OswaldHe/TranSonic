@@ -375,7 +375,17 @@ def test_an_over_budget_moe_ffn_splits_into_router_experts_and_combine(tmp_path)
     assert all(len(m.submodules) == 2 and m.is_parallel for m in experts)
     router = graph.by_id("layers.1.router")
     assert any("gate" in s for s in router.submodules)
-    assert graph.by_id("layers.1.combine").functional
+
+    # The combine step is declared, so the dataflow is complete — something consumes the
+    # expert groups' partials — but it is not a deliverable. There is no `nn.Module`
+    # behind it to hook, extract or install, and emitting it as a *partitioned* module
+    # counted it in the plan, had `install_implementations` skip it, and then failed
+    # emulation mechanically with no boundary any agent could repair.
+    combine = graph.by_id("layers.1.combine")
+    assert not combine.partitioned
+    assert combine not in graph.partitioned_modules
+    assert all(partial in combine.inputs
+               for partial in (m.outputs[0] for m in experts))
 
 
 def test_a_dense_layer_keeps_one_ffn_module(tmp_path):
@@ -407,3 +417,42 @@ def test_norms_are_listed_before_the_computation_they_normalize_for(tmp_path):
     parts = layer_parts(inventory, 0)
     assert "norm" in parts.attention[0]
     assert "norm" in parts.ffn[0]
+
+
+def test_a_dequantized_plan_sizes_every_split_on_the_dequantized_width():
+    """Only the first cut into layer groups used the dequantized size. Everything after
+    it — the group's residency, the attention/FFN split, each component — kept counting
+    fp8 bytes, so a layer that fits as stored and not as loaded was certified whole and
+    ran out of memory at verification."""
+    entries = [TensorEntry("model.embed_tokens.weight", "bfloat16", (8, 8), 64, "s0"),
+               TensorEntry("model.norm.weight", "bfloat16", (8,), 16, "s0"),
+               TensorEntry("lm_head.weight", "bfloat16", (8, 8), 64, "s0")]
+    for i in range(2):
+        entries += [
+            TensorEntry(f"model.layers.{i}.input_layernorm.weight", "bfloat16", (8,), 16, "s0"),
+            TensorEntry(f"model.layers.{i}.self_attn.q_proj.weight", "float8_e4m3fn",
+                        (8, 8), 100_000, "s0"),
+            TensorEntry(f"model.layers.{i}.mlp.up_proj.weight", "float8_e4m3fn",
+                        (8, 8), 100_000, "s0"),
+        ]
+    inventory = ModelInventory.build(
+        WeightIndex(entries=entries),
+        {"hidden_size": 8, "num_hidden_layers": 2, "vocab_size": 8,
+         "quantization_config": {"quant_method": "fp8"}},
+    )
+    budget = 300_000
+
+    stored = plan(inventory, budget_bytes=budget, options=PlanOptions(seq_len=8))
+    layers = [m for m in stored.modules if m.kind == "decoder_layers"]
+    assert len(layers) == 2 and all(m.param_bytes == 200_016 for m in layers)
+
+    loaded = plan(inventory, budget_bytes=budget,
+                  options=PlanOptions(seq_len=8, dequant_resident=True))
+    assert not [m for m in loaded.modules if m.kind == "decoder_layers"]
+    attention = [m for m in loaded.modules if m.kind == "attention"]
+    ffn = [m for m in loaded.modules if m.kind == "mlp"]
+    assert len(attention) == 2 and len(ffn) == 2
+    # Counted as loaded: the fp8 projection twice over, the bf16 norm as stored.
+    assert all(m.param_bytes == 200_016 for m in attention)
+    assert all(m.param_bytes == 200_000 for m in ffn)
+    assert all(m.resident_bytes <= budget for m in loaded.partitioned_modules)

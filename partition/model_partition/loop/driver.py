@@ -549,6 +549,13 @@ class PartitionLoop:
         try:
             if name in ("plan", "extract") and ctx.graph is None:
                 ctx.graph = PartitionGraph.load(ctx.layout.graph_path)
+            if name == "extract":
+                from model_partition.extract import vendor_runtime
+
+                # The one thing extraction writes that its inputs do not determine: the
+                # runtime copied out of this harness. Cached, a fix to the launcher would
+                # reach the loop's checks and never the artifact's own `inference.py`.
+                vendor_runtime(ctx.layout.root)
             if name in ("trace", "verify_modules", "verify_chain", "emulate", "retain"):
                 load_bundle(ctx)
         except Exception:

@@ -28,6 +28,27 @@ from typing import Any
 CALLS_FILENAME = "calls.json"
 CONFIG_FILENAME = "config.json"
 
+#: Where ``fetch_weights.py`` puts the checkpoint shards, relative to the run root. A run
+#: that read its weights from the checkpoint rather than dumping them — which is what makes
+#: a 475 GiB model traceable at all — leaves its modules short of the numbers they need,
+#: and this is where they are looked for instead.
+CHECKPOINT_DIR = "hf"
+
+#: Read in blocks when pulling a tensor out of a shard, so one tensor-sized allocation is
+#: enough. A single n-gram table is 94.4 GiB and the host holds 124.
+CHUNK_BYTES = 16 * 1024 * 1024
+
+#: safetensors' dtype names, which are not torch's. ``F8_E8M0`` is the exponent-only
+#: block scale a blockwise-quantized checkpoint stores beside each weight — 47589 of the
+#: tensors here are one — and it needs a torch new enough to have ``float8_e8m0fnu``.
+SAFETENSORS_DTYPES = {
+    "F64": "float64", "F32": "float32", "F16": "float16", "BF16": "bfloat16",
+    "F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2",
+    "F8_E8M0": "float8_e8m0fnu", "F4_E2M1": "float4_e2m1fn_x2",
+    "I64": "int64", "I32": "int32", "I16": "int16", "I8": "int8",
+    "U8": "uint8", "BOOL": "bool",
+}
+
 #: Keys the trace encodes a value tree with. A tensor is named by where its bytes are.
 TENSOR_KEY = "__tensor__"
 LIST_KEY = "__list__"
@@ -45,6 +66,12 @@ def read_tensor(directory: Path, spec: dict[str, Any], device: str = "cpu") -> A
     The bytes are read as ``uint8`` and reinterpreted, which is how they were written and
     the only way that works for every dtype in play: ``torch.frombuffer`` does not take
     bfloat16, fp8, a packed fp4 pair or a complex rotary table, and all four are here.
+
+    Read straight into one tensor rather than through ``bytes``. ``read_bytes()`` holds
+    the whole blob as an immutable object and a ``bytearray`` of it is a second full copy
+    that cannot be released until the first is, so the supported 94.4 GiB n-gram table
+    needed about 189 GiB of transient host memory just to begin a check — on hosts with
+    124 GiB, which is the class this is meant to run on.
     """
     import torch
 
@@ -54,10 +81,73 @@ def read_tensor(directory: Path, spec: dict[str, Any], device: str = "cpu") -> A
     dtype = getattr(torch, spec["dtype"], None)
     if not isinstance(dtype, torch.dtype):
         raise ArtifactError(f"this torch has no dtype {spec['dtype']!r}")
-    flat = torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8)
+    flat = torch.from_file(str(path), shared=False, size=path.stat().st_size,
+                           dtype=torch.uint8)
     if dtype is not torch.uint8:
         flat = flat.view(dtype)
     return flat.reshape(spec["shape"]).to(device)
+
+
+def read_shard_tensors(path: Path, wanted: list[tuple[str, str]],
+                       device: str = "cpu") -> dict[str, Any]:
+    """Named tensors out of one safetensors shard, opened once.
+
+    The format is read here rather than with the ``safetensors`` package on purpose: a
+    module directory's promise is that it runs with ``torch`` and nothing else installed,
+    and the format is an 8-byte little-endian header length, that many bytes of JSON
+    naming each tensor's dtype, shape and byte range, then the data. Reading it costs
+    twenty lines and keeps the promise.
+
+    ``wanted`` is ``(name to return it under, key inside the shard)``.
+    """
+    import torch
+
+    with path.open("rb") as handle:
+        length = int.from_bytes(handle.read(8), "little")
+        if not length:
+            raise ArtifactError(f"{path} has no safetensors header")
+        header = json.loads(handle.read(length))
+        start_of_data = 8 + length
+
+        loaded: dict[str, Any] = {}
+        for name, key in wanted:
+            entry = header.get(key)
+            if not isinstance(entry, dict):
+                raise ArtifactError(f"{path} does not hold {key!r}")
+            torch_name = SAFETENSORS_DTYPES.get(entry["dtype"])
+            dtype = getattr(torch, torch_name, None) if torch_name else None
+            if not isinstance(dtype, torch.dtype):
+                raise ArtifactError(
+                    f"{key}: this torch ({torch.__version__}) has no dtype for "
+                    f"{entry['dtype']!r}"
+                    + (f" (expected torch.{torch_name})" if torch_name else "")
+                    + ". A blockwise-quantized checkpoint needs a torch new enough for "
+                      "its scale format.")
+            begin, end = entry["data_offsets"]
+            nbytes = end - begin
+            # One tensor-sized allocation, filled in blocks. Reading the whole slice as
+            # `bytes` first would hold the largest tensors twice.
+            #
+            # `device` explicitly, never the default one: building a module sets the
+            # default device to the accelerator and leaves it set, so an unqualified
+            # `torch.empty` here put the *next* module's staging buffer on the card. For
+            # the host-only n-gram tables this path exists to serve — 94.6 GiB, asked for
+            # on a 44 GiB card — that is an out-of-memory error partway through
+            # `verify.py --all-modules`, where one module at a time succeeds.
+            flat = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+            handle.seek(start_of_data + begin)
+            at = 0
+            while at < nbytes:
+                block = handle.read(min(CHUNK_BYTES, nbytes - at))
+                if not block:
+                    raise ArtifactError(f"{path} ended early reading {key!r}")
+                flat[at:at + len(block)] = torch.frombuffer(
+                    bytearray(block), dtype=torch.uint8)
+                at += len(block)
+            if dtype is not torch.uint8:
+                flat = flat.view(dtype)
+            loaded[name] = flat.reshape(entry["shape"]).to(device)
+    return loaded
 
 
 def decode(directory: Path, value: Any, device: str = "cpu") -> Any:
@@ -100,8 +190,28 @@ class ModuleCalls:
 
     @property
     def missing_weights(self) -> list[str]:
-        """Parameters the run did not dump, so this module cannot be built from it."""
+        """Parameters the run did not dump, whether or not they can still be read."""
         return list(self.payload.get("weights_missing") or [])
+
+    @property
+    def fetched_weights(self) -> list[str]:
+        """Undumped parameters the fetched checkpoint beside this artifact does supply."""
+        root = self.checkpoint_root()
+        if root is None:
+            return []
+        return sorted(name for name, ref in self.checkpoint_weights.items()
+                      if ref.get("shard") and ref.get("key")
+                      and (root / ref["shard"]).is_file())
+
+    @property
+    def absent_weights(self) -> list[str]:
+        """Parameters nothing here can supply: not dumped, and not fetched either.
+
+        The distinction matters to anyone reading the output. "Not in the artifact" was
+        true of a parameter waiting for ``fetch_weights.py`` and of one that is simply
+        gone, and only the second is a reason the numbers will not match.
+        """
+        return sorted(set(self.missing_weights) - set(self.fetched_weights))
 
     def keys(self, sample_order: list[str] | None = None) -> list[str]:
         """The recorded passes, prefill first and in the run's own sample order."""
@@ -126,10 +236,72 @@ class ModuleCalls:
                 f"have {self.keys(sample_order)}")
         return keys[0], list((self.payload.get("calls") or {})[keys[0]])
 
+    @property
+    def checkpoint_weights(self) -> dict[str, dict[str, str]]:
+        """Parameters to read from the checkpoint, each with its shard and its key there.
+
+        Written down so the artifact is self-describing: ``fetch_weights.py`` can pull
+        exactly the shards these names live in instead of the whole checkpoint, and reading
+        one needs no rename rules here — the key it has *inside* the shard is recorded.
+        Older artifacts recorded only the names, which is a list rather than a mapping.
+        """
+        entry = self.payload.get("weights_missing") or {}
+        return entry if isinstance(entry, dict) else {name: {} for name in entry}
+
     def weights(self, device: str = "cpu") -> dict[str, Any]:
-        """This module's dumped weights, keyed by original parameter name."""
-        return {name: read_tensor(self.directory, spec, device)
-                for name, spec in (self.payload.get("weights") or {}).items()}
+        """This module's weights, keyed by original parameter name.
+
+        The dumped ones come from the ``.bin`` files beside this directory. Anything the
+        run read from the checkpoint instead is read from the checkpoint too, out of
+        ``<run>/hf/`` — which ``fetch_weights.py`` fills. Without that directory the module
+        still builds from whatever was dumped, and :attr:`missing_weights` says what it is
+        short of, because a partial build that reports its own gap beats an import error.
+        """
+        found = {name: read_tensor(self.directory, spec, device)
+                 for name, spec in (self.payload.get("weights") or {}).items()}
+        root = self.checkpoint_root()
+        if root is None:
+            return found
+        by_shard: dict[str, list[tuple[str, str]]] = {}
+        for name, ref in self.checkpoint_weights.items():
+            shard, key = ref.get("shard"), ref.get("key")
+            if shard and key and (root / shard).is_file():
+                by_shard.setdefault(shard, []).append((name, key))
+        for shard, pairs in by_shard.items():
+            found.update(read_shard_tensors(root / shard, pairs, device))
+        return found
+
+    def checkpoint_root(self) -> Path | None:
+        """``<run>/hf/``, if the checkpoint has been fetched beside this artifact."""
+        for base in (self.directory.parent.parent, self.directory.parent, self.directory):
+            candidate = base / CHECKPOINT_DIR
+            if candidate.is_dir():
+                return candidate
+        return None
+
+    def runs(self, calls: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """One pass's calls, split into the group's separate invocations.
+
+        A sequential group is one computation from its first submodule's input to its last
+        submodule's output — across *distinct* submodules. A submodule the pass called more
+        than once is not a longer chain, it is the group run again: DeepSeek's draft head
+        calls `markov_head` once per drafted position, each on the token the previous call
+        sampled. Pairing the first call's input with the last call's output checks neither,
+        and since that module is pure the whole mismatch would be the pairing's.
+        """
+        runs: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        for call in calls:
+            name = call.get("submodule")
+            if name in seen:
+                runs.append(current)
+                current, seen = [], set()
+            current.append(call)
+            seen.add(name)
+        if current:
+            runs.append(current)
+        return runs
 
     def arguments(self, calls: list[dict[str, Any]], device: str = "cpu") -> tuple[tuple, dict]:
         """Arguments for the whole group, not just its first submodule.

@@ -93,11 +93,17 @@ def test_resident_bytes_sums_params_activations_kv():
     assert node.resident_bytes == 60
 
 
-def test_uncovered_layer_is_a_warning_not_an_error():
+def test_a_layer_in_no_module_is_rejected():
+    """A layer no module claims is a layer the run never traces, verifies or ships.
+
+    On the streamed path it keeps running the vendor's implementation while installation
+    completeness is measured against this graph alone, so the run could pass without the
+    deliverable for that layer ever existing.
+    """
     graph = chain_graph()
     graph.num_layers = 6
-    warnings = graph.validate()
-    assert any("[4, 5]" in w for w in warnings)
+    with pytest.raises(GraphError, match=r"Layers in no partitioned module: \[4, 5\]"):
+        graph.validate()
 
 
 def test_layer_claimed_by_two_decoder_modules_is_rejected():

@@ -74,6 +74,7 @@ def tokenize_samples(
     tokenizer: Any,
     limit: int | None = None,
     pad_to_target: bool = True,
+    id_prefix: str = "sample",
 ) -> list[SampleInput]:
     """Tokenize records, trimming or repeating text to hit ``target_tokens``.
 
@@ -81,6 +82,11 @@ def tokenize_samples(
     truncated to it, or repeated up to it when ``pad_to_target`` is set, so long
     samples land on the intended budget instead of whatever the source happened
     to be.
+
+    ``id_prefix`` namespaces the ids of records that do not carry one. A sample id is a
+    tensor-path key, and the short and long sets are read independently, so numbering
+    both from zero would have the second set's blobs overwrite the first's while both
+    sets of call records kept pointing at the same names.
     """
     samples: list[SampleInput] = []
     for index, record in enumerate(records):
@@ -101,7 +107,7 @@ def tokenize_samples(
                 repeats = (target // len(ids)) + 1
                 ids = _encode(tokenizer, (prompt + "\n") * repeats, role)[:target]
         samples.append(SampleInput(
-            id=str(record.get("id") or f"sample-{index:03d}"),
+            id=str(record.get("id") or f"{id_prefix}-{index:03d}"),
             prompt=prompt, token_ids=list(ids), role=role,
             source=str(record.get("source", "")), target_tokens=target,
         ))
@@ -133,15 +139,30 @@ def load_input_set(
     """
     samples: list[SampleInput] = []
     if short_path:
-        samples.extend(tokenize_samples(read_jsonl(short_path), tokenizer, limit=max_short))
+        samples.extend(tokenize_samples(read_jsonl(short_path), tokenizer,
+                                        limit=max_short, id_prefix="short"))
     if long_path and Path(long_path).is_file():
         records = read_jsonl(long_path)
         if long_token_budgets:
             wanted = {int(budget) for budget in long_token_budgets}
             records = [r for r in records if int(r.get("target_tokens") or 0) in wanted]
-        samples.extend(tokenize_samples(records, tokenizer, limit=max_long))
+        samples.extend(tokenize_samples(records, tokenizer, limit=max_long,
+                                        id_prefix="long"))
     if not samples:
         raise InputError("Input set is empty; nothing to trace")
+    # A sample id names this sample's tensors in the store, so two samples sharing one
+    # would have the second's blobs overwrite the first's while both sets of call records
+    # kept the same names — and verification would then compare one prompt's input
+    # against another prompt's output. Namespacing the generated ids covers the common
+    # case; an id written twice by hand is caught here.
+    duplicates = sorted({s.id for s in samples if
+                         sum(1 for other in samples if other.id == s.id) > 1})
+    if duplicates:
+        raise InputError(
+            f"sample id(s) used more than once: {', '.join(duplicates)}. Each id names "
+            "its own tensors in the trace, so they have to be unique across the short "
+            "and long sets together."
+        )
     return samples
 
 

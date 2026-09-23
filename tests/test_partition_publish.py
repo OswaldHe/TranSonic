@@ -4,6 +4,7 @@
 """Tests for publishing a run's artifacts."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -136,6 +137,11 @@ def test_the_upload_carries_a_readme_describing_the_artifacts(tmp_path, monkeypa
     assert "logs/**" in seen["upload"]["ignore_patterns"]
     assert "modules/<group>/" in seen["readme"]
     assert "396 checks passed" in seen["readme"]
+    # And how to get the weights. Most of a module's parameters stay in the checkpoint —
+    # this set is published without a second copy of it — so a reader who is not told
+    # about `fetch_weights.py` has module directories that cannot reproduce their own
+    # reference and no stated reason why.
+    assert "fetch_weights.py" in seen["readme"]
     assert result.url.endswith("org/artifacts")
     # Written for the upload and not left behind in the run.
     assert not (root / "README.md").exists()
@@ -233,3 +239,159 @@ def test_publishing_a_subset_writes_its_weights_into_the_run(tiny_run, tmp_path)
     names = {(e.extra or {}).get("param") for e in again.store.entries
              if e.module_id == module_id}
     assert set(bundle.weight_params[module_id]) <= names
+
+
+def test_a_run_that_did_not_pass_is_refused_before_its_weights_are_read(
+        tmp_path, monkeypatch):
+    """Both refusals come before anything is written.
+
+    Materializing a selection reads tens or hundreds of gigabytes out of the checkpoint,
+    so reaching "this run did not pass" afterwards costs hours and a disk for nothing.
+    """
+    from model_partition import publish
+
+    root = _run(tmp_path, passed=False)
+    called: list[object] = []
+    monkeypatch.setattr(publish, "materialize_weights",
+                        lambda *a, **k: called.append(a) or 0)
+    with pytest.raises(PublishError, match="did not pass"):
+        publish_run(root, "org/artifacts", module_ids=["layers.0"], skip_check=True)
+    assert not called
+
+
+def test_a_selection_over_the_ceiling_is_refused_before_its_weights_are_read(
+        tmp_path, monkeypatch):
+    """What is on disk already is a floor for what will be there once the weights are in."""
+    from model_partition import publish
+
+    root = _run(tmp_path, blob_bytes=4096)
+    called: list[object] = []
+    monkeypatch.setattr(publish, "materialize_weights",
+                        lambda *a, **k: called.append(a) or 0)
+    with pytest.raises(PublishError, match="exceeds the"):
+        # `upload_all` sends the whole run while the selection says which modules also
+        # carry their weights, so the ceiling applies to everything on disk.
+        publish_run(root, "org/artifacts", max_bytes=1024, upload_all=True,
+                    module_ids=["layers.0"], skip_check=True)
+    assert not called
+
+
+def test_materialization_reads_the_revision_the_trace_was_taken_from(tmp_path, monkeypatch):
+    """A spec may name a moving branch, or name nothing at all.
+
+    Re-ingesting it would read weights from wherever that points now, and those do not
+    belong beside these activations — so the resolved revision in `run.yaml` wins.
+    """
+    from model_partition import ingest as ingest_module
+    from model_partition.publish import _weight_source
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.yaml").write_text(
+        "spec:\n  source: hf:org/model\n  loader: transformers\n  revision: main\n"
+        "revision: dba1be0a40aa45a94ad051997016db3960a90277\n"
+    )
+    seen: list[str] = []
+
+    def fake_ingest(spec, *a, **k):
+        seen.append(spec.revision or "")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(ingest_module, "ingest", fake_ingest)
+    with pytest.raises(PublishError, match="cannot be reached"):
+        _weight_source(root)
+    assert seen == ["dba1be0a40aa45a94ad051997016db3960a90277"]
+
+
+def test_a_fetched_checkpoint_is_never_republished(tmp_path):
+    """`hf/` is what `fetch_weights.py` downloads on the reader's machine.
+
+    Uploading it back would publish a copy of the model, which is the one thing an
+    artifact set exists to avoid.
+    """
+    from model_partition.publish import DEFAULT_EXCLUDE
+
+    root = _run(tmp_path)
+    (root / "hf").mkdir()
+    (root / "hf" / "model-00001-of-00002.safetensors").write_bytes(b"\x00" * 2048)
+
+    # And the Hub client's own resume bookkeeping, which it writes into the folder it is
+    # uploading: thousands of files, none of them content.
+    (root / ".cache" / "huggingface").mkdir(parents=True)
+    (root / ".cache" / "huggingface" / "upload.json").write_text("{}")
+
+    files, _total = collect(root)
+    names = {p.relative_to(root).as_posix() for p in files}
+    assert not any(name.startswith("hf/") for name in names)
+    assert not any(name.startswith(".cache/") for name in names)
+    assert "hf/**" in DEFAULT_EXCLUDE and ".cache/**" in DEFAULT_EXCLUDE
+
+
+def test_the_cli_default_exclusion_matches_the_library_one():
+    """The CLI spells the default out so it need not import `publish` eagerly."""
+    import click
+
+    from model_partition.cli import upload
+    from model_partition.publish import DEFAULT_EXCLUDE
+
+    option = next(p for p in upload.params
+                  if isinstance(p, click.Option) and p.name == "exclude")
+    assert tuple(option.default) == tuple(DEFAULT_EXCLUDE)
+
+
+def test_the_self_containment_check_brings_the_fetched_checkpoint_along(tmp_path, monkeypatch):
+    """`hf/` is not uploaded — republishing the model is what an artifact set avoids — but a
+    reader runs `fetch_weights.py` and has it. Checking without it asked whether the modules
+    work having skipped a documented step, so a `cache_weights: false` run failed here for
+    every group and the only way to publish was `--skip-check`."""
+    from model_partition import publish
+
+    root = _run(tmp_path)
+    (root / "hf").mkdir()
+    (root / "hf" / "model-00001-of-00002.safetensors").write_bytes(b"\x00" * 64)
+    # What `fetch_weights.py` leaves behind beside the shards. A directory cannot be
+    # hardlinked and cannot be copied as a file either, so including it crashed the check.
+    (root / "hf" / ".cache" / "huggingface").mkdir(parents=True)
+    (root / "hf" / ".cache" / "huggingface" / "download.json").write_text("{}")
+
+    files, _total = collect(root)
+    assert not any(p.name.endswith(".safetensors") for p in files), "hf/ is uploaded"
+
+    linked: list[str] = []
+
+    def fake_groups(run_dir, selected):
+        # Record what the check copied, then claim there is nothing to run.
+        for path in sorted(Path(run_dir).rglob("*")):
+            if path.is_file():
+                linked.append(path.relative_to(run_dir).as_posix())
+        return {}
+
+    monkeypatch.setattr(publish, "_published_groups", fake_groups)
+    assert publish.check_self_contained(root, files, ["layers.0"]) == []
+    assert "hf/model-00001-of-00002.safetensors" in linked
+    assert "modules/00-attn/source.py" in linked
+
+
+def test_the_upload_limits_its_own_concurrency(tmp_path, monkeypatch):
+    """A published run is thousands of small feature maps, so the Hub's request-per-minute
+    limit binds long before bandwidth does. The client's default worker count scales with
+    the core count, and on 16 cores it burst through a free account's 1000 requests per 5
+    minutes and aborted a third of the way through 16 000 files."""
+    from model_partition import publish
+
+    root = _run(tmp_path)
+    seen = {}
+
+    class FakeApi:
+        def create_repo(self, repo_id, **kwargs):
+            pass
+
+        def upload_large_folder(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(publish, "_api", lambda: (FakeApi(), "token"))
+    publish_run(root, "org/artifacts")
+    assert seen["num_workers"] == publish.UPLOAD_WORKERS <= 4
+
+    publish_run(root, "org/artifacts", workers=8)
+    assert seen["num_workers"] == 8

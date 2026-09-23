@@ -29,8 +29,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from model_partition.runtime import private_module_name
+
 IMPL_FILENAME = "inference.py"
 BUILD_FUNCTION = "build_module"
+
+#: What ``build_module`` may declare beyond ``config`` and ``weights``. Each is passed
+#: only when the implementation declares it, so an older one keeps working unchanged.
+OPTIONAL_ARGUMENTS = ("device", "submodule", "module_id")
 
 
 class ImplError(RuntimeError):
@@ -46,7 +52,7 @@ class ExtractedImpl:
     module_ids: list[str]
 
     def build(self, config: dict[str, Any], weights: dict[str, Any], device: str = "cpu",
-              submodule: str | None = None) -> Any:
+              submodule: str | None = None, module_id: str | None = None) -> Any:
         """Call the implementation's ``build_module``, passing what it accepts.
 
         The optional arguments are tried widest first so an implementation is free
@@ -62,17 +68,19 @@ class ExtractedImpl:
         try:
             parameters = inspect.signature(builder).parameters
             accepted = (
-                {"device", "submodule"}
+                set(OPTIONAL_ARGUMENTS)
                 if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
                 else set(parameters)
             )
         except (TypeError, ValueError):  # pragma: no cover - builtins only
-            accepted = {"device", "submodule"}
+            accepted = set(OPTIONAL_ARGUMENTS)
         kwargs: dict[str, Any] = {}
         if "device" in accepted:
             kwargs["device"] = device
         if "submodule" in accepted and submodule is not None:
             kwargs["submodule"] = submodule
+        if "module_id" in accepted and module_id is not None:
+            kwargs["module_id"] = module_id
         return builder(config, weights, **kwargs)
 
 
@@ -81,7 +89,7 @@ def load_impl(directory: str | Path) -> ExtractedImpl:
     path = Path(directory) / IMPL_FILENAME
     if not path.is_file():
         raise ImplError(f"No {IMPL_FILENAME} in {directory}")
-    name = f"_model_partition_impl_{abs(hash(str(path.resolve())))}"
+    name = private_module_name("_model_partition_impl_", path.resolve())
     sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -104,7 +112,14 @@ def load_impl(directory: str | Path) -> ExtractedImpl:
 
 
 def find_impl_dirs(modules_dir: str | Path) -> dict[str, Path]:
-    """Map each module id to the group directory implementing it."""
+    """Map each module id to the group directory implementing it.
+
+    The index names the directory, but a directory that has been renamed or moved since
+    the index was written would otherwise map every one of its modules to a path with no
+    ``inference.py`` — and that reads as "every module is unusable" rather than as "the
+    index is stale". So a name the index gives that is not there is looked up again by the
+    signature in each group's own ``meta.yaml``, which travels with the directory.
+    """
     root = Path(modules_dir)
     index = root / "index.yaml"
     if not index.is_file():
@@ -113,12 +128,23 @@ def find_impl_dirs(modules_dir: str | Path) -> dict[str, Path]:
 
     payload = yamlio.load_path(index) or {}
     mapping: dict[str, Path] = {}
+    by_signature: dict[str, Path] | None = None
     for group in payload.get("groups", []):
         directory = group.get("directory")
-        if not directory:
+        if directory and (root / directory).is_dir():
+            target = root / directory
+        else:
+            if by_signature is None:
+                by_signature = {}
+                for meta in sorted(root.glob("*/meta.yaml")):
+                    found = (yamlio.load_path(meta) or {}).get("signature")
+                    if found:
+                        by_signature[str(found)] = meta.parent
+            target = by_signature.get(str(group.get("signature")))
+        if target is None:
             continue
         for module_id in group.get("module_ids", []):
-            mapping[module_id] = root / directory
+            mapping[module_id] = target
     return mapping
 
 

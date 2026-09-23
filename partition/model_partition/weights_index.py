@@ -254,16 +254,35 @@ class CheckpointWeights:
     """Resolves original parameter names to tensors in local safetensors shards."""
 
     root: Path
+    #: Indexed under the names the *model* carries, which a spec's rename rules may have
+    #: rewritten from the checkpoint's own.
     shard_of: dict[str, str] = field(default_factory=dict)
+    #: Model name -> the key that tensor actually has inside its shard, for the read.
+    key_of: dict[str, str] = field(default_factory=dict)
     #: Names that needed a suffix match, for the run's notes.
     remapped: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_ingest(cls, result: Any) -> CheckpointWeights:
-        return cls(
-            root=Path(result.root),
-            shard_of={entry.name: entry.shard for entry in result.index.entries},
-        )
+    def from_ingest(cls, result: Any,
+                    rename: tuple[tuple[str, str], ...] = ()) -> CheckpointWeights:
+        """Index a checkpoint under the names the model's own modules use.
+
+        A vendor's conversion script renames as it writes, so the keys on disk are often
+        not the names the model carries — ``model.layers.0.self_attn.*`` against
+        ``layers.0.attn.*``. The spec's rename rules are what reconcile the two, and
+        :meth:`resolve`'s suffix fallback cannot stand in for them: ``.attn.wq.weight``
+        is not a suffix of ``self_attn.wq.weight``, so every such parameter would simply
+        be reported missing. The shard's own key is kept beside each name for the read.
+        """
+        from model_partition.loaders.streamed import rename as rename_key
+
+        shard_of: dict[str, str] = {}
+        key_of: dict[str, str] = {}
+        for entry in result.index.entries:
+            name = rename_key(entry.name, rename) if rename else entry.name
+            shard_of[name] = entry.shard
+            key_of[name] = entry.name
+        return cls(root=Path(result.root), shard_of=shard_of, key_of=key_of)
 
     def resolve(self, name: str) -> str | None:
         """Checkpoint tensor name for a model parameter name.
@@ -340,5 +359,8 @@ class CheckpointWeights:
                 )
             with safe_open(str(path), framework="pt", device="cpu") as handle:
                 for name, resolved in pairs:
-                    loaded[name] = handle.get_tensor(resolved).to(device)
+                    # The key inside the shard, which is the checkpoint's own name rather
+                    # than the model's when a rename rule rewrote it.
+                    loaded[name] = handle.get_tensor(
+                        self.key_of.get(resolved, resolved)).to(device)
         return loaded

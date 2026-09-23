@@ -109,6 +109,11 @@ class QuantProfile:
             return entry.nbytes * 2 * target_width
         return 0
 
+    def dequantized_bytes(self, entry: TensorEntry, target_width: int = 2) -> int:
+        """Bytes this tensor occupies in a dequantized model: a quantized one at
+        ``target_width``, anything else — a norm, a block scale — as it is stored."""
+        return self.dequant_bytes(entry, target_width) or entry.nbytes
+
 
 @dataclass
 class LayerProfile:
@@ -121,7 +126,8 @@ class LayerProfile:
     shards: list[str] = field(default_factory=list)
     expert_bytes: int = 0
     n_experts: int = 0
-    dequant_bytes: int = 0
+    #: The whole layer once dequantized, its unquantized tensors included.
+    dequantized_bytes: int = 0
 
     @property
     def has_experts(self) -> bool:
@@ -278,7 +284,7 @@ def _profiles(by_index: dict[int, list[TensorEntry]], quant: QuantProfile) -> li
             shards=sorted({e.shard for e in entries}),
             expert_bytes=sum(e.nbytes for e in expert_entries),
             n_experts=len({e.expert_index for e in expert_entries if e.expert_index is not None}),
-            dequant_bytes=sum(quant.dequant_bytes(e) for e in entries),
+            dequantized_bytes=sum(quant.dequantized_bytes(e) for e in entries),
         ))
     return profiles
 
