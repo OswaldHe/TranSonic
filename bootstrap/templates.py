@@ -223,6 +223,20 @@ Total: {total_mib:.1f} MiB across {tensor_count} file(s).
 `input` is what flows into the group; `reference` is the output the recorded forward
 produced and what your result is compared against. `weight` entries are parameters;
 `buffer` entries are non-persistent state the module registered.
+
+`state` entries are cross-module state: tensors the recorded forward read off a shared
+object rather than through its arguments, so they reach your kernel as arguments instead.
+Read them with care, because they are a *snapshot of that object* taken as this group was
+entered, not a list of what it reads:
+
+- An entry may be something this group **produces** rather than consumes. Computing it and
+  then finding the recorded answer sitting in an argument is the trap — using that value
+  instead of computing it reproduces nothing, and the review is looking for exactly this.
+- An entry may be **left over from an earlier pass**, because the shared object is not reset
+  between recorded samples. A shape that does not fit this module's own is the tell.
+
+`reference_torch.py` is what settles both: whichever names it reads before writing are
+inputs, and the rest are not yours to use.
 {notes_section}
 ## The numerical bar
 

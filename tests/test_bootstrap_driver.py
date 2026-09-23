@@ -488,3 +488,51 @@ def test_reading_one_parameter_is_enough_for_provenance(tmp_path: Path) -> None:
     )
     result = chk.check_provenance(_ast.parse(src), tmp_path, manifest)
     assert not any("reads none of" in p for p in result.findings), result.findings
+
+
+def test_cross_module_state_reaches_the_kernel_signature_with_its_caveat() -> None:
+    """A kernel has no shared holder, so recorded state has to arrive as an argument.
+
+    And the README has to say what the snapshot is, because an entry can be one the group
+    produces rather than reads — finding your own answer in an argument is the trap.
+    """
+    from bootstrap import templates
+    from bootstrap.materialize import Materialized, TensorRecord
+
+    result = Materialized(
+        repo=Path("/repo"), group="24-Attention", module_id="layers.24.attention",
+        sample_id="long-needle-8192-0", step=0, call_index=0,
+        tensors=[
+            TensorRecord("input", "input", "tensors/input.bin", "bfloat16",
+                         [1, 8192, 5120], 8, "h", required=True),
+            TensorRecord("reference", "golden", "tensors/reference.bin", "bfloat16",
+                         [1, 8192, 5120], 8, "h", required=True),
+            TensorRecord("state.shared_attn.compress_kv", "state",
+                         "tensors/state_shared_attn_compress_kv.bin", "bfloat16",
+                         [4, 16384, 512], 8, "h"),
+        ],
+        submodules=["layers.24.attn_norm", "layers.24.attn"],
+        tolerance={"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                   "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 2.2},
+        model="hf:some/model",
+    )
+
+    stub = templates.render_source_stub(result)
+    assert "state_shared_attn_compress_kv" in stub, "state must be a kernel parameter"
+
+    readme = templates.render_readme(result)
+    assert "| `state.shared_attn.compress_kv` | state |" in readme
+    assert "cross-module state" in readme
+    # The two ways the snapshot misleads both have to be spelled out.
+    assert "produces" in readme
+    assert "left over from an earlier pass" in readme
+
+
+def test_state_is_not_required_so_a_produced_entry_can_be_ignored() -> None:
+    """Requiring every state entry would force the kernel to consume its own output."""
+    from bootstrap.materialize import TensorRecord
+
+    record = TensorRecord("state.shared_attn.topk_idxs", "state",
+                          "tensors/state_shared_attn_topk_idxs.bin", "int32",
+                          [1, 8192, 512], 8, "h")
+    assert not record.required

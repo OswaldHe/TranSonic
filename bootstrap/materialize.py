@@ -301,6 +301,31 @@ def materialize(
         ))
         reference_max = max(reference_max, float(tensor.detach().float().abs().max()))
 
+    # Cross-module state: tensors the recorded forward read off a module-level holder rather
+    # than through its arguments — a shared KV cache, an index another layer published. The
+    # artifact restores these onto the holder before calling the vendor module
+    # (`ArtifactReader.apply_state`); a kernel has no holder, so they have to arrive as
+    # arguments or the kernel is missing data the recorded forward used.
+    #
+    # Two things make this a snapshot rather than a read-set, and the README says so: the
+    # tracer's pre-forward hook dumps *every* tensor on the holder, so an entry may be one
+    # this module overwrites rather than reads, and the holder is never reset between
+    # samples, so an entry may be residue from an earlier pass. Deciding which is which needs
+    # the model's own wiring, which the artifact does not record — so they are materialized,
+    # not required, and named for what they are.
+    state: dict[str, Any] = {}
+    for call in chain:
+        # Last call wins, as `apply_state` does: it replays every call in order onto the
+        # same holder, so the final write is the value the group ran on.
+        state.update(call.get("state") or {})
+    for dotted in sorted(state):
+        for name, tensor, origin in _flatten_tensors(
+            reader, directory, state[dotted], f"state.{dotted}",
+        ):
+            records.append(_write_tensor(
+                directory=repo, name=name, role="state", tensor=tensor, source=origin,
+            ))
+
     # Every weight the module needs, dumped ones and checkpoint-backed ones alike. The
     # reader resolves both, so this is where the fetched shards are paid for.
     weights = calls.weights("cpu")
