@@ -149,6 +149,27 @@ def check(path: Path, timeout: int) -> None:
     raise SystemExit(completed.returncode)
 
 
+def _commit_bar(repo: Path, changed: list[str]) -> bool:
+    """Commit retune's rewrite of the tracked README. True if the tree is left clean."""
+    import subprocess
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(("git", "-C", str(repo)) + args,
+                              capture_output=True, text=True, check=False)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        return True  # not a repo, so nothing can be left dirty
+    if git("add", "README.md").returncode != 0:
+        return False
+    if not git("diff", "--cached", "--quiet", "--", "README.md").returncode:
+        return True  # nothing staged: the README already matched
+    message = (f"Retune the numerical bar: {', '.join(changed)}\n\n"
+               "Written by `autohelix bootstrap retune`, which re-derives the bar from the\n"
+               "recorded tensors. inference.py still declares the old values; the gate names\n"
+               "the mismatch and the next iteration fixes it.\n")
+    return git("commit", "-q", "-m", message).returncode == 0
+
+
 @bootstrap.command()
 @click.option("--path", "-p", type=click.Path(exists=True, path_type=Path), default=".",
               show_default=True, help="The module repo")
@@ -157,9 +178,10 @@ def retune(path: Path, dry_run: bool) -> None:
     """Re-derive the numerical bar for an existing repo, keeping its history.
 
     Use this after the bar's derivation changes. It rewrites the manifest and the README's
-    bar section only — `inference.py` is the agent's, and the gate will name the mismatch for
-    it to fix on the next iteration. Run `bootstrap init --force` instead if you want a clean
-    repo, but note that discards the git history the loop has accumulated.
+    bar section and commits the README, so the next `bootstrap run` still starts on a clean
+    tree — `inference.py` is the agent's, and the gate will name the mismatch for it to fix on
+    the next iteration. Run `bootstrap init --force` instead if you want a clean repo, but
+    note that discards the git history the loop has accumulated.
     """
     repo = path.resolve()
     try:
@@ -180,6 +202,13 @@ def retune(path: Path, dry_run: bool) -> None:
                    f"   {('-' if new is None else f'{new:g}'):>10}")
     click.echo(f"\n{len(changed)} value(s) changed. inference.py still declares the old ones;"
                f"\nthe gate will name them and the next iteration fixes them.")
+
+    # README.md is tracked, so leaving the rewrite uncommitted makes the next `bootstrap run`
+    # refuse to start at ensure_clean_working_tree() — the retune workflow would stop on a
+    # manual step nothing told the operator about. The bar is the harness's to set, not the
+    # agent's, so recording it is part of retuning rather than something to hand back.
+    if not _commit_bar(repo, changed):
+        click.echo("\ncould not commit the bar; commit README.md before `bootstrap run`.")
 
 
 @bootstrap.command()

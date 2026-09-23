@@ -612,6 +612,18 @@ def check_provenance(inference: ast.Module, repo: Path, manifest: dict[str, Any]
             )
     unused = [e["file"] for e in tensors if not e.get("required") and e["file"] not in referenced]
 
+    # Individual parameters cannot be required: the recorded call may legitimately not read
+    # one (`gate.bias_vl` is only used for image spans, `window_kv_cache` is seeded but not
+    # read at prefill), so requiring each would fail correct kernels. But a validator that
+    # reads the boundary input and the golden output and *no* parameter at all is not feeding
+    # the kernel the recorded weights, which is the whole claim of this check.
+    parameters = [e for e in tensors if e.get("role") in ("weight", "buffer")]
+    if parameters and not any(e["file"] in referenced for e in parameters):
+        findings.append(
+            f"{INFERENCE_FILE} reads none of the {len(parameters)} recorded weight/buffer "
+            f"tensor(s), so the kernel is not being run on the recorded parameters"
+        )
+
     for node in ast.walk(inference):
         if not isinstance(node, ast.Call):
             continue

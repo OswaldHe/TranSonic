@@ -260,7 +260,10 @@ def materialize(
             f"call_index must be 0..{len(invocations) - 1}"
         )
     chain = invocations[call_index]
-    resolved_sample, _, resolved_step = key.partition("#")
+    # Split at the *last* separator, as the artifact reader does: a sample id comes from an
+    # input record and may itself contain a `#`, and only the trailing field is the step.
+    resolved_sample, _, resolved_step = key.rpartition("#")
+    composition = _composition(directory)
 
     repo.mkdir(parents=True, exist_ok=True)
     records: list[TensorRecord] = []
@@ -277,7 +280,11 @@ def materialize(
     inputs += _flatten_tensors(reader, directory, chain[0].get("kwargs") or {}, "input")
     if not inputs:
         raise MaterializeError(f"{module_id} records no tensor among its arguments")
-    outputs = _flatten_tensors(reader, directory, chain[-1].get("output"), "reference")
+    # Sequential groups end at the last call; a parallel group's calls are independent
+    # branches, and the artifact reader takes the first one's output as the reference, so
+    # `chain[-1]` there would pair branch 0's inputs with another branch's golden.
+    selected_output = chain[0] if composition == "parallel" else chain[-1]
+    outputs = _flatten_tensors(reader, directory, selected_output.get("output"), "reference")
     if not outputs:
         raise MaterializeError(f"{module_id} records no tensor as its output")
 
@@ -338,7 +345,7 @@ def materialize(
         total_bytes=sum(r.nbytes for r in records),
         tolerance=tolerance,
         model=_model_name(artifact),
-        composition=_composition(directory),
+        composition=composition,
     )
 
     _write_frozen_files(artifact, directory, repo, result)
