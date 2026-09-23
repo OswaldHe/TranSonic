@@ -497,8 +497,26 @@ def _tolerance_for(
     rtol, atol = max(rows.values(), key=lambda pair: pair[0]) if rows else default
 
     bar = {"RTOL": rtol, "ATOL": atol, **fractions}
-    bar["MAX_ABS_ERR"] = atol + rtol * reference_max
+    bar["MAX_ABS_ERR"] = _legible(atol + rtol * reference_max)
     return bar
+
+
+def _legible(value: float) -> float:
+    """A value that survives being written as a literal and read back.
+
+    The bar has to be typed into `inference.py` as a bare number and then compared for
+    equality against this one. `atol + rtol * max|reference|` is an arbitrary float —
+    0.28046875000000004 for one module — and `f"{v:g}"` prints six significant digits, so the
+    literal and the bar would differ in the last bits and the gate would report
+    "MAX_ABS_ERR is 0.280469, but the bar is 0.280469".
+
+    So the bar is rounded to what six digits can express, upward: a ceiling must never come
+    out stricter than the one that was derived.
+    """
+    rounded = float(f"{value:.6g}")
+    if rounded < value:
+        rounded = float(f"{value + abs(value) * 1e-6:.6g}")
+    return rounded
 
 
 def _model_name(artifact: Path) -> str:

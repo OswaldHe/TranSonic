@@ -337,6 +337,22 @@ def test_the_ceiling_literal_is_pinned_like_the_others(repo: Path) -> None:
     assert any(chk.CEILING_NAME in f and "does not declare" in f for f in result.findings)
 
 
+def test_a_derived_ceiling_survives_being_written_as_a_literal() -> None:
+    """The bar is typed into inference.py and then compared for equality against itself.
+
+    `atol + rtol * max|reference|` is an arbitrary float, and the literal carries six
+    significant digits — so without rounding the gate reports the absurd "MAX_ABS_ERR is
+    0.280469, but the bar is 0.280469". Observed on 01-MoE.
+    """
+    from bootstrap.materialize import _legible
+
+    for raw in (0.1 + 0.1 * 1.8046875, 0.1 + 0.1 * 7.53125, 1 / 3, 1e-9, 12345.6789, 0.0):
+        bar = _legible(raw)
+        assert float(f"{bar:g}") == bar, raw          # round-trips as a literal
+        assert bar >= raw, raw                        # never stricter than derived
+        assert abs(bar - raw) <= abs(raw) * 1e-5 + 1e-12, raw
+
+
 def test_a_manifest_without_a_ceiling_does_not_require_one(repo: Path) -> None:
     """There is no default for a number derived from this module's own recorded output."""
     assert chk.CEILING_NAME not in chk.expected_tolerance({})
