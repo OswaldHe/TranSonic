@@ -21,8 +21,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Harness-owned text, restored byte for byte. Everything the agent may edit —
-#: ``plan/partition_graph.yaml`` and ``modules/*/inference.py`` — is absent here
-#: by design.
+#: ``plan/partition_graph.yaml``, ``modules/*/inference.py`` and, when the surface is
+#: ``compat``, ``compat/*.py`` — is absent here by design.
+#:
+#: ``runtime/**`` and ``calls.json`` are here because the *standalone* verifier runs on
+#: them: the loop's own checks import the harness's copy of the comparator, but the
+#: isolated check that gates publication imports the artifact's. An agent that weakened
+#: the copied comparator, or pointed ``calls.json`` at another tensor, would leave the
+#: in-process checks honest and the shipped artifact passing on nothing.
 PROTECTED_FILES = (
     "run.yaml",
     "state.json",
@@ -30,9 +36,13 @@ PROTECTED_FILES = (
     "modules/*/verify.py",
     "modules/*/meta.yaml",
     "modules/*/README.md",
+    "modules/*/calls.json",
+    "modules/*/config.json",
+    "runtime/**/*.py",
     "trace/records.yaml",
     "trace/manifest.yaml",
     "reports/verify.json",
+    "reports/chain.json",
     "reports/emulate.json",
 )
 

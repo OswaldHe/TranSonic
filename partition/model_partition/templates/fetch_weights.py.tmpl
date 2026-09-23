@@ -1,0 +1,143 @@
+"""Fetch the checkpoint shards this artifact's modules read their weights from.
+
+This run traced with weight caching off — which is what makes a {{ checkpoint_size }}
+checkpoint traceable on a machine far smaller than it — so the feature maps beside every
+module are real dumps while most of its *parameters* were read from the checkpoint and
+never copied in. A module directory therefore builds from what was dumped and reports the
+rest as missing until this script has run.
+
+It downloads only the shards the published modules actually name. Each module's
+`calls.json` records, for every parameter the run did not dump, the shard it lives in and
+the key it has inside that shard — so one module's weights cost the few shards holding
+them rather than the whole checkpoint.
+
+    python fetch_weights.py --list                  # what would be fetched, and how big
+    python fetch_weights.py --group {{ example_group }}
+    python fetch_weights.py --module {{ example_module }}
+    python fetch_weights.py                         # every published module
+
+Shards land in `{{ checkpoint_dir }}/` beside `modules/`, which is where
+`runtime/model_partition/runtime/artifact.py` looks for them. Nothing else changes: run
+`inference.py` or `verify.py` again afterwards and the weights are simply there.
+
+Needs `huggingface_hub` installed, and that is the only thing here that does — it is the
+one step that talks to the network. Reading what it downloads needs `torch` alone, the
+same as the rest of the artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+#: The checkpoint this artifact was traced from, pinned to the revision that produced
+#: these feature maps. A moving branch would hand back weights that do not belong beside
+#: them.
+REPO_ID = {{ repo_id | tojson }}
+REVISION = {{ revision | tojson }}
+#: Where the shards go, relative to this file. The artifact's reader looks here.
+CHECKPOINT_DIR = {{ checkpoint_dir | tojson }}
+
+
+def _module_dirs() -> list[Path]:
+    return sorted(p for p in (HERE / "modules").glob("*/") if (p / "calls.json").is_file())
+
+
+def shards_wanted(groups: list[str], modules: list[str]) -> tuple[dict[str, set[str]], list[str]]:
+    """Shard -> the module ids needing it, plus the parameters nothing can supply.
+
+    A parameter recorded with no shard is one the checkpoint could not resolve when the
+    artifact was written. Fetching cannot help it, so it is reported rather than silently
+    counted as covered.
+    """
+    by_shard: dict[str, set[str]] = {}
+    unresolvable: list[str] = []
+    for directory in _module_dirs():
+        if groups and directory.name not in groups:
+            continue
+        payload = json.loads((directory / "calls.json").read_text())
+        for module_id, entry in (payload.get("modules") or {}).items():
+            if modules and module_id not in modules:
+                continue
+            missing = entry.get("weights_missing") or {}
+            if not isinstance(missing, dict):
+                unresolvable.extend(f"{module_id}: {name}" for name in missing)
+                continue
+            for name, ref in missing.items():
+                shard = ref.get("shard")
+                if shard:
+                    by_shard.setdefault(shard, set()).add(module_id)
+                else:
+                    unresolvable.append(f"{module_id}: {name}")
+    return by_shard, unresolvable
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Download the checkpoint shards this artifact's modules need.")
+    parser.add_argument("--group", action="append", default=[],
+                        help="Only this module directory (repeatable)")
+    parser.add_argument("--module", action="append", default=[],
+                        help="Only this module id (repeatable)")
+    parser.add_argument("--list", action="store_true",
+                        help="Report what would be fetched, and stop")
+    parser.add_argument("--revision", default=REVISION,
+                        help="Override the pinned revision; you probably should not")
+    parser.add_argument("--token", default=None, help="HuggingFace token, if the repo is gated")
+    args = parser.parse_args(argv)
+
+    by_shard, unresolvable = shards_wanted(args.group, args.module)
+    if not by_shard:
+        print("nothing to fetch: every parameter these modules need is already dumped "
+              "into the artifact")
+        return 0
+
+    print(f"repo     : {REPO_ID}")
+    print(f"revision : {args.revision}")
+    print(f"into     : {HERE / CHECKPOINT_DIR}")
+    print(f"shards   : {len(by_shard)}")
+    for shard in sorted(by_shard):
+        users = sorted(by_shard[shard])
+        shown = ", ".join(users[:3]) + (f" +{len(users) - 3} more" if len(users) > 3 else "")
+        print(f"  {shard}  ({shown})")
+    if unresolvable:
+        print(f"\n{len(unresolvable)} parameter(s) name no shard, so fetching cannot "
+              f"supply them:")
+        for name in unresolvable[:8]:
+            print(f"  {name}")
+    if args.list:
+        return 0
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print("\nerror: this step needs `huggingface_hub` installed "
+              "(pip install huggingface_hub).", file=sys.stderr)
+        return 2
+
+    target = HERE / CHECKPOINT_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=REPO_ID,
+        revision=args.revision,
+        allow_patterns=sorted(by_shard),
+        local_dir=str(target),
+        token=args.token,
+    )
+    absent = [shard for shard in by_shard if not (target / shard).is_file()]
+    if absent:
+        print(f"\nerror: {len(absent)} shard(s) did not arrive: "
+              f"{', '.join(sorted(absent)[:4])}", file=sys.stderr)
+        return 1
+    print(f"\nfetched {len(by_shard)} shard(s) into {target}")
+    print("Run `python inference.py` or `python verify.py` in a module directory again; "
+          "the weights are read from here now.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

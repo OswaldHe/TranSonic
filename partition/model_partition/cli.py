@@ -325,7 +325,10 @@ def report(run_dir: str, as_json: bool) -> None:
 @click.option("--private/--public", default=False, help="Repository visibility")
 @click.option("--max-gib", type=float, default=2048.0,
               help="Refuse to upload more than this (default 2048 GiB = 2 TB)")
-@click.option("--exclude", multiple=True, default=("logs/**",),
+# Spelled out rather than imported from `publish`, which this module loads lazily inside
+# the command so that nothing else pays for `huggingface_hub`. Kept in step with
+# `publish.DEFAULT_EXCLUDE` by a test.
+@click.option("--exclude", multiple=True, default=("logs/**", "hf/**", ".cache/**"),
               help="Glob of paths to leave out; repeatable")
 @click.option("--dry-run", is_flag=True, help="Report what would be uploaded and stop")
 @click.option("--module", "modules", multiple=True,

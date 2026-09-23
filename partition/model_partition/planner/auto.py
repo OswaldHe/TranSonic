@@ -56,6 +56,18 @@ class PlanOptions:
     #: Give attention and the FFN/MoE block of every layer their own modules,
     #: whatever their size. One kernel per module is the point, not capacity.
     split_attention_ffn: bool = False
+    #: The loader will materialize weights wider than the checkpoint stores them, so
+    #: size against the dequantized width. A quantized checkpoint requested as bfloat16
+    #: expands two to four times as the vendor code loads it, and a module sized on the
+    #: fp8 bytes appears to fit the card, OOMs at verification, and comes back asking to
+    #: be repartitioned — against a seed plan that had already certified it.
+    dequant_resident: bool = False
+
+    def layer_bytes(self, layer: LayerProfile) -> int:
+        """What one layer's parameters occupy once the loader has materialized them."""
+        if self.dequant_resident:
+            return max(layer.param_bytes, layer.dequant_bytes)
+        return layer.param_bytes
 
 
 def classify_global(name: str) -> tuple[str, str] | None:
@@ -202,7 +214,7 @@ def plan(
     layer_groups = _group_layers(
         backbone,
         options.max_layers_per_module or cost.max_layers_per_module(
-            max((layer.param_bytes for layer in inventory.layers), default=0),
+            max((options.layer_bytes(layer) for layer in inventory.layers), default=0),
             budget_bytes, options.seq_len,
         ),
         options,
@@ -690,8 +702,17 @@ def _split_ffn(
         inputs=[input_tensor, *partials], outputs=[output], layer_indices=[stack.layer_id(index)],
         activation_bytes=activation,
         code_signature=f"{signature}:combine",
-        notes=("functional: sums expert-group partials into the residual stream. "
-               "No submodule of its own, so no traced reference"),
+        # Declared so the dataflow is complete — something has to consume the expert
+        # groups' partials — but not partitioned, because there is no `nn.Module` here to
+        # hook, extract or install. Emitted as a partitioned module it was counted in the
+        # plan, skipped by `install_implementations`, and then failed emulation
+        # mechanically with no boundary for any agent to repair: the automatic
+        # over-budget MoE plan could never finish. Give it a real submodule and it can be
+        # partitioned like anything else.
+        partitioned=False,
+        notes=("sums expert-group partials into the residual stream. No submodule of its "
+               "own, so nothing to trace, extract or install: a kernel author has to "
+               "write this one from the plan rather than from a module directory"),
     ))
     return output
 

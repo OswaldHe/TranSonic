@@ -50,9 +50,12 @@ COMPUTE_DTYPE_KEY = "_compute_dtype"
 #: The recorded call and weight map a module's ``inference.py`` reads, written beside it.
 CALLS_FILENAME = "calls.json"
 
-#: Imported source per directory. Executing a modeling file is not cheap and every
-#: module of a group asks for the same one.
-_SOURCE_CACHE: dict[str, Any] = {}
+#: Imported source per directory, keyed by the file's own mtime and size as well as its
+#: path. Executing a modeling file is not cheap and every module of a group asks for the
+#: same one — but the repair agent edits ``source.py`` between iterations, and a cache
+#: keyed by path alone would hand back the module the iteration was meant to replace, so
+#: the loop could spend every repair it has on code that never ran.
+_SOURCE_CACHE: dict[tuple[str, int, int], Any] = {}
 
 #: Total weight bytes above which a module is constructed on the meta device and handed
 #: its recorded tensors by reference instead of copying into freshly allocated ones.
@@ -114,17 +117,24 @@ def load_source(directory: str | Path, source_module: str | None = None,
     if not path.is_file():
         raise LauncherError(f"No {SOURCE_FILENAME} in {directory}")
 
-    key = str(path.resolve())
+    stamp = path.stat()
+    key = (str(path.resolve()), stamp.st_mtime_ns, stamp.st_size)
     cached = _SOURCE_CACHE.get(key)
     if cached is not None:
         return cached
+    # An earlier revision of this same file is of no further use, and an imported
+    # modeling module is not small.
+    for stale in [k for k in _SOURCE_CACHE if k[0] == key[0]]:
+        _SOURCE_CACHE.pop(stale, None)
 
     # A private leaf name inside the original package: registering the artifact's copy
     # as `transformers...modeling_x` would shadow the installed module for everything
     # else in the process, while a bare private name would break the `from . import ...`
     # the file does. Naming it `<package>.<private>` gives it the right parent for
     # relative imports without taking the real module's place.
-    leaf = f"{SOURCE_MODULE_PREFIX}{abs(hash(key))}"
+    # Named from the path alone, so re-importing an edited file takes the place of the
+    # revision it replaces in ``sys.modules`` instead of accumulating beside it.
+    leaf = f"{SOURCE_MODULE_PREFIX}{abs(hash(key[0]))}"
     package = source_module.rsplit(".", 1)[0] if source_module and "." in source_module else ""
     name = f"{package}.{leaf}" if package else leaf
     spec = importlib.util.spec_from_file_location(name, path)

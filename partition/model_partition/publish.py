@@ -24,9 +24,13 @@ from typing import Any, Callable
 from model_partition.extract import refresh_calls
 from model_partition.hardware import format_bytes
 
-#: Left out by default: agent transcripts, which are large and say nothing about the
-#: artifacts themselves.
-DEFAULT_EXCLUDE = ("logs/**",)
+#: Left out by default. Agent transcripts are large and say nothing about the artifacts.
+#: ``hf/`` is what ``fetch_weights.py`` downloads on the *reader's* machine —
+#: republishing it would upload a copy of the model, which is the one thing an artifact
+#: set exists to avoid, and the shards are a pinned revision of a repo anyone can reach.
+#: ``.cache/`` is the Hub client's own resume bookkeeping, which it writes *into* the
+#: folder it is uploading: 13562 files on the first run here, none of them content.
+DEFAULT_EXCLUDE = ("logs/**", "hf/**", ".cache/**")
 
 #: What a run has to contain before uploading it means anything.
 REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
@@ -146,14 +150,22 @@ def _weight_source(root: Path):
     payload = manifest.get("spec")
     if not payload:
         raise PublishError(f"{root / 'run.yaml'} does not record the model it partitioned")
+    # The revision the trace was actually taken from, which is not always the one the
+    # spec asked for: a spec may name a moving branch or name nothing at all, and ingest
+    # pins whatever that resolved to. Re-ingesting the spec alone would read weights from
+    # whatever the branch points at now, and those do not belong beside these activations.
+    payload = dict(payload)
+    if resolved := str(manifest.get("revision") or ""):
+        payload["revision"] = resolved
     try:
-        result = ingest(parse_spec(payload))
+        spec = parse_spec(payload)
+        result = ingest(spec)
     except Exception as exc:
         raise PublishError(
             f"this run read its weights from the checkpoint rather than dumping them, and "
             f"the checkpoint cannot be reached to copy them in: {exc}"
         ) from exc
-    return CheckpointWeights.from_ingest(result)
+    return CheckpointWeights.from_ingest(result, rename=spec.checkpoint.rename)
 
 
 def _safe(name: str) -> str:
@@ -206,7 +218,10 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
         # the others are in the artifact for their code and cannot be built from it.
         module = sorted(selected)[0] if selected else None
         for label, command in (
-            ("verify.py", [sys.executable, "verify.py", "--all-samples"]
+            # The first recorded pass, not every sample: `verify_modules` already
+            # checked every module against every sample, and what is being asked here is
+            # whether the published files can answer the question at all.
+            ("verify.py", [sys.executable, "verify.py"]
                           + (["--module", module] if module else [])),
             ("inference.py", _isolated_command(module)),
         ):
@@ -354,6 +369,22 @@ def _published_groups(root: Path, module_ids: set[str]) -> dict[str, set[str]]:
     return found
 
 
+def _largest(root: Path, files: list[Path], count: int = 5) -> list[tuple[str, int]]:
+    """The biggest published files, named relative to the run, for a size report."""
+    return [(path.relative_to(root).as_posix(), path.stat().st_size)
+            for path in files[:count]]
+
+
+def _ceiling_error(total: int, max_bytes: int,
+                   largest: list[tuple[str, int]]) -> PublishError:
+    """The refusal when a set is larger than the operator allowed."""
+    return PublishError(
+        f"{format_bytes(total)} exceeds the {format_bytes(max_bytes)} ceiling. Largest: "
+        + "; ".join(f"{name} {format_bytes(size)}" for name, size in largest)
+        + ". Exclude what you do not need with --exclude, or raise --max-gib."
+    )
+
+
 def _selected(relative: str, module_ids: set[str], groups: set[str]) -> bool:
     """Whether one path belongs to a published subset."""
     head, _, rest = relative.partition("/")
@@ -385,6 +416,24 @@ def publish_run(
 ) -> PublishResult:
     """Upload a run directory, or a selection of its modules, as a dataset repo."""
     root = Path(run_dir)
+    selection = None if upload_all else module_ids
+    # Both refusals before anything is written. Materializing a subset's weights reads
+    # tens or hundreds of gigabytes out of the checkpoint, so reaching "this run did not
+    # pass" or "this is over the ceiling" afterwards costs hours and a disk for nothing.
+    verdict = _verdict(root)
+    if not verdict.get("passed") and not allow_unverified:
+        raise PublishError(
+            f"this run did not pass ({verdict.get('detail', 'no state recorded')}); "
+            "an unverified artifact set is worse than none. Pass allow_unverified to "
+            "upload it anyway."
+        )
+    if max_bytes is not None:
+        # What is on disk already is a floor for what will be there once the weights are
+        # in, so a set over the ceiling now is over it then. The exact total is checked
+        # again below, because a subset's final size is not knowable until then.
+        present, floor = collect(root, exclude, module_ids=selection)
+        if floor > max_bytes:
+            raise _ceiling_error(floor, max_bytes, _largest(root, present))
     if module_ids and not dry_run:
         # The weights first: a subset has to carry its own, or nothing in it can be
         # checked away from the checkpoint it was traced against.
@@ -403,26 +452,11 @@ def publish_run(
     # every module's code, plan, reports and recorded feature maps — and a reader is better
     # served by all of it than by a subset. The selection then says which modules also
     # carry their weights, and so which can be verified where they land.
-    files, total = collect(root, exclude,
-                           module_ids=None if upload_all else module_ids)
+    files, total = collect(root, exclude, module_ids=selection)
     result = PublishResult(repo_id=repo_id, files=len(files), total_bytes=total,
-                           dry_run=dry_run,
-                           largest=[(p.relative_to(root).as_posix(), p.stat().st_size)
-                                    for p in files[:5]])
+                           dry_run=dry_run, largest=_largest(root, files))
     if max_bytes is not None and total > max_bytes:
-        raise PublishError(
-            f"{format_bytes(total)} exceeds the {format_bytes(max_bytes)} ceiling. "
-            f"Largest: "
-            + "; ".join(f"{name} {format_bytes(size)}" for name, size in result.largest)
-            + ". Exclude what you do not need with --exclude, or raise --max-gib."
-        )
-    verdict = _verdict(root)
-    if not verdict.get("passed") and not allow_unverified:
-        raise PublishError(
-            f"this run did not pass ({verdict.get('detail', 'no state recorded')}); "
-            "an unverified artifact set is worse than none. Pass allow_unverified to "
-            "upload it anyway."
-        )
+        raise _ceiling_error(total, max_bytes, result.largest)
     report(f"{len(files)} file(s), {format_bytes(total)}")
     for name, size in result.largest:
         report(f"  {format_bytes(size):>10}  {name}")

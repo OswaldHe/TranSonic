@@ -436,8 +436,11 @@ generated module harness as a subprocess to confirm it actually replays.
   splitting a single matmul chain apart is the operator's call or the agent's.
 - Parameters a layer module owns directly, rather than through a child module, are
   not assigned to any partition module. They appear in the fill report as unclaimed.
-- Decode-step tracing is accounted for in the storage estimate but not yet
-  captured; prefill IO is.
+- Only prefill IO is captured. Decode-step tracing is not, and is no longer
+  budgeted or configurable either: tracing runs with caching disabled, so a
+  "decode step" would be a longer prefill and would exercise none of the
+  cache-sensitive behaviour the name implies. Budgeting for a pass that never ran
+  reported coverage the run did not have.
 - Tracing and emulation need the whole model resident, so a checkpoint larger than
   the GPU is spread across GPU and host by layer placement. Most of the compute
   still lands on the GPU, but the host-resident layers are slow. Full GPU residency

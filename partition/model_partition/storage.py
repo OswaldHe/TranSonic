@@ -42,8 +42,6 @@ class DumpPolicy:
     cache_weights: bool = True
     #: Persist the bf16 dequant mirror; ``False`` recomputes it per load.
     cache_dequant: bool = True
-    #: Decode steps traced beyond prefill, first sample only.
-    decode_steps: int = 4
     #: Hard ceiling; tracing aborts rather than truncating silently.
     max_total_bytes: int | None = None
 
@@ -167,14 +165,10 @@ def estimate_storage(
                if policy.slice_long else "full")
     est.add("feature maps (long)", long_bytes, f"{len(trace.long_seq_lens)} samples, {slicing}")
 
-    if policy.decode_steps and trace.short_seq_lens:
-        est.add(
-            "feature maps (decode)",
-            trace.tensors_per_module * trace.n_modules * policy.decode_steps
-            * trace.boundary_bytes_per_token,
-            f"{policy.decode_steps} steps, first sample only",
-        )
-
+    # No decode term. Decode-step IO is not captured — tracing runs with caching
+    # disabled, so a "decode step" would be a longer prefill and would exercise none of
+    # the cache-sensitive behaviour the name implies — and budgeting for a pass that never
+    # runs reported coverage the run did not have.
     n_samples = len(trace.short_seq_lens) + len(trace.long_seq_lens)
     est.add("aux (routing maps, metadata)", trace.aux_bytes_per_module * trace.n_modules * n_samples)
     return est

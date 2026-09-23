@@ -136,29 +136,41 @@ def main(argv: list[str] | None = None) -> int:
         for key in wanted:
             sample, _, step = key.rpartition("#")
             try:
-                _, calls = module.select(sample, int(step), SAMPLE_IDS)
-                weights = module.weights(args.device)
-                call_args, call_kwargs = module.arguments(calls, args.device)
-                reference = module.reference(calls, parallel, args.device)
-                built = inference.build_module(
-                    config, weights, device=args.device,
-                    submodule=calls[0]["submodule"] if parallel else None)
-                module.apply_state(inference.load_implementation(), calls, args.device)
-                with torch.no_grad():
-                    output = built(*call_args, **call_kwargs)
+                _, recorded_calls = module.select(sample, int(step), SAMPLE_IDS)
+                # Every invocation, not just the first: a submodule the pass called more
+                # than once was the group run again, and this is the gate.
+                invocations = module.runs(recorded_calls)
+                # Onto the host: the builder places what it constructs, and a submodule
+                # too large for the card stays behind rather than being asked for on it.
+                weights = module.weights("cpu")
             except ArtifactError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
-            except Exception as exc:  # the implementation's own failure is a failure
-                print(f"  {module_id}@{sample}: FAIL {type(exc).__name__}: {exc}")
-                failures += 1
-                checks += 1
-                continue
-            label = f"{module_id}@{sample}" + (f"#{step}" if int(step) else "")
-            for comparison in compare_outputs(output, reference, label, tolerance):
-                checks += 1
-                failures += 0 if comparison.passed else 1
-                print("  " + comparison.summary())
+            for nth, calls in enumerate(invocations):
+                label = f"{module_id}@{sample}" + (f"#{step}" if int(step) else "")
+                if len(invocations) > 1:
+                    label += f"[call {nth}]"
+                try:
+                    call_args, call_kwargs = module.arguments(calls, args.device)
+                    reference = module.reference(calls, parallel, args.device)
+                    built = inference.build_module(
+                        config, weights, device=args.device,
+                        submodule=calls[0]["submodule"] if parallel else None)
+                    module.apply_state(inference.load_implementation(), calls, args.device)
+                    with torch.no_grad():
+                        output = built(*call_args, **call_kwargs)
+                except ArtifactError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 2
+                except Exception as exc:  # the implementation's own failure is a failure
+                    print(f"  {label}: FAIL {type(exc).__name__}: {exc}")
+                    failures += 1
+                    checks += 1
+                    continue
+                for comparison in compare_outputs(output, reference, label, tolerance):
+                    checks += 1
+                    failures += 0 if comparison.passed else 1
+                    print("  " + comparison.summary())
 
     verdict = "PASS" if not failures else "FAIL"
     print(f"{verdict}: {checks - failures}/{checks} tensor(s) match the dumped reference")

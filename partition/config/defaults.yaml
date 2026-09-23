@@ -24,7 +24,6 @@ loop:
   slice_long: false         # true windows long-context feature maps to a
                             # head/tail, which also means those records cannot be
                             # numerically verified
-  decode_steps: 4
 
   # --- emulation and judging -------------------------------------------------
   max_new_tokens: 32

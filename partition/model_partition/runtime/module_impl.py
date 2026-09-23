@@ -104,7 +104,14 @@ def load_impl(directory: str | Path) -> ExtractedImpl:
 
 
 def find_impl_dirs(modules_dir: str | Path) -> dict[str, Path]:
-    """Map each module id to the group directory implementing it."""
+    """Map each module id to the group directory implementing it.
+
+    The index names the directory, but a directory that has been renamed or moved since
+    the index was written would otherwise map every one of its modules to a path with no
+    ``inference.py`` — and that reads as "every module is unusable" rather than as "the
+    index is stale". So a name the index gives that is not there is looked up again by the
+    signature in each group's own ``meta.yaml``, which travels with the directory.
+    """
     root = Path(modules_dir)
     index = root / "index.yaml"
     if not index.is_file():
@@ -113,12 +120,23 @@ def find_impl_dirs(modules_dir: str | Path) -> dict[str, Path]:
 
     payload = yamlio.load_path(index) or {}
     mapping: dict[str, Path] = {}
+    by_signature: dict[str, Path] | None = None
     for group in payload.get("groups", []):
         directory = group.get("directory")
-        if not directory:
+        if directory and (root / directory).is_dir():
+            target = root / directory
+        else:
+            if by_signature is None:
+                by_signature = {}
+                for meta in sorted(root.glob("*/meta.yaml")):
+                    found = (yamlio.load_path(meta) or {}).get("signature")
+                    if found:
+                        by_signature[str(found)] = meta.parent
+            target = by_signature.get(str(group.get("signature")))
+        if target is None:
             continue
         for module_id in group.get("module_ids", []):
-            mapping[module_id] = root / directory
+            mapping[module_id] = target
     return mapping
 
 

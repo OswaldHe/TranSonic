@@ -30,6 +30,7 @@ from model_partition.runtime.emulation import (
     capture_boundaries,
     fill_from_dumps,
     generate,
+    logits_extractor,
     place_across_devices,
 )
 from model_partition.verify.judge import Judge, StubJudge, Verdict
@@ -217,9 +218,9 @@ def emulate(
     check_boundaries: bool = True,
     place_max_memory: dict | None = None,
     impl_dirs: dict[str, Any] | None = None,
-    run_dir: Any = None,
     out_of_scope: tuple[str, ...] = (),
     streamed: bool = False,
+    returns: tuple[str, ...] = (),
 ) -> EmulationReport:
     """Assemble from dumps, install the implementations, generate, and judge.
 
@@ -232,9 +233,13 @@ def emulate(
     implementation is built at the moment its submodule is called. What is being read out
     of the generated text is the same thing either way: whether the loop's own code, in
     place of the model's, still writes what the model writes.
+
+    ``returns`` names the forward's return tuple positionally, from the spec, so the
+    logits can be picked out of a model that returns several things.
     """
     judge = judge or StubJudge()
     report = EmulationReport(min_score=min_score)
+    extract_logits = logits_extractor(returns)
 
     if streamed:
         model = build_model(placed=True)
@@ -268,7 +273,7 @@ def emulate(
         try:
             outcome.token_ids, _ = generate(
                 model, ids, max_new_tokens=max_new_tokens, temperature=temperature,
-                seed=seed, eos_token_id=eos_token_id,
+                seed=seed, eos_token_id=eos_token_id, logits_of=extract_logits,
             )
         except Exception as exc:
             outcome.error = f"generation failed: {exc}"
@@ -338,8 +343,19 @@ def _check_boundaries(
     Only the first forward is compared: later generation steps run on a longer
     sequence than the trace recorded. The hook fires on the module's *last*
     submodule, so the matching record is that submodule's, not the group's first.
+
+    A module the forward never called contributes no comparison, so the modules the
+    recording says should have been reached are checked against the ones that were —
+    otherwise an implementation that is installed and never exercised reads as a
+    boundary that held.
     """
     comparisons: list[Comparison] = []
+    for module_id in _unobserved(bundle, graph, sample_id, set(sink)):
+        comparisons.append(Comparison(
+            name=f"boundary:{module_id}", passed=False, cosine=0.0,
+            reason="the prefill trace recorded this module and the emulated forward "
+                   "never called it, so its implementation was not exercised",
+        ))
     for module_id, observed in sink.items():
         records = bundle.select(module_id=module_id, sample_id=sample_id, step=0)
         if not records:
@@ -356,12 +372,30 @@ def _check_boundaries(
             continue
         if tuple(actual.shape) != tuple(reference.shape):
             # A sliced long-context dump covers only head+tail positions.
-            actual = _match_slice(actual, reference, record, bundle)
+            actual = _match_slice(actual, record, bundle)
         comparisons.append(compare(actual, reference, f"boundary:{module_id}", tolerance))
     return comparisons
 
 
-def _match_slice(actual: Any, reference: Any, record: Any, bundle: TraceBundle) -> Any:
+def _unobserved(bundle: TraceBundle, graph: PartitionGraph, sample_id: str,
+                observed: set[str]) -> list[str]:
+    """Modules the prefill trace recorded that the emulated forward never called.
+
+    Only the prefill pass is expected here. A module traced through
+    ``trace.extra_passes`` — the draft stack, driven from its own entry point — has no
+    step-0 record, and ``model(input_ids)`` is not supposed to reach it; those are
+    unexercised by emulation by construction rather than missing from it. A sliced
+    record documents a module without being able to verify it, so it is no basis for
+    demanding a comparison either.
+    """
+    expected = {record.module_id for record in bundle.records
+                if record.sample_id == sample_id and record.step == 0
+                and not record.sliced}
+    known = {module.id for module in graph.partitioned_modules if not module.functional}
+    return sorted((expected & known) - observed)
+
+
+def _match_slice(actual: Any, record: Any, bundle: TraceBundle) -> Any:
     """Reduce a full tensor to the head/tail window a sliced dump recorded.
 
     Sound here in a way it is not for module replay: the tensor being windowed

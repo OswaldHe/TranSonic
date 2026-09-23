@@ -105,20 +105,20 @@ def test_streamed_checkpoint_is_labelled_as_peak():
     assert any("streamed, peak" in line.label for line in est.lines)
 
 
-def test_decode_steps_are_counted_once_not_per_sample():
-    trace = qwen27b_trace()
-    with_decode = estimate_storage(
+def test_no_room_is_budgeted_for_a_decode_pass_that_never_runs():
+    """Tracing captures prefill IO only.
+
+    Caching is disabled while tracing, so a "decode step" would be a longer prefill and
+    would exercise none of the cache-sensitive behaviour the name implies. Budgeting for
+    it reported coverage the run did not have, so neither the estimate nor the policy
+    mentions it.
+    """
+    est = estimate_storage(
         checkpoint_bytes=0, module_weight_bytes=0, dequant_bytes=0,
-        trace=trace, policy=DumpPolicy(decode_steps=4),
+        trace=qwen27b_trace(), policy=DumpPolicy(),
     )
-    without = estimate_storage(
-        checkpoint_bytes=0, module_weight_bytes=0, dequant_bytes=0,
-        trace=trace, policy=DumpPolicy(decode_steps=0),
-    )
-    delta = with_decode.total_bytes - without.total_bytes
-    # tensors/module x n_modules x steps x bytes/token, once — not once per sample.
-    assert delta == (trace.tensors_per_module * trace.n_modules * 4
-                     * trace.boundary_bytes_per_token)
+    assert not any("decode" in line.label for line in est.lines)
+    assert not hasattr(DumpPolicy(), "decode_steps")
 
 
 def test_preflight_passes_with_ample_disk():
