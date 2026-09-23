@@ -48,11 +48,14 @@ def bootstrap() -> None:
 @click.option("--step", type=int, default=None, help="Decode step (prefill by default)")
 @click.option("--call", "call_index", type=int, default=0, show_default=True,
               help="Which invocation, when the pass called the group more than once")
+@click.option("--no-state", "include_state", is_flag=True, default=True, flag_value=False,
+              help="Omit recorded cross-module state. For a group that publishes it rather "
+                   "than reads it, where the snapshot is only its own output and stale residue")
 @click.option("--force", is_flag=True,
               help="Clear a non-empty target directory first, git history included")
 def init(
     repo: Path, artifact: Path, module_id: str, group: str | None, sample: str | None,
-    step: int | None, call_index: int, force: bool,
+    step: int | None, call_index: int, include_state: bool, force: bool,
 ) -> None:
     """Materialize a module of ARTIFACT into REPO as a git repo to bootstrap in.
 
@@ -84,6 +87,7 @@ def init(
         result = mat.materialize(
             artifact=artifact.resolve(), group=resolved_group, module_id=module_id, repo=repo,
             sample_id=sample, step=step, call_index=call_index,
+            include_state=include_state,
         )
         manifest_path = mat.write_manifest(result)
         head = mat.git_init(repo)
@@ -95,6 +99,13 @@ def init(
     click.echo(f"  chain    : {' -> '.join(s for s in result.submodules if s)}")
     click.echo(f"  tensors  : {len(result.tensors)} file(s), "
                f"{result.total_bytes / (1 << 20):.1f} MiB")
+    state_count = sum(1 for t in result.tensors if t.role == "state")
+    if not result.state_included:
+        click.echo("  state    : omitted (--no-state), so the kernel is not handed values "
+                   "this group publishes")
+    elif state_count:
+        click.echo(f"  state    : {state_count} cross-module tensor(s) as kernel inputs — see "
+                   f"the README, some may be this group's own output")
     click.echo(f"  manifest : {manifest_path.relative_to(repo)}")
     click.echo(f"  config   : {PRESET_PATH} (fixed, read directly)")
     click.echo(f"  baseline : {head}")

@@ -536,3 +536,25 @@ def test_state_is_not_required_so_a_produced_entry_can_be_ignored() -> None:
                           "tensors/state_shared_attn_topk_idxs.bin", "int32",
                           [1, 8192, 512], 8, "h")
     assert not record.required
+
+
+def test_omitting_state_is_recorded_in_the_manifest(tmp_path: Path) -> None:
+    """Whether the kernel was handed cross-module state has to be auditable after the fact.
+
+    A repo with no `state` rows is ambiguous on its own — the group may have had none
+    recorded, or the operator may have judged them to be its own output and left them out.
+    """
+    from bootstrap.materialize import Materialized, TensorRecord, write_manifest
+
+    def built(state_included: bool) -> dict:
+        result = Materialized(
+            repo=tmp_path, group="20-Attention", module_id="layers.20.attention",
+            sample_id="long-needle-8192-0", step=0, call_index=0,
+            tensors=[TensorRecord("input", "input", "tensors/input.bin", "bfloat16",
+                                  [1, 8192, 5120], 8, "h", required=True)],
+            submodules=["layers.20.attn"], model="hf:m", state_included=state_included,
+        )
+        return json.loads(write_manifest(result).read_text())
+
+    assert built(False)["state_included"] is False
+    assert built(True)["state_included"] is True

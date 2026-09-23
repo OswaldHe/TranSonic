@@ -100,6 +100,8 @@ class Materialized:
     tolerance: dict[str, float] = field(default_factory=dict)
     model: str = ""
     composition: str = "sequential"
+    #: False when cross-module state was deliberately left out (a publishing group).
+    state_included: bool = True
 
 
 class MaterializeError(RuntimeError):
@@ -248,8 +250,15 @@ def materialize(
     sample_id: str | None = None,
     step: int | None = None,
     call_index: int = 0,
+    include_state: bool = True,
 ) -> Materialized:
-    """Write the module out as a bootstrap repo. Returns what was written."""
+    """Write the module out as a bootstrap repo. Returns what was written.
+
+    `include_state=False` omits the recorded cross-module state. Use it for a group that
+    *publishes* that state rather than reading it: the snapshot then holds only values the
+    group overwrites and residue from earlier passes, so materializing it hands the kernel
+    its own answer as an argument. See the `state` note in the generated README.
+    """
     reader, directory, calls = _load_module_calls(artifact, group, module_id)
     samples = _sample_order(directory)
     key, recorded = calls.select(sample_id, step, samples)
@@ -314,7 +323,7 @@ def materialize(
     # the model's own wiring, which the artifact does not record — so they are materialized,
     # not required, and named for what they are.
     state: dict[str, Any] = {}
-    for call in chain:
+    for call in chain if include_state else ():
         # Last call wins, as `apply_state` does: it replays every call in order onto the
         # same holder, so the final write is the value the group ran on.
         state.update(call.get("state") or {})
@@ -371,6 +380,7 @@ def materialize(
         tolerance=tolerance,
         model=_model_name(artifact),
         composition=composition,
+        state_included=include_state,
     )
 
     _write_frozen_files(artifact, directory, repo, result)
@@ -724,6 +734,7 @@ def write_manifest(result: Materialized) -> Path:
         "call_index": result.call_index,
         "submodules": result.submodules,
         "composition": result.composition,
+        "state_included": result.state_included,
         "scalar_args": result.scalar_args,
         # The bar check (e) holds this repo to, derived from the reference's dtype rather
         # than fixed globally: an fp8 boundary and a float32 one are not the same question.
