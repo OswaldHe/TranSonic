@@ -521,6 +521,52 @@ def test_a_class_gets_the_config_value_under_the_name_the_config_uses():
     assert _config_kwargs(Norm, {"dim": 8, "eps": 0.5}, None) == {"dim": 8, "eps": 0.5}
 
 
+def test_a_class_that_takes_nothing_is_built_with_nothing():
+    """DeepSeek's hyper-connection output half is arithmetic on its inputs: no config
+    field describes it and it owns no weight. Every attempt passed it the config, and
+    `nn.Module.__init__` refuses one, so it could not be built at all."""
+    from torch import nn
+
+    from model_partition.runtime.launcher import LauncherError, _construct
+
+    class Inherited(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Declared(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    for cls in (Inherited, Declared):
+        assert isinstance(_construct(cls, {"dim": 8}, 0, {}, {"dim": 8}), cls)
+
+    # A class naming a parameter is not one of these even when it defaults every one:
+    # built from nothing, it is built from its defaults.
+    class Defaulted(nn.Module):
+        def __init__(self, scale: float = 2.0):
+            super().__init__()
+            self.scale = float(scale)
+
+    with pytest.raises(LauncherError, match="could not construct Defaulted"):
+        _construct(Defaulted, {"dim": 8}, 0, {}, {"dim": 8})
+
+
+def test_a_module_the_trace_saw_own_nothing_has_all_its_weights():
+    """An empty parameter list is the trace saying so; no entry at all is not."""
+    from types import SimpleNamespace
+
+    from model_partition.runtime.module_runner import owns_weights
+
+    bundle = SimpleNamespace(
+        weights={"dumped": ["dumped.w"]},
+        weight_params={"mix_out": [], "attn": ["attn.wq.weight"], "dumped": []},
+    )
+    assert not owns_weights(bundle, "mix_out")
+    assert owns_weights(bundle, "attn")
+    assert owns_weights(bundle, "dumped")
+    assert owns_weights(bundle, "never_indexed")
+
+
 def test_a_recorded_tensor_that_already_fits_becomes_the_parameter():
     """Copying into a freshly allocated parameter holds the module twice, which a 94.4
     GiB n-gram table does not allow — and fp4-packed expert weights have no `copy_` at
@@ -568,6 +614,37 @@ def test_the_launcher_identifies_the_module_from_its_weights(tiny_deep_run, tmp_
     assert found[0] == target.id
 
     assert _module_paths(submodules, {"nothing.recognisable": None}) is None
+
+
+def test_a_module_owning_no_weights_is_named_by_its_caller():
+    """86 identical hyper-connection output halves, and no weight names to tell them
+    apart: the caller knows which one it is building, and says so."""
+    from model_partition.runtime.launcher import _module_paths
+
+    submodules = {"layers.0.hc_attn_out": ["layers.0.hc_attn_out"],
+                  "layers.7.hc_ffn_out": ["layers.7.hc_ffn_out"]}
+    assert _module_paths(submodules, {}) is None
+    assert _module_paths(submodules, {}, "layers.7.hc_ffn_out") == (
+        "layers.7.hc_ffn_out", ["layers.7.hc_ffn_out"])
+
+
+def test_an_implementation_is_passed_only_the_arguments_it_declares(tmp_path):
+    """`module_id` is new; an `inference.py` written before it must still build."""
+    from model_partition.runtime.module_impl import load_impl
+
+    older, newer = tmp_path / "older", tmp_path / "newer"
+    for directory in (older, newer):
+        directory.mkdir()
+    (older / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu', submodule=None):\n"
+        "    return lambda: (device, submodule)\n")
+    (newer / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu', submodule=None, module_id=None):\n"
+        "    return lambda: (device, submodule, module_id)\n")
+
+    assert load_impl(older).build({}, {}, "cpu", module_id="layers.3.ffn")() == ("cpu", None)
+    assert load_impl(newer).build({}, {}, "cpu", module_id="layers.3.ffn")() == (
+        "cpu", None, "layers.3.ffn")
 
 
 def test_every_module_of_a_shared_group_verifies(tiny_deep_run, tmp_path):

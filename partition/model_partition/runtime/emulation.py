@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from model_partition.planner.graph import PartitionGraph
-from model_partition.runtime.module_runner import TraceBundle, load_named_weights
+from model_partition.runtime.module_runner import TraceBundle, load_named_weights, owns_weights
 from model_partition.trace import _lookup
 
 
@@ -362,7 +362,6 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
     import torch
 
     from model_partition.runtime.module_impl import load_impl
-    from model_partition.runtime.module_runner import load_named_weights
     from model_partition.trace import _lookup
 
     pending: list[tuple[str, Any]] = []
@@ -388,7 +387,7 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
             # constructor wanting more than a dict is built from.
             config = bundle.config
             weights = {} if lazy else load_named_weights(bundle, module.id, device=device)
-            if not lazy and not weights:
+            if not lazy and not weights and owns_weights(bundle, module.id):
                 raise EmulationError("no weights available")
         except Exception as exc:
             report.skipped[module.id] = str(exc)
@@ -407,7 +406,8 @@ def _install_all(model: Any, graph: Any, bundle: Any, impl_dirs: dict[str, Any],
                                             bundle, device, lazy_weights))))
                 continue
             try:
-                built = impl.build(config, weights, device, submodule=submodule_name)
+                built = impl.build(config, weights, device, submodule=submodule_name,
+                                   module_id=module.id)
             except Exception as exc:
                 report.skipped[submodule_name] = f"build failed: {exc}"
                 continue
@@ -525,12 +525,13 @@ def _bundle_factory(impl: Any, config: dict[str, Any], module_id: str,
             # The previous module's first, or the two of them do not fit together.
             cache.clear()
             weights = load_named_weights(bundle, module_id, device="cpu")
-            if not weights:
+            if not weights and owns_weights(bundle, module_id):
                 raise EmulationError(
                     f"{module_id} has no recorded weights, so its implementation cannot be "
                     f"built from the artifacts")
             cache[module_id] = weights
-        return impl.build(config, weights, device, submodule=submodule_name)
+        return impl.build(config, weights, device, submodule=submodule_name,
+                          module_id=module_id)
 
     return build
 

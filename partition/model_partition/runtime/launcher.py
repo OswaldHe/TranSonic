@@ -269,6 +269,7 @@ def build_group(
     layer_map: dict[str, list[int]] | None = None,
     submodule: str | None = None,
     source: Any = None,
+    module_id: str | None = None,
 ) -> Any:
     """Build a whole partition module out of ``source.py`` and return it callable.
 
@@ -282,9 +283,12 @@ def build_group(
 
     ``config`` is what the caller has; the ``config.json`` in the directory wins when
     it is there, because that is the config this module's subtree was built from.
+
+    ``module_id`` says which of the group's modules this is. Without it the weight names
+    decide, which is all they can do for a module that owns none.
     """
     config = module_config(directory, config)
-    paths = _module_paths(submodules or {}, weights)
+    paths = _module_paths(submodules or {}, weights, module_id)
     if not paths:
         raise LauncherError(
             "could not tell which module these weights belong to; keys look like "
@@ -313,14 +317,18 @@ def build_group(
     return built[0] if len(built) == 1 else _chain(built)
 
 
-def _module_paths(submodules: dict[str, list[str]],
-                  weights: dict[str, Any]) -> tuple[str, list[str]] | None:
+def _module_paths(submodules: dict[str, list[str]], weights: dict[str, Any],
+                  module_id: str | None = None) -> tuple[str, list[str]] | None:
     """Which module of the group these weights belong to, and its submodule paths.
 
     One implementation serves every module sharing a signature, so the group alone
     does not say which instance is running; the weight names do, because they are the
-    original parameter names.
+    original parameter names. A caller that knows says so, and has to for a module that
+    owns no weights: DeepSeek's hyper-connection output half is one of 86 identical
+    instances with nothing to tell them apart but the layer it sits in.
     """
+    if module_id is not None and module_id in submodules:
+        return module_id, submodules[module_id]
     best: tuple[int, str, list[str]] | None = None
     for module_id, paths in submodules.items():
         matches = sum(1 for key in weights
@@ -1027,6 +1035,14 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
             attempts.append(((width, eps), {}))
         attempts.append(((width,), {}))
 
+    # A class that names no parameter is built with nothing: DeepSeek's hyper-connection
+    # output half is arithmetic on its inputs, described by no config field and no weight.
+    # Never a class that names parameters and defaults them all — that builds just as
+    # readily, from the defaults, which is the quietly wrong module `_config_kwargs` warns
+    # about.
+    if _names_no_parameter(cls):
+        attempts.append(((), {}))
+
     errors: list[str] = []
     for args, kwargs in attempts:
         try:
@@ -1037,6 +1053,18 @@ def _construct(cls: Any, settings: Any, layer_index: int | None,
         f"could not construct {cls.__name__} from the recorded config and weights. "
         "Tried:\n  " + "\n  ".join(errors[:5])
     )
+
+
+def _names_no_parameter(cls: Any) -> bool:
+    """Whether a constructor takes nothing, bar the pass-through ``*args, **kwargs`` of
+    ``nn.Module.__init__`` that a class without an ``__init__`` of its own inherits."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(cls).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return all(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in parameters)
 
 
 def _named_kwargs(parameters: list[str], config: dict[str, Any],

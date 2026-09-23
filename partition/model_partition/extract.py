@@ -346,7 +346,8 @@ def extract(
         if had_source and not regenerate:
             group.preserved = True
         group.launchable = _write_source(directory, principal, sources, signature, files,
-                                         classes=names, regenerate=regenerate)
+                                         classes=names, regenerate=regenerate,
+                                         origin_root=origin_root)
         # What source.py actually holds, so the reported figure is the code someone has
         # to read rather than the size of the file it was taken from.
         source_path = directory / SOURCE_FILENAME
@@ -872,7 +873,8 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
 
 def _write_source(directory: Path, principal: Any, sources: list[str],
                   signature: str, files: list[str], classes: list[str] | None = None,
-                  regenerate: bool = False) -> bool:
+                  regenerate: bool = False,
+                  origin_root: str | Path | None = None) -> bool:
     """Write ``source.py``: the implementation if there is one, else an excerpt.
 
     Returns whether the result is importable. What makes the module directory a unit
@@ -881,6 +883,10 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
     whole file, which is the entire model. An existing one is left alone for the same
     reason ``inference.py`` is: it is the file being optimized, and re-extracting must
     not throw that away.
+
+    The file it came from is named the way the recorded provenance names it, relative to
+    the checkpoint: the header is published, and a path on this disk is no use to whoever
+    reads it.
     """
     import inspect
 
@@ -905,13 +911,15 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
             body, kept, total = result
             scope = SLICED_SCOPE.format(kept=kept, total=total)
         destination.write_text(
-            SOURCE_BANNER.format(signature=signature, origin=origin, scope=scope,
+            SOURCE_BANNER.format(signature=signature, scope=scope,
+                                 origin=_origin_name(str(origin), origin_root),
                                  class_name=type(principal).__name__)
             + body
         )
         return True
 
-    provenance = ("\n".join(f"  {path}" for path in sorted(files))
+    provenance = ("\n".join(f"  {_origin_name(path, origin_root)}"
+                            for path in sorted(files))
                   or "  (not present in the loaded model)")
     destination.write_text(
         EXCERPT_HEADER.format(signature=signature, provenance=provenance)

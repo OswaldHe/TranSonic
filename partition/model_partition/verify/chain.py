@@ -41,9 +41,12 @@ from typing import Any
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import (
     TraceBundle,
+    apply_state,
     decode_group_call,
     expected_output,
     first_tensor,
+    load_named_weights,
+    owns_weights,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare, top1_agreement
 
@@ -381,7 +384,7 @@ def _chain_sample(
                 recent.append(name)
             impl = load_impl(impl_dir)
             weights = _weights_for(bundle, module_id)
-            built = impl.build(bundle.config, weights, device)
+            built = impl.build(bundle.config, weights, device, module_id=module_id)
             # The cross-module state this call read, put back where the module reads it.
             # DeepSeek's attention layers share their compressed KV through a module-level
             # object, so a consumer of it has no argument naming the largest thing it
@@ -509,8 +512,6 @@ def _restore_state(impl: Any, records: list, bundle: TraceBundle, device: str) -
     between modules through a module-level object is state, and it comes from the
     recording either way.
     """
-    from model_partition.runtime.module_runner import apply_state
-
     source = getattr(impl.module, "load_implementation", None)
     if source is None:
         return 0
@@ -530,10 +531,8 @@ def _weights_for(bundle: TraceBundle, module_id: str) -> dict[str, Any]:
     stays on the host with its inputs moved across the boundary, which is how the table's
     lookup runs beside an fp8 GEMM that runs nowhere but the GPU.
     """
-    from model_partition.runtime.module_runner import load_named_weights
-
     weights = load_named_weights(bundle, module_id, device="cpu")
-    if not weights:
+    if not weights and owns_weights(bundle, module_id):
         raise RuntimeError(f"no weights available for {module_id!r}")
     return weights
 

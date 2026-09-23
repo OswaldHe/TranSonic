@@ -155,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
                     reference = module.reference(calls, parallel, args.device)
                     built = inference.build_module(
                         config, weights, device=args.device,
-                        submodule=calls[0]["submodule"] if parallel else None)
+                        submodule=calls[0]["submodule"] if parallel else None,
+                        module_id=module_id)
                     module.apply_state(inference.load_implementation(), calls, args.device)
                     with torch.no_grad():
                         output = built(*call_args, **call_kwargs)

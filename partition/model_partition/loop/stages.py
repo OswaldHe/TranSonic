@@ -622,8 +622,19 @@ def _param_names(ctx: LoopContext) -> dict[str, list[str]]:
 
 def hash_extract(ctx: LoopContext) -> list[Any]:
     # Not the implementation's content: an edit must re-run verification, not
-    # re-extract over the top of the edit.
-    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx)]
+    # re-extract over the top of the edit. The templates are an input, though: the
+    # harness's files are rendered from them afresh every extraction, and while it stays
+    # cached a fixed `verify.py` would never reach the artifact.
+    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx),
+            _templates_fingerprint()]
+
+
+def _templates_fingerprint() -> str:
+    """Content hash of the templates extraction renders module directories from."""
+    from model_partition.loop.state import content_hash
+
+    root = Path(__file__).resolve().parent.parent / "templates"
+    return content_hash([[p.name, p.read_text()] for p in sorted(root.glob("*.tmpl"))])
 
 
 def _impl_fingerprint(ctx: LoopContext) -> str:
@@ -631,11 +642,17 @@ def _impl_fingerprint(ctx: LoopContext) -> str:
 
     The agent edits these, so a change must re-run verification without
     re-extracting over the top of the edit.
+
+    ``source.py`` as well as ``inference.py``, and it matters more: the module's classes
+    live in ``source.py`` and ``inference.py`` is the template that builds them. Hashing
+    only the template let an edited class keep the pass recorded for the one before it.
     """
     from model_partition.loop.state import content_hash
 
-    paths = sorted(ctx.layout.modules_dir.glob("*/inference.py"))
-    return content_hash([p.read_text() for p in paths]) if paths else ""
+    root = ctx.layout.modules_dir
+    paths = sorted([*root.glob("*/source.py"), *root.glob("*/inference.py")])
+    return (content_hash([[p.relative_to(root).as_posix(), p.read_text()] for p in paths])
+            if paths else "")
 
 
 # -- stage: trace ------------------------------------------------------------

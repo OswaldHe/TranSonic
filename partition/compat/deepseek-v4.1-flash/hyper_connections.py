@@ -19,9 +19,10 @@ What this changes, and nothing else:
   two ends of the rank-4 stream and were likewise inside a method.
 
 Every formula below is copied verbatim from `Block.hc_mixes` / `hc_pre` / `hc_post` and
-`Transformer.forward`. `tests/test_partition_compat.py` asserts the outputs are identical
-to the unpatched methods on random inputs, because a "structural" patch that changed a
-number would silently move the reference every later stage is measured against.
+`Transformer.forward`. `tests/test_partition_compat.py` runs a stand-in carrying those
+methods' text before and after patching and asserts the logits are bit-identical, because
+a "structural" patch that changed a number would silently move the reference every later
+stage is measured against.
 """
 
 from __future__ import annotations
@@ -46,18 +47,27 @@ class HyperConnectSublayerIn(nn.Module):
     nothing. Returns `(x_in, post, comb, pre)` — `x_in` for this sublayer, `post` and
     `comb` for the `Out` half, and `pre` for the *next* sublayer, which is the vendor's
     "the coefficients a sublayer computes are used by the next one".
+
+    Built the way any module of the model is: from config fields, named as `ModelArgs`
+    names them, with the checkpoint's tensors loaded onto the parameters afterwards. A
+    constructor that took the parameters themselves could only ever be called from inside
+    `Block.__init__`, so nothing that rebuilds one module from its config and a state
+    dict — which is how every stage after the trace runs it — could construct it at all.
     """
 
-    def __init__(self, hc_mult: int, sinkhorn_iters: int, hc_eps: float, norm_eps: float,
-                 fn: nn.Parameter, base: nn.Parameter, scale: nn.Parameter) -> None:
+    def __init__(self, dim: int, hc_mult: int, hc_sinkhorn_iters: int, hc_eps: float,
+                 norm_eps: float) -> None:
         super().__init__()
         self.hc_mult = hc_mult
-        self.hc_sinkhorn_iters = sinkhorn_iters
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
         self.norm_eps = norm_eps
-        self.fn = fn
-        self.base = base
-        self.scale = scale
+        mix_hc = (2 + hc_mult) * hc_mult
+        # float32 inside a bfloat16 model, as `Block.__init__` builds them under
+        # `set_dtype(torch.float32)`.
+        self.fn = nn.Parameter(torch.empty(mix_hc, hc_mult * dim, dtype=torch.float32))
+        self.base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, pre_mix: torch.Tensor):
         # Block.hc_mixes, verbatim: normalized over the whole flattened hc*d stream, one
@@ -116,9 +126,14 @@ def _install_block(block) -> None:
         if fn is None or base is None or scale is None:
             # Already moved: the coefficients live on the submodule now.
             continue
-        block.add_module(f"hc_{which}_in", HyperConnectSublayerIn(
-            block.hc_mult, block.hc_sinkhorn_iters, block.hc_eps, block.norm_eps,
-            fn, base, scale))
+        # On meta, because its own freshly allocated coefficients are replaced at once by
+        # the block's: the very tensors the loader has already placed or will stream into.
+        with torch.device("meta"):
+            mix_in = HyperConnectSublayerIn(
+                fn.shape[1] // block.hc_mult, block.hc_mult, block.hc_sinkhorn_iters,
+                block.hc_eps, block.norm_eps)
+        mix_in.fn, mix_in.base, mix_in.scale = fn, base, scale
+        block.add_module(f"hc_{which}_in", mix_in)
         block.add_module(f"hc_{which}_out", HyperConnectSublayerOut())
 
 

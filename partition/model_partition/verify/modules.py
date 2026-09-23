@@ -23,6 +23,7 @@ from model_partition.runtime.module_runner import (
     apply_state,
     expected_output,
     load_named_weights,
+    owns_weights,
     replay_record,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
@@ -511,9 +512,10 @@ def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
             return built
         try:
             impl = load_impl(impl_dir)
-            if not weights:
+            if not weights and owns_weights(bundle, module_id):
                 raise RuntimeError(f"no weights available for {module_id!r}")
-            built = impl.build(bundle.config, weights, device, submodule=submodule)
+            built = impl.build(bundle.config, weights, device, submodule=submodule,
+                               module_id=module_id)
             if not callable(built):
                 raise RuntimeError(f"{impl.path}: build_module() returned a non-callable")
         except Exception as exc:

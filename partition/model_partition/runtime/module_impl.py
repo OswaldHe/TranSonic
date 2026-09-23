@@ -32,6 +32,10 @@ from typing import Any
 IMPL_FILENAME = "inference.py"
 BUILD_FUNCTION = "build_module"
 
+#: What ``build_module`` may declare beyond ``config`` and ``weights``. Each is passed
+#: only when the implementation declares it, so an older one keeps working unchanged.
+OPTIONAL_ARGUMENTS = ("device", "submodule", "module_id")
+
 
 class ImplError(RuntimeError):
     """Raised when an extracted implementation is missing or unusable."""
@@ -46,7 +50,7 @@ class ExtractedImpl:
     module_ids: list[str]
 
     def build(self, config: dict[str, Any], weights: dict[str, Any], device: str = "cpu",
-              submodule: str | None = None) -> Any:
+              submodule: str | None = None, module_id: str | None = None) -> Any:
         """Call the implementation's ``build_module``, passing what it accepts.
 
         The optional arguments are tried widest first so an implementation is free
@@ -62,17 +66,19 @@ class ExtractedImpl:
         try:
             parameters = inspect.signature(builder).parameters
             accepted = (
-                {"device", "submodule"}
+                set(OPTIONAL_ARGUMENTS)
                 if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
                 else set(parameters)
             )
         except (TypeError, ValueError):  # pragma: no cover - builtins only
-            accepted = {"device", "submodule"}
+            accepted = set(OPTIONAL_ARGUMENTS)
         kwargs: dict[str, Any] = {}
         if "device" in accepted:
             kwargs["device"] = device
         if "submodule" in accepted and submodule is not None:
             kwargs["submodule"] = submodule
+        if "module_id" in accepted and module_id is not None:
+            kwargs["module_id"] = module_id
         return builder(config, weights, **kwargs)
 
 
