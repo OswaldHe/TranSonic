@@ -298,6 +298,51 @@ def test_computing_a_tolerance_instead_of_declaring_it_fails(repo: Path) -> None
     assert not _pass_test_with_clean_run(repo).passed
 
 
+def test_the_ceiling_is_checked_against_the_run_not_just_pinned(repo: Path) -> None:
+    """A declared ceiling the candidate then ignores would be no ceiling at all.
+
+    This closes the gap a pass fraction leaves: at 0.999, 0.1% of elements may be wrong by
+    any amount, and cosine notices one wild value but not a few dozen merely-bad ones.
+    """
+    text = (repo / "inference.py").read_text().replace(
+        "MIN_PASS_FRACTION = 0.999", "MIN_PASS_FRACTION = 0.999\nMAX_ABS_ERR = 0.5")
+    (repo / "inference.py").write_text(text)
+    inference = chk._parse(repo / chk.INFERENCE_FILE)
+    bar = {**chk.PINNED_TOLERANCE, chk.CEILING_NAME: 0.5}
+
+    within = chk.RunOutcome(ran=True, return_code=0,
+                            output="##autohelix[max_abs_err=0.4]\n##autohelix[passed=1]")
+    assert chk.check_pass_test(inference, within, bar).passed
+
+    over = chk.RunOutcome(ran=True, return_code=0,
+                          output="##autohelix[max_abs_err=0.9]\n##autohelix[passed=1]")
+    result = chk.check_pass_test(inference, over, bar)
+    assert not result.passed
+    assert any("ceiling" in f for f in result.findings)
+
+    silent = chk.RunOutcome(ran=True, return_code=0, output="##autohelix[passed=1]")
+    result = chk.check_pass_test(inference, silent, bar)
+    assert not result.passed
+    assert any(chk.MAX_ABS_ERR_MARKER in f for f in result.findings)
+
+
+def test_the_ceiling_literal_is_pinned_like_the_others(repo: Path) -> None:
+    inference = chk._parse(repo / chk.INFERENCE_FILE)
+    bar = {**chk.PINNED_TOLERANCE, chk.CEILING_NAME: 0.5}
+    run = chk.RunOutcome(ran=True, return_code=0,
+                         output="##autohelix[max_abs_err=0.4]\n##autohelix[passed=1]")
+    # Absent from inference.py entirely.
+    result = chk.check_pass_test(inference, run, bar)
+    assert not result.passed
+    assert any(chk.CEILING_NAME in f and "does not declare" in f for f in result.findings)
+
+
+def test_a_manifest_without_a_ceiling_does_not_require_one(repo: Path) -> None:
+    """There is no default for a number derived from this module's own recorded output."""
+    assert chk.CEILING_NAME not in chk.expected_tolerance({})
+    assert chk.expected_tolerance({"tolerance": {chk.CEILING_NAME: 1.5}})[chk.CEILING_NAME] == 1.5
+
+
 def test_nonzero_exit_fails(repo: Path) -> None:
     inference = chk._parse(repo / chk.INFERENCE_FILE)
     run = chk.RunOutcome(ran=True, return_code=1, output="##autohelix[passed=1]")

@@ -53,6 +53,13 @@ PINNED_TOLERANCE: dict[str, float] = {
     "MIN_PASS_FRACTION": 0.999,
 }
 
+#: A fifth constant, and the only one with no sensible default: it is `atol + rtol *
+#: max|reference|` for *this* module's recorded output, so it exists only when the manifest
+#: records it. Unlike the other four it is also checked against what the run reports — a
+#: declared ceiling the candidate then ignores would be no ceiling at all.
+CEILING_NAME = "MAX_ABS_ERR"
+MAX_ABS_ERR_MARKER = "max_abs_err"
+
 #: Import roots source.py may have. NKI and the standard library, and that is all.
 SOURCE_ALLOWED_IMPORTS = frozenset({"nki", "neuronxcc"})
 
@@ -135,11 +142,16 @@ CHECK_TITLES: dict[str, str] = {
 
 
 def expected_tolerance(manifest: dict[str, Any]) -> dict[str, float]:
-    """The bar this repo is held to: the manifest's, or the bfloat16 default."""
+    """The bar this repo is held to: the manifest's, or the bfloat16 default.
+
+    `MAX_ABS_ERR` joins the four when the manifest carries it, and is absent otherwise —
+    there is no default for a number derived from this module's own recorded output.
+    """
     recorded = manifest.get("tolerance") or {}
-    return {
-        name: float(recorded.get(name, PINNED_TOLERANCE[name])) for name in TOLERANCE_NAMES
-    }
+    bar = {name: float(recorded.get(name, PINNED_TOLERANCE[name])) for name in TOLERANCE_NAMES}
+    if CEILING_NAME in recorded:
+        bar[CEILING_NAME] = float(recorded[CEILING_NAME])
+    return bar
 
 
 @dataclass
@@ -532,9 +544,25 @@ def check_pass_test(
                 f"the numerical tolerance may not be loosened"
             )
 
+    ceiling = (tolerance or {}).get(CEILING_NAME)
+
     if not run.ran:
         findings.append(f"{INFERENCE_FILE} could not be run: {run.detail}")
     else:
+        if ceiling is not None:
+            # The ceiling is checked against the run, not only pinned as a literal: a
+            # candidate that declares it and then compares without it has not been held to it.
+            worst = _marker_value(run.output, MAX_ABS_ERR_MARKER)
+            if worst is None:
+                findings.append(
+                    f"the run printed no ##autohelix[{MAX_ABS_ERR_MARKER}=...] line, so the "
+                    f"{CEILING_NAME} ceiling could not be checked"
+                )
+            elif worst > ceiling:
+                findings.append(
+                    f"worst element is off by {worst:.6g}, past the {CEILING_NAME} ceiling of "
+                    f"{ceiling:.6g} — no single element may exceed it, whatever the pass fraction"
+                )
         if run.return_code != 0:
             tail = "\n".join(run.output.strip().splitlines()[-20:])
             findings.append(f"{INFERENCE_FILE} exited {run.return_code}")

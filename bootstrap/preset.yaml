@@ -105,12 +105,16 @@ goal: |
       at least MIN_COSINE — reimplemented here rather than imported. Nothing about it may be
       weakened: not the tolerances, not how many elements are compared, not by comparing a
       reduction instead of the tensor, and not by swallowing a mismatch.
-    - Declares the numerical bar as four module-level number literals named `RTOL`, `ATOL`,
-      `MIN_COSINE` and `MIN_PASS_FRACTION`, with exactly the values `README.md` gives under
-      "The numerical bar". Those are the tolerances this module's reference was accepted at,
-      and they follow its dtype, so they are not the same for every module. Do not change
-      them in either direction, and do not compute them from an expression — a bare literal
-      each, so the bar is legible at a glance.
+    - Declares the numerical bar as five module-level number literals named `RTOL`, `ATOL`,
+      `MIN_COSINE`, `MIN_PASS_FRACTION` and `MAX_ABS_ERR`, with exactly the values `README.md`
+      gives under "The numerical bar". They are derived from this module's own recorded
+      output, so they are not the same for every module. Do not change any of them in either
+      direction, and do not compute them from an expression — a bare literal each, so the bar
+      is legible at a glance.
+    - `MAX_ABS_ERR` is a hard ceiling, not a fraction: **no single element** may differ from
+      the reference by more than it, whatever the pass fraction says. Enforce it — print the
+      worst element's absolute error as `##autohelix[max_abs_err=<number>]` and report
+      `passed=0` when it exceeds `MAX_ABS_ERR`.
     - Imports nothing beyond the standard library, torch, torch_neuronx, numpy, nki and
       `source`. Opens nothing outside this repository — no relative path escaping it, no
       reaching back to a checkpoint or an artifact tree.

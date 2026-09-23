@@ -96,12 +96,26 @@ def test_the_goal_names_every_tolerance_constant() -> None:
     assert "numerical bar" in goal
 
 
+def test_the_goal_names_the_ceiling_and_says_it_is_hard() -> None:
+    """The ceiling is the one constant that is not a fraction, so the goal must say so.
+
+    An agent that treats MAX_ABS_ERR as another pass-fraction knob will declare it and not
+    enforce it, and the gate would then fail it for a reason the goal never explained.
+    """
+    goal = preset.render_goal()
+    assert chk.CEILING_NAME in goal
+    assert chk.MAX_ABS_ERR_MARKER in goal
+    assert "no single element" in goal.lower()
+    assert "five" in goal.lower()
+
+
 def test_the_readme_carries_the_values_the_goal_defers_to() -> None:
     """Whatever the goal points at has to actually be there, with this repo's numbers."""
     from bootstrap import templates
     from bootstrap.materialize import Materialized, TensorRecord
 
-    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999}
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999,
+           "MAX_ABS_ERR": 0.853}
     result = Materialized(
         repo=Path("/repo"), group="g", module_id="m", sample_id="s", step=0, call_index=0,
         tensors=[

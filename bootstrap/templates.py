@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from bootstrap.nki_checker import PINNED_TOLERANCE
+from bootstrap.nki_checker import CEILING_NAME, PINNED_TOLERANCE
 
 if TYPE_CHECKING:
     from bootstrap.materialize import Materialized, TensorRecord
@@ -84,8 +84,9 @@ Four things this file must end up doing, none of which it does yet:
 2. trace and run `kernel` with `torch_neuronx.trace`, leaving a `.neff` and a `.ntff`
 3. run `neuron-explorer` on those, read `total_exec_time`, and print it as
    `##autohelix[latency_ms=...]`
-4. compare against the reference at the tolerance below and print
-   `##autohelix[passed=1]`, exiting 0 only when it matches
+4. compare against the reference at the tolerance below, print the worst element as
+   `##autohelix[max_abs_err=...]`, and print `##autohelix[passed=1]` exiting 0 only when
+   every element is within tolerance *and* none exceeds MAX_ABS_ERR
 
 The tolerances are the ones the reference was recorded at. They are the bar, not a
 suggestion, and raising any of them is not an available way to pass.
@@ -108,6 +109,9 @@ RTOL = {rtol:g}
 ATOL = {atol:g}
 MIN_COSINE = {min_cosine:g}
 MIN_PASS_FRACTION = {min_pass_fraction:g}
+#: A hard ceiling: no single element may be off by more than this, whatever the pass
+#: fraction says. Report the worst element as ##autohelix[max_abs_err=...] and fail on it.
+MAX_ABS_ERR = {max_abs_err:g}
 
 #: The profiler this reads its latency from, and the field it reads.
 NEURON_EXPLORER = "neuron-explorer"
@@ -146,8 +150,9 @@ def measure_latency(neff, ntff):
 def compare(actual, expected):
     """Whether `actual` matches the recorded reference at the pinned bar.
 
-    All four constants apply: elementwise closeness at RTOL/ATOL over at least
-    MIN_PASS_FRACTION of elements, and cosine similarity of at least MIN_COSINE.
+    All five constants apply: elementwise closeness at RTOL/ATOL over at least
+    MIN_PASS_FRACTION of elements, cosine similarity of at least MIN_COSINE, and no single
+    element off by more than MAX_ABS_ERR.
     """
     raise NotImplementedError("compare against the reference at RTOL/ATOL/MIN_COSINE")
 
@@ -221,11 +226,15 @@ produced and what your result is compared against. `weight` entries are paramete
 {notes_section}
 ## The numerical bar
 
-Declare these four in `inference.py` as module-level number literals, under exactly these
-names and with exactly these values. They are the tolerance this module's reference was
-accepted at — derived from its dtype, so they are these numbers for this module and not
-for every module. Do not change them in either direction, and do not compute them from an
-expression.
+Declare these five in `inference.py` as module-level number literals, under exactly these
+names and with exactly these values. They are derived from this module's own recorded output
+— from the coarsest number format anywhere in its chain, and from the largest reference
+value — so they are these numbers for this module and not for every module. Do not change
+any of them in either direction, and do not compute them from an expression.
+
+`MAX_ABS_ERR` is a hard ceiling: **no single element** may differ from the reference by more
+than it, whatever the pass fraction says. Print the worst element as
+`##autohelix[max_abs_err=...]` and fail when it exceeds the ceiling.
 
 ```python
 {tolerance_block}
@@ -277,7 +286,7 @@ def _bar(result: "Materialized", name: str) -> float:
     The stub, the README and the gate all read it from the same place, so they cannot
     disagree about the bar.
     """
-    return result.tolerance.get(name, PINNED_TOLERANCE[name])
+    return result.tolerance.get(name, PINNED_TOLERANCE.get(name, 0.0))
 
 
 def _kernel_params(result: "Materialized") -> list["TensorRecord"]:
@@ -328,6 +337,7 @@ def render_inference_stub(result: "Materialized") -> str:
         module_id=result.module_id,
         tensor_rows=rows,
         scalar_args=result.scalar_args,
+        max_abs_err=_bar(result, "MAX_ABS_ERR"),
         rtol=_bar(result, "RTOL"),
         atol=_bar(result, "ATOL"),
         min_cosine=_bar(result, "MIN_COSINE"),
@@ -362,7 +372,8 @@ def render_readme(result: "Materialized") -> str:
         )
 
     tolerance_block = "\n".join(
-        f"{name} = {_bar(result, name):g}" for name in PINNED_TOLERANCE
+        f"{name} = {_bar(result, name):g}"
+        for name in (*PINNED_TOLERANCE, CEILING_NAME) if name in result.tolerance
     )
     return README.format(
         tolerance_block=tolerance_block,

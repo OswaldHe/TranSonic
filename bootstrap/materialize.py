@@ -286,12 +286,13 @@ def materialize(
             directory=repo, name=name, role="input", tensor=tensor, required=True,
             source=origin,
         ))
+    reference_max = 0.0
     for name, tensor, origin in outputs:
         records.append(_write_tensor(
             directory=repo, name=name, role="golden", tensor=tensor, required=True,
             source=origin,
         ))
-    tolerance = _tolerance_for(artifact, [t for _, t, _ in outputs])
+        reference_max = max(reference_max, float(tensor.detach().float().abs().max()))
 
     # Every weight the module needs, dumped ones and checkpoint-backed ones alike. The
     # reader resolves both, so this is where the fetched shards are paid for.
@@ -312,6 +313,7 @@ def materialize(
             source="dumped" if name in dumped else _shard_of(calls, name),
         ))
     del weights
+    tolerance = _tolerance_for(artifact, records, reference_max)
 
     # Non-tensor arguments (a decode position, a flag) are values, not files. They belong
     # in the generated stub as literals and in the README as a table.
@@ -430,44 +432,73 @@ def _flatten_tensors(
     return found
 
 
-def _tolerance_for(artifact: Path, outputs: list[Any]) -> dict[str, float]:
-    """The bar this module's reference was accepted at, from the artifact's own table.
+def _numerics(artifact: Path) -> tuple[dict[str, tuple[float, float]], tuple[float, float], dict[str, float]]:
+    """The artifact's own tolerance table, default row and pass fractions.
 
-    Read out of the artifact's `numerics.py` rather than retyped, and keyed on the dtype of
-    what is actually being compared: an fp8 boundary is not held to a float32 bar, and a
-    float32 one is not let off with bfloat16's. Where a module returns several tensors the
-    loosest applicable row wins, since one bar has to cover all of them.
+    Loaded from the artifact rather than retyped, so the bar is the one the run used.
     """
     import importlib.util
 
-    path = artifact / "runtime" / "model_partition" / "verify" / "numerics.py"
     table: dict[str, tuple[float, float]] = {}
     default = (2e-2, 2e-2)
     fractions = {"MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999}
-    if path.is_file():
-        spec = importlib.util.spec_from_file_location("_bootstrap_numerics", path)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["_bootstrap_numerics"] = module
-            try:
-                spec.loader.exec_module(module)
-                table = dict(getattr(module, "TOLERANCES", {}))
-                default = getattr(module, "DEFAULT_TOLERANCE", default)
-                bar = getattr(module, "Tolerance", None)
-                if bar is not None:
-                    fractions = {
-                        "MIN_COSINE": float(bar.min_cosine),
-                        "MIN_PASS_FRACTION": float(bar.min_pass_fraction),
-                    }
-            finally:
-                sys.modules.pop("_bootstrap_numerics", None)
+    path = artifact / "runtime" / "model_partition" / "verify" / "numerics.py"
+    if not path.is_file():
+        return table, default, fractions
+    spec = importlib.util.spec_from_file_location("_bootstrap_numerics", path)
+    if spec is None or spec.loader is None:
+        return table, default, fractions
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_bootstrap_numerics"] = module
+    try:
+        spec.loader.exec_module(module)
+        table = dict(getattr(module, "TOLERANCES", {}))
+        default = getattr(module, "DEFAULT_TOLERANCE", default)
+        bar = getattr(module, "Tolerance", None)
+        if bar is not None:
+            fractions = {"MIN_COSINE": float(bar.min_cosine),
+                         "MIN_PASS_FRACTION": float(bar.min_pass_fraction)}
+    finally:
+        sys.modules.pop("_bootstrap_numerics", None)
+    return table, default, fractions
 
-    rtol, atol = 0.0, 0.0
-    for tensor in outputs:
-        dtype = str(tensor.dtype).removeprefix("torch.")
-        candidate = table.get(dtype, default)
-        rtol, atol = max(rtol, candidate[0]), max(atol, candidate[1])
-    return {"RTOL": rtol or default[0], "ATOL": atol or default[1], **fractions}
+
+def _tolerance_for(
+    artifact: Path, records: list[TensorRecord], reference_max: float,
+) -> dict[str, float]:
+    """The bar this module is held to: five numbers, all derived.
+
+    **rtol/atol come from the coarsest number format anywhere in the module, not from the
+    output's dtype.** That distinction is the whole point. `layers.0.attention` returns
+    bfloat16, whose row is 2e-2 — but its weights are fp8 and its `kv` is fp8-quantized
+    mid-chain, so one adjacent-grid step is a ~9% relative change, four times that bar. An
+    implementation that is correct but not bit-identical through an fp8 rounding therefore
+    fails elementwise at every value sitting near a grid midpoint, however small the
+    underlying error. Keying on the output dtype asks for bit-exactness with a CUDA fp8
+    tensor-core MMA, which no other hardware can give; keying on the narrowest format in the
+    chain asks for the precision the computation actually carries.
+
+    Non-float dtypes are skipped. An fp4 expert weight is stored packed in `uint8`, which the
+    table has no row for and which says nothing about precision — so a module whose real
+    floor is fp4 currently gets fp8's bar. That is a known open question, not an oversight:
+    the loosening is measured on fp8 and unmeasured on fp4.
+
+    **MAX_ABS_ERR is a ceiling no element may cross**, set at the most generous allowance the
+    elementwise test gives anywhere in the tensor — `atol + rtol * max|reference|`. It closes
+    the gap a pass-fraction leaves open: at 0.999, 0.1% of elements may be wrong by *any*
+    amount, and cosine notices one wild value but not a few dozen merely-bad ones. A small
+    element normally gets a small allowance; this stops it borrowing a large one.
+    """
+    table, default, fractions = _numerics(artifact)
+
+    present = {r.dtype for r in records}
+    rows = {dt: table[dt] for dt in present if dt in table}
+    # Coarsest row wins: the largest rtol among the formats actually in the chain.
+    rtol, atol = max(rows.values(), key=lambda pair: pair[0]) if rows else default
+
+    bar = {"RTOL": rtol, "ATOL": atol, **fractions}
+    bar["MAX_ABS_ERR"] = atol + rtol * reference_max
+    return bar
 
 
 def _model_name(artifact: Path) -> str:
