@@ -295,12 +295,27 @@ def _capture_and_check(
     device: str,
     tolerance: Tolerance,
 ) -> list[Comparison]:
-    """Run one forward with every module hooked, compare, and let the tensors go."""
+    """Run one forward with every module hooked, comparing each output as it appears.
+
+    Each boundary is compared inside its hook and only the comparison is kept, so the
+    forward holds one module's output at a time rather than every module's at once.
+    """
     import torch
 
     from model_partition.trace import forward_no_cache
 
-    handles, sink = capture_boundaries(model, graph)
+    def check(module_id: str, output: Any) -> Comparison | None:
+        try:
+            return _compare_boundary(module_id, output, bundle, graph, sample_id, device,
+                                     tolerance)
+        except Exception as exc:
+            # The reference could not be read or compared. That is this boundary's
+            # failure, not the forward's: raising here would abort it and report every
+            # other boundary as unchecked.
+            return Comparison(name=f"boundary:{module_id}", passed=False, cosine=0.0,
+                              reason=f"could not compare: {type(exc).__name__}: {exc}")
+
+    handles, compared = capture_boundaries(model, graph, on_output=check)
     try:
         with torch.no_grad():
             forward_no_cache(model, input_ids)
@@ -313,11 +328,8 @@ def _capture_and_check(
     finally:
         for handle in handles:
             handle.remove()
-    try:
-        return _check_boundaries(sink, bundle, graph, sample_id, device, tolerance)
-    finally:
-        sink.clear()
         _release(device)
+    return _check_boundaries(compared, bundle, graph, sample_id)
 
 
 def _release(device: str) -> None:
@@ -331,18 +343,12 @@ def _release(device: str) -> None:
 
 
 def _check_boundaries(
-    sink: dict[str, Any],
+    compared: dict[str, Comparison | None],
     bundle: TraceBundle,
     graph: PartitionGraph,
     sample_id: str,
-    device: str,
-    tolerance: Tolerance | None,
 ) -> list[Comparison]:
-    """Compare captured module outputs against the traced ones.
-
-    Only the first forward is compared: later generation steps run on a longer
-    sequence than the trace recorded. The hook fires on the module's *last*
-    submodule, so the matching record is that submodule's, not the group's first.
+    """Every boundary's comparison, and a failure for each one that never ran.
 
     A module the forward never called contributes no comparison, so the modules the
     recording says should have been reached are checked against the ones that were —
@@ -350,31 +356,48 @@ def _check_boundaries(
     boundary that held.
     """
     comparisons: list[Comparison] = []
-    for module_id in _unobserved(bundle, graph, sample_id, set(sink)):
+    for module_id in _unobserved(bundle, graph, sample_id, set(compared)):
         comparisons.append(Comparison(
             name=f"boundary:{module_id}", passed=False, cosine=0.0,
             reason="the prefill trace recorded this module and the emulated forward "
                    "never called it, so its implementation was not exercised",
         ))
-    for module_id, observed in sink.items():
-        records = bundle.select(module_id=module_id, sample_id=sample_id, step=0)
-        if not records:
-            continue
-        try:
-            last_submodule = graph.by_id(module_id).submodules[-1]
-        except (KeyError, IndexError):
-            last_submodule = records[-1].submodule
-        matching = [r for r in records if r.submodule == last_submodule] or records[-1:]
-        record = matching[-1]
-        reference = first_tensor(expected_output(record, bundle.store, device=device))
-        actual = first_tensor(observed)
-        if reference is None or actual is None:
-            continue
-        if tuple(actual.shape) != tuple(reference.shape):
-            # A sliced long-context dump covers only head+tail positions.
-            actual = _match_slice(actual, record, bundle)
-        comparisons.append(compare(actual, reference, f"boundary:{module_id}", tolerance))
+    comparisons.extend(c for c in compared.values() if c is not None)
     return comparisons
+
+
+def _compare_boundary(
+    module_id: str,
+    observed: Any,
+    bundle: TraceBundle,
+    graph: PartitionGraph,
+    sample_id: str,
+    device: str,
+    tolerance: Tolerance | None,
+) -> Comparison | None:
+    """Compare one module's output against the traced one; None if nothing to compare.
+
+    Only the first forward is compared: later generation steps run on a longer
+    sequence than the trace recorded. The hook fires on the module's *last*
+    submodule, so the matching record is that submodule's, not the group's first.
+    """
+    records = bundle.select(module_id=module_id, sample_id=sample_id, step=0)
+    if not records:
+        return None
+    try:
+        last_submodule = graph.by_id(module_id).submodules[-1]
+    except (KeyError, IndexError):
+        last_submodule = records[-1].submodule
+    matching = [r for r in records if r.submodule == last_submodule] or records[-1:]
+    record = matching[-1]
+    reference = first_tensor(expected_output(record, bundle.store, device=device))
+    actual = first_tensor(observed)
+    if reference is None or actual is None:
+        return None
+    if tuple(actual.shape) != tuple(reference.shape):
+        # A sliced long-context dump covers only head+tail positions.
+        actual = _match_slice(actual, record, bundle)
+    return compare(actual, reference, f"boundary:{module_id}", tolerance)
 
 
 def _unobserved(bundle: TraceBundle, graph: PartitionGraph, sample_id: str,

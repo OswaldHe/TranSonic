@@ -22,7 +22,7 @@ context the logits alone are gigabytes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from model_partition.planner.graph import PartitionGraph
 from model_partition.runtime.module_runner import TraceBundle, load_named_weights, owns_weights
@@ -159,11 +159,19 @@ def _first_param_device(model: Any) -> str:
         return "cpu"
 
 
-def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[str, Any]]:
+def capture_boundaries(model: Any, graph: PartitionGraph,
+                       on_output: Callable[[str, Any], Any] | None = None,
+                       ) -> tuple[list, dict[str, Any]]:
     """Hook every partitioned module to record its output on the *first* forward.
 
     Generation re-runs the forward on a growing sequence, so only the first pass
     is comparable with a trace taken at the prompt's length.
+
+    ``on_output(module_id, output)``, when given, is recorded in the output's place. A
+    boundary check needs a comparison from each output, not the output, and keeping the
+    outputs until the forward ends keeps one per module: at 8192 tokens DeepSeek V4.1's
+    rank-4 residual stream is 320 MiB a boundary, 247 boundaries are more than the card,
+    and the check ran out of memory on a forward that generated fine.
     """
     sink: dict[str, Any] = {}
     handles = []
@@ -175,7 +183,9 @@ def capture_boundaries(model: Any, graph: PartitionGraph) -> tuple[list, dict[st
     def make_hook(module_ids: list[str]):
         def hook(_module, _args, output):
             for module_id in module_ids:
-                sink.setdefault(module_id, output)
+                if module_id not in sink:
+                    sink[module_id] = (output if on_output is None
+                                       else on_output(module_id, output))
         return hook
 
     for submodule_name, module_ids in owners.items():
