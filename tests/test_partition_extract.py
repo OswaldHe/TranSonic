@@ -210,12 +210,17 @@ def test_extraction_copies_the_runtime_into_the_run(tiny_run, tmp_path):
     assert (vendored / "runtime" / "launcher.py").is_file()
     assert (vendored / "verify" / "numerics.py").is_file()
     # And nothing that drags the rest of the harness in behind it: every module it
-    # imports has to be one of the copies beside it.
+    # imports has to be one of the copies beside it — either a vendored file, or a
+    # vendored package, which is what `from model_partition.runtime import ...` resolves to.
     for path in vendored.rglob("*.py"):
         for line in path.read_text().splitlines():
             if line.startswith(("import model_partition", "from model_partition")):
                 dotted = line.split()[1].removeprefix("model_partition.")
-                assert (vendored / (dotted.replace(".", "/") + ".py")).is_file(), line
+                if dotted == "model_partition":
+                    continue
+                target = vendored / dotted.replace(".", "/")
+                assert target.with_suffix(".py").is_file() \
+                    or (target / "__init__.py").is_file(), line
 
 
 def test_calls_json_names_every_tensor_a_module_needs(tiny_run, tmp_path):

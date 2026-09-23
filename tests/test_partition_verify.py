@@ -3,6 +3,8 @@
 
 """Tests for numeric comparison and module verification."""
 
+from pathlib import Path
+
 import pytest
 
 from model_partition.verify.modules import (
@@ -18,6 +20,9 @@ from model_partition.verify.numerics import (
 )
 
 torch = pytest.importorskip("torch")
+
+#: Where the partition package lives, for tests that start a fresh interpreter.
+PARTITION_ROOT = Path(__import__("model_partition").__file__).resolve().parents[1]
 
 
 # -- tolerances --------------------------------------------------------------
@@ -1280,3 +1285,33 @@ def test_an_input_its_producer_never_ran_is_reported_as_a_broken_edge(tmp_path):
                   unchained_reason="h.1 is produced by layers.0.combine, which the chain "
                                    "does not run")])
     assert not spoken.unbroken and not spoken.credited_tokens
+
+
+def test_a_source_is_registered_under_the_same_private_name_in_every_process():
+    """`hash()` of a string is salted per process, so a name built from it changed every
+    run. Nothing reads the recorded value for a flat name like these, so the churn was
+    invisible — except that it rewrote all 32 `meta.yaml` files of an artifact each run and
+    added a version of every one to the published history."""
+    import subprocess
+    import sys
+
+    from model_partition.runtime import private_module_name
+
+    # Unique per path, which is the property the launcher needs: re-importing an edited
+    # file must replace its predecessor in `sys.modules` rather than sit beside it.
+    assert private_module_name("_p_", "/a/b.py") != private_module_name("_p_", "/a/c.py")
+    assert private_module_name("_p_", "/a/b.py").startswith("_p_")
+
+    # And identical across processes, which `hash()` was not. Two interpreters with
+    # different hash seeds is the only way to show it.
+    program = ("from model_partition.runtime import private_module_name as n;"
+               "print(n('_model_partition_source_', '/some/source.py'))")
+    seen = set()
+    for seed in ("0", "12345"):
+        out = subprocess.run([sys.executable, "-c", program], capture_output=True,
+                             text=True, env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin",
+                                             "PYTHONPATH": str(PARTITION_ROOT)})
+        assert out.returncode == 0, out.stderr
+        seen.add(out.stdout.strip())
+    assert len(seen) == 1, f"the name moved with the hash seed: {seen}"
+    assert seen == {private_module_name("_model_partition_source_", "/some/source.py")}

@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from model_partition.runtime import private_module_name
+
 IMPL_FILENAME = "inference.py"
 BUILD_FUNCTION = "build_module"
 
@@ -87,7 +89,7 @@ def load_impl(directory: str | Path) -> ExtractedImpl:
     path = Path(directory) / IMPL_FILENAME
     if not path.is_file():
         raise ImplError(f"No {IMPL_FILENAME} in {directory}")
-    name = f"_model_partition_impl_{abs(hash(str(path.resolve())))}"
+    name = private_module_name("_model_partition_impl_", path.resolve())
     sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:

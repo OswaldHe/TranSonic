@@ -15,9 +15,10 @@ its own imports resolve against the installed ``torch`` and ``transformers``. Th
 class bodies that run are the artifact's.
 
 This module imports nothing else from the harness beyond its two small neighbours
-(:mod:`~model_partition.runtime.compat` and :mod:`~model_partition.hardware`), which is
-what lets :func:`~model_partition.extract.vendor_runtime` copy it into a run so a
-module's ``inference.py`` builds from the artifact alone. Keep it that way: the names
+(:mod:`~model_partition.runtime.compat` and :mod:`~model_partition.hardware`) and the
+naming helper in its own package's ``__init__``, which is what lets
+:func:`~model_partition.extract.vendor_runtime` copy it into a run so a module's
+``inference.py`` builds from the artifact alone. Keep it that way: the names
 below live here rather than in :mod:`~model_partition.extract` because that module
 renders templates and a published artifact must not need a template engine to run.
 """
@@ -27,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from model_partition.runtime import private_module_name
 
 SOURCE_FILENAME = "source.py"
 
@@ -134,7 +137,7 @@ def load_source(directory: str | Path, source_module: str | None = None,
     # relative imports without taking the real module's place.
     # Named from the path alone, so re-importing an edited file takes the place of the
     # revision it replaces in ``sys.modules`` instead of accumulating beside it.
-    leaf = f"{SOURCE_MODULE_PREFIX}{abs(hash(key[0]))}"
+    leaf = private_module_name(SOURCE_MODULE_PREFIX, key[0])
     package = source_module.rsplit(".", 1)[0] if source_module and "." in source_module else ""
     name = f"{package}.{leaf}" if package else leaf
     spec = importlib.util.spec_from_file_location(name, path)
