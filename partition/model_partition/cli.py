@@ -343,10 +343,13 @@ def report(run_dir: str, as_json: bool) -> None:
 @click.option("--allow-unverified", is_flag=True,
               help="Upload even though a stage of the run failed. The README records "
                    "which stages passed, so the artifacts say so themselves")
+@click.option("--workers", type=int, default=None,
+              help="Concurrent uploaders. Fewer means fewer API requests per minute, "
+                   "which is what a free account's rate limit counts")
 def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
            exclude: tuple[str, ...], dry_run: bool, modules: tuple[str, ...],
            one_per_kind: bool, upload_all: bool, skip_check: bool,
-           allow_unverified: bool) -> None:
+           allow_unverified: bool, workers: int | None) -> None:
     """Upload a run's artifacts, or a selection of its modules, to a dataset repo.
 
     A selection carries its own weights, so each module directory can be verified where
@@ -363,7 +366,7 @@ def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
                              max_bytes=int(max_gib * GIB), exclude=exclude,
                              dry_run=dry_run, module_ids=selected or None,
                              upload_all=upload_all, skip_check=skip_check,
-                             allow_unverified=allow_unverified,
+                             allow_unverified=allow_unverified, workers=workers,
                              report=click.echo)
     except PublishError as exc:
         raise click.ClickException(str(exc)) from exc

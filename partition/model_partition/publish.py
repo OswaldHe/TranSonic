@@ -44,6 +44,15 @@ REQUIRED = ("run.yaml", "plan/partition_graph.yaml", "modules/index.yaml")
 #: can run.
 ALWAYS = ("vendor", "compat", "runtime", "plan", "reports")
 
+#: Concurrent uploaders. The Hub's own default scales with the core count, and each
+#: worker asks the API about the files it is sending: on 16 cores that burst straight
+#: through a free account's 1000 requests per 5 minutes, and the upload aborted a third
+#: of the way through a 16 000-file artifact set. A published run is thousands of small
+#: feature maps rather than a few big shards, so the request count is the limit that
+#: binds, not the bandwidth. Two workers stay under it; raise it with ``--workers`` on an
+#: account whose limit is higher.
+UPLOAD_WORKERS = 2
+
 #: A token file an operator may leave beside the checkout, searched when the Hub's own
 #: sources (``HF_TOKEN``, a login) have nothing. Read, never written and never logged;
 #: it is in ``.gitignore`` so it cannot be committed by accident.
@@ -422,6 +431,7 @@ def publish_run(
     module_ids: list[str] | None = None,
     upload_all: bool = False,
     skip_check: bool = False,
+    workers: int | None = None,
     report: Callable[[str], None] = lambda _message: None,
 ) -> PublishResult:
     """Upload a run directory, or a selection of its modules, as a dataset repo."""
@@ -498,6 +508,7 @@ def publish_run(
         api.upload_large_folder(
             repo_id=repo_id, repo_type="dataset", folder_path=str(root),
             ignore_patterns=list(exclude) + ["**/__pycache__/**"],
+            num_workers=workers or UPLOAD_WORKERS,
             **({"allow_patterns": sorted({p.relative_to(root).as_posix() for p in files})}
                if module_ids else {}),
         )

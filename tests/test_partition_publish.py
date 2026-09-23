@@ -366,3 +366,28 @@ def test_the_self_containment_check_brings_the_fetched_checkpoint_along(tmp_path
     assert publish.check_self_contained(root, files, ["layers.0"]) == []
     assert "hf/model-00001-of-00002.safetensors" in linked
     assert "modules/00-attn/source.py" in linked
+
+
+def test_the_upload_limits_its_own_concurrency(tmp_path, monkeypatch):
+    """A published run is thousands of small feature maps, so the Hub's request-per-minute
+    limit binds long before bandwidth does. The client's default worker count scales with
+    the core count, and on 16 cores it burst through a free account's 1000 requests per 5
+    minutes and aborted a third of the way through 16 000 files."""
+    from model_partition import publish
+
+    root = _run(tmp_path)
+    seen = {}
+
+    class FakeApi:
+        def create_repo(self, repo_id, **kwargs):
+            pass
+
+        def upload_large_folder(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(publish, "_api", lambda: (FakeApi(), "token"))
+    publish_run(root, "org/artifacts")
+    assert seen["num_workers"] == publish.UPLOAD_WORKERS <= 4
+
+    publish_run(root, "org/artifacts", workers=8)
+    assert seen["num_workers"] == 8
