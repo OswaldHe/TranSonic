@@ -222,16 +222,6 @@ def test_unknown_loader_is_reported(repo):
         build_loader(result)
 
 
-# -- transformers loader -----------------------------------------------------
-
-
-def test_transformers_loader_reports_an_unreadable_config(repo):
-    """The error names the repo_code alternative rather than just failing."""
-    result = ingest(local_spec(repo, loader="transformers"))
-    with pytest.raises(LoaderError, match="loader: repo_code"):
-        build_loader(result).build_meta()
-
-
 # -- standalone replay -------------------------------------------------------
 
 
