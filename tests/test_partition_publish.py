@@ -4,6 +4,7 @@
 """Tests for publishing a run's artifacts."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -136,6 +137,11 @@ def test_the_upload_carries_a_readme_describing_the_artifacts(tmp_path, monkeypa
     assert "logs/**" in seen["upload"]["ignore_patterns"]
     assert "modules/<group>/" in seen["readme"]
     assert "396 checks passed" in seen["readme"]
+    # And how to get the weights. Most of a module's parameters stay in the checkpoint —
+    # this set is published without a second copy of it — so a reader who is not told
+    # about `fetch_weights.py` has module directories that cannot reproduce their own
+    # reference and no stated reason why.
+    assert "fetch_weights.py" in seen["readme"]
     assert result.url.endswith("org/artifacts")
     # Written for the upload and not left behind in the run.
     assert not (root / "README.md").exists()
@@ -331,3 +337,32 @@ def test_the_cli_default_exclusion_matches_the_library_one():
     option = next(p for p in upload.params
                   if isinstance(p, click.Option) and p.name == "exclude")
     assert tuple(option.default) == tuple(DEFAULT_EXCLUDE)
+
+
+def test_the_self_containment_check_brings_the_fetched_checkpoint_along(tmp_path, monkeypatch):
+    """`hf/` is not uploaded — republishing the model is what an artifact set avoids — but a
+    reader runs `fetch_weights.py` and has it. Checking without it asked whether the modules
+    work having skipped a documented step, so a `cache_weights: false` run failed here for
+    every group and the only way to publish was `--skip-check`."""
+    from model_partition import publish
+
+    root = _run(tmp_path)
+    (root / "hf").mkdir()
+    (root / "hf" / "model-00001-of-00002.safetensors").write_bytes(b"\x00" * 64)
+
+    files, _total = collect(root)
+    assert not any(p.name.endswith(".safetensors") for p in files), "hf/ is uploaded"
+
+    linked: list[str] = []
+
+    def fake_groups(run_dir, selected):
+        # Record what the check copied, then claim there is nothing to run.
+        for path in sorted(Path(run_dir).rglob("*")):
+            if path.is_file():
+                linked.append(path.relative_to(run_dir).as_posix())
+        return {}
+
+    monkeypatch.setattr(publish, "_published_groups", fake_groups)
+    assert publish.check_self_contained(root, files, ["layers.0"]) == []
+    assert "hf/model-00001-of-00002.safetensors" in linked
+    assert "modules/00-attn/source.py" in linked

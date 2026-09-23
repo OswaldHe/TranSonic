@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from model_partition.extract import refresh_calls
 from model_partition.hardware import format_bytes
+from model_partition.runtime.artifact import CHECKPOINT_DIR
 
 #: Left out by default. Agent transcripts are large and say nothing about the artifacts.
 #: ``hf/`` is what ``fetch_weights.py`` downloads on the *reader's* machine —
@@ -189,6 +190,13 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     somebody who downloads the artifact runs, and it is launched with this package taken
     off ``sys.path`` — so it passes only if the copies under ``runtime/`` and ``vendor/``
     inside the artifact are enough on their own.
+
+    The fetched checkpoint comes too, when the run has one. It is deliberately *not*
+    uploaded — republishing a copy of the model is the one thing an artifact set exists to
+    avoid — but a reader runs ``fetch_weights.py`` and has it, so a check without it asks
+    whether the modules work having skipped a documented step. Without this, a run that
+    traced with weight caching off failed here for every group and the only way to publish
+    was to turn the check off.
     """
     import shutil
     import subprocess
@@ -200,7 +208,9 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     # check is about which paths are reachable, not about having a second hundred
     # gigabytes of the same bytes.
     elsewhere = Path(tempfile.mkdtemp(prefix="published-", dir=root.parent))
-    for path in files:
+    checkpoint = root / CHECKPOINT_DIR
+    fetched = sorted(checkpoint.glob("*")) if checkpoint.is_dir() else []
+    for path in list(files) + fetched:
         target = elsewhere / path.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -592,6 +602,25 @@ artifacts alone and compared against the recorded reference.
 - `reports/` — per-module verification, chained drift, emulated generation, tokens.
 - `compat/` — patches that made the model's own code run on the GPU used here, if any
   were needed. The reference was produced with them applied.
+- `runtime/` — the harness a module directory builds itself with, so running one needs
+  `torch` and nothing installed from the tool that produced this.
+- `fetch_weights.py` — present when the run read weights from the checkpoint rather than
+  copying them in here. See below.
+
+## Weights
+
+A module's recorded inputs and outputs are all in `trace/`. Its *parameters* may not be:
+this set is published without a second copy of the checkpoint, so each module records the
+shard and key each weight lives in instead. `fetch_weights.py` downloads only those shards,
+pinned to the revision above, into `hf/`, which is where the modules look:
+
+```bash
+python fetch_weights.py --list                 # what it would fetch, and how big
+python fetch_weights.py --group <group>        # just one group's shards
+```
+
+A module short of a weight says so and names the script, rather than reporting numbers it
+computed from values it does not have.
 
 ## Checking a module
 
