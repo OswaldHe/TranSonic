@@ -313,7 +313,7 @@ def materialize(
             source="dumped" if name in dumped else _shard_of(calls, name),
         ))
     del weights
-    tolerance = _tolerance_for(artifact, records, reference_max)
+    tolerance = _tolerance_for(artifact.joinpath(*NUMERICS_SOURCE), records, reference_max)
 
     # Non-tensor arguments (a decode position, a flag) are values, not files. They belong
     # in the generated stub as literals and in the README as a table.
@@ -432,39 +432,52 @@ def _flatten_tensors(
     return found
 
 
-def _numerics(artifact: Path) -> tuple[dict[str, tuple[float, float]], tuple[float, float], dict[str, float]]:
-    """The artifact's own tolerance table, default row and pass fractions.
+def _numerics(path: Path) -> tuple[dict[str, tuple[float, float]], tuple[float, float], dict[str, float]]:
+    """The tolerance table, default row and pass fractions out of a `numerics.py`.
 
-    Loaded from the artifact rather than retyped, so the bar is the one the run used.
+    Parsed, not imported. Two reasons: it works on the copy inside a materialized repo, which
+    carries a frozen-reference banner the artifact's own copy does not; and it means neither
+    `init` nor `retune` executes code out of the artifact to learn a handful of constants.
     """
-    import importlib.util
+    import ast
 
     table: dict[str, tuple[float, float]] = {}
     default = (2e-2, 2e-2)
     fractions = {"MIN_COSINE": 0.9999, "MIN_PASS_FRACTION": 0.999}
-    path = artifact / "runtime" / "model_partition" / "verify" / "numerics.py"
     if not path.is_file():
         return table, default, fractions
-    spec = importlib.util.spec_from_file_location("_bootstrap_numerics", path)
-    if spec is None or spec.loader is None:
-        return table, default, fractions
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["_bootstrap_numerics"] = module
     try:
-        spec.loader.exec_module(module)
-        table = dict(getattr(module, "TOLERANCES", {}))
-        default = getattr(module, "DEFAULT_TOLERANCE", default)
-        bar = getattr(module, "Tolerance", None)
-        if bar is not None:
-            fractions = {"MIN_COSINE": float(bar.min_cosine),
-                         "MIN_PASS_FRACTION": float(bar.min_pass_fraction)}
-    finally:
-        sys.modules.pop("_bootstrap_numerics", None)
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        return table, default, fractions
+
+    def literal(node: ast.AST) -> Any:
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, SyntaxError):
+            return None
+
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [x.id for x in targets if isinstance(x, ast.Name)]
+            value = literal(node.value) if node.value is not None else None
+            if "TOLERANCES" in names and isinstance(value, dict):
+                table = {k: tuple(v) for k, v in value.items() if isinstance(v, (list, tuple))}
+            elif "DEFAULT_TOLERANCE" in names and isinstance(value, (list, tuple)):
+                default = tuple(value)
+        elif isinstance(node, ast.ClassDef) and node.name == "Tolerance":
+            for item in node.body:
+                if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                    continue
+                value = literal(item.value) if item.value is not None else None
+                if isinstance(value, (int, float)):
+                    fractions[item.target.id.upper()] = float(value)
     return table, default, fractions
 
 
 def _tolerance_for(
-    artifact: Path, records: list[TensorRecord], reference_max: float,
+    numerics: Path, records: list[TensorRecord], reference_max: float,
 ) -> dict[str, float]:
     """The bar this module is held to: five numbers, all derived.
 
@@ -489,7 +502,7 @@ def _tolerance_for(
     amount, and cosine notices one wild value but not a few dozen merely-bad ones. A small
     element normally gets a small allowance; this stops it borrowing a large one.
     """
-    table, default, fractions = _numerics(artifact)
+    table, default, fractions = _numerics(numerics)
 
     present = {r.dtype for r in records}
     rows = {dt: table[dt] for dt in present if dt in table}
@@ -605,11 +618,14 @@ def _frozen_header(why: str, origin: str) -> str:
     Each one says what it is *for*, because a file the agent may read but not import, call
     or edit is an unusual thing to be handed and the reason has to travel with it.
     """
+    # Comment lines, not a docstring: a docstring here would displace the body's own
+    # `from __future__ import annotations`, which must be the first statement in the file,
+    # and the reference would stop being importable at all.
+    body = "\n".join(f"# {line}" if line else "#" for line in why.splitlines())
     return (
-        f'"""FROZEN REFERENCE — {why}\n\n'
-        f"Frozen: any edit to this file is reverted before your work is judged. Copied\n"
-        f"verbatim from the artifact's {origin}.\n"
-        '"""\n\n'
+        f"# FROZEN REFERENCE\n{body}\n#\n"
+        f"# Frozen: any edit to this file is reverted before your work is judged. Copied\n"
+        f"# verbatim from the artifact's {origin}.\n\n"
     )
 
 
@@ -683,6 +699,88 @@ def write_manifest(result: Materialized) -> Path:
         "tensors": [t.to_dict() for t in result.tensors],
     })
     return manifest_path
+
+
+#: The README section `retune` rewrites, and the fence its numbers live in.
+BAR_HEADING = "## The numerical bar"
+
+
+def derive_bar(repo: Path) -> tuple[dict[str, float], dict[str, float]]:
+    """This repo's recorded bar and the bar its own data now implies. Writes nothing.
+
+    Exists because the bar is not final: it was loosened once already, after two iterations
+    of `layers.0.attention` established that the old one could not be met by a correct
+    implementation. A repo mid-run then has the old numbers in its manifest and its README,
+    and re-initializing to pick up the new ones would throw away the git history that is the
+    whole point of a ratcheting loop.
+
+    Works from the repo alone — the tolerance table comes from the vendored
+    `reference_numerics.py`, the dtypes from the manifest, and `max|reference|` from the
+    recorded tensor — so it needs neither the artifact nor the checkpoint.
+
+    Rewrites only frozen files: the manifest and the README's bar section. `inference.py` is
+    the agent's, and updating its literals is the agent's work; the gate names the mismatch.
+    """
+    import torch
+
+    manifest = load_manifest(repo)
+    before = dict(manifest.get("tolerance") or {})
+
+    records = [
+        TensorRecord(
+            name=t["name"], role=t["role"], file=t["file"], dtype=t["dtype"],
+            shape=t["shape"], nbytes=t["nbytes"], sha256=t["sha256"],
+            required=t.get("required", False),
+        )
+        for t in manifest.get("tensors") or []
+    ]
+    golden = [r for r in records if r.role == "golden"]
+    if not golden:
+        raise MaterializeError(f"{repo} records no reference tensor to derive a ceiling from")
+
+    reference_max = 0.0
+    for record in golden:
+        path = repo / record.file
+        raw = torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8)
+        dtype = getattr(torch, record.dtype)
+        tensor = raw.view(dtype).reshape(record.shape) if dtype is not torch.uint8 else raw
+        reference_max = max(reference_max, float(tensor.detach().float().abs().max()))
+
+    # The repo carries its own vendored copy of numerics.py, so retuning needs no artifact.
+    after = _tolerance_for(repo / NUMERICS_TARGET, records, reference_max)
+    return before, after
+
+
+def retune(repo: Path) -> tuple[dict[str, float], dict[str, float]]:
+    """Write the derived bar into the manifest and the README. Returns (before, after)."""
+    before, after = derive_bar(repo)
+    manifest = load_manifest(repo)
+    manifest["tolerance"] = after
+    dump_manifest(repo / MANIFEST_REL, manifest)
+    _rewrite_bar_section(repo / "README.md", after)
+    return before, after
+
+
+def _rewrite_bar_section(readme: Path, bar: dict[str, float]) -> None:
+    """Replace the numbers in the README's bar section, leaving the prose alone.
+
+    The goal sends the agent to this section for the values, so a manifest the README
+    disagrees with would have the agent typing one bar while the gate checks another.
+    """
+    if not readme.is_file():
+        return
+    text = readme.read_text()
+    start = text.find(BAR_HEADING)
+    if start < 0:
+        return
+    open_fence = text.find("```python", start)
+    if open_fence < 0:
+        return
+    close_fence = text.find("```", open_fence + 9)
+    if close_fence < 0:
+        return
+    block = "\n".join(f"{name} = {value:g}" for name, value in bar.items())
+    readme.write_text(text[:open_fence] + f"```python\n{block}\n" + text[close_fence:])
 
 
 def clear(repo: Path) -> None:

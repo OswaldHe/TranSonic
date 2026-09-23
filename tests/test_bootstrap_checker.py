@@ -261,13 +261,17 @@ def test_loosening_any_tolerance_fails(repo: Path, name: str) -> None:
     (repo / "inference.py").write_text(text.replace(original, loosened))
     result = _pass_test_with_clean_run(repo)
     assert not result.passed
-    assert any(name in f and "may not be loosened" in f for f in result.findings)
+    assert any(name in f and "in either direction" in f for f in result.findings)
 
 
 @pytest.mark.parametrize("name", sorted(chk.PINNED_TOLERANCE))
 def test_tightening_a_tolerance_also_fails(repo: Path, name: str) -> None:
-    """The bar is pinned, not bounded: it is the tolerance the reference was recorded at,
-    and a repo that quietly moved it is not reporting against that reference."""
+    """The bar is pinned, not bounded, and the message has to say so in both directions.
+
+    It matters more than it looks: `bootstrap retune` can loosen the bar between runs, and a
+    candidate still carrying the old stricter value is then told its number is wrong. A
+    message reading "may not be loosened" would make that finding unactionable.
+    """
     original = f"{name} = {chk.PINNED_TOLERANCE[name]:g}"
     text = (repo / "inference.py").read_text()
     (repo / "inference.py").write_text(

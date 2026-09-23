@@ -152,6 +152,39 @@ def check(path: Path, timeout: int) -> None:
 @bootstrap.command()
 @click.option("--path", "-p", type=click.Path(exists=True, path_type=Path), default=".",
               show_default=True, help="The module repo")
+@click.option("--dry-run", is_flag=True, help="Report what would change and write nothing")
+def retune(path: Path, dry_run: bool) -> None:
+    """Re-derive the numerical bar for an existing repo, keeping its history.
+
+    Use this after the bar's derivation changes. It rewrites the manifest and the README's
+    bar section only — `inference.py` is the agent's, and the gate will name the mismatch for
+    it to fix on the next iteration. Run `bootstrap init --force` instead if you want a clean
+    repo, but note that discards the git history the loop has accumulated.
+    """
+    repo = path.resolve()
+    try:
+        before, after = mat.derive_bar(repo) if dry_run else mat.retune(repo)
+    except mat.MaterializeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    names = sorted(set(before) | set(after))
+    changed = [n for n in names if before.get(n) != after.get(n)]
+    if not changed:
+        click.echo("the bar is already current; nothing changed")
+        return
+    click.echo(f"{repo}\n")
+    for name in names:
+        old, new = before.get(name), after.get(name)
+        mark = "  " if old == new else "->"
+        click.echo(f"  {mark} {name:18} {('-' if old is None else f'{old:g}'):>10}"
+                   f"   {('-' if new is None else f'{new:g}'):>10}")
+    click.echo(f"\n{len(changed)} value(s) changed. inference.py still declares the old ones;"
+               f"\nthe gate will name them and the next iteration fixes them.")
+
+
+@bootstrap.command()
+@click.option("--path", "-p", type=click.Path(exists=True, path_type=Path), default=".",
+              show_default=True, help="The module repo")
 def report(path: Path) -> None:
     """Print the gate's verdict for each iteration so far."""
     repo = path.resolve()

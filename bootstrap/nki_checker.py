@@ -539,9 +539,12 @@ def check_pass_test(
             continue
         value, line = constants[name]
         if float(value) != expected:
+            # Direction-neutral on purpose. "may not be loosened" was the original wording and
+            # it misreads badly when the bar has been *retuned* between runs: the candidate is
+            # then told its stricter value is wrong for a reason that says do not loosen.
             findings.append(
                 f"{INFERENCE_FILE}:{line}: {name} is {value:g}, but the bar is {expected:g} — "
-                f"the numerical tolerance may not be loosened"
+                f"it must be exactly the value README.md gives, in either direction"
             )
 
     ceiling = (tolerance or {}).get(CEILING_NAME)
