@@ -92,7 +92,9 @@ class ModuleNode:
     kv_bytes: int = 0
     #: Dedup key: modules sharing a signature get one extracted implementation.
     code_signature: str | None = None
-    #: False for nodes discovered but out of scope (vision, MTP, engram).
+    #: False for a node that is in the graph but is not a deliverable: one discovered and
+    #: out of scope (vision, MTP, engram), or one that is real dataflow with no
+    #: ``nn.Module`` behind it to hook, extract or install.
     partitioned: bool = True
     expert_range: list[int] = field(default_factory=list)
     #: One of :data:`COMPOSITIONS`.
@@ -337,7 +339,17 @@ class PartitionGraph:
                     covered[index].append(module.id)
             missing = sorted(set(range(self.num_layers)) - set(covered))
             if missing:
-                warnings.append(f"Layers not covered by any partitioned module: {missing}")
+                # Structural, not advisory. A layer in no module is a layer the run never
+                # traces, verifies or ships — and on the streamed path it quietly keeps
+                # running the vendor's implementation while installation completeness is
+                # measured against this graph alone, so the run can pass without the
+                # deliverable for that layer existing. An agent-edited plan that drops a
+                # layer has to fail here rather than several stages later.
+                raise GraphError(
+                    f"Layers in no partitioned module: {missing}. Every in-scope decoder "
+                    f"layer needs one, or its implementation is never produced and never "
+                    f"checked."
+                )
             doubled = {i: ids for i, ids in covered.items() if len(ids) > 1}
             if doubled:
                 # Legitimate when a layer is split (attention | router | experts).

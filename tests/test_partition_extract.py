@@ -149,7 +149,7 @@ def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
     completed = _script(tiny_run, tmp_path, "inference.py")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "output shape=" in completed.stdout
-    assert "dumped tensor(s)" in completed.stdout
+    assert "tensor(s) loaded" in completed.stdout
 
 
 def test_inference_reports_error_and_latency_as_autohelix_metrics(tiny_run, tmp_path):
@@ -288,8 +288,17 @@ def test_group_directory_names_are_readable_and_unique(tiny_moe_run, tmp_path):
                      run_root=tiny_moe_run.layout.root)
     names = [g.directory.name for g in groups]
     assert len(set(names)) == len(names)
-    assert any("decoder_layers" in name for name in names)
-    assert all(name[:2].isdigit() for name in names)
+    # Named for the class the model calls it, not for a kind and a signature hash.
+    assert any("TinyDecoderLayer" in name for name in names)
+    assert not any("other" in name for name in names)
+    for group in groups:
+        name = group.directory.name
+        if group.layer_indices:
+            # A layer number first, zero-padded so the directory listing reads in order.
+            assert name[:2].isdigit(), name
+            assert name == f"{min(group.layer_indices):02d}-{name.split('-', 1)[1]}", name
+        else:
+            assert not name[:1].isdigit(), name
 
 
 def test_missing_submodule_is_recorded_not_fatal(tiny_run, tmp_path):
@@ -368,7 +377,14 @@ def test_source_holds_this_module_and_not_the_rest_of_the_model(tiny_run, tmp_pa
     assert "class RMSNorm" in source
     for absent in ("class TinyAttention", "class TinyMoE", "class TinyCausalLM"):
         assert absent not in source, f"{absent} is not part of this module"
-    origin = Path(next(iter(norm.source_files)))
+    # Provenance is recorded relative to the checkpoint the code came out of, because the
+    # artifact is published and an absolute path names the producer's disk. The file
+    # itself travels into the run's `vendor/`, which is where to read it back from.
+    from model_partition.extract import VENDOR_DIR
+
+    recorded = Path(next(iter(norm.source_files)))
+    assert not recorded.is_absolute()
+    origin = Path(tiny_run.layout.root) / VENDOR_DIR / recorded.name
     assert len(source) < len(origin.read_text())
 
 
@@ -666,3 +682,81 @@ def test_a_copied_run_checks_itself_where_it_landed(tiny_run, tmp_path):
         completed = subprocess.run(command, cwd=copied, capture_output=True,
                                    text=True, timeout=300)
         assert completed.returncode == 0, name + ": " + completed.stdout + completed.stderr
+
+
+# -- what a module directory is called ---------------------------------------
+
+
+class _Node:
+    def __init__(self, module_id: str, kind: str = "other",
+                 layer_indices: list[int] | None = None) -> None:
+        self.id = module_id
+        self.kind = kind
+        self.layer_indices = layer_indices or []
+
+
+def test_a_directory_is_named_for_its_layer_and_its_class():
+    """`00-Attention`, not `10-attention-91e2bc99` and certainly not `04-other-...`.
+
+    A group index and a signature hash tell a reader nothing, and `other` tells them less
+    than nothing. The class name is the model's own word for what the module is.
+    """
+    from model_partition.extract import _group_dirname
+
+    assert _group_dirname(_Node("layers.0.attention", "decoder_layers", [0]),
+                          "sig-91e2bc99171d:attention", class_name="Attention") == "00-Attention"
+    assert _group_dirname(_Node("mtp.2.markov_head", "other", [42]), "sig-abc",
+                          class_name="DSparkMarkovHead") == "42-DSparkMarkovHead"
+    # No layer to name: a global module is simply its class.
+    assert _group_dirname(_Node("embed", "embed"), "embed",
+                          class_name="ParallelEmbedding") == "ParallelEmbedding"
+
+
+def test_a_group_with_no_instantiated_class_falls_back_to_its_own_name():
+    """`(not instantiated)` is not a directory name, and neither is a bare kind."""
+    from model_partition.extract import _group_dirname
+
+    assert _group_dirname(_Node("layers.3.ffn", "mlp", [3]), "sig-x",
+                          class_name="(not instantiated)") == "03-ffn"
+    assert _group_dirname(_Node("layers.3.ffn", "mlp", [3]), "sig-x") == "03-ffn"
+
+
+def test_two_groups_that_would_share_a_name_stay_apart():
+    """Several expert groups of one layer would otherwise replace each other."""
+    from model_partition.extract import _group_dirname
+
+    taken: set[str] = set()
+    first = _group_dirname(_Node("layers.1.experts", "moe_experts", [1]), "sig-aaaaaaaa11",
+                           taken, "MoE")
+    taken.add(first)
+    second = _group_dirname(_Node("layers.1.experts", "moe_experts", [1]), "sig-bbbbbbbb22",
+                            taken, "MoE")
+    assert first == "01-MoE"
+    assert second != first and second.startswith("01-MoE-")
+
+
+def test_a_renamed_group_directory_is_still_found(tiny_run, tmp_path):
+    """A stale `directory` in the index must not read as "every module is unusable".
+
+    The index names the directory; `meta.yaml` travels *with* it. When the two disagree,
+    the one that moved with the files wins.
+    """
+    import yaml as _yaml
+
+    from model_partition.runtime.module_impl import find_impl_dirs
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    root = tiny_run.layout.modules_dir
+    before = find_impl_dirs(root)
+    assert before and all((p / "inference.py").is_file() for p in before.values())
+
+    moved = groups[0].directory
+    moved.rename(moved.parent / "renamed-out-of-band")
+    after = find_impl_dirs(root)
+    assert set(after) == set(before)
+    assert all((p / "inference.py").is_file() for p in after.values()), \
+        "a renamed directory left its modules pointing at nothing"
+    served = _yaml.safe_load((moved.parent / "renamed-out-of-band" / "meta.yaml").read_text())
+    for module_id in served["module_ids"]:
+        assert after[module_id].name == "renamed-out-of-band"

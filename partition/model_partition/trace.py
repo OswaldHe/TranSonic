@@ -467,12 +467,24 @@ class Tracer:
                    produced: list[CallRecord], only: set[str] | None = None):
         """Install per-submodule hooks for the duration of one pass."""
         counter = {"n": 0}
+        #: How many times each submodule has been called in this pass, so a second call
+        #: gets its own tensor paths. Sharing one prefix would have
+        #: :meth:`TensorStore.write` overwrite the first call's blobs while both records
+        #: kept the identical tensor names, and replay would then read the last
+        #: invocation's arguments and output for every one of them. The first call keeps
+        #: the unsuffixed path, which is what almost every submodule has.
+        calls: dict[str, int] = {}
 
         def make_hook(submodule_name: str, module_ids: list[str]):
             def hook(_module, args, kwargs, output):
                 self._capture_derived(submodule_name, _module)
+                nth = calls.get(submodule_name, 0)
+                calls[submodule_name] = nth + 1
+                # Outside the module_id loop: two modules sharing a submodule share one
+                # invocation, and dumping it once for both is the point.
+                repeat = f"/c{nth}" if nth else ""
                 for module_id in module_ids:
-                    prefix = f"{sample_id}/s{step}/{_safe_name(submodule_name)}"
+                    prefix = f"{sample_id}/s{step}/{_safe_name(submodule_name)}{repeat}"
                     self._sliced = False
                     record = CallRecord(
                         module_id=module_id, submodule=submodule_name,

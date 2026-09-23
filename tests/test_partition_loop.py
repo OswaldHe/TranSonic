@@ -6,6 +6,7 @@
 import json
 
 import pytest
+import yaml
 
 from model_partition.layout import RunLayout
 from model_partition.loop.state import (
@@ -654,7 +655,14 @@ def test_a_wrong_module_implementation_fails_the_run(tiny_run, tmp_path):
     # Replace an implementation with one that returns the wrong thing.
     impls = sorted(first.context.layout.modules_dir.glob("*/inference.py"))
     assert impls
-    target = next(p for p in impls if "decoder" in p.parent.name)
+    # By what the group *serves*, not by what its directory is called: the name is the
+    # layer and the class (`00-TinyDecoderLayer`), which is a reader's spelling and not
+    # a selector's.
+    decoders = {m.id for m in first.context.graph.partitioned_modules
+                if m.kind == "decoder_layers"}
+    target = next(p for p in impls
+                  if decoders & set(yaml.safe_load(
+                      (p.parent / "meta.yaml").read_text())["module_ids"]))
     target.write_text(
         "MODULE_IDS = " + repr([m.id for m in first.context.graph.partitioned_modules
                                if m.kind == "decoder_layers"]) + "\n"
@@ -769,8 +777,8 @@ def test_a_second_run_retraces_into_a_clean_directory(tiny_run, tmp_path):
     orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(b"\x00" * 1024)
 
-    # decode_steps is part of the trace hash, so changing it re-runs that stage.
-    assert loop_for(tiny_run, tmp_path, retain=False, decode_steps=8).run().passed
+    # slice_long is part of the trace hash, so changing it re-runs that stage.
+    assert loop_for(tiny_run, tmp_path, retain=False, slice_long=True).run().passed
     assert not orphan.exists()
 
 

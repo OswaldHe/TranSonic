@@ -233,3 +233,101 @@ def test_publishing_a_subset_writes_its_weights_into_the_run(tiny_run, tmp_path)
     names = {(e.extra or {}).get("param") for e in again.store.entries
              if e.module_id == module_id}
     assert set(bundle.weight_params[module_id]) <= names
+
+
+def test_a_run_that_did_not_pass_is_refused_before_its_weights_are_read(
+        tmp_path, monkeypatch):
+    """Both refusals come before anything is written.
+
+    Materializing a selection reads tens or hundreds of gigabytes out of the checkpoint,
+    so reaching "this run did not pass" afterwards costs hours and a disk for nothing.
+    """
+    from model_partition import publish
+
+    root = _run(tmp_path, passed=False)
+    called: list[object] = []
+    monkeypatch.setattr(publish, "materialize_weights",
+                        lambda *a, **k: called.append(a) or 0)
+    with pytest.raises(PublishError, match="did not pass"):
+        publish_run(root, "org/artifacts", module_ids=["layers.0"], skip_check=True)
+    assert not called
+
+
+def test_a_selection_over_the_ceiling_is_refused_before_its_weights_are_read(
+        tmp_path, monkeypatch):
+    """What is on disk already is a floor for what will be there once the weights are in."""
+    from model_partition import publish
+
+    root = _run(tmp_path, blob_bytes=4096)
+    called: list[object] = []
+    monkeypatch.setattr(publish, "materialize_weights",
+                        lambda *a, **k: called.append(a) or 0)
+    with pytest.raises(PublishError, match="exceeds the"):
+        # `upload_all` sends the whole run while the selection says which modules also
+        # carry their weights, so the ceiling applies to everything on disk.
+        publish_run(root, "org/artifacts", max_bytes=1024, upload_all=True,
+                    module_ids=["layers.0"], skip_check=True)
+    assert not called
+
+
+def test_materialization_reads_the_revision_the_trace_was_taken_from(tmp_path, monkeypatch):
+    """A spec may name a moving branch, or name nothing at all.
+
+    Re-ingesting it would read weights from wherever that points now, and those do not
+    belong beside these activations — so the resolved revision in `run.yaml` wins.
+    """
+    from model_partition import ingest as ingest_module
+    from model_partition.publish import _weight_source
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.yaml").write_text(
+        "spec:\n  source: hf:org/model\n  loader: transformers\n  revision: main\n"
+        "revision: dba1be0a40aa45a94ad051997016db3960a90277\n"
+    )
+    seen: list[str] = []
+
+    def fake_ingest(spec, *a, **k):
+        seen.append(spec.revision or "")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(ingest_module, "ingest", fake_ingest)
+    with pytest.raises(PublishError, match="cannot be reached"):
+        _weight_source(root)
+    assert seen == ["dba1be0a40aa45a94ad051997016db3960a90277"]
+
+
+def test_a_fetched_checkpoint_is_never_republished(tmp_path):
+    """`hf/` is what `fetch_weights.py` downloads on the reader's machine.
+
+    Uploading it back would publish a copy of the model, which is the one thing an
+    artifact set exists to avoid.
+    """
+    from model_partition.publish import DEFAULT_EXCLUDE
+
+    root = _run(tmp_path)
+    (root / "hf").mkdir()
+    (root / "hf" / "model-00001-of-00002.safetensors").write_bytes(b"\x00" * 2048)
+
+    # And the Hub client's own resume bookkeeping, which it writes into the folder it is
+    # uploading: thousands of files, none of them content.
+    (root / ".cache" / "huggingface").mkdir(parents=True)
+    (root / ".cache" / "huggingface" / "upload.json").write_text("{}")
+
+    files, _total = collect(root)
+    names = {p.relative_to(root).as_posix() for p in files}
+    assert not any(name.startswith("hf/") for name in names)
+    assert not any(name.startswith(".cache/") for name in names)
+    assert "hf/**" in DEFAULT_EXCLUDE and ".cache/**" in DEFAULT_EXCLUDE
+
+
+def test_the_cli_default_exclusion_matches_the_library_one():
+    """The CLI spells the default out so it need not import `publish` eagerly."""
+    import click
+
+    from model_partition.cli import upload
+    from model_partition.publish import DEFAULT_EXCLUDE
+
+    option = next(p for p in upload.params
+                  if isinstance(p, click.Option) and p.name == "exclude")
+    assert tuple(option.default) == tuple(DEFAULT_EXCLUDE)

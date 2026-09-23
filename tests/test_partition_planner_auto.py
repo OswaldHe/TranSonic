@@ -375,7 +375,17 @@ def test_an_over_budget_moe_ffn_splits_into_router_experts_and_combine(tmp_path)
     assert all(len(m.submodules) == 2 and m.is_parallel for m in experts)
     router = graph.by_id("layers.1.router")
     assert any("gate" in s for s in router.submodules)
-    assert graph.by_id("layers.1.combine").functional
+
+    # The combine step is declared, so the dataflow is complete — something consumes the
+    # expert groups' partials — but it is not a deliverable. There is no `nn.Module`
+    # behind it to hook, extract or install, and emitting it as a *partitioned* module
+    # counted it in the plan, had `install_implementations` skip it, and then failed
+    # emulation mechanically with no boundary any agent could repair.
+    combine = graph.by_id("layers.1.combine")
+    assert not combine.partitioned
+    assert combine not in graph.partitioned_modules
+    assert all(partial in combine.inputs
+               for partial in (m.outputs[0] for m in experts))
 
 
 def test_a_dense_layer_keeps_one_ffn_module(tmp_path):

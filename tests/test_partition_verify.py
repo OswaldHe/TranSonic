@@ -1028,3 +1028,66 @@ def test_tokens_are_only_credited_when_the_chain_is_unbroken(tiny_run, tmp_path)
     assert suite.kept_tokens() == 0
     assert suite.mean_top1() == 0.0
     assert report.passed  # held, because nothing carried drifted
+
+
+# -- one submodule, several invocations --------------------------------------
+
+
+class _Rec:
+    """Just enough of a CallRecord for the run-splitting logic."""
+
+    def __init__(self, submodule: str) -> None:
+        self.submodule = submodule
+
+
+class _Node:
+    def __init__(self, is_parallel: bool = False) -> None:
+        self.is_parallel = is_parallel
+
+
+def test_a_submodule_called_twice_is_two_checks_not_one_long_chain():
+    """DeepSeek's draft head calls `markov_head` once per drafted position.
+
+    Those calls are not a chain — the module is pure, and each one runs on the token the
+    previous call sampled. Pairing the first call's input with the last call's output
+    checks neither, and it only looked like a pass because the dumps used to share tensor
+    paths, so every record read the last invocation's numbers.
+    """
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("mtp.2.markov_head") for _ in range(5)]
+    runs = _record_runs(_Node(), records, with_impl=True)
+    assert len(runs) == 5
+    assert all(len(run) == 1 for run in runs)
+    assert [run[0] for run in runs] == records
+
+
+def test_a_heterogeneous_group_is_still_one_computation():
+    """A norm feeding attention is input-from-the-first, reference-from-the-last."""
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("layers.0.attn_norm"), _Rec("layers.0.attn")]
+    runs = _record_runs(_Node(), records, with_impl=True)
+    assert runs == [records]
+
+
+def test_a_group_invoked_twice_splits_into_two_computations():
+    """Both things at once: distinct submodules chained, and the chain run again."""
+    from model_partition.verify.modules import _record_runs
+
+    norm_a, attn_a = _Rec("layers.0.attn_norm"), _Rec("layers.0.attn")
+    norm_b, attn_b = _Rec("layers.0.attn_norm"), _Rec("layers.0.attn")
+    runs = _record_runs(_Node(), [norm_a, attn_a, norm_b, attn_b], with_impl=True)
+    assert runs == [[norm_a, attn_a], [norm_b, attn_b]]
+
+
+def test_a_parallel_group_checks_every_call_against_its_own_output():
+    """Each expert sees its own routed tokens, so there is no chain to collapse."""
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("experts.0"), _Rec("experts.1")]
+    assert _record_runs(_Node(is_parallel=True), records, with_impl=True) == [
+        [records[0]], [records[1]],
+    ]
+    # And without an implementation each submodule is replayed against its own record.
+    assert _record_runs(_Node(), records, with_impl=False) == [[records[0]], [records[1]]]
