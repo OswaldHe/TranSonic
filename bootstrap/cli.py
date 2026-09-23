@@ -19,6 +19,7 @@ from pathlib import Path
 import click
 
 from bootstrap import materialize as mat
+from bootstrap import memory as mem
 from bootstrap.preset import PRESET_PATH
 
 #: The test target: layer 0's attention is the one pure sliding-window attention in its
@@ -158,6 +159,41 @@ def check(path: Path, timeout: int) -> None:
         cwd=repo,
     )
     raise SystemExit(completed.returncode)
+
+
+@bootstrap.command()
+@click.option("--path", "-p", type=click.Path(exists=True, path_type=Path), default=".",
+              show_default=True, help="A module repo; the memory beside it is the one meant")
+@click.option("--clear", "do_clear", is_flag=True,
+              help="Delete every entry. Off by default: memory accumulates across modules")
+def memory(path: Path, do_clear: bool) -> None:
+    """List what earlier modules left behind, or clear it.
+
+    Entries accumulate as modules are bootstrapped, and each iteration reads a seeded copy.
+    Clearing is for when the accumulated kernels stop being relevant — a different model, or
+    a partition whose archetypes do not resemble the recorded ones.
+    """
+    store = mem.location(Path(path).resolve())
+    found = mem.entries(store)
+    if do_clear:
+        if not found:
+            click.echo(f"{store} holds nothing to clear")
+            return
+        removed = mem.clear(store)
+        click.echo(f"cleared {removed} entr{'y' if removed == 1 else 'ies'} from {store}")
+        return
+
+    click.echo(f"{store}\n")
+    if not found:
+        click.echo("  empty — the first module bootstrapped here will start it")
+        return
+    for entry in found:
+        state = "passed" if entry.passed else "failed"
+        click.echo(f"  {entry.name}")
+        click.echo(f"    {entry.module_id}  sample {entry.sample_id}  "
+                   f"{state} after {entry.iterations} iteration(s)")
+    click.echo(f"\n{len(found)} entr{'y' if len(found) == 1 else 'ies'}. "
+               f"Clear with `autohelix bootstrap memory --clear`.")
 
 
 def _commit_bar(repo: Path, changed: list[str]) -> bool:

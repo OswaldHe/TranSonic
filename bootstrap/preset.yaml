@@ -127,6 +127,28 @@ goal: |
   the gate passes, so build on what is already in the repository instead of restarting, and
   write down in your notes what you learned about the kernel and the device.
 
+  **Modules bootstrapped before this one are at `.autohelix/memory/`, when there are any.**
+  Read `.autohelix/memory/INDEX.md` first — it is one table — and then open the entry closest
+  to this module. Each holds that module's finished `source.py`, its `inference.py`, and the
+  notes every iteration wrote about the device and the compiler. Start here, because a
+  partition instantiates a handful of archetypes many times: the module you are given is
+  often another one at a different shape, and its validator is very nearly yours.
+
+  What it is good for, in order: the validator, which is the same load-trace-profile-compare
+  shape every time and is where iterations are otherwise wasted; the NKI idioms that compiled,
+  and the ones the notes record as rejected; and the shape of a kernel for the same archetype.
+
+  How to be wrong with it: it is evidence from a *different* module, not a specification.
+  Shapes, dtypes, expert counts and the numerical bar all differ between modules, and a kernel
+  pasted across without re-deriving those is wrong in ways that look right. Your own
+  `reference_torch.py` and `README.md` remain the only authority on what to compute and what
+  to match. Check what you take against them, and say in your notes which entry you drew on
+  so the next module knows whether it helped.
+
+  The memory is read-only and outside your editable scope. Nothing you write there is kept —
+  record what you learned in your notes instead, which is what becomes the next module's
+  memory when this run ends.
+
 # The gate: six checks, all of which must pass. Runs with the iteration worktree as its
 # working directory, so `--repo .` is the candidate.
 #

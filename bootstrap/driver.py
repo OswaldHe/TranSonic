@@ -35,7 +35,7 @@ from autohelix.dashboard import generate_dashboard
 from autohelix.harness import AutoHelixRunError, Harness, _IterationSpinner
 from autohelix.history import IterationResult
 from autohelix.sandbox import Worktree
-
+from bootstrap import memory as mem
 from bootstrap.materialize import CHECKS_REL, MANIFEST_REL
 from bootstrap.preset import PRESET_PATH, load_prompt_template
 
@@ -296,6 +296,13 @@ class BootstrapLoop(Harness):
         worktree = self.sandbox.create_worktree(iteration)
         self.sandbox.prepare_worktree(worktree)
         (worktree.working_dir / ".autohelix" / "notes").mkdir(parents=True, exist_ok=True)
+        # What earlier modules left behind. Seeded per iteration so a module bootstrapped
+        # while this one was running is visible on the next pass.
+        seeded = mem.seed(self.project_path, worktree.working_dir)
+        if seeded:
+            self.console.print(
+                f"  [dim]memory: {seeded} earlier module(s) available at {mem.SEEDED_REL}[/dim]"
+            )
 
         agent_usage: dict = {}
         try:
@@ -628,5 +635,19 @@ class BootstrapLoop(Harness):
                 "\n[yellow]Not bootstrapped yet.[/yellow] The gate is still failing; "
                 "run again to continue from where this left off."
             )
+
+        # Record what this module reached for the next one to read. After the loop, never
+        # inside an iteration: an iteration must not be able to plant its own precedent. A
+        # failing kernel is recorded too — its notes are where the dead ends are written down,
+        # and the index says it failed so the reader can weigh it.
+        last = self.history.get_last_iteration()
+        verdict = self._verdicts.get(last)
+        entry = mem.record(
+            self.project_path, passed=passed, iterations=max(last, 0),
+            summary=verdict.summary() if verdict else ("bootstrapped" if passed else "no verdict"),
+        )
+        if entry:
+            self.console.print(f"  [dim]memory: recorded {entry.name}[/dim]")
+
         self._print_summary()
         return passed
