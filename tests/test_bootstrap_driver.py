@@ -375,3 +375,116 @@ def test_the_agent_prompt_never_renders_the_constraint() -> None:
     template = preset.load_prompt_template()
     assert "constraints" not in template
     assert "nki_checker" not in template
+
+
+def _git(repo: Path, *args: str) -> None:
+    import subprocess
+    subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True)
+
+
+def _repo_with_one_commit(tmp_path: Path) -> Path:
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "source.py").write_text("gated\n")
+    (repo / "reference_torch.py").write_text("frozen\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "gated state")
+    return repo
+
+
+class _FakeWorktree:
+    def __init__(self, path: Path) -> None:
+        self.working_dir = path
+
+
+def test_a_commit_the_reviewer_makes_is_visible_to_the_head_probe(tmp_path: Path) -> None:
+    """`merge_worktree` merges the worktree's HEAD, so a moved HEAD has to be detectable."""
+    from bootstrap.driver import BootstrapLoop
+
+    repo = _repo_with_one_commit(tmp_path)
+    worktree = _FakeWorktree(repo)
+    before = BootstrapLoop._worktree_head(worktree)
+    assert before
+
+    (repo / "reference_torch.py").write_text("reviewer rewrote the spec\n")
+    _git(repo, "commit", "-aqm", "reviewer commit")
+    assert BootstrapLoop._worktree_head(worktree) != before
+
+
+def test_resetting_the_reviewers_commit_exposes_it_to_scope_enforcement(tmp_path: Path) -> None:
+    """Committing is what hides a change from `revert_out_of_scope`, which diffs against HEAD.
+
+    So the reset has to come first: after it the edit is an uncommitted change again, which is
+    the only form scope enforcement can see and revert.
+    """
+    import subprocess
+
+    from bootstrap.driver import BootstrapLoop
+
+    repo = _repo_with_one_commit(tmp_path)
+    worktree = _FakeWorktree(repo)
+    before = BootstrapLoop._worktree_head(worktree)
+
+    (repo / "reference_torch.py").write_text("reviewer rewrote the spec\n")
+    _git(repo, "commit", "-aqm", "reviewer commit")
+
+    def dirty() -> set[str]:
+        out = subprocess.run(("git", "diff", "--name-only", "HEAD"), cwd=repo,
+                             capture_output=True, text=True, check=True).stdout
+        return set(out.split())
+
+    assert dirty() == set(), "a committed change is invisible to a diff against HEAD"
+
+    BootstrapLoop._git(worktree, "reset", "--soft", before)
+    assert BootstrapLoop._worktree_head(worktree) == before
+    assert dirty() == {"reference_torch.py"}
+    assert (repo / "reference_torch.py").read_text() == "reviewer rewrote the spec\n", (
+        "--soft keeps the file so scope enforcement, not the reset, decides its fate"
+    )
+
+
+def _manifest(tensors: list[dict]) -> dict:
+    return {"tensors": tensors}
+
+
+def test_a_validator_that_reads_no_parameter_fails_provenance(tmp_path: Path) -> None:
+    """(f) claims the kernel runs on the recorded parameters, so reading none must fail."""
+    import ast as _ast
+
+    manifest = _manifest([
+        {"name": "input", "role": "input", "file": "tensors/input.bin", "required": True},
+        {"name": "reference", "role": "golden", "file": "tensors/reference.bin", "required": True},
+        {"name": "w", "role": "weight", "file": "tensors/w.bin"},
+    ])
+    src = (
+        'x = open("tensors/input.bin", "rb").read()\n'
+        'r = open("tensors/reference.bin", "rb").read()\n'
+    )
+    result = chk.check_provenance(_ast.parse(src), tmp_path, manifest)
+    assert not result.passed
+    assert any("reads none of the 1 recorded weight/buffer" in p for p in result.findings), (
+        result.findings
+    )
+
+
+def test_reading_one_parameter_is_enough_for_provenance(tmp_path: Path) -> None:
+    """A recorded parameter the reference itself never read (`gate.bias_vl`, a prefill
+    `window_kv_cache`) must not be forced on a correct kernel, so the bar is aggregate."""
+    import ast as _ast
+
+    manifest = _manifest([
+        {"name": "input", "role": "input", "file": "tensors/input.bin", "required": True},
+        {"name": "reference", "role": "golden", "file": "tensors/reference.bin", "required": True},
+        {"name": "w", "role": "weight", "file": "tensors/w.bin"},
+        {"name": "bias_vl", "role": "weight", "file": "tensors/bias_vl.bin"},
+    ])
+    src = (
+        'x = open("tensors/input.bin", "rb").read()\n'
+        'r = open("tensors/reference.bin", "rb").read()\n'
+        'w = open("tensors/w.bin", "rb").read()\n'
+    )
+    result = chk.check_provenance(_ast.parse(src), tmp_path, manifest)
+    assert not any("reads none of" in p for p in result.findings), result.findings

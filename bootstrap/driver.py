@@ -147,6 +147,17 @@ class BootstrapLoop(Harness):
         return {p: p.read_text() for p in paths if p.is_file()}
 
     @staticmethod
+    def _git(worktree: Worktree, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(("git", *args), cwd=worktree.working_dir,
+                              capture_output=True, text=True, check=False)
+
+    @classmethod
+    def _worktree_head(cls, worktree: Worktree) -> str | None:
+        """The worktree's current commit, or None if it cannot be read."""
+        result = cls._git(worktree, "rev-parse", "HEAD")
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    @staticmethod
     def _restore(snapshot: dict[Path, str]) -> list[str]:
         """Put back anything that changed. Returns the names that had to be restored."""
         changed: list[str] = []
@@ -331,6 +342,7 @@ class BootstrapLoop(Harness):
                 # made would otherwise be merged un-gated, so the recorded verdict would
                 # describe code that is not what landed.
                 snapshot = self._snapshot(worktree, effective_editable)
+                pre_review_head = self._worktree_head(worktree)
                 if self.run_reviewer(worktree, iteration):
                     review = read_review_verdict(
                         self.reports_dir.parent / "reviews" / f"iter-{iteration}.md"
@@ -340,6 +352,26 @@ class BootstrapLoop(Harness):
                     # its work. Recorded so a persistent failure is visible in the reports.
                     self.console.print("  [yellow]![/yellow] Reviewer failed")
                     (self.reports_dir / f"iter-{iteration}-review-failed").write_text("")
+                # A snapshot of the editable files is not enough on its own. `merge_worktree`
+                # merges the worktree's HEAD, so a commit the reviewer made would land as
+                # ancestry, and `revert_out_of_scope` compares against HEAD, so committing is
+                # exactly what hides a change from it. Undo the commits first, then re-run
+                # scope enforcement for the frozen paths the snapshot never covered, and only
+                # then restore the editable files.
+                if pre_review_head and self._worktree_head(worktree) != pre_review_head:
+                    self._git(worktree, "reset", "--soft", pre_review_head)
+                    self.console.print(
+                        "  [yellow]![/yellow] Discarded commit(s) the reviewer created"
+                    )
+                    self.log.info(f"iter {iteration} reset reviewer commit(s)")
+                if effective_editable is not None:
+                    escaped = self.sandbox.revert_out_of_scope(worktree, effective_editable)
+                    if escaped:
+                        self.console.print(
+                            f"  [yellow]![/yellow] Reverted {len(escaped)} out-of-scope "
+                            f"file(s) the reviewer touched"
+                        )
+                        self.log.info(f"iter {iteration} reviewer touched out-of-scope {escaped}")
                 restored = self._restore(snapshot)
                 if restored:
                     self.console.print(
