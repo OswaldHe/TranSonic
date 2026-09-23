@@ -1091,3 +1091,26 @@ def test_a_rerun_that_fails_does_not_stay_passed(tiny_run, tmp_path, monkeypatch
     assert not again.state.passed
     from model_partition.loop.state import LoopState
     assert not LoopState.load(again.context.layout.state_file).passed
+
+
+def test_a_bare_repo_id_gets_a_fetch_script_like_a_prefixed_one(tmp_path):
+    """`org/model` is a HuggingFace checkpoint to ingestion, and has to be one to the fetch
+    script too: a run started that way published modules short of their weights and no
+    advertised way to get them."""
+    from types import SimpleNamespace
+
+    from model_partition.loop.stages import _checkpoint_identity
+    from model_partition.spec import ModelSpec
+
+    result = SimpleNamespace(revision="dba1be0a")
+    for source in ("org/model", "hf:org/model"):
+        ctx = SimpleNamespace(result=result, inventory=None,
+                              spec=ModelSpec(name="m", source=source))
+        assert _checkpoint_identity(ctx) == {
+            "repo_id": "org/model", "revision": "dba1be0a", "checkpoint_size": "large"}
+
+    local = tmp_path / "checkpoint"
+    local.mkdir()
+    ctx = SimpleNamespace(result=result, inventory=None,
+                          spec=ModelSpec(name="m", source=str(local)))
+    assert _checkpoint_identity(ctx) is None

@@ -9,7 +9,9 @@ rest as missing until this script has run.
 It downloads only the shards the published modules actually name. Each module's
 `calls.json` records, for every parameter the run did not dump, the shard it lives in and
 the key it has inside that shard — so one module's weights cost the few shards holding
-them rather than the whole checkpoint.
+them rather than the whole checkpoint. A module whose feature maps this artifact does not
+carry is skipped: a published subset keeps every sibling in its group's `calls.json`, and
+their weights would be no use without inputs and outputs to check them against.
 
     python fetch_weights.py --list                  # what would be fetched, and how big
     python fetch_weights.py --group {{ example_group }}
@@ -47,8 +49,37 @@ def _module_dirs() -> list[Path]:
     return sorted(p for p in (HERE / "modules").glob("*/") if (p / "calls.json").is_file())
 
 
-def shards_wanted(groups: list[str], modules: list[str]) -> tuple[dict[str, set[str]], list[str]]:
-    """Shard -> the module ids needing it, plus the parameters nothing can supply.
+def _first_dump(value):
+    """The first dumped file a recorded value points at, or None."""
+    if isinstance(value, dict):
+        spec = value.get("__tensor__")
+        if isinstance(spec, dict):
+            return spec.get("bin")
+        value = list(value.values())
+    if isinstance(value, list):
+        for item in value:
+            found = _first_dump(item)
+            if found:
+                return found
+    return None
+
+
+def is_published(directory: Path, entry: dict) -> bool:
+    """Whether this artifact carries the module's recorded feature maps.
+
+    One implementation serves every module of a signature, so a group's `calls.json`
+    lists them all even when only one was published. Fetching for the rest by default
+    pulled shards for dozens of modules that could not run: after `--one-per-kind`, most
+    of the checkpoint.
+    """
+    dump = _first_dump(entry.get("calls") or {})
+    return dump is not None and (directory / dump).is_file()
+
+
+def shards_wanted(groups: list[str], modules: list[str],
+                  ) -> tuple[dict[str, set[str]], list[str], list[str]]:
+    """Shard -> the module ids needing it, the parameters nothing can supply, and the
+    modules skipped because their feature maps are not here.
 
     A parameter recorded with no shard is one the checkpoint could not resolve when the
     artifact was written. Fetching cannot help it, so it is reported rather than silently
@@ -56,12 +87,16 @@ def shards_wanted(groups: list[str], modules: list[str]) -> tuple[dict[str, set[
     """
     by_shard: dict[str, set[str]] = {}
     unresolvable: list[str] = []
+    unpublished: list[str] = []
     for directory in _module_dirs():
         if groups and directory.name not in groups:
             continue
         payload = json.loads((directory / "calls.json").read_text())
         for module_id, entry in (payload.get("modules") or {}).items():
             if modules and module_id not in modules:
+                continue
+            if not is_published(directory, entry):
+                unpublished.append(module_id)
                 continue
             missing = entry.get("weights_missing") or {}
             if not isinstance(missing, dict):
@@ -73,7 +108,7 @@ def shards_wanted(groups: list[str], modules: list[str]) -> tuple[dict[str, set[
                     by_shard.setdefault(shard, set()).add(module_id)
                 else:
                     unresolvable.append(f"{module_id}: {name}")
-    return by_shard, unresolvable
+    return by_shard, unresolvable, unpublished
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,7 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", default=None, help="HuggingFace token, if the repo is gated")
     args = parser.parse_args(argv)
 
-    by_shard, unresolvable = shards_wanted(args.group, args.module)
+    by_shard, unresolvable, unpublished = shards_wanted(args.group, args.module)
+    if unpublished:
+        print(f"skipping {len(unpublished)} module(s) whose feature maps this artifact "
+              f"does not carry: {', '.join(unpublished[:4])}"
+              + (f" +{len(unpublished) - 4} more" if len(unpublished) > 4 else ""))
     if not by_shard:
         print("nothing to fetch: every parameter these modules need is already dumped "
               "into the artifact")

@@ -15,9 +15,17 @@ kernel-development convenience.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from model_partition.planner.graph import ModuleNode, PartitionGraph, TensorRef
-from model_partition.sizing import CostModel, LayerProfile, ModelInventory, config_get
+from model_partition.sizing import (
+    CostModel,
+    LayerProfile,
+    ModelInventory,
+    QuantProfile,
+    config_get,
+)
+from model_partition.weights_index import TensorEntry
 
 #: Module path used for a head whose weights are tied to the embedding, so the
 #: checkpoint holds no tensor naming it. Reconciliation remaps it if the model
@@ -66,8 +74,19 @@ class PlanOptions:
     def layer_bytes(self, layer: LayerProfile) -> int:
         """What one layer's parameters occupy once the loader has materialized them."""
         if self.dequant_resident:
-            return max(layer.param_bytes, layer.dequant_bytes)
+            return max(layer.param_bytes, layer.dequantized_bytes)
         return layer.param_bytes
+
+    def sizer(self, quant: QuantProfile) -> Callable[[TensorEntry], int]:
+        """What one tensor occupies once the loader has materialized it.
+
+        Every size the planner decides with goes through this, not only the first cut
+        into layer groups: a component sized on its fp8 bytes is certified to fit, is
+        never split or sent to the host, and runs out of memory at verification.
+        """
+        if self.dequant_resident:
+            return quant.dequantized_bytes
+        return _stored_bytes
 
 
 def classify_global(name: str) -> tuple[str, str] | None:
@@ -200,12 +219,13 @@ def plan(
     graph.entry_tensors = ["tokens"]
 
     # -- globals ---------------------------------------------------------------
+    size = options.sizer(inventory.quant)
     global_bytes: dict[str, int] = {}
     global_names: dict[str, list[str]] = {}
     for name in inventory.global_tensor_names:
         classified = classify_global(name)
         key = classified[1] if classified else "other_globals"
-        global_bytes[key] = global_bytes.get(key, 0) + _tensor_bytes(inventory, name)
+        global_bytes[key] = global_bytes.get(key, 0) + _tensor_bytes(inventory, name, size)
         path = module_path_of(name)
         if path not in global_names.setdefault(key, []):
             global_names[key].append(path)
@@ -277,7 +297,7 @@ def plan(
         groups = _group_layers(
             stack,
             options.max_layers_per_module or cost.max_layers_per_module(
-                max((layer.param_bytes for layer in layers), default=0),
+                max((options.layer_bytes(layer) for layer in layers), default=0),
                 budget_bytes, options.seq_len,
             ),
             options,
@@ -305,8 +325,13 @@ def plan(
     return graph
 
 
-def _tensor_bytes(inventory: ModelInventory, name: str) -> int:
-    return sum(e.nbytes for e in inventory.entries if e.name == name)
+def _tensor_bytes(inventory: ModelInventory, name: str,
+                  size: Callable[[TensorEntry], int]) -> int:
+    return sum(size(e) for e in inventory.entries if e.name == name)
+
+
+def _stored_bytes(entry: TensorEntry) -> int:
+    return entry.nbytes
 
 
 #: Component-name fragments that put a layer's direct child on the FFN side of the
@@ -362,9 +387,14 @@ class LayerParts:
         return next((p for p in self.ffn if not _is_norm(p)), None)
 
 
-def layer_parts(inventory: ModelInventory, index: int,
-                stack: Stack | None = None) -> LayerParts:
-    """Split one layer's tensors across its direct child modules."""
+def layer_parts(inventory: ModelInventory, index: int, stack: Stack | None = None,
+                size: Callable[[TensorEntry], int] | None = None) -> LayerParts:
+    """Split one layer's tensors across its direct child modules.
+
+    ``size`` is what each tensor counts for; stored bytes unless the plan sizes against
+    the dequantized width.
+    """
+    size = size or _stored_bytes
     stack_prefix = stack.prefix if stack is not None else (inventory.stack_prefix or "")
     prefix = f"{stack_prefix}{index}."
     parts = LayerParts()
@@ -380,12 +410,12 @@ def layer_parts(inventory: ModelInventory, index: int,
         component, _, remainder = entry.name[len(prefix):].partition(".")
         if not remainder:
             parts.own_params.append(entry.name)
-            parts.nbytes["own"] = parts.bytes_for("own") + entry.nbytes
+            parts.nbytes["own"] = parts.bytes_for("own") + size(entry)
             continue
         role = component_role(component)
-        parts.nbytes[role] = parts.bytes_for(role) + entry.nbytes
+        parts.nbytes[role] = parts.bytes_for(role) + size(entry)
         path = prefix + component
-        parts.path_bytes[path] = parts.path_bytes.get(path, 0) + entry.nbytes
+        parts.path_bytes[path] = parts.path_bytes.get(path, 0) + size(entry)
         if path not in seen:
             seen.add(path)
             buckets[role].append(path)
@@ -434,11 +464,15 @@ def _is_norm(path: str) -> bool:
     return "norm" in path.rsplit(".", 1)[-1].lower()
 
 
-def moe_parts(inventory: ModelInventory, ffn_path: str) -> tuple[list[str], dict[int, str], list[str], dict[str, int]]:
+def moe_parts(inventory: ModelInventory, ffn_path: str,
+              size: Callable[[TensorEntry], int] | None = None,
+              ) -> tuple[list[str], dict[int, str], list[str], dict[str, int]]:
     """Router, per-expert and shared submodule paths beneath one FFN module.
 
-    Returns ``(router_paths, {expert_index: path}, shared_paths, bytes_by_part)``.
+    Returns ``(router_paths, {expert_index: path}, shared_paths, bytes_by_part)``, the
+    bytes counted by ``size`` as :func:`layer_parts` counts them.
     """
+    size = size or _stored_bytes
     prefix = f"{ffn_path}."
     router: list[str] = []
     shared: list[str] = []
@@ -456,15 +490,15 @@ def moe_parts(inventory: ModelInventory, ffn_path: str) -> tuple[list[str], dict
         head = remainder.partition(".")[0]
         if "expert" in component and head.isdigit():
             experts[int(head)] = f"{path}.{head}"
-            account("experts", entry.nbytes)
+            account("experts", size(entry))
         elif "expert" in component:
             if path not in shared:
                 shared.append(path)
-            account("shared", entry.nbytes)
+            account("shared", size(entry))
         else:
             if path not in router:
                 router.append(path)
-            account("router", entry.nbytes)
+            account("router", size(entry))
     return router, experts, shared, nbytes
 
 
@@ -485,7 +519,7 @@ def _add_layer_group(
 ) -> str:
     """Append one group of layers, splitting further if it cannot fit."""
     profiles = {layer.index: layer for layer in stack.layers}
-    group_bytes = sum(profiles[i].param_bytes for i in group)
+    group_bytes = sum(options.layer_bytes(profiles[i]) for i in group)
     resident = cost.resident_bytes(group_bytes, len(group), options.seq_len)
 
     if options.split_attention_ffn or (resident > budget_bytes and len(group) > 1):
@@ -536,7 +570,7 @@ def _split_layer(
     """
     profile = next(layer for layer in stack.layers if layer.index == index)
     signature = _signature_key(profile.signature)
-    parts = layer_parts(inventory, index, stack)
+    parts = layer_parts(inventory, index, stack, size=options.sizer(inventory.quant))
     activation = cost.activation_bytes(options.seq_len)
     if parts.own_params:
         # Tensors the layer module holds itself (DeepSeek's Hyper-Connections
@@ -645,7 +679,8 @@ def _split_ffn(
     ffn_path = parts.ffn_compute()
     if ffn_path is None:
         raise ValueError(f"layer {index} has no FFN computation to split")
-    router, experts, shared, nbytes = moe_parts(inventory, ffn_path)
+    router, experts, shared, nbytes = moe_parts(inventory, ffn_path,
+                                                size=options.sizer(inventory.quant))
     # The FFN side's normalization runs before the gate, so it leads the router
     # module rather than becoming a module of its own.
     norms = [path for path in parts.ffn if _is_norm(path)]

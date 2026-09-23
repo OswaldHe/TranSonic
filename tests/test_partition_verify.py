@@ -1168,3 +1168,41 @@ def test_a_parallel_group_checks_every_call_against_its_own_output():
     ]
     # And without an implementation each submodule is replayed against its own record.
     assert _record_runs(_Node(), records, with_impl=False) == [[records[0]], [records[1]]]
+
+
+def test_a_chain_that_moves_a_token_on_drift_no_boundary_flags_stays_repairable(
+        tmp_path, monkeypatch):
+    """Two nearly tied logits can swap after accumulated drift while every boundary is
+    inside tolerance. With no first divergence to name, the stage was marked
+    unrepairable and the loop stopped instead of handing the implementations back."""
+    from types import SimpleNamespace
+
+    from model_partition.loop import stages
+    from model_partition.verify.chain import ChainReport, ChainStep, ChainSuite
+    from model_partition.verify.numerics import Comparison
+
+    def step(module_id, cosine):
+        return ChainStep(module_id=module_id, tensor=f"{module_id}.out", chained=True,
+                         comparison=Comparison(name=module_id, passed=True, cosine=cosine))
+
+    report = ChainReport(sample_id="s",
+                         steps=[step("embed", 1.0), step("layers.0", 0.9991),
+                                step("layers.1", 0.9997)],
+                         tokens=[5], reference_tokens=[7])
+    suite = ChainSuite(reports=[report])
+    assert not suite.passed and not suite.diverging_modules()
+    assert suite.most_drifted() == ["layers.0", "layers.1", "embed"]
+
+    (tmp_path / "reports").mkdir()
+    ctx = SimpleNamespace(graph=object(),
+                          layout=SimpleNamespace(reports_dir=tmp_path / "reports"))
+    monkeypatch.setattr(stages, "load_bundle", lambda ctx: None)
+    monkeypatch.setattr(stages, "_impl_dirs", lambda ctx: {"layers.0": tmp_path})
+    monkeypatch.setattr(stages, "_accelerator", lambda ctx: "cpu")
+    monkeypatch.setattr(stages, "verify_chain", lambda *a, **k: suite)
+
+    result = stages.stage_verify_chain(ctx)
+    assert not result.ok
+    assert result.repairable
+    assert result.failing_modules[0] == "layers.0"
+    assert "every carried boundary held" in result.detail

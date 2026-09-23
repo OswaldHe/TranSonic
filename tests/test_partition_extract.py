@@ -760,3 +760,64 @@ def test_a_renamed_group_directory_is_still_found(tiny_run, tmp_path):
     served = _yaml.safe_load((moved.parent / "renamed-out-of-band" / "meta.yaml").read_text())
     for module_id in served["module_ids"]:
         assert after[module_id].name == "renamed-out-of-band"
+
+
+def test_an_optimized_group_under_an_earlier_name_moves_with_its_work(tiny_run, tmp_path):
+    """Directories used to be `<index>-<kind>-<signature>`. Re-extracting a run from then
+    found nothing at the new name, wrote a fresh baseline there, and left the optimized
+    files in a directory the index no longer names."""
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    current = group.directory
+    (current / "inference.py").write_text("# an agent's optimized launcher\n")
+    (current / "source.py").write_text((current / "source.py").read_text()
+                                       + "\n# an agent's optimized kernel\n")
+    earlier = current.parent / "03-decoder_layers-0a1b2c3d"
+    current.rename(earlier)
+
+    again = _extract(tiny_run, tmp_path)
+    moved = next(g for g in again if g.signature == group.signature)
+    assert moved.directory == current
+    assert not earlier.exists()
+    assert moved.preserved
+    assert (current / "inference.py").read_text() == "# an agent's optimized launcher\n"
+    assert (current / "source.py").read_text().endswith("# an agent's optimized kernel\n")
+
+
+def test_fetching_skips_modules_whose_feature_maps_were_not_published(tmp_path):
+    """A published subset keeps every same-signature sibling in its group's `calls.json`.
+    Fetching for all of them by default pulled shards for modules that could not run —
+    after `--one-per-kind`, most of a 475 GiB checkpoint."""
+    import importlib.util
+    import json
+
+    from model_partition.extract import write_fetch_script
+
+    root = tmp_path / "run"
+    group = root / "modules" / "00-Attention"
+    group.mkdir(parents=True)
+    published = root / "trace" / "activations" / "layers.0.attn"
+    published.mkdir(parents=True)
+    (published / "x.bin").write_bytes(b"\x00" * 2)
+
+    def entry(module_id, shard):
+        dump = f"../../trace/activations/{module_id}/x.bin"
+        return {"weights_missing": {f"{module_id}.wq.weight": {"shard": shard, "key": "k"}},
+                "calls": {"s#0": [{"args": [
+                    {"__tensor__": {"bin": dump, "dtype": "bfloat16", "shape": [1]}}]}]}}
+
+    (group / "calls.json").write_text(json.dumps({"modules": {
+        "layers.0.attn": entry("layers.0.attn", "model-00001.safetensors"),
+        "layers.7.attn": entry("layers.7.attn", "model-00007.safetensors"),
+    }}))
+    path = write_fetch_script(root, "org/model", "dba1be0a")
+    spec = importlib.util.spec_from_file_location("_fetch_weights_under_test", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    by_shard, unresolvable, unpublished = script.shards_wanted([], [])
+    assert by_shard == {"model-00001.safetensors": {"layers.0.attn"}}
+    assert unpublished == ["layers.7.attn"]
+    assert not unresolvable
+    # Asking for the sibling by name does not make its feature maps appear.
+    assert script.shards_wanted([], ["layers.7.attn"])[0] == {}

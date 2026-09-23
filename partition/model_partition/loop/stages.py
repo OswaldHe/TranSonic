@@ -578,9 +578,10 @@ def _checkpoint_identity(ctx: LoopContext) -> dict[str, str] | None:
     """
     if ctx.result is None:
         return None
-    source = str(ctx.spec.source or "")
-    repo_id = source.split("hf:", 1)[1] if source.startswith("hf:") else ""
-    if not repo_id or "/" not in repo_id:
+    # The spec's own reading of its source, so `org/model` and `hf:org/model` are the
+    # same checkpoint here as they are to ingestion.
+    repo_id = ctx.spec.repo_id or ""
+    if "/" not in repo_id:
         return None
     size = format_bytes(ctx.inventory.total_param_bytes()) if ctx.inventory else "large"
     return {"repo_id": repo_id, "revision": str(ctx.result.revision or "main"),
@@ -1185,14 +1186,19 @@ def stage_verify_chain(ctx: LoopContext) -> StageResult:
         coverage += f"; {len(uncarried)} edge(s) not carried: {', '.join(uncarried[:4])}"
     if not suite.passed:
         diverging = suite.diverging_modules()
+        # Repairable with or without a boundary to point at. Tokens can move on drift no
+        # single boundary flags, and that is still the implementations' to fix; the
+        # modules that drifted furthest are where a repair starts.
+        suspects = diverging or suite.most_drifted()
         kept = suite.kept_tokens()
+        where = (f"; first divergence at {', '.join(diverging[:4])}" if diverging
+                 else f"; every carried boundary held, most drift at {', '.join(suspects)}"
+                 if suspects else "")
         return StageResult(
-            ok=False, repairable=bool(diverging), repair_surface="modules",
-            failing_modules=diverging,
+            ok=False, repairable=True, repair_surface="modules",
+            failing_modules=suspects,
             detail=(f"{len(suite.failures)}/{len(suite.reports)} chain(s) failed; "
-                    f"{kept}/{len(suite.reports)} kept every token; {coverage}"
-                    + (f"; first divergence at {', '.join(diverging[:4])}"
-                       if diverging else "")),
+                    f"{kept}/{len(suite.reports)} kept every token; {coverage}{where}"),
             metrics=metrics,
         )
     return StageResult(ok=True, detail=(

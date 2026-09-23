@@ -302,6 +302,7 @@ def extract(
     vendored: set[Path] = set()
     #: Directory names already handed out, so two groups cannot land on one directory.
     taken: set[str] = set()
+    earlier = _existing_group_dirs(root)
     vendor_runtime(run_root)
 
     for index, (signature, module_ids) in enumerate(sorted(graph.signature_groups().items())):
@@ -330,6 +331,13 @@ def extract(
         dirname = _group_dirname(representative, signature, taken, group.class_name)
         taken.add(dirname)
         directory = root / dirname
+        # A directory an earlier extraction named differently holds whatever has been
+        # optimized in it, and only its name has changed. Left where it was, the check
+        # below finds nothing to preserve, writes a fresh baseline over the work, and
+        # strands it in a directory the index no longer names.
+        previous = earlier.get(signature)
+        if previous is not None and previous != directory and not directory.exists():
+            previous.rename(directory)
         directory.mkdir(parents=True, exist_ok=True)
         group.directory = directory
 
@@ -926,6 +934,20 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
         + "\n\n".join(sources)
     )
     return False
+
+
+def _existing_group_dirs(root: Path) -> dict[str, Path]:
+    """Signature -> the directory a previous extraction wrote for it.
+
+    Read from each directory's own ``meta.yaml``, which travels with it, rather than from
+    the index, which is rewritten by the extraction that needs the answer.
+    """
+    found: dict[str, Path] = {}
+    for meta in sorted(root.glob("*/meta.yaml")):
+        signature = (yamlio.load_path(meta) or {}).get("signature")
+        if signature:
+            found.setdefault(str(signature), meta.parent)
+    return found
 
 
 def _group_dirname(module: Any, signature: str, taken: set[str] | None = None,

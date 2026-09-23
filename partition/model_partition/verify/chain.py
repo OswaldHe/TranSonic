@@ -255,6 +255,22 @@ class ChainSuite:
                 seen.append(step.module_id)
         return seen
 
+    def most_drifted(self, limit: int = 4) -> list[str]:
+        """Where the failed chains' carried outputs moved furthest from the trace.
+
+        A chain can fail with every boundary inside tolerance: two nearly tied logits
+        swap after drift too small for any one boundary to flag. There is no first
+        divergence to name then, but there is still somewhere to start.
+        """
+        steps = [s for r in self.failures for s in r.steps if s.chained and s.comparison]
+        ranked: list[str] = []
+        for step in sorted(steps, key=lambda s: s.cosine):
+            if step.module_id not in ranked:
+                ranked.append(step.module_id)
+            if len(ranked) == limit:
+                break
+        return ranked
+
     def worst_cosine(self) -> float:
         values = [r.worst_cosine() for r in self.reports]
         return min(values) if values else 1.0
