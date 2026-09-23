@@ -57,7 +57,7 @@ def test_an_entry_round_trips_with_its_kernel_and_notes(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     entry = mem.record(repo, passed=True, iterations=5, summary="gate: all 6 checks pass")
     assert entry is not None
-    assert entry.name == "02-Attention__long-needle-8192-0"
+    assert entry.name == "layers_2_attention__long-needle-8192-0"
 
     assert (entry / "source.py").read_text() == "# the kernel\n"
     assert (entry / "inference.py").read_text() == "# the validator\n"
@@ -102,7 +102,7 @@ def test_the_seeded_copy_cannot_be_written_back_through(tmp_path: Path) -> None:
     (worktree / ".autohelix" / "notes").mkdir(parents=True)
 
     assert mem.seed(repo, worktree) == 1
-    planted = worktree / mem.SEEDED_REL / "02-Attention__long-needle-8192-0" / "source.py"
+    planted = worktree / mem.SEEDED_REL / "layers_2_attention__long-needle-8192-0" / "source.py"
     assert planted.is_file()
     with pytest.raises(PermissionError):
         planted.write_text("tampered")
@@ -149,3 +149,37 @@ def test_the_goal_points_at_the_path_the_code_seeds(tmp_path: Path) -> None:
     # And it has to say what the limits are, not just where the directory is.
     assert "read-only" in goal
     assert "reference_torch.py" in goal
+
+
+def test_two_modules_of_one_group_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    """A group is a shared implementation, not one module: `00-Attention` serves 31 layers.
+
+    Keying an entry by group and sample alone made the second layer bootstrapped delete the
+    first one's kernel and notes — removing precisely what the memory exists to accumulate.
+    """
+    first = _repo(tmp_path, "a")
+    second = _repo(tmp_path, "b")
+    # Same group and same sample, different module: the collision that mattered.
+    for repo, module in ((first, "layers.0.attention"), (second, "layers.3.attention")):
+        manifest = repo / ".autohelix" / "bootstrap" / "manifest.json"
+        payload = json.loads(manifest.read_text())
+        payload["module_id"] = module
+        manifest.write_text(json.dumps(payload))
+        mem.record(repo, passed=True, iterations=2, summary="ok")
+
+    listed = mem.entries(mem.location(first))
+    assert sorted(e.module_id for e in listed) == ["layers.0.attention", "layers.3.attention"], (
+        "one module overwrote the other"
+    )
+
+
+def test_a_different_invocation_of_one_module_is_its_own_entry(tmp_path: Path) -> None:
+    """Prefill and a decode step of the same module are different recorded invocations."""
+    repo = _repo(tmp_path)
+    manifest = repo / ".autohelix" / "bootstrap" / "manifest.json"
+    for step, call in ((0, 0), (1, 3)):
+        payload = json.loads(manifest.read_text())
+        payload["step"], payload["call_index"] = step, call
+        manifest.write_text(json.dumps(payload))
+        mem.record(repo, passed=True, iterations=1, summary="ok")
+    assert len(mem.entries(mem.location(repo))) == 2

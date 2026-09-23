@@ -78,13 +78,23 @@ class Entry:
         )
 
 
-def entry_name(group: str, sample_id: str) -> str:
-    """`02-Attention` + `long-needle-8192-0` -> `02-Attention__long-needle-8192-0`.
+def entry_name(
+    module_id: str, sample_id: str, step: int = 0, call_index: int = 0,
+) -> str:
+    """`layers.2.attention` + `long-needle-8192-0` -> `layers_2_attention__long-needle-8192-0`.
 
-    Group and sample both, because the same group at a different sequence length is a
-    different kernel problem — and the agent wants to know which one it is looking at.
+    Keyed by the *module*, not its group. A group is a deduplicated implementation shared by
+    many modules — `00-Attention` serves thirty-one layers — so keying on it would make the
+    second layer bootstrapped overwrite the first, which is exactly the accumulation this
+    exists for. Step and call index join the key when they are not the default, because the
+    same module at a different decode step is a different recorded invocation.
     """
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in f"{group}__{sample_id}")
+    key = f"{module_id}__{sample_id}"
+    if step:
+        key += f"__s{step}"
+    if call_index:
+        key += f"__c{call_index}"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
     return safe.strip("_")
 
 
@@ -126,7 +136,10 @@ def record(
         module_id = manifest.get("module_id") or "unknown"
         sample_id = manifest.get("sample_id") or "unknown"
 
-        target = (memory or location(repo)) / entry_name(group, sample_id)
+        target = (memory or location(repo)) / entry_name(
+            module_id, sample_id, int(manifest.get("step") or 0),
+            int(manifest.get("call_index") or 0),
+        )
         # A re-run of the same module replaces its entry rather than accumulating duplicates;
         # accumulation is across *modules*, which is what makes the index worth reading.
         if target.exists():

@@ -558,3 +558,31 @@ def test_omitting_state_is_recorded_in_the_manifest(tmp_path: Path) -> None:
 
     assert built(False)["state_included"] is False
     assert built(True)["state_included"] is True
+
+
+def test_a_non_finite_worst_error_does_not_clear_the_ceiling() -> None:
+    """`nan > ceiling` is false, so a NaN would otherwise pass the ceiling by not comparing.
+
+    Reachable for real: an error reduction over a tensor holding a non-finite value prints
+    `nan`, and the run can still exit 0 and print passed=1.
+    """
+    import ast as _ast
+
+    from bootstrap.nki_checker import RunOutcome
+
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995, "MIN_PASS_FRACTION": 0.999,
+           "MAX_ABS_ERR": 0.28}
+    src = "".join(f"{k} = {v!r}\n" for k, v in bar.items())
+
+    def findings(marker: str) -> list[str]:
+        run = RunOutcome(
+            ran=True, return_code=0, duration_s=1.0,
+            output=f"##autohelix[latency_ms=1.0]\n##autohelix[max_abs_err={marker}]\n"
+                   f"##autohelix[passed=1]\n",
+        )
+        return chk.check_pass_test(_ast.parse(src), run, bar).findings
+
+    assert any("not a number" in f for f in findings("nan")), findings("nan")
+    assert any("not a number" in f for f in findings("inf")), findings("inf")
+    # A real value inside the ceiling still passes, so the guard is not over-broad.
+    assert not any("not a number" in f or "past the" in f for f in findings("0.09"))

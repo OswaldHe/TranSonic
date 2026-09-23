@@ -54,6 +54,22 @@ CHECKS_REL = f"{STATE_DIR}/nki_checks.json"
 #: dimension of 2, and a README that says so.
 COMPLEX_SPLIT_NOTE = "complex64 written as float32 with a trailing [real, imag] dimension"
 
+#: The loosest cosine a bootstrapped module is held to, applied only here and never to the
+#: shared table `partition` verifies with.
+#:
+#: 0.9999 (rel L2 1.414%) is below the floor a correct kernel can reach wherever the chain
+#: ends in a discrete top-k. Measured on `layers.2.attention` at 8192 rows: a faithful
+#: host-torch reproduction of the reference sits at 1.4878%, and perturbing every GEMM by one
+#: fp32 ULP — the smallest difference two correct implementations can have — already costs
+#: 1.2261% of the budget. The indexer ranks candidates on a bf16 `index_score` whose ULP
+#: (~0.0078 at |score| ~ 1.8) is eight times the ~1e-3 gap between the 512th and 513th, so
+#: which positions the recorded run selected is not reproducible without bit-exact
+#: accumulation; computing the chain in fp64 does not help (1.4876%).
+#:
+#: Genuine semantic errors stay far outside it — the mildest of 14 ablation variants was
+#: 5.07% — and rtol/atol, MIN_PASS_FRACTION and the MAX_ABS_ERR ceiling are untouched.
+MIN_COSINE_CEILING = 0.9995
+
 
 @dataclass
 class TensorRecord:
@@ -285,6 +301,16 @@ def materialize(
     # taking only the first of each would drop inputs the kernel needs and check only part of
     # what it produced, and both would go unnoticed on a module where the first happens to be
     # the only one.
+    for call in chain:
+        for field_name in ("args", "kwargs", "state", "output"):
+            if _unsupported_in(call.get(field_name)):
+                raise MaterializeError(
+                    f"{module_id} recorded a value the tracer could not encode in its "
+                    f"{field_name} for {key} — the invocation cannot be reproduced, so there is "
+                    f"no kernel this repo could hold to it. Trace the module again, or pick "
+                    f"another sample with --sample."
+                )
+
     inputs = _flatten_tensors(reader, directory, chain[0].get("args") or [], "input")
     inputs += _flatten_tensors(reader, directory, chain[0].get("kwargs") or {}, "input")
     if not inputs:
@@ -425,8 +451,27 @@ def _sample_order(directory: Path) -> list[str]:
     return [str(v) for v in value] if isinstance(value, (list, tuple)) else []
 
 
+#: What the tracer writes in place of a value it could not encode. The partition verifier
+#: refuses such a record outright (`CallRecord.has_unsupported`) because it cannot be
+#: replayed, and a bootstrap repo built from one is worse: the placeholder is not a tensor, so
+#: it would be recorded as a *scalar literal* and `init` would succeed while the kernel is
+#: missing an argument the recorded forward was given.
+UNSUPPORTED_KEY = "__unsupported__"
+
+
 def _is_tensor(value: Any) -> bool:
     return isinstance(value, dict) and "__tensor__" in value
+
+
+def _unsupported_in(value: Any) -> bool:
+    """Whether an encoded value holds a placeholder anywhere inside it."""
+    if isinstance(value, dict):
+        if UNSUPPORTED_KEY in value:
+            return True
+        return any(_unsupported_in(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_unsupported_in(v) for v in value)
+    return False
 
 
 def _bin_of(value: Any) -> str:
@@ -552,6 +597,12 @@ def _tolerance_for(
     rtol, atol = max(rows.values(), key=lambda pair: pair[0]) if rows else default
 
     bar = {"RTOL": rtol, "ATOL": atol, **fractions}
+    # Never tighter than the shared table, and looser on cosine, because this is not the
+    # question that table answers. Partition verification replays the *same torch code*
+    # against its own recording, where near-bit-exactness is the right expectation. Bootstrap
+    # compares a reimplementation, in another language, on another vendor's hardware, with a
+    # different accumulation order — against a recording made on a GPU.
+    bar["MIN_COSINE"] = min(fractions.get("MIN_COSINE", MIN_COSINE_CEILING), MIN_COSINE_CEILING)
     bar["MAX_ABS_ERR"] = _legible(atol + rtol * reference_max)
     return bar
 

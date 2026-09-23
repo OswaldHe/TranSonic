@@ -26,6 +26,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -560,6 +561,12 @@ def check_pass_test(
                 findings.append(
                     f"the run printed no ##autohelix[{MAX_ABS_ERR_MARKER}=...] line, so the "
                     f"{CEILING_NAME} ceiling could not be checked"
+                )
+            elif not math.isfinite(worst):
+                findings.append(
+                    f"the run reported {MAX_ABS_ERR_MARKER}={worst}, which is not a number — "
+                    f"a non-finite worst error is not a bound, and `nan > ceiling` is false, so "
+                    f"it would otherwise clear the {CEILING_NAME} ceiling without meeting it"
                 )
             elif worst > ceiling:
                 findings.append(

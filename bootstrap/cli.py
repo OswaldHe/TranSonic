@@ -206,15 +206,16 @@ def _commit_bar(repo: Path, changed: list[str]) -> bool:
 
     if git("rev-parse", "--git-dir").returncode != 0:
         return True  # not a repo, so nothing can be left dirty
-    if git("add", "README.md").returncode != 0:
-        return False
-    if not git("diff", "--cached", "--quiet", "--", "README.md").returncode:
-        return True  # nothing staged: the README already matched
+    if not git("diff", "--quiet", "--", "README.md").returncode:
+        return True  # the README already matched; nothing to record
     message = (f"Retune the numerical bar: {', '.join(changed)}\n\n"
                "Written by `autohelix bootstrap retune`, which re-derives the bar from the\n"
                "recorded tensors. inference.py still declares the old values; the gate names\n"
                "the mismatch and the next iteration fixes it.\n")
-    return git("commit", "-q", "-m", message).returncode == 0
+    # `--only` with a pathspec commits that path alone. A plain `git commit` would fold in
+    # whatever the operator already had staged, silently attributing their work in progress to
+    # an automatic bar change.
+    return git("commit", "-q", "--only", "-m", message, "--", "README.md").returncode == 0
 
 
 @bootstrap.command()
