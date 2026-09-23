@@ -26,6 +26,8 @@ number would silently move the reference every later stage is measured against.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -108,9 +110,12 @@ class HyperConnectCollapse(nn.Module):
 def _install_block(block) -> None:
     """Give one block its four mHC children, moving the coefficients onto them."""
     for which in ("attn", "ffn"):
-        fn = block._parameters.pop(f"hc_{which}_fn")
-        base = block._parameters.pop(f"hc_{which}_base")
-        scale = block._parameters.pop(f"hc_{which}_scale")
+        fn = block._parameters.pop(f"hc_{which}_fn", None)
+        base = block._parameters.pop(f"hc_{which}_base", None)
+        scale = block._parameters.pop(f"hc_{which}_scale", None)
+        if fn is None or base is None or scale is None:
+            # Already moved: the coefficients live on the submodule now.
+            continue
         block.add_module(f"hc_{which}_in", HyperConnectSublayerIn(
             block.hc_mult, block.hc_sinkhorn_iters, block.hc_eps, block.norm_eps,
             fn, base, scale))
@@ -176,13 +181,35 @@ def _make_transformer_forward(vendor):
     return forward
 
 
+#: Marks the classes as already patched. A patch that *rebinds* a name is idempotent for
+#: free; this one wraps `__init__`, so applying it twice would wrap the wrapper and try to
+#: move the coefficients a second time — `KeyError: 'hc_attn_fn'` from inside construction.
+#: A run builds the model more than once (once on meta for structure, once for real), and
+#: patches are applied each time.
+PATCH_MARKER = "_hyper_connections_patched"
+
+REPLACED = ["Block.hc_mixes", "Block.hc_pre", "Block.hc_post",
+            "Transformer.hc_expand", "Transformer.hc_collapse"]
+
+
 def apply(vendor, device):
     """Replace the mHC methods with submodules. Returns what was replaced."""
     del device  # structural: the same on every card
 
     block_cls = vendor.Block
+    if getattr(block_cls, PATCH_MARKER, False):
+        return REPLACED
+    setattr(block_cls, PATCH_MARKER, True)
     original_init = block_cls.__init__
 
+    # `functools.wraps` is load-bearing, not tidiness. The loader decides what to hand the
+    # model factory by inspecting its signature — a `tokenizer` parameter is how DeepSeek's
+    # engram layout gets the vocabulary it builds its compressed token map from. A
+    # replacement `__init__` declaring only `*args, **kwargs` advertises no such parameter,
+    # so the tokenizer is silently not passed and construction dies inside `engram.py` on
+    # `None.backend_tokenizer`. Copying `__wrapped__` over is what keeps
+    # `inspect.signature` telling the truth about the constructor.
+    @functools.wraps(original_init)
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         _install_block(self)
@@ -193,6 +220,7 @@ def apply(vendor, device):
     transformer_cls = vendor.Transformer
     original_transformer_init = transformer_cls.__init__
 
+    @functools.wraps(original_transformer_init)
     def transformer_init(self, *args, **kwargs):
         original_transformer_init(self, *args, **kwargs)
         self.add_module("hc_expand", HyperConnectExpand(self.hc_mult))
@@ -200,5 +228,4 @@ def apply(vendor, device):
 
     transformer_cls.__init__ = transformer_init
     transformer_cls.forward = _make_transformer_forward(vendor)
-    return ["Block.hc_mixes", "Block.hc_pre", "Block.hc_post",
-            "Transformer.hc_expand", "Transformer.hc_collapse"]
+    return REPLACED
