@@ -50,6 +50,14 @@ def _load_defaults(path: Path | None = None) -> dict[str, Any]:
     return payload.get("loop", payload) if isinstance(payload, dict) else {}
 
 
+#: Loop options that once existed and are now ignored. A spec carrying one is a spec
+#: written against an older version of this tool, not a spec with a typo — and the
+#: difference matters, because an unknown key stops the run before it starts. Kept here
+#: rather than kept as a dead field, so nothing reads them by accident.
+#: ``decode_steps`` never reached the tracer; it only inflated the storage estimate.
+RETIRED_OPTIONS = frozenset({"decode_steps"})
+
+
 def build_options(config: Path | None = None, spec: Any = None, **overrides: Any):
     """Build LoopOptions, layering defaults, the spec, then the command line.
 
@@ -66,7 +74,7 @@ def build_options(config: Path | None = None, spec: Any = None, **overrides: Any
     known = {f.name for f in fields(LoopOptions)}
     values = {k: v for k, v in _load_defaults(config).items() if k in known}
     if spec is not None:
-        unknown = set(getattr(spec, "overrides", {})) - known
+        unknown = set(getattr(spec, "overrides", {})) - known - RETIRED_OPTIONS
         if unknown:
             raise click.ClickException(
                 f"Spec {spec.name!r} overrides unknown loop option(s): "

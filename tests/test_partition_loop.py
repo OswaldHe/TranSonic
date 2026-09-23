@@ -1114,3 +1114,26 @@ def test_a_bare_repo_id_gets_a_fetch_script_like_a_prefixed_one(tmp_path):
     ctx = SimpleNamespace(result=result, inventory=None,
                           spec=ModelSpec(name="m", source=str(local)))
     assert _checkpoint_identity(ctx) is None
+
+
+def test_a_native_dtype_checkpoint_is_not_sized_as_if_it_were_widened(tmp_path):
+    """`dtype: checkpoint` keeps the fp8 and fp4 tensors the vendor's kernels take as
+    stored. Counting those at up to four times their residency splits modules that fit and
+    sends others to the host for nothing."""
+    from types import SimpleNamespace
+
+    from model_partition.loop.stages import _loader_widens_dtype
+
+    def ctx(dtype, loader="repo_code", dequant=1 << 30):
+        return SimpleNamespace(spec=SimpleNamespace(dtype=dtype),
+                               result=SimpleNamespace(loader=loader),
+                               inventory=SimpleNamespace(dequant_bytes=dequant))
+
+    # Kept as stored: nothing is widened, so nothing is sized as if it were.
+    for native in ("checkpoint", "native", "auto", ""):
+        assert not _loader_widens_dtype(ctx(native)), native
+    # A dtype the loader casts the whole model to is the case the sizing exists for.
+    assert _loader_widens_dtype(ctx("bfloat16"))
+    # And an unquantized checkpoint has nothing to widen either way.
+    assert not _loader_widens_dtype(ctx("bfloat16", dequant=0))
+    assert not _loader_widens_dtype(ctx("bfloat16", loader="transformers"))

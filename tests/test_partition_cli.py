@@ -388,3 +388,45 @@ def test_every_bundled_spec_overrides_only_real_options():
 
     for path in MODELS_DIR.glob("*.yaml"):
         build_options(None, spec=load_spec(path))
+
+
+def test_a_retired_override_is_ignored_not_an_error(tmp_path):
+    """`decode_steps` was a real option once and never reached the tracer. Removing the
+    field made every spec still carrying it abort before the run started, which is a
+    worse answer than ignoring it."""
+    from types import SimpleNamespace
+
+    from model_partition.cli import RETIRED_OPTIONS, build_options
+
+    spec = SimpleNamespace(name="old", overrides={"decode_steps": 4, "max_new_tokens": 8})
+    options = build_options(spec=spec)
+    assert options.max_new_tokens == 8
+    assert not hasattr(options, "decode_steps")
+    assert "decode_steps" in RETIRED_OPTIONS
+
+    # A typo is still a typo.
+    with pytest.raises(Exception, match="unknown loop option"):
+        build_options(spec=SimpleNamespace(name="typo", overrides={"max_new_token": 8}))
+
+
+def test_the_wheel_ships_what_the_bundled_specs_need(tmp_path):
+    """The DeepSeek spec's `checkpoint.rename` rules map the checkpoint's `hc_*`
+    coefficients onto submodules that exist only once the compat patch has installed them.
+    Shipping the spec without the patch installs renames that resolve nowhere."""
+    import tomllib
+    from pathlib import Path
+
+    import model_partition
+
+    root = Path(model_partition.__file__).resolve().parents[2]
+    config = tomllib.loads((root / "pyproject.toml").read_text())
+    build = config["tool"]["hatch"]["build"]["targets"]
+    wheel = build["wheel"]["force-include"]
+    sdist = build["sdist"]["only-include"]
+
+    for asset in ("partition/compat", "partition/scripts"):
+        assert asset in wheel, f"{asset} is not in the wheel"
+        assert asset in sdist, f"{asset} is not in the sdist"
+    # And the two files the bundled DeepSeek spec actually needs are there to ship.
+    assert (root / "partition/compat/deepseek-v4.1-flash/hyper_connections.py").is_file()
+    assert (root / "partition/scripts/build_hc_plan.py").is_file()

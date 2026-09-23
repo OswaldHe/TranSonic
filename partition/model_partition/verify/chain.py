@@ -348,6 +348,10 @@ def _chain_sample(
         return report
 
     by_id = {module.id: module for module in graph.partitioned_modules}
+    # Which plan node declares each tensor, partitioned or not. A tensor nothing here
+    # produces is an entry point; one produced by a node the walk skips is a hole.
+    produced_by = {tensor: module.id for module in graph.modules
+                   for tensor in module.outputs}
     #: Graph tensor name -> the value this chain computed for it.
     carried: dict[str, Any] = {}
     #: Graph tensor name -> what the trace recorded for it. What makes an edge check a
@@ -379,6 +383,20 @@ def _chain_sample(
         upstream = next((t for t in module.inputs if t in carried), None)
         produced = module.outputs[0] if module.outputs else module_id
         step = ChainStep(module_id=module_id, tensor=produced)
+        if upstream is None:
+            # Nothing of this module's input was carried. Two very different reasons, and
+            # only one of them is fine: the chain has to start somewhere, and `embed` reads
+            # the token ids, which no module produces. But an input some *other plan node*
+            # produces and that never ran — an expert-combine step is unpartitioned, so the
+            # walk skips it — means this module quietly restarts from the recording with
+            # the whole expert path bypassed. Unsaid, that read as an unbroken chain and
+            # credited the tokens it predicted.
+            skipped = sorted({t for t in module.inputs if t in produced_by})
+            if skipped:
+                step.unchained_reason = (
+                    f"{', '.join(skipped)} is produced by "
+                    f"{', '.join(produced_by[t] for t in skipped)}, which the chain does "
+                    "not run, so this module restarts from the recording")
         try:
             args, kwargs = decode_group_call(records, bundle.store, device)
             # What the trace gave this module, before anything is substituted for it.

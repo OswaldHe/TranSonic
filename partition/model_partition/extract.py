@@ -338,6 +338,8 @@ def extract(
         previous = earlier.get(signature)
         if previous is not None and previous != directory and not directory.exists():
             previous.rename(directory)
+            # It is this group's directory now, which is what the preservation below asks.
+            earlier[signature] = directory
         directory.mkdir(parents=True, exist_ok=True)
         group.directory = directory
 
@@ -348,13 +350,23 @@ def extract(
         group.config_class = config_class
         (directory / CONFIG_FILENAME).write_text(
             json.dumps(settings, indent=2, sort_keys=True, default=str) + "\n")
-        # Whether a previous extraction has been here, asked before this one writes
-        # anything. It decides what counts as somebody's work to keep.
-        had_source = (directory / SOURCE_FILENAME).is_file()
+        # Whether a previous extraction has been *this group* here, asked before this one
+        # writes anything. It decides what counts as somebody's work to keep.
+        #
+        # The signature has to match, not just the path. A repaired plan can change a
+        # group's signature while its first layer and principal class stay put, so the
+        # readable name resolves to a directory holding a different group's
+        # implementation: preserving that keeps the old `source.py` under the new group's
+        # metadata and calls, which is a relabelled implementation rather than a kept one.
+        mine = earlier.get(signature) == directory
+        had_source = (directory / SOURCE_FILENAME).is_file() and mine
         if had_source and not regenerate:
             group.preserved = True
+        # A directory whose recorded signature is not this group's has nothing of this
+        # group's to keep, so its files are rewritten rather than adopted.
         group.launchable = _write_source(directory, principal, sources, signature, files,
-                                         classes=names, regenerate=regenerate,
+                                         classes=names,
+                                         regenerate=regenerate or not mine,
                                          origin_root=origin_root)
         # What source.py actually holds, so the reported figure is the code someone has
         # to read rather than the size of the file it was taken from.

@@ -218,7 +218,11 @@ def check_self_contained(run_dir: str | Path, files: list[Path], module_ids: lis
     # gigabytes of the same bytes.
     elsewhere = Path(tempfile.mkdtemp(prefix="published-", dir=root.parent))
     checkpoint = root / CHECKPOINT_DIR
-    fetched = sorted(checkpoint.glob("*")) if checkpoint.is_dir() else []
+    # Files only, and at any depth: the Hub client leaves its own resume bookkeeping in a
+    # `.cache/` directory inside the folder it downloads into, and asking to hardlink a
+    # directory raises where the copy fallback cannot help either.
+    fetched = sorted(p for p in checkpoint.rglob("*") if p.is_file()) \
+        if checkpoint.is_dir() else []
     for path in list(files) + fetched:
         target = elsewhere / path.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)

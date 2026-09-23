@@ -821,3 +821,67 @@ def test_fetching_skips_modules_whose_feature_maps_were_not_published(tmp_path):
     assert not unresolvable
     # Asking for the sibling by name does not make its feature maps appear.
     assert script.shards_wanted([], ["layers.7.attn"])[0] == {}
+
+
+def test_a_directory_holding_another_group_is_not_preserved_as_this_one(tiny_run, tmp_path):
+    """A repaired plan can change a group's signature while its first layer and principal
+    class stay put, so the readable name resolves to a directory holding a different
+    group's implementation. Preserving that keeps the old `source.py` under the new
+    group's metadata and calls — a relabelled implementation, not a kept one."""
+    from model_partition import yamlio
+
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    directory = group.directory
+    (directory / "source.py").write_text("# another group's implementation\n")
+    # What a plan repair leaves behind: the same directory, a different signature recorded.
+    meta = yamlio.load_path(directory / "meta.yaml")
+    meta["signature"] = "sig-something-else"
+    (directory / "meta.yaml").write_text(yamlio.dumps(meta, sort_keys=False))
+
+    again = _extract(tiny_run, tmp_path)
+    same = next(g for g in again if g.signature == group.signature)
+    assert same.directory == directory
+    assert not same.preserved, "kept an implementation belonging to another signature"
+    assert "another group's implementation" not in (directory / "source.py").read_text()
+
+
+def test_fetching_reports_a_nonzero_status_while_a_weight_stays_unresolved(tmp_path):
+    """A parameter recorded with no shard is one nothing can supply. Reporting that as
+    "every parameter is already dumped", with a zero status, told a caller the artifact had
+    been made runnable when it had not — and left no way for a script to tell."""
+    import importlib.util
+    import json
+
+    from model_partition.extract import write_fetch_script
+
+    root = tmp_path / "run"
+    group = root / "modules" / "00-Attention"
+    group.mkdir(parents=True)
+    dumps = root / "trace" / "activations" / "layers.0.attn"
+    dumps.mkdir(parents=True)
+    (dumps / "x.bin").write_bytes(b"\x00" * 2)
+    calls = {"calls": {"s#0": [{"args": [{"__tensor__": {
+        "bin": "../../trace/activations/layers.0.attn/x.bin",
+        "dtype": "bfloat16", "shape": [1]}}]}]}}
+
+    def write(missing):
+        (group / "calls.json").write_text(json.dumps(
+            {"modules": {"layers.0.attn": {**calls, "weights_missing": missing}}}))
+        path = write_fetch_script(root, "org/model", "rev")
+        spec = importlib.util.spec_from_file_location(f"_fetch_{id(missing)}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # Nothing names a shard: fetching cannot help, and the status has to say so.
+    script = write({"layers.0.attn.wq.weight": {}})
+    by_shard, unresolvable, _ = script.shards_wanted([], [])
+    assert not by_shard and unresolvable == ["layers.0.attn: layers.0.attn.wq.weight"]
+    assert script.main(["--list"]) == 1
+    assert script.main([]) == 1
+
+    # Everything resolves, so --list is a clean report.
+    script = write({"layers.0.attn.wq.weight": {"shard": "model-00001.safetensors",
+                                                "key": "k"}})
+    assert script.main(["--list"]) == 0

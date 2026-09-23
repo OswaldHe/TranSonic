@@ -1063,12 +1063,23 @@ def test_a_split_layers_residual_add_is_reconstructed_from_the_recording(tiny_sp
     """
     suite = _chain(tiny_split_run, tmp_path)
     report = suite.reports[0]
-    assert suite.passed, suite.render()
-    assert report.unbroken, report.render()
-    assert not report.unchained, report.render()
     residual = [s for s in report.steps if "residual add" in s.via]
     assert len(residual) >= 2, report.render()
+    assert all(s.passed for s in residual), report.render()
     assert report.tokens_agree
+
+    # This plan also splits an over-budget MoE, which leaves `layers.N.combine`
+    # unpartitioned — there is no `nn.Module` to hook — so the chain cannot run it and the
+    # layer after it restarts from the recording with the whole expert path bypassed. That
+    # is a hole in the coverage rather than drift, and it has to be named: unsaid, it read
+    # as an unbroken chain that had earned the tokens it predicted.
+    bypassed = {s.module_id for s in report.unchained}
+    assert bypassed == {"layers.2.attention", "final_norm"}, report.render()
+    assert all("combine" in s.unchained_reason for s in report.unchained), report.render()
+    assert not report.unbroken, report.render()
+    assert not report.credited_tokens, "credited tokens for a chain it did not carry"
+    # Still passing: every boundary the chain *did* carry held, which is what it measures.
+    assert suite.passed, suite.render()
 
 
 def test_an_edge_the_recording_contradicts_is_not_carried(tiny_run, tmp_path):
@@ -1206,3 +1217,66 @@ def test_a_chain_that_moves_a_token_on_drift_no_boundary_flags_stays_repairable(
     assert result.repairable
     assert result.failing_modules[0] == "layers.0"
     assert "every carried boundary held" in result.detail
+
+
+def test_a_shard_is_staged_on_the_host_whatever_the_default_device_is(tmp_path, monkeypatch):
+    """Building a module sets the default device to the accelerator and leaves it set, so an
+    unqualified allocation here put the next module's staging buffer on the card — and the
+    n-gram tables this path exists to serve are 94.6 GiB against a 44 GiB card."""
+    import json as _json
+
+    from model_partition.runtime.artifact import read_shard_tensors
+
+    payload = torch.arange(8, dtype=torch.float32)
+    raw = payload.numpy().tobytes()
+    header = _json.dumps({"w": {"dtype": "F32", "shape": [8], "data_offsets": [0, len(raw)]}})
+    shard = tmp_path / "shard.safetensors"
+    shard.write_bytes(len(header).to_bytes(8, "little") + header.encode() + raw)
+
+    asked: list[object] = []
+    real_empty = torch.empty
+
+    def watched(*args, **kwargs):
+        asked.append(kwargs.get("device", "(default)"))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", watched)
+    out = read_shard_tensors(shard, [("w", "w")], device="cpu")
+    assert torch.equal(out["w"], payload)
+    assert "(default)" not in asked, "staged on whatever device happened to be default"
+    assert all(str(d) == "cpu" for d in asked), asked
+
+
+def test_an_input_its_producer_never_ran_is_reported_as_a_broken_edge(tmp_path):
+    """An expert-combine step is unpartitioned, so the walk skips it and the next layer
+    restarts from the recording with the whole expert path bypassed. Unsaid, that read as an
+    unbroken chain and credited the tokens it predicted."""
+    from model_partition.planner.graph import ModuleNode, PartitionGraph
+    from model_partition.verify.chain import ChainReport, ChainStep
+
+    graph = PartitionGraph(model="m")
+    graph.modules += [
+        ModuleNode(id="embed", kind="embed", inputs=["tokens"], outputs=["h.0"],
+                   submodules=["embed"]),
+        ModuleNode(id="layers.0.combine", kind="mlp", inputs=["h.0.moe.0"],
+                   outputs=["h.1"], partitioned=False),
+        ModuleNode(id="layers.1.attention", kind="attention", inputs=["h.1"],
+                   outputs=["h.2"], submodules=["layers.1.attn"]),
+    ]
+    produced_by = {t: m.id for m in graph.modules for t in m.outputs}
+    # `tokens` is an entry point: nothing produces it, so starting from the recording there
+    # is the chain beginning, not a hole.
+    assert not [t for t in ["tokens"] if t in produced_by]
+    # `h.1` is produced by a node the walk never runs, which is a hole.
+    assert produced_by["h.1"] == "layers.0.combine"
+
+    # A step with no reason leaves the chain looking unbroken and credits the tokens.
+    silent = ChainReport(sample_id="s", tokens=[7], reference_tokens=[7], steps=[
+        ChainStep(module_id="layers.1.attention", tensor="h.2", chained=False)])
+    assert silent.unbroken and silent.credited_tokens
+    # Saying why is what makes it count as uncarried.
+    spoken = ChainReport(sample_id="s", tokens=[7], reference_tokens=[7], steps=[
+        ChainStep(module_id="layers.1.attention", tensor="h.2", chained=False,
+                  unchained_reason="h.1 is produced by layers.0.combine, which the chain "
+                                   "does not run")])
+    assert not spoken.unbroken and not spoken.credited_tokens

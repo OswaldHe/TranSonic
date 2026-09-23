@@ -127,7 +127,14 @@ def read_shard_tensors(path: Path, wanted: list[tuple[str, str]],
             nbytes = end - begin
             # One tensor-sized allocation, filled in blocks. Reading the whole slice as
             # `bytes` first would hold the largest tensors twice.
-            flat = torch.empty(nbytes, dtype=torch.uint8)
+            #
+            # `device` explicitly, never the default one: building a module sets the
+            # default device to the accelerator and leaves it set, so an unqualified
+            # `torch.empty` here put the *next* module's staging buffer on the card. For
+            # the host-only n-gram tables this path exists to serve — 94.6 GiB, asked for
+            # on a 44 GiB card — that is an out-of-memory error partway through
+            # `verify.py --all-modules`, where one module at a time succeeds.
+            flat = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
             handle.seek(start_of_data + begin)
             at = 0
             while at < nbytes:

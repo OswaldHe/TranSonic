@@ -425,11 +425,14 @@ def stage_plan(ctx: LoopContext) -> StageResult:
             ctx.inventory, ctx.budget.usable_bytes,
             # Sized against what the loader will actually hold. Vendor code casts a
             # quantized checkpoint to the spec's dtype as it loads, so the module that
-            # has to fit the card is the bf16 one, not the fp8 bytes on disk.
+            # has to fit the card is the bf16 one, not the fp8 bytes on disk — but only
+            # when a dtype was asked for. `dtype: checkpoint` means the opposite: the fp8
+            # and fp4 tensors are kept as stored because the vendor's kernels take them
+            # that way, and sizing those at four times their residency splits modules that
+            # fit and sends others to the host for nothing.
             ctx.options.plan_options(
                 ctx.seq_len,
-                dequant_resident=bool(ctx.inventory.dequant_bytes
-                                      and ctx.result.loader == "repo_code"),
+                dequant_resident=_loader_widens_dtype(ctx),
             ),
             cost=cost, model_name=ctx.spec.source, revision=ctx.result.revision,
         )
@@ -586,6 +589,20 @@ def _checkpoint_identity(ctx: LoopContext) -> dict[str, str] | None:
     size = format_bytes(ctx.inventory.total_param_bytes()) if ctx.inventory else "large"
     return {"repo_id": repo_id, "revision": str(ctx.result.revision or "main"),
             "checkpoint_size": size}
+
+
+def _loader_widens_dtype(ctx: LoopContext) -> bool:
+    """Whether the model will be held wider than the checkpoint stores it.
+
+    True only when a quantized checkpoint is loaded by vendor code *and* the spec names a
+    dtype to cast to. ``dtype: checkpoint`` (or ``native``/``auto``) keeps the stored
+    dtypes, which for a quantized checkpoint is the point of it.
+    """
+    from model_partition.loaders.repo_code_loader import NATIVE_DTYPES
+
+    if not (ctx.inventory and ctx.result) or ctx.result.loader != "repo_code":
+        return False
+    return bool(ctx.inventory.dequant_bytes) and ctx.spec.dtype not in NATIVE_DTYPES
 
 
 def _extraction_config(ctx: LoopContext) -> dict[str, Any]:

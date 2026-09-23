@@ -349,6 +349,10 @@ def test_the_self_containment_check_brings_the_fetched_checkpoint_along(tmp_path
     root = _run(tmp_path)
     (root / "hf").mkdir()
     (root / "hf" / "model-00001-of-00002.safetensors").write_bytes(b"\x00" * 64)
+    # What `fetch_weights.py` leaves behind beside the shards. A directory cannot be
+    # hardlinked and cannot be copied as a file either, so including it crashed the check.
+    (root / "hf" / ".cache" / "huggingface").mkdir(parents=True)
+    (root / "hf" / ".cache" / "huggingface" / "download.json").write_text("{}")
 
     files, _total = collect(root)
     assert not any(p.name.endswith(".safetensors") for p in files), "hf/ is uploaded"
