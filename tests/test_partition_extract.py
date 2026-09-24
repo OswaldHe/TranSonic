@@ -149,7 +149,7 @@ def test_inference_script_runs_the_module_from_its_dumps(tiny_run, tmp_path):
     completed = _script(tiny_run, tmp_path, "inference.py")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "output shape=" in completed.stdout
-    assert "dumped tensor(s)" in completed.stdout
+    assert "tensor(s) loaded" in completed.stdout
 
 
 def test_inference_reports_error_and_latency_as_autohelix_metrics(tiny_run, tmp_path):
@@ -210,12 +210,17 @@ def test_extraction_copies_the_runtime_into_the_run(tiny_run, tmp_path):
     assert (vendored / "runtime" / "launcher.py").is_file()
     assert (vendored / "verify" / "numerics.py").is_file()
     # And nothing that drags the rest of the harness in behind it: every module it
-    # imports has to be one of the copies beside it.
+    # imports has to be one of the copies beside it — either a vendored file, or a
+    # vendored package, which is what `from model_partition.runtime import ...` resolves to.
     for path in vendored.rglob("*.py"):
         for line in path.read_text().splitlines():
             if line.startswith(("import model_partition", "from model_partition")):
                 dotted = line.split()[1].removeprefix("model_partition.")
-                assert (vendored / (dotted.replace(".", "/") + ".py")).is_file(), line
+                if dotted == "model_partition":
+                    continue
+                target = vendored / dotted.replace(".", "/")
+                assert target.with_suffix(".py").is_file() \
+                    or (target / "__init__.py").is_file(), line
 
 
 def test_calls_json_names_every_tensor_a_module_needs(tiny_run, tmp_path):
@@ -288,8 +293,17 @@ def test_group_directory_names_are_readable_and_unique(tiny_moe_run, tmp_path):
                      run_root=tiny_moe_run.layout.root)
     names = [g.directory.name for g in groups]
     assert len(set(names)) == len(names)
-    assert any("decoder_layers" in name for name in names)
-    assert all(name[:2].isdigit() for name in names)
+    # Named for the class the model calls it, not for a kind and a signature hash.
+    assert any("TinyDecoderLayer" in name for name in names)
+    assert not any("other" in name for name in names)
+    for group in groups:
+        name = group.directory.name
+        if group.layer_indices:
+            # A layer number first, zero-padded so the directory listing reads in order.
+            assert name[:2].isdigit(), name
+            assert name == f"{min(group.layer_indices):02d}-{name.split('-', 1)[1]}", name
+        else:
+            assert not name[:1].isdigit(), name
 
 
 def test_missing_submodule_is_recorded_not_fatal(tiny_run, tmp_path):
@@ -368,7 +382,14 @@ def test_source_holds_this_module_and_not_the_rest_of_the_model(tiny_run, tmp_pa
     assert "class RMSNorm" in source
     for absent in ("class TinyAttention", "class TinyMoE", "class TinyCausalLM"):
         assert absent not in source, f"{absent} is not part of this module"
-    origin = Path(next(iter(norm.source_files)))
+    # Provenance is recorded relative to the checkpoint the code came out of, because the
+    # artifact is published and an absolute path names the producer's disk. The file
+    # itself travels into the run's `vendor/`, which is where to read it back from.
+    from model_partition.extract import VENDOR_DIR
+
+    recorded = Path(next(iter(norm.source_files)))
+    assert not recorded.is_absolute()
+    origin = Path(tiny_run.layout.root) / VENDOR_DIR / recorded.name
     assert len(source) < len(origin.read_text())
 
 
@@ -666,3 +687,206 @@ def test_a_copied_run_checks_itself_where_it_landed(tiny_run, tmp_path):
         completed = subprocess.run(command, cwd=copied, capture_output=True,
                                    text=True, timeout=300)
         assert completed.returncode == 0, name + ": " + completed.stdout + completed.stderr
+
+
+# -- what a module directory is called ---------------------------------------
+
+
+class _Node:
+    def __init__(self, module_id: str, kind: str = "other",
+                 layer_indices: list[int] | None = None) -> None:
+        self.id = module_id
+        self.kind = kind
+        self.layer_indices = layer_indices or []
+
+
+def test_a_directory_is_named_for_its_layer_and_its_class():
+    """`00-Attention`, not `10-attention-91e2bc99` and certainly not `04-other-...`.
+
+    A group index and a signature hash tell a reader nothing, and `other` tells them less
+    than nothing. The class name is the model's own word for what the module is.
+    """
+    from model_partition.extract import _group_dirname
+
+    assert _group_dirname(_Node("layers.0.attention", "decoder_layers", [0]),
+                          "sig-91e2bc99171d:attention", class_name="Attention") == "00-Attention"
+    assert _group_dirname(_Node("mtp.2.markov_head", "other", [42]), "sig-abc",
+                          class_name="DSparkMarkovHead") == "42-DSparkMarkovHead"
+    # No layer to name: a global module is simply its class.
+    assert _group_dirname(_Node("embed", "embed"), "embed",
+                          class_name="ParallelEmbedding") == "ParallelEmbedding"
+
+
+def test_a_group_with_no_instantiated_class_falls_back_to_its_own_name():
+    """`(not instantiated)` is not a directory name, and neither is a bare kind."""
+    from model_partition.extract import _group_dirname
+
+    assert _group_dirname(_Node("layers.3.ffn", "mlp", [3]), "sig-x",
+                          class_name="(not instantiated)") == "03-ffn"
+    assert _group_dirname(_Node("layers.3.ffn", "mlp", [3]), "sig-x") == "03-ffn"
+
+
+def test_two_groups_that_would_share_a_name_stay_apart():
+    """Several expert groups of one layer would otherwise replace each other."""
+    from model_partition.extract import _group_dirname
+
+    taken: set[str] = set()
+    first = _group_dirname(_Node("layers.1.experts", "moe_experts", [1]), "sig-aaaaaaaa11",
+                           taken, "MoE")
+    taken.add(first)
+    second = _group_dirname(_Node("layers.1.experts", "moe_experts", [1]), "sig-bbbbbbbb22",
+                            taken, "MoE")
+    assert first == "01-MoE"
+    assert second != first and second.startswith("01-MoE-")
+
+
+def test_a_renamed_group_directory_is_still_found(tiny_run, tmp_path):
+    """A stale `directory` in the index must not read as "every module is unusable".
+
+    The index names the directory; `meta.yaml` travels *with* it. When the two disagree,
+    the one that moved with the files wins.
+    """
+    import yaml as _yaml
+
+    from model_partition.runtime.module_impl import find_impl_dirs
+
+    groups = extract(tiny_run.graph, tiny_run.build_model(), tiny_run.layout.modules_dir,
+                     run_root=tiny_run.layout.root, sample_ids=tiny_run.sample_ids)
+    root = tiny_run.layout.modules_dir
+    before = find_impl_dirs(root)
+    assert before and all((p / "inference.py").is_file() for p in before.values())
+
+    moved = groups[0].directory
+    moved.rename(moved.parent / "renamed-out-of-band")
+    after = find_impl_dirs(root)
+    assert set(after) == set(before)
+    assert all((p / "inference.py").is_file() for p in after.values()), \
+        "a renamed directory left its modules pointing at nothing"
+    served = _yaml.safe_load((moved.parent / "renamed-out-of-band" / "meta.yaml").read_text())
+    for module_id in served["module_ids"]:
+        assert after[module_id].name == "renamed-out-of-band"
+
+
+def test_an_optimized_group_under_an_earlier_name_moves_with_its_work(tiny_run, tmp_path):
+    """Directories used to be `<index>-<kind>-<signature>`. Re-extracting a run from then
+    found nothing at the new name, wrote a fresh baseline there, and left the optimized
+    files in a directory the index no longer names."""
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    current = group.directory
+    (current / "inference.py").write_text("# an agent's optimized launcher\n")
+    (current / "source.py").write_text((current / "source.py").read_text()
+                                       + "\n# an agent's optimized kernel\n")
+    earlier = current.parent / "03-decoder_layers-0a1b2c3d"
+    current.rename(earlier)
+
+    again = _extract(tiny_run, tmp_path)
+    moved = next(g for g in again if g.signature == group.signature)
+    assert moved.directory == current
+    assert not earlier.exists()
+    assert moved.preserved
+    assert (current / "inference.py").read_text() == "# an agent's optimized launcher\n"
+    assert (current / "source.py").read_text().endswith("# an agent's optimized kernel\n")
+
+
+def test_fetching_skips_modules_whose_feature_maps_were_not_published(tmp_path):
+    """A published subset keeps every same-signature sibling in its group's `calls.json`.
+    Fetching for all of them by default pulled shards for modules that could not run —
+    after `--one-per-kind`, most of a 475 GiB checkpoint."""
+    import importlib.util
+    import json
+
+    from model_partition.extract import write_fetch_script
+
+    root = tmp_path / "run"
+    group = root / "modules" / "00-Attention"
+    group.mkdir(parents=True)
+    published = root / "trace" / "activations" / "layers.0.attn"
+    published.mkdir(parents=True)
+    (published / "x.bin").write_bytes(b"\x00" * 2)
+
+    def entry(module_id, shard):
+        dump = f"../../trace/activations/{module_id}/x.bin"
+        return {"weights_missing": {f"{module_id}.wq.weight": {"shard": shard, "key": "k"}},
+                "calls": {"s#0": [{"args": [
+                    {"__tensor__": {"bin": dump, "dtype": "bfloat16", "shape": [1]}}]}]}}
+
+    (group / "calls.json").write_text(json.dumps({"modules": {
+        "layers.0.attn": entry("layers.0.attn", "model-00001.safetensors"),
+        "layers.7.attn": entry("layers.7.attn", "model-00007.safetensors"),
+    }}))
+    path = write_fetch_script(root, "org/model", "dba1be0a")
+    spec = importlib.util.spec_from_file_location("_fetch_weights_under_test", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    by_shard, unresolvable, unpublished = script.shards_wanted([], [])
+    assert by_shard == {"model-00001.safetensors": {"layers.0.attn"}}
+    assert unpublished == ["layers.7.attn"]
+    assert not unresolvable
+    # Asking for the sibling by name does not make its feature maps appear.
+    assert script.shards_wanted([], ["layers.7.attn"])[0] == {}
+
+
+def test_a_directory_holding_another_group_is_not_preserved_as_this_one(tiny_run, tmp_path):
+    """A repaired plan can change a group's signature while its first layer and principal
+    class stay put, so the readable name resolves to a directory holding a different
+    group's implementation. Preserving that keeps the old `source.py` under the new
+    group's metadata and calls — a relabelled implementation, not a kept one."""
+    from model_partition import yamlio
+
+    groups = _extract(tiny_run, tmp_path)
+    group = next(g for g in groups if g.class_name == "TinyDecoderLayer")
+    directory = group.directory
+    (directory / "source.py").write_text("# another group's implementation\n")
+    # What a plan repair leaves behind: the same directory, a different signature recorded.
+    meta = yamlio.load_path(directory / "meta.yaml")
+    meta["signature"] = "sig-something-else"
+    (directory / "meta.yaml").write_text(yamlio.dumps(meta, sort_keys=False))
+
+    again = _extract(tiny_run, tmp_path)
+    same = next(g for g in again if g.signature == group.signature)
+    assert same.directory == directory
+    assert not same.preserved, "kept an implementation belonging to another signature"
+    assert "another group's implementation" not in (directory / "source.py").read_text()
+
+
+def test_fetching_reports_a_nonzero_status_while_a_weight_stays_unresolved(tmp_path):
+    """A parameter recorded with no shard is one nothing can supply. Reporting that as
+    "every parameter is already dumped", with a zero status, told a caller the artifact had
+    been made runnable when it had not — and left no way for a script to tell."""
+    import importlib.util
+    import json
+
+    from model_partition.extract import write_fetch_script
+
+    root = tmp_path / "run"
+    group = root / "modules" / "00-Attention"
+    group.mkdir(parents=True)
+    dumps = root / "trace" / "activations" / "layers.0.attn"
+    dumps.mkdir(parents=True)
+    (dumps / "x.bin").write_bytes(b"\x00" * 2)
+    calls = {"calls": {"s#0": [{"args": [{"__tensor__": {
+        "bin": "../../trace/activations/layers.0.attn/x.bin",
+        "dtype": "bfloat16", "shape": [1]}}]}]}}
+
+    def write(missing):
+        (group / "calls.json").write_text(json.dumps(
+            {"modules": {"layers.0.attn": {**calls, "weights_missing": missing}}}))
+        path = write_fetch_script(root, "org/model", "rev")
+        spec = importlib.util.spec_from_file_location(f"_fetch_{id(missing)}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    # Nothing names a shard: fetching cannot help, and the status has to say so.
+    script = write({"layers.0.attn.wq.weight": {}})
+    by_shard, unresolvable, _ = script.shards_wanted([], [])
+    assert not by_shard and unresolvable == ["layers.0.attn: layers.0.attn.wq.weight"]
+    assert script.main(["--list"]) == 1
+    assert script.main([]) == 1
+
+    # Everything resolves, so --list is a clean report.
+    script = write({"layers.0.attn.wq.weight": {"shard": "model-00001.safetensors",
+                                                "key": "k"}})
+    assert script.main(["--list"]) == 0

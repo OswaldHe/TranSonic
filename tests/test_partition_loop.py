@@ -6,6 +6,7 @@
 import json
 
 import pytest
+import yaml
 
 from model_partition.layout import RunLayout
 from model_partition.loop.state import (
@@ -654,7 +655,14 @@ def test_a_wrong_module_implementation_fails_the_run(tiny_run, tmp_path):
     # Replace an implementation with one that returns the wrong thing.
     impls = sorted(first.context.layout.modules_dir.glob("*/inference.py"))
     assert impls
-    target = next(p for p in impls if "decoder" in p.parent.name)
+    # By what the group *serves*, not by what its directory is called: the name is the
+    # layer and the class (`00-TinyDecoderLayer`), which is a reader's spelling and not
+    # a selector's.
+    decoders = {m.id for m in first.context.graph.partitioned_modules
+                if m.kind == "decoder_layers"}
+    target = next(p for p in impls
+                  if decoders & set(yaml.safe_load(
+                      (p.parent / "meta.yaml").read_text())["module_ids"]))
     target.write_text(
         "MODULE_IDS = " + repr([m.id for m in first.context.graph.partitioned_modules
                                if m.kind == "decoder_layers"]) + "\n"
@@ -769,8 +777,8 @@ def test_a_second_run_retraces_into_a_clean_directory(tiny_run, tmp_path):
     orphan.parent.mkdir(parents=True, exist_ok=True)
     orphan.write_bytes(b"\x00" * 1024)
 
-    # decode_steps is part of the trace hash, so changing it re-runs that stage.
-    assert loop_for(tiny_run, tmp_path, retain=False, decode_steps=8).run().passed
+    # slice_long is part of the trace hash, so changing it re-runs that stage.
+    assert loop_for(tiny_run, tmp_path, retain=False, slice_long=True).run().passed
     assert not orphan.exists()
 
 
@@ -1083,3 +1091,49 @@ def test_a_rerun_that_fails_does_not_stay_passed(tiny_run, tmp_path, monkeypatch
     assert not again.state.passed
     from model_partition.loop.state import LoopState
     assert not LoopState.load(again.context.layout.state_file).passed
+
+
+def test_a_bare_repo_id_gets_a_fetch_script_like_a_prefixed_one(tmp_path):
+    """`org/model` is a HuggingFace checkpoint to ingestion, and has to be one to the fetch
+    script too: a run started that way published modules short of their weights and no
+    advertised way to get them."""
+    from types import SimpleNamespace
+
+    from model_partition.loop.stages import _checkpoint_identity
+    from model_partition.spec import ModelSpec
+
+    result = SimpleNamespace(revision="dba1be0a")
+    for source in ("org/model", "hf:org/model"):
+        ctx = SimpleNamespace(result=result, inventory=None,
+                              spec=ModelSpec(name="m", source=source))
+        assert _checkpoint_identity(ctx) == {
+            "repo_id": "org/model", "revision": "dba1be0a", "checkpoint_size": "large"}
+
+    local = tmp_path / "checkpoint"
+    local.mkdir()
+    ctx = SimpleNamespace(result=result, inventory=None,
+                          spec=ModelSpec(name="m", source=str(local)))
+    assert _checkpoint_identity(ctx) is None
+
+
+def test_a_native_dtype_checkpoint_is_not_sized_as_if_it_were_widened(tmp_path):
+    """`dtype: checkpoint` keeps the fp8 and fp4 tensors the vendor's kernels take as
+    stored. Counting those at up to four times their residency splits modules that fit and
+    sends others to the host for nothing."""
+    from types import SimpleNamespace
+
+    from model_partition.loop.stages import _loader_widens_dtype
+
+    def ctx(dtype, loader="repo_code", dequant=1 << 30):
+        return SimpleNamespace(spec=SimpleNamespace(dtype=dtype),
+                               result=SimpleNamespace(loader=loader),
+                               inventory=SimpleNamespace(dequant_bytes=dequant))
+
+    # Kept as stored: nothing is widened, so nothing is sized as if it were.
+    for native in ("checkpoint", "native", "auto", ""):
+        assert not _loader_widens_dtype(ctx(native)), native
+    # A dtype the loader casts the whole model to is the case the sizing exists for.
+    assert _loader_widens_dtype(ctx("bfloat16"))
+    # And an unquantized checkpoint has nothing to widen either way.
+    assert not _loader_widens_dtype(ctx("bfloat16", dequant=0))
+    assert not _loader_widens_dtype(ctx("bfloat16", loader="transformers"))

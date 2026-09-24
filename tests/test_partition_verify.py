@@ -3,6 +3,8 @@
 
 """Tests for numeric comparison and module verification."""
 
+from pathlib import Path
+
 import pytest
 
 from model_partition.verify.modules import (
@@ -18,6 +20,9 @@ from model_partition.verify.numerics import (
 )
 
 torch = pytest.importorskip("torch")
+
+#: Where the partition package lives, for tests that start a fresh interpreter.
+PARTITION_ROOT = Path(__import__("model_partition").__file__).resolve().parents[1]
 
 
 # -- tolerances --------------------------------------------------------------
@@ -521,6 +526,52 @@ def test_a_class_gets_the_config_value_under_the_name_the_config_uses():
     assert _config_kwargs(Norm, {"dim": 8, "eps": 0.5}, None) == {"dim": 8, "eps": 0.5}
 
 
+def test_a_class_that_takes_nothing_is_built_with_nothing():
+    """DeepSeek's hyper-connection output half is arithmetic on its inputs: no config
+    field describes it and it owns no weight. Every attempt passed it the config, and
+    `nn.Module.__init__` refuses one, so it could not be built at all."""
+    from torch import nn
+
+    from model_partition.runtime.launcher import LauncherError, _construct
+
+    class Inherited(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Declared(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    for cls in (Inherited, Declared):
+        assert isinstance(_construct(cls, {"dim": 8}, 0, {}, {"dim": 8}), cls)
+
+    # A class naming a parameter is not one of these even when it defaults every one:
+    # built from nothing, it is built from its defaults.
+    class Defaulted(nn.Module):
+        def __init__(self, scale: float = 2.0):
+            super().__init__()
+            self.scale = float(scale)
+
+    with pytest.raises(LauncherError, match="could not construct Defaulted"):
+        _construct(Defaulted, {"dim": 8}, 0, {}, {"dim": 8})
+
+
+def test_a_module_the_trace_saw_own_nothing_has_all_its_weights():
+    """An empty parameter list is the trace saying so; no entry at all is not."""
+    from types import SimpleNamespace
+
+    from model_partition.runtime.module_runner import owns_weights
+
+    bundle = SimpleNamespace(
+        weights={"dumped": ["dumped.w"]},
+        weight_params={"mix_out": [], "attn": ["attn.wq.weight"], "dumped": []},
+    )
+    assert not owns_weights(bundle, "mix_out")
+    assert owns_weights(bundle, "attn")
+    assert owns_weights(bundle, "dumped")
+    assert owns_weights(bundle, "never_indexed")
+
+
 def test_a_recorded_tensor_that_already_fits_becomes_the_parameter():
     """Copying into a freshly allocated parameter holds the module twice, which a 94.4
     GiB n-gram table does not allow — and fp4-packed expert weights have no `copy_` at
@@ -568,6 +619,37 @@ def test_the_launcher_identifies_the_module_from_its_weights(tiny_deep_run, tmp_
     assert found[0] == target.id
 
     assert _module_paths(submodules, {"nothing.recognisable": None}) is None
+
+
+def test_a_module_owning_no_weights_is_named_by_its_caller():
+    """86 identical hyper-connection output halves, and no weight names to tell them
+    apart: the caller knows which one it is building, and says so."""
+    from model_partition.runtime.launcher import _module_paths
+
+    submodules = {"layers.0.hc_attn_out": ["layers.0.hc_attn_out"],
+                  "layers.7.hc_ffn_out": ["layers.7.hc_ffn_out"]}
+    assert _module_paths(submodules, {}) is None
+    assert _module_paths(submodules, {}, "layers.7.hc_ffn_out") == (
+        "layers.7.hc_ffn_out", ["layers.7.hc_ffn_out"])
+
+
+def test_an_implementation_is_passed_only_the_arguments_it_declares(tmp_path):
+    """`module_id` is new; an `inference.py` written before it must still build."""
+    from model_partition.runtime.module_impl import load_impl
+
+    older, newer = tmp_path / "older", tmp_path / "newer"
+    for directory in (older, newer):
+        directory.mkdir()
+    (older / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu', submodule=None):\n"
+        "    return lambda: (device, submodule)\n")
+    (newer / "inference.py").write_text(
+        "def build_module(config, weights, device='cpu', submodule=None, module_id=None):\n"
+        "    return lambda: (device, submodule, module_id)\n")
+
+    assert load_impl(older).build({}, {}, "cpu", module_id="layers.3.ffn")() == ("cpu", None)
+    assert load_impl(newer).build({}, {}, "cpu", module_id="layers.3.ffn")() == (
+        "cpu", None, "layers.3.ffn")
 
 
 def test_every_module_of_a_shared_group_verifies(tiny_deep_run, tmp_path):
@@ -986,12 +1068,23 @@ def test_a_split_layers_residual_add_is_reconstructed_from_the_recording(tiny_sp
     """
     suite = _chain(tiny_split_run, tmp_path)
     report = suite.reports[0]
-    assert suite.passed, suite.render()
-    assert report.unbroken, report.render()
-    assert not report.unchained, report.render()
     residual = [s for s in report.steps if "residual add" in s.via]
     assert len(residual) >= 2, report.render()
+    assert all(s.passed for s in residual), report.render()
     assert report.tokens_agree
+
+    # This plan also splits an over-budget MoE, which leaves `layers.N.combine`
+    # unpartitioned — there is no `nn.Module` to hook — so the chain cannot run it and the
+    # layer after it restarts from the recording with the whole expert path bypassed. That
+    # is a hole in the coverage rather than drift, and it has to be named: unsaid, it read
+    # as an unbroken chain that had earned the tokens it predicted.
+    bypassed = {s.module_id for s in report.unchained}
+    assert bypassed == {"layers.2.attention", "final_norm"}, report.render()
+    assert all("combine" in s.unchained_reason for s in report.unchained), report.render()
+    assert not report.unbroken, report.render()
+    assert not report.credited_tokens, "credited tokens for a chain it did not carry"
+    # Still passing: every boundary the chain *did* carry held, which is what it measures.
+    assert suite.passed, suite.render()
 
 
 def test_an_edge_the_recording_contradicts_is_not_carried(tiny_run, tmp_path):
@@ -1028,3 +1121,197 @@ def test_tokens_are_only_credited_when_the_chain_is_unbroken(tiny_run, tmp_path)
     assert suite.kept_tokens() == 0
     assert suite.mean_top1() == 0.0
     assert report.passed  # held, because nothing carried drifted
+
+
+# -- one submodule, several invocations --------------------------------------
+
+
+class _Rec:
+    """Just enough of a CallRecord for the run-splitting logic."""
+
+    def __init__(self, submodule: str) -> None:
+        self.submodule = submodule
+
+
+class _Node:
+    def __init__(self, is_parallel: bool = False) -> None:
+        self.is_parallel = is_parallel
+
+
+def test_a_submodule_called_twice_is_two_checks_not_one_long_chain():
+    """DeepSeek's draft head calls `markov_head` once per drafted position.
+
+    Those calls are not a chain — the module is pure, and each one runs on the token the
+    previous call sampled. Pairing the first call's input with the last call's output
+    checks neither, and it only looked like a pass because the dumps used to share tensor
+    paths, so every record read the last invocation's numbers.
+    """
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("mtp.2.markov_head") for _ in range(5)]
+    runs = _record_runs(_Node(), records, with_impl=True)
+    assert len(runs) == 5
+    assert all(len(run) == 1 for run in runs)
+    assert [run[0] for run in runs] == records
+
+
+def test_a_heterogeneous_group_is_still_one_computation():
+    """A norm feeding attention is input-from-the-first, reference-from-the-last."""
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("layers.0.attn_norm"), _Rec("layers.0.attn")]
+    runs = _record_runs(_Node(), records, with_impl=True)
+    assert runs == [records]
+
+
+def test_a_group_invoked_twice_splits_into_two_computations():
+    """Both things at once: distinct submodules chained, and the chain run again."""
+    from model_partition.verify.modules import _record_runs
+
+    norm_a, attn_a = _Rec("layers.0.attn_norm"), _Rec("layers.0.attn")
+    norm_b, attn_b = _Rec("layers.0.attn_norm"), _Rec("layers.0.attn")
+    runs = _record_runs(_Node(), [norm_a, attn_a, norm_b, attn_b], with_impl=True)
+    assert runs == [[norm_a, attn_a], [norm_b, attn_b]]
+
+
+def test_a_parallel_group_checks_every_call_against_its_own_output():
+    """Each expert sees its own routed tokens, so there is no chain to collapse."""
+    from model_partition.verify.modules import _record_runs
+
+    records = [_Rec("experts.0"), _Rec("experts.1")]
+    assert _record_runs(_Node(is_parallel=True), records, with_impl=True) == [
+        [records[0]], [records[1]],
+    ]
+    # And without an implementation each submodule is replayed against its own record.
+    assert _record_runs(_Node(), records, with_impl=False) == [[records[0]], [records[1]]]
+
+
+def test_a_chain_that_moves_a_token_on_drift_no_boundary_flags_stays_repairable(
+        tmp_path, monkeypatch):
+    """Two nearly tied logits can swap after accumulated drift while every boundary is
+    inside tolerance. With no first divergence to name, the stage was marked
+    unrepairable and the loop stopped instead of handing the implementations back."""
+    from types import SimpleNamespace
+
+    from model_partition.loop import stages
+    from model_partition.verify.chain import ChainReport, ChainStep, ChainSuite
+    from model_partition.verify.numerics import Comparison
+
+    def step(module_id, cosine):
+        return ChainStep(module_id=module_id, tensor=f"{module_id}.out", chained=True,
+                         comparison=Comparison(name=module_id, passed=True, cosine=cosine))
+
+    report = ChainReport(sample_id="s",
+                         steps=[step("embed", 1.0), step("layers.0", 0.9991),
+                                step("layers.1", 0.9997)],
+                         tokens=[5], reference_tokens=[7])
+    suite = ChainSuite(reports=[report])
+    assert not suite.passed and not suite.diverging_modules()
+    assert suite.most_drifted() == ["layers.0", "layers.1", "embed"]
+
+    (tmp_path / "reports").mkdir()
+    ctx = SimpleNamespace(graph=object(),
+                          layout=SimpleNamespace(reports_dir=tmp_path / "reports"))
+    monkeypatch.setattr(stages, "load_bundle", lambda ctx: None)
+    monkeypatch.setattr(stages, "_impl_dirs", lambda ctx: {"layers.0": tmp_path})
+    monkeypatch.setattr(stages, "_accelerator", lambda ctx: "cpu")
+    monkeypatch.setattr(stages, "verify_chain", lambda *a, **k: suite)
+
+    result = stages.stage_verify_chain(ctx)
+    assert not result.ok
+    assert result.repairable
+    assert result.failing_modules[0] == "layers.0"
+    assert "every carried boundary held" in result.detail
+
+
+def test_a_shard_is_staged_on_the_host_whatever_the_default_device_is(tmp_path, monkeypatch):
+    """Building a module sets the default device to the accelerator and leaves it set, so an
+    unqualified allocation here put the next module's staging buffer on the card — and the
+    n-gram tables this path exists to serve are 94.6 GiB against a 44 GiB card."""
+    import json as _json
+
+    from model_partition.runtime.artifact import read_shard_tensors
+
+    payload = torch.arange(8, dtype=torch.float32)
+    raw = payload.numpy().tobytes()
+    header = _json.dumps({"w": {"dtype": "F32", "shape": [8], "data_offsets": [0, len(raw)]}})
+    shard = tmp_path / "shard.safetensors"
+    shard.write_bytes(len(header).to_bytes(8, "little") + header.encode() + raw)
+
+    asked: list[object] = []
+    real_empty = torch.empty
+
+    def watched(*args, **kwargs):
+        asked.append(kwargs.get("device", "(default)"))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", watched)
+    out = read_shard_tensors(shard, [("w", "w")], device="cpu")
+    assert torch.equal(out["w"], payload)
+    assert "(default)" not in asked, "staged on whatever device happened to be default"
+    assert all(str(d) == "cpu" for d in asked), asked
+
+
+def test_an_input_its_producer_never_ran_is_reported_as_a_broken_edge(tmp_path):
+    """An expert-combine step is unpartitioned, so the walk skips it and the next layer
+    restarts from the recording with the whole expert path bypassed. Unsaid, that read as an
+    unbroken chain and credited the tokens it predicted."""
+    from model_partition.planner.graph import ModuleNode, PartitionGraph
+    from model_partition.verify.chain import ChainReport, ChainStep
+
+    graph = PartitionGraph(model="m")
+    graph.modules += [
+        ModuleNode(id="embed", kind="embed", inputs=["tokens"], outputs=["h.0"],
+                   submodules=["embed"]),
+        ModuleNode(id="layers.0.combine", kind="mlp", inputs=["h.0.moe.0"],
+                   outputs=["h.1"], partitioned=False),
+        ModuleNode(id="layers.1.attention", kind="attention", inputs=["h.1"],
+                   outputs=["h.2"], submodules=["layers.1.attn"]),
+    ]
+    produced_by = {t: m.id for m in graph.modules for t in m.outputs}
+    # `tokens` is an entry point: nothing produces it, so starting from the recording there
+    # is the chain beginning, not a hole.
+    assert not [t for t in ["tokens"] if t in produced_by]
+    # `h.1` is produced by a node the walk never runs, which is a hole.
+    assert produced_by["h.1"] == "layers.0.combine"
+
+    # A step with no reason leaves the chain looking unbroken and credits the tokens.
+    silent = ChainReport(sample_id="s", tokens=[7], reference_tokens=[7], steps=[
+        ChainStep(module_id="layers.1.attention", tensor="h.2", chained=False)])
+    assert silent.unbroken and silent.credited_tokens
+    # Saying why is what makes it count as uncarried.
+    spoken = ChainReport(sample_id="s", tokens=[7], reference_tokens=[7], steps=[
+        ChainStep(module_id="layers.1.attention", tensor="h.2", chained=False,
+                  unchained_reason="h.1 is produced by layers.0.combine, which the chain "
+                                   "does not run")])
+    assert not spoken.unbroken and not spoken.credited_tokens
+
+
+def test_a_source_is_registered_under_the_same_private_name_in_every_process():
+    """`hash()` of a string is salted per process, so a name built from it changed every
+    run. Nothing reads the recorded value for a flat name like these, so the churn was
+    invisible — except that it rewrote all 32 `meta.yaml` files of an artifact each run and
+    added a version of every one to the published history."""
+    import subprocess
+    import sys
+
+    from model_partition.runtime import private_module_name
+
+    # Unique per path, which is the property the launcher needs: re-importing an edited
+    # file must replace its predecessor in `sys.modules` rather than sit beside it.
+    assert private_module_name("_p_", "/a/b.py") != private_module_name("_p_", "/a/c.py")
+    assert private_module_name("_p_", "/a/b.py").startswith("_p_")
+
+    # And identical across processes, which `hash()` was not. Two interpreters with
+    # different hash seeds is the only way to show it.
+    program = ("from model_partition.runtime import private_module_name as n;"
+               "print(n('_model_partition_source_', '/some/source.py'))")
+    seen = set()
+    for seed in ("0", "12345"):
+        out = subprocess.run([sys.executable, "-c", program], capture_output=True,
+                             text=True, env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin",
+                                             "PYTHONPATH": str(PARTITION_ROOT)})
+        assert out.returncode == 0, out.stderr
+        seen.add(out.stdout.strip())
+    assert len(seen) == 1, f"the name moved with the hash seed: {seen}"
+    assert seen == {private_module_name("_model_partition_source_", "/some/source.py")}

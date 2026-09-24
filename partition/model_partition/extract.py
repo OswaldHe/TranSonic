@@ -36,6 +36,7 @@ from model_partition.trace import _lookup
 # Not a field of any framework config: a quantized checkpoint names its *storage* dtype
 # and computes in another, and a module built in the wrong one has its kernels reject
 # their own output buffers.
+from model_partition.runtime.artifact import CHECKPOINT_DIR
 from model_partition.runtime.launcher import (  # noqa: F401  (re-exported)
     CALLS_FILENAME,
     COMPUTE_DTYPE_KEY,
@@ -49,6 +50,10 @@ from model_partition.runtime.launcher import (  # noqa: F401  (re-exported)
 #: once and then left alone — an optimization made to a module has to survive the
 #: next extraction. Everything else belongs to the harness and is regenerated.
 EDITABLE_TEMPLATES = {"inference.py": "module_inference.py.tmpl"}
+
+#: Written at the run root when the run read weights from the checkpoint instead of
+#: dumping them, so the artifact carries the means to fetch what it is short of.
+FETCH_SCRIPT_NAME = "fetch_weights.py"
 
 #: Config fields a framework keeps private and ``to_dict()`` leaves out, but which
 #: decide what a module computes. The attention implementation is the one that
@@ -125,6 +130,10 @@ class ExtractedGroup:
     layer_indices: list[int] = field(default_factory=list)
     class_name: str = ""
     classes: list[str] = field(default_factory=list)
+    #: Where this group's code came from, named relative to the checkpoint it was read
+    #: out of. Provenance, and the artifact is published: an absolute path names a
+    #: directory on the producer's machine and nowhere else, which is neither useful to a
+    #: reader nor theirs to know.
     source_files: list[str] = field(default_factory=list)
     #: Dotted name the implementation's classes were defined under, so ``source.py``
     #: can be imported with its own relative imports intact.
@@ -258,6 +267,8 @@ def extract(
     regenerate: bool = False,
     config: dict[str, Any] | None = None,
     bundle: Any = None,
+    origin_root: str | Path | None = None,
+    checkpoint: dict[str, str] | None = None,
 ) -> list[ExtractedGroup]:
     """Write one implementation directory per signature group.
 
@@ -274,12 +285,24 @@ def extract(
     ``bundle`` is the trace, and with it each directory also gets the recorded calls and
     weight paths its ``inference.py`` reads. Without it the directories are written all
     the same, so ``extract`` still works before anything has been traced.
+
+    ``origin_root`` is the checkpoint the code was read out of, and recorded provenance is
+    named relative to it. The artifact gets published, and an absolute path names a
+    directory on the machine that produced it and nowhere else.
+
+    ``checkpoint`` names the repo and revision the weights came from (``repo_id``,
+    ``revision``, optionally ``checkpoint_size``). Given it, a run that read its weights
+    from the checkpoint rather than dumping them also gets ``fetch_weights.py``, so the
+    published modules can be completed where they land.
     """
     param_names = param_names or {}
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
     groups: list[ExtractedGroup] = []
     vendored: set[Path] = set()
+    #: Directory names already handed out, so two groups cannot land on one directory.
+    taken: set[str] = set()
+    earlier = _existing_group_dirs(root)
     vendor_runtime(run_root)
 
     for index, (signature, module_ids) in enumerate(sorted(graph.signature_groups().items())):
@@ -301,9 +324,22 @@ def extract(
             group.class_name = type(_principal(targets)).__name__
             vendored |= vendor_code(run_root, files)
         group.classes = names
-        group.source_files = files
+        # Absolute while `vendor_code` needs them to find each file's siblings; recorded
+        # relative, because the record is published and the paths are not the reader's.
+        group.source_files = [_origin_name(f, origin_root) for f in files]
 
-        directory = root / _group_dirname(index, representative, signature)
+        dirname = _group_dirname(representative, signature, taken, group.class_name)
+        taken.add(dirname)
+        directory = root / dirname
+        # A directory an earlier extraction named differently holds whatever has been
+        # optimized in it, and only its name has changed. Left where it was, the check
+        # below finds nothing to preserve, writes a fresh baseline over the work, and
+        # strands it in a directory the index no longer names.
+        previous = earlier.get(signature)
+        if previous is not None and previous != directory and not directory.exists():
+            previous.rename(directory)
+            # It is this group's directory now, which is what the preservation below asks.
+            earlier[signature] = directory
         directory.mkdir(parents=True, exist_ok=True)
         group.directory = directory
 
@@ -314,13 +350,24 @@ def extract(
         group.config_class = config_class
         (directory / CONFIG_FILENAME).write_text(
             json.dumps(settings, indent=2, sort_keys=True, default=str) + "\n")
-        # Whether a previous extraction has been here, asked before this one writes
-        # anything. It decides what counts as somebody's work to keep.
-        had_source = (directory / SOURCE_FILENAME).is_file()
+        # Whether a previous extraction has been *this group* here, asked before this one
+        # writes anything. It decides what counts as somebody's work to keep.
+        #
+        # The signature has to match, not just the path. A repaired plan can change a
+        # group's signature while its first layer and principal class stay put, so the
+        # readable name resolves to a directory holding a different group's
+        # implementation: preserving that keeps the old `source.py` under the new group's
+        # metadata and calls, which is a relabelled implementation rather than a kept one.
+        mine = earlier.get(signature) == directory
+        had_source = (directory / SOURCE_FILENAME).is_file() and mine
         if had_source and not regenerate:
             group.preserved = True
+        # A directory whose recorded signature is not this group's has nothing of this
+        # group's to keep, so its files are rewritten rather than adopted.
         group.launchable = _write_source(directory, principal, sources, signature, files,
-                                         classes=names, regenerate=regenerate)
+                                         classes=names,
+                                         regenerate=regenerate or not mine,
+                                         origin_root=origin_root)
         # What source.py actually holds, so the reported figure is the code someone has
         # to read rather than the size of the file it was taken from.
         source_path = directory / SOURCE_FILENAME
@@ -341,7 +388,6 @@ def extract(
             "submodules": list(representative.submodules),
             "weight_names": weight_names,
             "weight_count": len(weight_names),
-            "run_root": str(run_root),
             "kind": representative.kind,
             "class_names": class_names,
             "config_class": config_class,
@@ -391,7 +437,27 @@ def extract(
             for g in groups
         ],
     }, sort_keys=False))
+    if checkpoint:
+        # Last, because it reads the `calls.json` files written above to decide whether
+        # anything is missing at all.
+        write_fetch_script(run_root, groups=groups, **checkpoint)
     return groups
+
+
+def _origin_name(path: str, origin_root: str | Path | None) -> str:
+    """One source file, named relative to the checkpoint it was read out of.
+
+    Falls back to the last two components — ``inference/model.py`` — which is the same
+    shape a spec's ``code_paths`` uses, so a file from outside the checkpoint still reads
+    as a place inside a repo rather than as a path on this disk.
+    """
+    candidate = Path(path)
+    if origin_root:
+        try:
+            return candidate.resolve().relative_to(Path(origin_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return "/".join(candidate.parts[-2:]) if len(candidate.parts) > 1 else candidate.name
 
 
 def _module_config(model: Any, submodule_names: list[str],
@@ -536,16 +602,51 @@ def write_calls(bundle: Any, directory: str | Path, module_ids: list[str],
             "classes": list(classes),
             "layers": list(layer_map.get(module_id) or []),
             "weights": weights,
-            # Parameters the run did not dump: read from the checkpoint during the run,
-            # and materialized into the artifact before it is published.
-            "weights_missing": [p for p in (bundle.weight_params.get(module_id) or [])
-                                if p not in weights],
+            # Parameters the run did not dump, each with the shard and the key it has in
+            # the checkpoint. Read from the checkpoint during the run; read from
+            # `<run>/hf/` afterwards, which `fetch_weights.py` fills with just these shards.
+            "weights_missing": _checkpoint_refs(bundle, module_id, weights),
             "calls": steps,
         }
 
     path = directory / CALLS_FILENAME
     path.write_text(json.dumps({"version": 1, "modules": modules}, indent=1) + "\n")
     return path
+
+
+def _checkpoint_refs(bundle: Any, module_id: str,
+                     dumped: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Where to find each parameter this run did not dump, in the checkpoint itself.
+
+    Recorded rather than left as bare names, for two reasons. ``fetch_weights.py`` can
+    then pull exactly the shards a module needs instead of a 475 GiB checkpoint, and the
+    artifact's reader needs no rename rules of its own — the key each parameter has
+    *inside* its shard is written down here.
+
+    A quantized weight's block scale comes along whether or not the module named it: the
+    class declares a width the checkpoint does not store, so building without the scale
+    gives values wrong by its magnitude. A name the checkpoint cannot resolve is recorded
+    with no location, which is how the artifact says "this one is genuinely missing"
+    rather than implying it can be fetched.
+    """
+    wanted = [p for p in (bundle.weight_params.get(module_id) or []) if p not in dumped]
+    source = getattr(bundle, "checkpoint", None)
+    if source is None:
+        return {name: {} for name in wanted}
+    refs: dict[str, dict[str, str]] = {}
+    for name in wanted:
+        resolved = source.resolve(name)
+        if resolved is None or resolved not in source.shard_of:
+            refs[name] = {}
+            continue
+        refs[name] = {"shard": source.shard_of[resolved],
+                      "key": source.key_of.get(resolved, resolved)}
+        scale = source.scale_of(name)
+        sibling = f"{name[:-len('weight')]}scale" if name.endswith(".weight") else None
+        if scale is not None and sibling and sibling not in dumped and sibling not in refs:
+            refs[sibling] = {"shard": source.shard_of[scale],
+                             "key": source.key_of.get(scale, scale)}
+    return refs
 
 
 def _tensor_ref(bundle: Any, directory: Path, entry: Any) -> dict[str, Any] | None:
@@ -592,8 +693,7 @@ def refresh_calls(bundle: Any, directory: str | Path) -> int:
         if weights == entry.get("weights"):
             continue
         entry["weights"] = weights
-        entry["weights_missing"] = [p for p in (bundle.weight_params.get(module_id) or [])
-                                    if p not in weights]
+        entry["weights_missing"] = _checkpoint_refs(bundle, module_id, weights)
         updated += 1
     if updated:
         path.write_text(json.dumps(payload, indent=1) + "\n")
@@ -616,6 +716,53 @@ RUNTIME_FILES = (
     "verify/__init__.py",
     "verify/numerics.py",
 )
+
+
+def write_fetch_script(run_root: str | Path, repo_id: str, revision: str,
+                       groups: list[ExtractedGroup] | None = None,
+                       checkpoint_size: str = "large") -> Path | None:
+    """Write ``fetch_weights.py`` at the run root, for a run that dumped no weights.
+
+    A run traced with weight caching off leaves its modules short of most of their
+    parameters, and materializing them all into the artifact is not always an option: one
+    per kind of module here comes to 249 GiB, three quarters of it two n-gram tables. So
+    the artifact carries the means to fetch them instead, pinned to the revision that
+    produced these feature maps, and each module's ``calls.json`` says which shards it
+    needs — which is what turns "download the checkpoint" into "download four files".
+
+    Returns ``None`` when nothing is missing, because then the script would have nothing
+    to do and its presence would imply otherwise.
+    """
+    root = Path(run_root)
+    wanted = [g for g in (groups or []) if g.directory]
+    example_group = wanted[0].directory.name if wanted else "<group>"
+    example_module = (wanted[0].module_ids[0] if wanted and wanted[0].module_ids
+                      else "<module-id>")
+    if not _anything_missing(root):
+        return None
+    path = root / FETCH_SCRIPT_NAME
+    path.write_text(_render_template("fetch_weights.py.tmpl", {
+        "repo_id": repo_id,
+        "revision": revision,
+        "checkpoint_dir": CHECKPOINT_DIR,
+        "checkpoint_size": checkpoint_size,
+        "example_group": example_group,
+        "example_module": example_module,
+    }))
+    return path
+
+
+def _anything_missing(root: Path) -> bool:
+    """Whether any published module still needs a parameter out of the checkpoint."""
+    for calls in sorted((root / "modules").glob("*/calls.json")):
+        try:
+            payload = json.loads(calls.read_text())
+        except (OSError, ValueError):
+            continue
+        for entry in (payload.get("modules") or {}).values():
+            if entry.get("weights_missing"):
+                return True
+    return False
 
 
 def vendor_runtime(run_root: str | Path) -> Path:
@@ -746,7 +893,8 @@ def _slice_source(origin: Path, wanted: list[str]) -> tuple[str, int, int] | Non
 
 def _write_source(directory: Path, principal: Any, sources: list[str],
                   signature: str, files: list[str], classes: list[str] | None = None,
-                  regenerate: bool = False) -> bool:
+                  regenerate: bool = False,
+                  origin_root: str | Path | None = None) -> bool:
     """Write ``source.py``: the implementation if there is one, else an excerpt.
 
     Returns whether the result is importable. What makes the module directory a unit
@@ -755,6 +903,10 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
     whole file, which is the entire model. An existing one is left alone for the same
     reason ``inference.py`` is: it is the file being optimized, and re-extracting must
     not throw that away.
+
+    The file it came from is named the way the recorded provenance names it, relative to
+    the checkpoint: the header is published, and a path on this disk is no use to whoever
+    reads it.
     """
     import inspect
 
@@ -779,13 +931,15 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
             body, kept, total = result
             scope = SLICED_SCOPE.format(kept=kept, total=total)
         destination.write_text(
-            SOURCE_BANNER.format(signature=signature, origin=origin, scope=scope,
+            SOURCE_BANNER.format(signature=signature, scope=scope,
+                                 origin=_origin_name(str(origin), origin_root),
                                  class_name=type(principal).__name__)
             + body
         )
         return True
 
-    provenance = ("\n".join(f"  {path}" for path in sorted(files))
+    provenance = ("\n".join(f"  {_origin_name(path, origin_root)}"
+                            for path in sorted(files))
                   or "  (not present in the loaded model)")
     destination.write_text(
         EXCERPT_HEADER.format(signature=signature, provenance=provenance)
@@ -794,8 +948,49 @@ def _write_source(directory: Path, principal: Any, sources: list[str],
     return False
 
 
-def _group_dirname(index: int, module: Any, signature: str) -> str:
-    """Readable directory name: kind plus a short signature tag."""
+def _existing_group_dirs(root: Path) -> dict[str, Path]:
+    """Signature -> the directory a previous extraction wrote for it.
+
+    Read from each directory's own ``meta.yaml``, which travels with it, rather than from
+    the index, which is rewritten by the extraction that needs the answer.
+    """
+    found: dict[str, Path] = {}
+    for meta in sorted(root.glob("*/meta.yaml")):
+        signature = (yamlio.load_path(meta) or {}).get("signature")
+        if signature:
+            found.setdefault(str(signature), meta.parent)
+    return found
+
+
+def _group_dirname(module: Any, signature: str, taken: set[str] | None = None,
+                   class_name: str = "") -> str:
+    """Readable directory name: the layer this group starts at, and the class it runs.
+
+    ``00-Attention`` and ``42-DSparkMarkovHead`` rather than ``10-attention-91e2bc99`` and
+    ``04-other-7448c805``. Somebody opening the artifact is looking for a layer and a piece
+    of work; a group index and a signature hash told them neither, and ``other`` told them
+    less than nothing. The class name is the model's own word for what the module is, so it
+    is the one worth putting in the path.
+
+    A group covers every layer that shares its structure, so the first one is what gets
+    named and ``meta.yaml`` lists the rest — which is why the number is the layer's and not
+    the group's. Modules outside the stack have no layer and are simply their class:
+    ``ParallelEmbedding``, ``ParallelHead``.
+
+    Two groups that would land on the same name — several expert groups of one layer, say —
+    keep the signature tag to tell them apart, since a directory that silently replaced
+    another would lose it.
+    """
+    fallback = str(getattr(module, "id", "") or module.kind).rsplit(".", 1)[-1]
+    name = class_name if class_name and class_name[:1].isalpha() else fallback
+    layers = sorted(getattr(module, "layer_indices", None) or [])
+    stem = f"{layers[0]:02d}-{name}" if layers else name
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in stem)
+    if taken is None or safe not in taken:
+        return safe
     tag = signature.removeprefix("sig-")[:8] if signature.startswith("sig-") else signature[:8]
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in f"{module.kind}-{tag}")
-    return f"{index:02d}-{safe}"
+    tagged = "".join(c if c.isalnum() or c in "-_" else "-" for c in f"{safe}-{tag}")
+    suffix = 2
+    while tagged in taken:
+        tagged, suffix = f"{safe}-{tag}-{suffix}", suffix + 1
+    return tagged

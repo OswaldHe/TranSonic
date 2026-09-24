@@ -35,6 +35,17 @@ checkpoint:
     - ['^(?!vision\.)(.*?)mlp', '\1ffn']
     - ['weight_scale_inv', 'scale']
     - ['e_score_correction_bias', 'bias']
+    # The mHC coefficients. `compat/hyper_connections.py` moves them off the Block and
+    # onto the `hc_*_in` submodules it installs, so that the arithmetic sitting on every
+    # sublayer boundary has a module — and exactly one thing — owning it. These rules put
+    # the checkpoint's flat names onto those paths; without them the parameters resolve
+    # nowhere, because `.fn` is a suffix of six tensors per layer and of none uniquely.
+    - ['hc_attn_fn', 'hc_attn_in.fn']
+    - ['hc_attn_base', 'hc_attn_in.base']
+    - ['hc_attn_scale', 'hc_attn_in.scale']
+    - ['hc_ffn_fn', 'hc_ffn_in.fn']
+    - ['hc_ffn_base', 'hc_ffn_in.base']
+    - ['hc_ffn_scale', 'hc_ffn_in.scale']
 
 scope:
   # The n-gram memory writes into the residual stream at layers 1 and 14

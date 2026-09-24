@@ -24,7 +24,13 @@ from model_partition.retention import RetentionPolicy, apply_retention, plan_ret
 from model_partition.runtime.compat import is_hardware_limit
 from model_partition.sizing import CostModel, ModelInventory
 from model_partition.spec import ModelSpec
-from model_partition.storage import DumpPolicy, TraceShape, estimate_storage, preflight
+from model_partition.storage import (
+    DumpPolicy,
+    StoragePreflightError,
+    TraceShape,
+    estimate_storage,
+    preflight,
+)
 from model_partition.tensorstore import TensorStore
 from model_partition.trace import Tracer
 from model_partition.runtime.module_runner import TraceBundle
@@ -37,6 +43,10 @@ from model_partition.verify.modules import verify_modules
 #: Fraction of GPU memory offered to a whole-model stage. Lower than 1.0 so
 #: activations and workspaces still fit alongside the resident layers.
 WHOLE_MODEL_GPU_FRACTION = 0.80
+
+#: Left free on the filesystem the Hub writes its cache to, when that is not the one the
+#: artifacts go to. The same reserve the artifact-side preflight keeps.
+CHECKPOINT_RESERVE_BYTES = 8 * 1024 ** 3
 
 
 @dataclass
@@ -61,7 +71,6 @@ class LoopOptions:
     cache_weights: bool = True
     cache_dequant: bool = True
     slice_long: bool = False
-    decode_steps: int = 4
     max_new_tokens: int = 32
     temperature: float = 0.0
     seed: int = 0
@@ -87,16 +96,17 @@ class LoopOptions:
             slice_long=self.slice_long,
             cache_weights=self.cache_weights,
             cache_dequant=self.cache_dequant,
-            decode_steps=self.decode_steps,
         )
 
-    def plan_options(self, seq_len: int) -> auto.PlanOptions:
+    def plan_options(self, seq_len: int,
+                     dequant_resident: bool = False) -> auto.PlanOptions:
         return auto.PlanOptions(
             seq_len=seq_len,
             max_layers_per_module=self.max_layers_per_module,
             one_layer_per_module=self.one_layer_per_module,
             experts_per_group=self.experts_per_group,
             split_attention_ffn=self.split_attention_ffn,
+            dequant_resident=dequant_resident,
         )
 
 
@@ -204,6 +214,8 @@ def stage_ingest(ctx: LoopContext) -> StageResult:
 
     estimate = _storage_estimate(ctx)
     warnings = preflight(estimate, strict=ctx.options.strict_storage)
+    # And the download separately, when it lands on another filesystem than the artifacts.
+    warnings += _checkpoint_preflight(ctx, ctx.options.strict_storage)
     ctx.notes.extend(warnings)
 
     ctx.layout.ensure()
@@ -295,6 +307,63 @@ def _checkpoint_to_fetch(ctx: LoopContext) -> int:
         ctx.result.index.total_bytes
 
 
+def _device_of(path: Any) -> int | None:
+    """The filesystem backing a path, walking up to the nearest ancestor that exists."""
+    probe = Path(path).expanduser()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return probe.stat().st_dev
+    except OSError:
+        return None
+
+
+def _checkpoint_shares_artifact_volume(ctx: LoopContext) -> bool:
+    """Whether the downloaded shards land on the same filesystem as the artifacts."""
+    if not ctx.result:
+        return True
+    left = _device_of(ctx.result.root)
+    right = _device_of(ctx.layout.root)
+    return left is not None and left == right
+
+
+def _checkpoint_preflight(ctx: LoopContext, strict: bool) -> list[str]:
+    """Check the shards still to download against the filesystem they are written to.
+
+    Remote shards go under the Hub's own cache root, which need not be the volume
+    ``--artifact-root`` names. Measuring them against the artifact volume gets it wrong in
+    both directions: a large artifact disk passes preflight while a small home disk fills
+    partway through a several-hundred-gigabyte download, and a small artifact disk refuses
+    a download that was never going to touch it.
+    """
+    import shutil
+
+    to_fetch = _checkpoint_to_fetch(ctx)
+    if not to_fetch or _checkpoint_shares_artifact_volume(ctx):
+        return []
+    probe = Path(ctx.result.root).expanduser()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return [f"Could not determine free space at {probe}; the checkpoint download was "
+                f"not checked against it."]
+    budget = max(free - CHECKPOINT_RESERVE_BYTES, 0)
+    if to_fetch <= budget:
+        return []
+    message = (
+        f"The {format_bytes(to_fetch)} of checkpoint shards still to fetch are written "
+        f"under {probe}, which is a different filesystem from the artifact root and has "
+        f"{format_bytes(budget)} usable ({format_bytes(free)} free minus "
+        f"{format_bytes(CHECKPOINT_RESERVE_BYTES)} reserve). Point HF_HOME at a larger "
+        f"volume, or fetch the checkpoint there first."
+    )
+    if strict:
+        raise StoragePreflightError(message)
+    return [message]
+
+
 def _storage_estimate(ctx: LoopContext):
     inventory = ctx.inventory
     assert inventory is not None
@@ -305,9 +374,12 @@ def _storage_estimate(ctx: LoopContext):
     per_layer = 2 if ctx.options.split_attention_ffn else 1
     n_modules = max(len(inventory.layers), 1) * per_layer + 3
     return estimate_storage(
-        # Only what still has to be fetched: shards already in the snapshot are on this
-        # disk and counting them again asks for room for a second copy of the model.
-        checkpoint_bytes=_checkpoint_to_fetch(ctx),
+        # Only what still has to be fetched, and only when it lands here: shards already
+        # in the snapshot are on this disk and counting them again asks for room for a
+        # second copy of the model, while shards bound for another volume are checked
+        # against that one by `_checkpoint_preflight`.
+        checkpoint_bytes=(_checkpoint_to_fetch(ctx)
+                          if _checkpoint_shares_artifact_volume(ctx) else 0),
         module_weight_bytes=inventory.total_param_bytes(include_excluded=False),
         dequant_bytes=inventory.dequant_bytes,
         trace=TraceShape(
@@ -350,7 +422,18 @@ def stage_plan(ctx: LoopContext) -> StageResult:
     if graph is None:
         cost = CostModel.from_config(ctx.result.config, dtype_bytes=2, seq_len=ctx.seq_len)
         graph = auto.plan(
-            ctx.inventory, ctx.budget.usable_bytes, ctx.options.plan_options(ctx.seq_len),
+            ctx.inventory, ctx.budget.usable_bytes,
+            # Sized against what the loader will actually hold. Vendor code casts a
+            # quantized checkpoint to the spec's dtype as it loads, so the module that
+            # has to fit the card is the bf16 one, not the fp8 bytes on disk — but only
+            # when a dtype was asked for. `dtype: checkpoint` means the opposite: the fp8
+            # and fp4 tensors are kept as stored because the vendor's kernels take them
+            # that way, and sizing those at four times their residency splits modules that
+            # fit and sends others to the host for nothing.
+            ctx.options.plan_options(
+                ctx.seq_len,
+                dequant_resident=_loader_widens_dtype(ctx),
+            ),
             cost=cost, model_name=ctx.spec.source, revision=ctx.result.revision,
         )
         ctx.notes.extend(graph.validate(ctx.budget.usable_bytes))
@@ -473,6 +556,12 @@ def stage_extract(ctx: LoopContext) -> StageResult:
         param_names=_param_names(ctx),
         config=_extraction_config(ctx),
         bundle=ctx.bundle,
+        # So recorded provenance names a place inside the checkpoint rather than a
+        # directory on this machine, which is what gets published.
+        origin_root=ctx.result.root if ctx.result else None,
+        # And so a run that read its weights from the checkpoint ships the means to fetch
+        # them again, pinned to the revision these feature maps came from.
+        checkpoint=_checkpoint_identity(ctx),
     )
     lines = sum(g.source_lines for g in groups)
     preserved = sum(1 for g in groups if g.preserved)
@@ -482,6 +571,38 @@ def stage_extract(ctx: LoopContext) -> StageResult:
     return StageResult(ok=True, detail=detail, metrics={
         "n_groups": len(groups), "source_lines": lines, "preserved": preserved,
     })
+
+
+def _checkpoint_identity(ctx: LoopContext) -> dict[str, str] | None:
+    """The repo and pinned revision a fetch script would download from.
+
+    ``None`` for a local checkpoint, which cannot be fetched by name — and a script that
+    named a repo nobody can reach would be worse than its absence.
+    """
+    if ctx.result is None:
+        return None
+    # The spec's own reading of its source, so `org/model` and `hf:org/model` are the
+    # same checkpoint here as they are to ingestion.
+    repo_id = ctx.spec.repo_id or ""
+    if "/" not in repo_id:
+        return None
+    size = format_bytes(ctx.inventory.total_param_bytes()) if ctx.inventory else "large"
+    return {"repo_id": repo_id, "revision": str(ctx.result.revision or "main"),
+            "checkpoint_size": size}
+
+
+def _loader_widens_dtype(ctx: LoopContext) -> bool:
+    """Whether the model will be held wider than the checkpoint stores it.
+
+    True only when a quantized checkpoint is loaded by vendor code *and* the spec names a
+    dtype to cast to. ``dtype: checkpoint`` (or ``native``/``auto``) keeps the stored
+    dtypes, which for a quantized checkpoint is the point of it.
+    """
+    from model_partition.loaders.repo_code_loader import NATIVE_DTYPES
+
+    if not (ctx.inventory and ctx.result) or ctx.result.loader != "repo_code":
+        return False
+    return bool(ctx.inventory.dequant_bytes) and ctx.spec.dtype not in NATIVE_DTYPES
 
 
 def _extraction_config(ctx: LoopContext) -> dict[str, Any]:
@@ -519,8 +640,19 @@ def _param_names(ctx: LoopContext) -> dict[str, list[str]]:
 
 def hash_extract(ctx: LoopContext) -> list[Any]:
     # Not the implementation's content: an edit must re-run verification, not
-    # re-extract over the top of the edit.
-    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx)]
+    # re-extract over the top of the edit. The templates are an input, though: the
+    # harness's files are rendered from them afresh every extraction, and while it stays
+    # cached a fixed `verify.py` would never reach the artifact.
+    return [_graph_fingerprint(ctx.layout.graph_path), _trace_fingerprint(ctx),
+            _templates_fingerprint()]
+
+
+def _templates_fingerprint() -> str:
+    """Content hash of the templates extraction renders module directories from."""
+    from model_partition.loop.state import content_hash
+
+    root = Path(__file__).resolve().parent.parent / "templates"
+    return content_hash([[p.name, p.read_text()] for p in sorted(root.glob("*.tmpl"))])
 
 
 def _impl_fingerprint(ctx: LoopContext) -> str:
@@ -528,11 +660,17 @@ def _impl_fingerprint(ctx: LoopContext) -> str:
 
     The agent edits these, so a change must re-run verification without
     re-extracting over the top of the edit.
+
+    ``source.py`` as well as ``inference.py``, and it matters more: the module's classes
+    live in ``source.py`` and ``inference.py`` is the template that builds them. Hashing
+    only the template let an edited class keep the pass recorded for the one before it.
     """
     from model_partition.loop.state import content_hash
 
-    paths = sorted(ctx.layout.modules_dir.glob("*/inference.py"))
-    return content_hash([p.read_text() for p in paths]) if paths else ""
+    root = ctx.layout.modules_dir
+    paths = sorted([*root.glob("*/source.py"), *root.glob("*/inference.py")])
+    return (content_hash([[p.relative_to(root).as_posix(), p.read_text()] for p in paths])
+            if paths else "")
 
 
 # -- stage: trace ------------------------------------------------------------
@@ -543,10 +681,16 @@ def _can_stream(ctx: LoopContext) -> bool:
 
     Needs a checkpoint of safetensors shards to read from and a loader that knows how:
     the vendor path builds on meta and materializes each module for its own forward.
+
+    Asked of the tensor index rather than of the filesystem. A fresh remote ingest reads
+    metadata and deliberately downloads no shards, so a directory listing answers "cannot
+    stream" for exactly the models large enough to need it — and the streamed build only
+    ever runs after ``build_model`` has fetched what it reads.
     """
     if not (ctx.result and ctx.result.loader == "repo_code"):
         return False
-    return any(ctx.result.root.glob("*.safetensors"))
+    return any(str(shard).endswith(".safetensors")
+               for shard in ctx.result.index.shard_bytes)
 
 
 def memory_shortfall(ctx: LoopContext) -> str:
@@ -576,12 +720,24 @@ def memory_shortfall(ctx: LoopContext) -> str:
                    f"{ctx.spec.dtype} as the vendor code loads them)")
     host = detect_host(ctx.layout.root)
     gpu_bytes = ctx.budget.gpu.total_bytes if ctx.budget and ctx.budget.gpu else 0
-    capacity = host.ram_available_bytes + gpu_bytes
+    # Only memory the loader can actually build into. The repo-code loader's non-streamed
+    # path merges every shard into a host `state_dict` and constructs the model there; it
+    # does not honour a `device_map`, so the card's memory is not capacity for it and a
+    # checkpoint that fits RAM-plus-GPU is still killed while the host copy is made. A run
+    # asked for `--device cpu` has no card in play either way.
+    builds_on_host = bool(ctx.result and ctx.result.loader == "repo_code")
+    usable_gpu = 0 if builds_on_host or not ctx.options.device.startswith("cuda") \
+        else gpu_bytes
+    capacity = host.ram_available_bytes + usable_gpu
     if not capacity or needed <= capacity:
         return ""
     where = f"{format_bytes(host.ram_available_bytes)} host RAM available"
-    if gpu_bytes:
-        where += f" + {format_bytes(gpu_bytes)} on {ctx.budget.gpu.name}"
+    if usable_gpu:
+        where += f" + {format_bytes(usable_gpu)} on {ctx.budget.gpu.name}"
+    elif gpu_bytes:
+        where += (f"; the {format_bytes(gpu_bytes)} on {ctx.budget.gpu.name} is not "
+                  f"capacity for the {ctx.result.loader if ctx.result else '?'} loader, "
+                  f"which constructs on the host")
     return (
         f"the model needs about {format_bytes(needed)} resident for one forward{why} "
         f"and this machine has {format_bytes(capacity)} ({where}). Tracing needs the "
@@ -813,7 +969,10 @@ def attach_weight_source(ctx: LoopContext, bundle: TraceBundle) -> None:
         cached = bool(bundle.weights)
     if cached or not bundle.weight_params or ctx.result is None:
         return
-    bundle.checkpoint = CheckpointWeights.from_ingest(ctx.result)
+    # With the spec's rename rules, because the names being asked for are the model's and
+    # the names on disk are the checkpoint's.
+    bundle.checkpoint = CheckpointWeights.from_ingest(
+        ctx.result, rename=ctx.spec.checkpoint.rename)
 
 
 def _unresolved_result(ctx: LoopContext, unresolved: list[str]) -> StageResult:
@@ -856,7 +1015,7 @@ def hash_trace(ctx: LoopContext) -> list[Any]:
     return [
         _graph_fingerprint(ctx.layout.graph_path, edges=False),
         [[s.id, s.token_ids] for s in ctx.samples],
-        options.slice_long, options.cache_weights, options.decode_steps,
+        options.slice_long, options.cache_weights,
         # Which entry points get driven decides which modules have a reference at all.
         ctx.spec.trace.to_dict(),
     ]
@@ -1021,28 +1180,47 @@ def stage_verify_chain(ctx: LoopContext) -> StageResult:
     ctx.chain_report = suite
     (ctx.layout.reports_dir / "chain.json").write_text(json.dumps(suite.to_dict(), indent=2))
 
+    # Edges the recording did not bear out. Not drift: the plan claims a value flows from
+    # one module to the next and it does not, which is a statement about the partition
+    # rather than about anyone's arithmetic. Reported either way, because a chain that
+    # restarts from the recording covers less than one that does not.
+    uncarried = sorted({step.module_id for report in suite.reports
+                        for step in report.unchained})
+    carried = sum(len(r.chained_steps) for r in suite.reports)
+    boundaries = sum(len(r.steps) for r in suite.reports)
     metrics = {
         "n_samples": len(suite.reports),
         "n_failed": len(suite.failures),
         "worst_cosine": suite.worst_cosine(),
         "mean_top1_agreement": suite.mean_top1(),
         "diverging_modules": suite.diverging_modules(),
+        "carried_boundaries": carried,
+        "boundaries": boundaries,
+        "uncarried_edges": uncarried,
     }
+    coverage = f"{carried}/{boundaries} boundary value(s) carried"
+    if uncarried:
+        coverage += f"; {len(uncarried)} edge(s) not carried: {', '.join(uncarried[:4])}"
     if not suite.passed:
         diverging = suite.diverging_modules()
+        # Repairable with or without a boundary to point at. Tokens can move on drift no
+        # single boundary flags, and that is still the implementations' to fix; the
+        # modules that drifted furthest are where a repair starts.
+        suspects = diverging or suite.most_drifted()
         kept = suite.kept_tokens()
+        where = (f"; first divergence at {', '.join(diverging[:4])}" if diverging
+                 else f"; every carried boundary held, most drift at {', '.join(suspects)}"
+                 if suspects else "")
         return StageResult(
             ok=False, repairable=True, repair_surface="modules",
-            failing_modules=diverging,
-            detail=(f"{len(suite.failures)}/{len(suite.reports)} chain(s) drifted past "
-                    f"tolerance; {kept}/{len(suite.reports)} kept every token"
-                    + (f"; first divergence at {', '.join(diverging[:4])}"
-                       if diverging else "")),
+            failing_modules=suspects,
+            detail=(f"{len(suite.failures)}/{len(suite.reports)} chain(s) failed; "
+                    f"{kept}/{len(suite.reports)} kept every token; {coverage}{where}"),
             metrics=metrics,
         )
     return StageResult(ok=True, detail=(
         f"{len(suite.reports)} chain(s) held, worst cosine {suite.worst_cosine():.6f}, "
-        f"top-1 agreement {suite.mean_top1():.4f}"
+        f"top-1 agreement {suite.mean_top1():.4f}; {coverage}"
     ), metrics=metrics)
 
 
@@ -1100,8 +1278,11 @@ def stage_emulate(ctx: LoopContext) -> StageResult:
         strict_fill=not streamed, place_max_memory=place_max_memory, streamed=streamed,
         # Generation runs the loop's own implementations, not the model's modules:
         # these tokens are the deliverable's tokens or they are worth nothing.
-        impl_dirs=impl_dirs, run_dir=ctx.layout.root,
+        impl_dirs=impl_dirs,
         out_of_scope=_excluded_markers(ctx.spec),
+        # Which of the forward's return values is the logits. A model that returns a
+        # bare tuple says nothing about that, and the spec is where it is recorded.
+        returns=ctx.spec.trace.returns,
     )
     ctx.emulate_report = report
     (ctx.layout.reports_dir / "emulate.json").write_text(json.dumps(report.to_dict(), indent=2))

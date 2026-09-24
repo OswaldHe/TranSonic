@@ -228,10 +228,16 @@ class TensorStore:
         path = self.blob_path(meta)
         if not path.is_file():
             raise TensorStoreError(f"Missing blob for {meta.name}: {path}")
-        raw = path.read_bytes()
-        if len(raw) != meta.nbytes:
-            raise TensorStoreError(f"{meta.name}: expected {meta.nbytes} bytes, found {len(raw)}")
-        digest = hashlib.sha256(raw).hexdigest()
+        size = path.stat().st_size
+        if size != meta.nbytes:
+            raise TensorStoreError(f"{meta.name}: expected {meta.nbytes} bytes, found {size}")
+        # Digested in blocks. The largest blob in a run is tens of gigabytes, and holding
+        # one whole to hash it costs as much host memory as reading the tensor does.
+        running = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+                running.update(block)
+        digest = running.hexdigest()
         if digest != meta.sha256:
             raise TensorStoreError(f"{meta.name}: sha256 mismatch ({digest} != {meta.sha256})")
 
@@ -246,17 +252,25 @@ class TensorStore:
         return np.frombuffer(raw, dtype=np.dtype(np_dtype)).reshape(meta.shape)
 
     def read_torch(self, meta: TensorMeta, device: str = "cpu"):
-        """Read as a torch tensor, reinterpreting bfloat16/fp8 correctly."""
+        """Read as a torch tensor, reinterpreting bfloat16/fp8 correctly.
+
+        Read straight into one tensor. ``bytearray(path.read_bytes())`` holds the blob
+        twice — an immutable copy and a mutable one, neither releasable until the other
+        is — which for the largest tensors in a run is the difference between a check
+        that starts and one the kernel kills.
+
+        Always read as ``uint8`` and reinterpret: neither ``from_file`` nor
+        ``frombuffer`` takes every dtype torch has, and bfloat16, fp8 and a packed fp4
+        pair are among the ones they do not.
+        """
         import torch
 
-        raw = bytearray(self.blob_path(meta).read_bytes())
+        path = self.blob_path(meta)
         torch_dtype = getattr(torch, meta.dtype) if hasattr(torch, meta.dtype) else torch.uint8
-        if DTYPES.get(meta.dtype, (0, ""))[1] is None:
-            # Read the bytes and reinterpret: `frombuffer` does not take every dtype
-            # torch has, and these are the ones it does not.
-            flat = torch.frombuffer(raw, dtype=torch.uint8).view(torch_dtype)
-        else:
-            flat = torch.frombuffer(raw, dtype=torch_dtype)
+        flat = torch.from_file(str(path), shared=False, size=path.stat().st_size,
+                               dtype=torch.uint8)
+        if torch_dtype is not torch.uint8:
+            flat = flat.view(torch_dtype)
         return flat.reshape(meta.shape).to(device)
 
     # -- manifest --------------------------------------------------------------

@@ -23,6 +23,7 @@ from model_partition.runtime.module_runner import (
     apply_state,
     expected_output,
     load_named_weights,
+    owns_weights,
     replay_record,
 )
 from model_partition.verify.numerics import Comparison, Tolerance, compare_outputs
@@ -50,19 +51,32 @@ def poison_parameters(model: Any, value: float = float("nan"),
     return count
 
 
-def move_submodules(model: Any, graph_module: Any, device: str) -> int:
+def move_submodules(model: Any, graph_module: Any, device: str,
+                    partial: bool = False) -> int:
     """Move just one module's submodules to ``device``; returns how many moved.
 
     This is what makes the plan's guarantee testable: a module sized to fit the
     GPU is verified *on* the GPU even when the whole model never could be
     resident there.
+
+    ``partial`` is for the module the measurement already says will not go whole: each
+    submodule is placed with whatever fits and the rest left on the host, its boundaries
+    wrapped. An indivisible 94.4 GiB table needs exactly that — moved wholesale it OOMs,
+    and the resulting failure reads as "partition it further", which is the one thing
+    that cannot help a single table.
     """
+    from model_partition.runtime.launcher import place
     from model_partition.trace import _lookup
 
     moved = 0
     for submodule_name in graph_module.submodules:
         submodule = _lookup(model, submodule_name)
-        if submodule is not None and hasattr(submodule, "to"):
+        if submodule is None:
+            continue
+        if partial:
+            place(submodule, device)
+            moved += 1
+        elif hasattr(submodule, "to"):
             submodule.to(device)
             moved += 1
     return moved
@@ -288,7 +302,8 @@ def verify_modules(
         applied = (len(weights) if placeholders
                    else apply_named_weights(model, weights, graph_module))
         residency = target
-        if not _weights_fit(target, weights):
+        fits = _weights_fit(target, weights)
+        if not fits:
             # Not a broken promise and not something partitioning fixes: one 94.4 GiB
             # embedding table is one piece of work whatever it is cut into. The check
             # still runs on the accelerator — the launcher leaves the table on the host
@@ -300,17 +315,21 @@ def verify_modules(
             )
         if target != host and not placeholders:
             try:
-                move_submodules(model, graph_module, target)
+                # Partially when the measurement above says it will not go whole.
+                move_submodules(model, graph_module, target, partial=not fits)
             except RuntimeError as exc:
                 # The plan said this module would fit and it did not. That is a
                 # partition failure, not something to work around by finishing the
-                # check on the host and calling the promise kept.
+                # check on the host and calling the promise kept. An indivisible module
+                # that will not go even partially is a different statement, and says so.
                 move_submodules(model, graph_module, host)
                 _release(target)
+                advice = ("Partition it further." if fits else
+                          "It cannot be split further, so this machine cannot check it.")
                 report.results.append(ModuleVerification(
                     module_id=module_id, sample_id="-", passed=False,
-                    weights_applied=applied, device=target, oversized=True,
-                    error=f"will not load on {target}: {exc}. Partition it further.",
+                    weights_applied=applied, device=target, oversized=fits,
+                    error=f"will not load on {target}: {exc}. {advice}",
                 ))
                 continue
         # Built once per (module, branch): constructing a module from its source and
@@ -336,8 +355,9 @@ def verify_modules(
                 records = bundle.select(module_id=module_id, sample_id=sample_id)
                 if not records:
                     continue
-                pairs = _record_pairs(graph_module, records, with_impl=builder is not None)
-                for source, reference_record in pairs:
+                runs = _record_runs(graph_module, records, with_impl=builder is not None)
+                for run in runs:
+                    source, reference_record = run[0], run[-1]
                     if source.sliced or reference_record.sliced:
                         report.results.append(ModuleVerification(
                             module_id=module_id, sample_id=sample_id, passed=False,
@@ -345,9 +365,9 @@ def verify_modules(
                                     "not a function of the recorded input",
                         ))
                         continue
-                    # A group run as one computation is handed every argument any
-                    # of its submodules received.
-                    group = records if len(pairs) == 1 else [source]
+                    # A group run as one computation is handed every argument any of the
+                    # submodules in *this* invocation received.
+                    group = run
                     comparisons: list[Comparison] = []
                     try:
                         actual = _run_once(model, source, bundle, builder, residency,
@@ -439,18 +459,36 @@ def _is_out_of_memory(exc: Exception) -> bool:
     return "out of memory" in str(exc).lower()
 
 
-def _record_pairs(graph_module: Any, records: list[Any], with_impl: bool):
-    """Which (input record, reference record) pairs to check for one module.
+def _record_runs(graph_module: Any, records: list[Any], with_impl: bool) -> list[list[Any]]:
+    """The records behind each independent check of one module on one sample.
 
-    A sequential group run through its implementation is one computation: input
-    from the first submodule's call, reference from the last submodule's output.
-    A parallel group is not — each expert sees its own routed tokens — so every
-    recorded call is checked against its own output. Without an implementation,
-    each submodule is replayed against its own record either way.
+    A sequential group run through its implementation is one computation: input from the
+    first submodule's call, reference from the last submodule's output. That holds across
+    *distinct* submodules. A submodule the pass called more than once is not a longer
+    chain — it is the group run again, and DeepSeek's draft head does exactly that, calling
+    `markov_head` once per drafted position on the token the previous call sampled. Taking
+    the first call's input with the last call's output would check neither: the module is
+    pure, so the mismatch is entirely the pairing's. Each invocation therefore gets its own
+    run, which is also what makes the repeat-call dumps worth keeping apart.
+
+    A parallel group is not a chain at all, since each expert sees its own routed tokens,
+    and without an implementation each submodule is replayed against its own record either
+    way — one record per run in both cases.
     """
-    if with_impl and not graph_module.is_parallel:
-        return [(records[0], records[-1])]
-    return [(record, record) for record in records]
+    if not with_impl or graph_module.is_parallel:
+        return [[record] for record in records]
+    runs: list[list[Any]] = []
+    current: list[Any] = []
+    seen: set[Any] = set()
+    for record in records:
+        if record.submodule in seen:
+            runs.append(current)
+            current, seen = [], set()
+        current.append(record)
+        seen.add(record.submodule)
+    if current:
+        runs.append(current)
+    return runs
 
 
 def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
@@ -474,9 +512,10 @@ def _impl_builder(impl_dir: Any, weights: dict[str, Any], bundle: TraceBundle,
             return built
         try:
             impl = load_impl(impl_dir)
-            if not weights:
+            if not weights and owns_weights(bundle, module_id):
                 raise RuntimeError(f"no weights available for {module_id!r}")
-            built = impl.build(bundle.config, weights, device, submodule=submodule)
+            built = impl.build(bundle.config, weights, device, submodule=submodule,
+                               module_id=module_id)
             if not callable(built):
                 raise RuntimeError(f"{impl.path}: build_module() returned a non-callable")
         except Exception as exc:

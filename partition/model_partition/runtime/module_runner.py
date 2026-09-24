@@ -214,6 +214,21 @@ def load_named_weights(bundle: TraceBundle, module_id: str, device: str = "cpu")
     return result
 
 
+def owns_weights(bundle: TraceBundle, module_id: str) -> bool:
+    """Whether a module has parameters, so that finding none of them is a failure.
+
+    Some modules own nothing: DeepSeek's hyper-connection output half is arithmetic on
+    its inputs alone. For those an empty mapping *is* the complete set of weights, and
+    refusing to build them turned 264 correct modules into failures. The trace is what
+    can say which: it records every module's parameter list, and an empty list is a
+    positive statement. A module it has no entry for at all is unknown, not weightless,
+    and still counts as missing its weights.
+    """
+    if bundle.weights.get(module_id):
+        return True
+    return module_id not in bundle.weight_params or bool(bundle.weight_params[module_id])
+
+
 def apply_named_weights(model: Any, weights: dict[str, Any], graph_module: Any) -> int:
     """Overwrite a module's live parameters from ``{original name: tensor}``.
 

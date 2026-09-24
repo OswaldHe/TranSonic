@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from model_partition.runtime import private_module_name
+
 #: Where a run keeps its compatibility patches, applied in sorted order.
 COMPAT_DIR = "compat"
 
@@ -125,7 +127,7 @@ def apply_patches(vendor: Any, paths: list[Path], device: Any = None) -> CompatR
 
 
 def _import(path: Path) -> Any:
-    name = f"_model_partition_compat_{abs(hash(str(path.resolve())))}"
+    name = private_module_name("_model_partition_compat_", path.resolve())
     sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:

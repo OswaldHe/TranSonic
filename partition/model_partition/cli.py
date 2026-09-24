@@ -50,6 +50,14 @@ def _load_defaults(path: Path | None = None) -> dict[str, Any]:
     return payload.get("loop", payload) if isinstance(payload, dict) else {}
 
 
+#: Loop options that once existed and are now ignored. A spec carrying one is a spec
+#: written against an older version of this tool, not a spec with a typo — and the
+#: difference matters, because an unknown key stops the run before it starts. Kept here
+#: rather than kept as a dead field, so nothing reads them by accident.
+#: ``decode_steps`` never reached the tracer; it only inflated the storage estimate.
+RETIRED_OPTIONS = frozenset({"decode_steps"})
+
+
 def build_options(config: Path | None = None, spec: Any = None, **overrides: Any):
     """Build LoopOptions, layering defaults, the spec, then the command line.
 
@@ -66,7 +74,7 @@ def build_options(config: Path | None = None, spec: Any = None, **overrides: Any
     known = {f.name for f in fields(LoopOptions)}
     values = {k: v for k, v in _load_defaults(config).items() if k in known}
     if spec is not None:
-        unknown = set(getattr(spec, "overrides", {})) - known
+        unknown = set(getattr(spec, "overrides", {})) - known - RETIRED_OPTIONS
         if unknown:
             raise click.ClickException(
                 f"Spec {spec.name!r} overrides unknown loop option(s): "
@@ -325,7 +333,10 @@ def report(run_dir: str, as_json: bool) -> None:
 @click.option("--private/--public", default=False, help="Repository visibility")
 @click.option("--max-gib", type=float, default=2048.0,
               help="Refuse to upload more than this (default 2048 GiB = 2 TB)")
-@click.option("--exclude", multiple=True, default=("logs/**",),
+# Spelled out rather than imported from `publish`, which this module loads lazily inside
+# the command so that nothing else pays for `huggingface_hub`. Kept in step with
+# `publish.DEFAULT_EXCLUDE` by a test.
+@click.option("--exclude", multiple=True, default=("logs/**", "hf/**", ".cache/**"),
               help="Glob of paths to leave out; repeatable")
 @click.option("--dry-run", is_flag=True, help="Report what would be uploaded and stop")
 @click.option("--module", "modules", multiple=True,
@@ -340,10 +351,13 @@ def report(run_dir: str, as_json: bool) -> None:
 @click.option("--allow-unverified", is_flag=True,
               help="Upload even though a stage of the run failed. The README records "
                    "which stages passed, so the artifacts say so themselves")
+@click.option("--workers", type=int, default=None,
+              help="Concurrent uploaders. Fewer means fewer API requests per minute, "
+                   "which is what a free account's rate limit counts")
 def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
            exclude: tuple[str, ...], dry_run: bool, modules: tuple[str, ...],
            one_per_kind: bool, upload_all: bool, skip_check: bool,
-           allow_unverified: bool) -> None:
+           allow_unverified: bool, workers: int | None) -> None:
     """Upload a run's artifacts, or a selection of its modules, to a dataset repo.
 
     A selection carries its own weights, so each module directory can be verified where
@@ -360,7 +374,7 @@ def upload(run_dir: str, repo_id: str, private: bool, max_gib: float,
                              max_bytes=int(max_gib * GIB), exclude=exclude,
                              dry_run=dry_run, module_ids=selected or None,
                              upload_all=upload_all, skip_check=skip_check,
-                             allow_unverified=allow_unverified,
+                             allow_unverified=allow_unverified, workers=workers,
                              report=click.echo)
     except PublishError as exc:
         raise click.ClickException(str(exc)) from exc

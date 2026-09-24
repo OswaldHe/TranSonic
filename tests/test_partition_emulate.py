@@ -98,6 +98,29 @@ def test_boundaries_are_hooked_on_each_group_s_last_submodule(tiny_run):
     assert set(sink) == {m.id for m in tiny_run.graph.partitioned_modules if m.submodules}
 
 
+def test_a_boundary_is_compared_as_it_appears_and_its_output_let_go(tiny_run):
+    """Holding every output until the forward ends held 247 of DeepSeek V4.1's 320 MiB
+    rank-4 boundaries at 8192 tokens, and the check ran out of memory on a forward that
+    generated fine. What is kept is what the callback returns, once per module."""
+    model = tiny_run.build_model()
+    seen: list[str] = []
+
+    def on_output(module_id, output):
+        seen.append(module_id)
+        tensor = output[0] if isinstance(output, tuple) else output
+        return tuple(tensor.shape)
+
+    handles, sink = capture_boundaries(model, tiny_run.graph, on_output=on_output)
+    try:
+        model(torch.zeros(1, 8, dtype=torch.long))
+        model(torch.zeros(1, 13, dtype=torch.long))
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert sorted(seen) == sorted(sink)
+    assert all(isinstance(kept, tuple) and kept[1] == 8 for kept in sink.values())
+
+
 # -- generation --------------------------------------------------------------
 
 
