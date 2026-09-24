@@ -168,6 +168,101 @@ def _write_tensor(
     )
 
 
+#: A weight with more rows than this is a lookup table, not a dense parameter: the largest
+#: dense leading dimension in the DeepSeek partition is the 129280-row vocabulary, and the
+#: n-gram tables are 384 million. Only tables are eligible for row compaction.
+TABLE_ROW_THRESHOLD = 10_000_000
+
+
+def _safetensors_index(path: Path) -> tuple[dict[str, Any], int]:
+    """A shard's header and the offset its data starts at, read without loading any tensor."""
+    with path.open("rb") as handle:
+        length = int.from_bytes(handle.read(8), "little")
+        if not length:
+            raise MaterializeError(f"{path} has no safetensors header")
+        return json.loads(handle.read(length)), 8 + length
+
+
+def _read_table_rows(path: Path, key: str, rows: "Any") -> tuple[bytes, str, list[int]]:
+    """Just the named rows of one tensor, by seeking to each.
+
+    The point of the exercise: an n-gram table is 91.55 GiB and a recorded pass reads 3040 of
+    its 384 million rows. Reading the rows asked for costs a seek each and a megabyte of
+    memory, where the reader's whole-tensor path needs `torch.empty(91.55 GiB)` — twice over,
+    once more in `_raw_bytes`.
+    """
+    header, base = _safetensors_index(path)
+    entry = header.get(key)
+    if not isinstance(entry, dict):
+        raise MaterializeError(f"{path} does not hold {key!r}")
+    shape = list(entry["shape"])
+    begin, end = entry["data_offsets"]
+    if len(shape) < 2 or not shape[0]:
+        raise MaterializeError(f"{key} is {shape}; row compaction needs a leading dimension")
+    row_bytes, remainder = divmod(end - begin, shape[0])
+    if remainder:
+        raise MaterializeError(f"{key}: {end - begin} bytes over {shape[0]} rows is not exact")
+    out = bytearray()
+    with path.open("rb") as handle:
+        for row in rows:
+            handle.seek(base + begin + int(row) * row_bytes)
+            block = handle.read(row_bytes)
+            if len(block) != row_bytes:
+                raise MaterializeError(f"{path} ended early reading row {int(row)} of {key}")
+            out += block
+    return bytes(out), entry["dtype"], [len(rows)] + shape[1:]
+
+
+def _compaction_plan(
+    artifact: Path, calls: Any, chain: list[dict[str, Any]], reader: Any, directory: Path,
+) -> tuple[dict[str, dict[str, Any]], Any, Any]:
+    """Which checkpoint weights are tables, and the recorded indices that select their rows.
+
+    Returns (tables, original index tensor, remapped index tensor). Tables are keyed by
+    parameter name. Raises rather than guessing: a module with an oversized table and no
+    integer input that indexes it cannot be compacted, and silently materializing the whole
+    table is the out-of-memory this exists to avoid.
+    """
+    import torch
+
+    root = calls.checkpoint_root()
+    if root is None:
+        raise MaterializeError("no hf/ beside the artifact, so no checkpoint rows to read")
+
+    tables: dict[str, dict[str, Any]] = {}
+    for name, ref in calls.checkpoint_weights.items():
+        shard, key = ref.get("shard"), ref.get("key")
+        if not (shard and key and (root / shard).is_file()):
+            continue
+        header, _ = _safetensors_index(root / shard)
+        entry = header.get(key) or {}
+        shape = list(entry.get("shape") or [])
+        if shape and shape[0] > TABLE_ROW_THRESHOLD:
+            tables[name] = {"shard": shard, "key": key, "shape": shape}
+    if not tables:
+        return {}, None, None
+
+    rows = max(t["shape"][0] for t in tables.values())
+    candidates = []
+    for call in chain:
+        for value in list(call.get("args") or []) + list((call.get("kwargs") or {}).values()):
+            for _, tensor, _ in _flatten_tensors(reader, directory, value, "idx"):
+                if not tensor.dtype.is_floating_point and tensor.numel():
+                    if 0 <= int(tensor.min()) and int(tensor.max()) < rows:
+                        candidates.append(tensor)
+    if len(candidates) != 1:
+        raise MaterializeError(
+            f"row compaction needs exactly one integer input indexing the table's "
+            f"{rows} rows; found {len(candidates)}"
+        )
+    original = candidates[0]
+    unique = torch.unique(original.reshape(-1))
+    remapped = torch.searchsorted(unique, original.reshape(-1)).reshape(original.shape)
+    if not bool((unique[remapped] == original).all()):
+        raise MaterializeError("the remapped indices do not reproduce the recorded ones")
+    return tables, unique, remapped.to(original.dtype)
+
+
 def find_group(artifact: Path, module_id: str) -> str:
     """The implementation group holding a module id.
 
@@ -268,6 +363,7 @@ def materialize(
     step: int | None = None,
     call_index: int = 0,
     include_state: bool = True,
+    compact_tables: bool = False,
 ) -> Materialized:
     """Write the module out as a bootstrap repo. Returns what was written.
 
@@ -312,8 +408,25 @@ def materialize(
                     f"another sample with --sample."
                 )
 
+    # Row compaction, for a module whose weight is a lookup table too large to materialize.
+    # Planned before anything is written, because it rewrites one of the inputs.
+    tables: dict[str, dict[str, Any]] = {}
+    table_rows = remapped_idx = None
+    if compact_tables:
+        tables, table_rows, remapped_idx = _compaction_plan(
+            artifact, calls, chain, reader, directory)
+
     inputs = _flatten_tensors(reader, directory, chain[0].get("args") or [], "input")
     inputs += _flatten_tensors(reader, directory, chain[0].get("kwargs") or {}, "input")
+    if remapped_idx is not None:
+        # The recorded indices address the full table; the kernel is given the compacted one,
+        # so they are replaced by their positions in it. `unique[remapped] == recorded` is
+        # asserted in the plan, so the rows gathered are the same rows either way.
+        inputs = [
+            (n, remapped_idx, o) if tuple(v.shape) == tuple(remapped_idx.shape)
+            and not v.dtype.is_floating_point else (n, v, o)
+            for n, v, o in inputs
+        ]
     if not inputs:
         raise MaterializeError(f"{module_id} records no tensor among its arguments")
     # Sequential groups end at the last call; a parallel group's calls are independent
@@ -373,8 +486,17 @@ def materialize(
 
     # Every weight the module needs, dumped ones and checkpoint-backed ones alike. The
     # reader resolves both, so this is where the fetched shards are paid for.
+    if tables:
+        # `calls.weights()` would allocate the whole table, which is the thing being avoided.
+        # Hide the table entries from it and read their rows directly below.
+        held = dict(calls.payload.get("weights_missing") or {})
+        calls.payload["weights_missing"] = {
+            k: v for k, v in held.items() if k not in tables}
     weights = calls.weights("cpu")
+    if tables:
+        calls.payload["weights_missing"] = held
     missing = set(calls.payload.get("weights") or {}) | set(calls.checkpoint_weights)
+    missing -= set(tables)
     absent = missing - set(weights)
     if absent:
         raise MaterializeError(
@@ -390,6 +512,34 @@ def materialize(
             source="dumped" if name in dumped else _shard_of(calls, name),
         ))
     del weights
+
+    # The tables: their rows, read by seeking, with what was done recorded on the tensor so a
+    # reader of the manifest or the README cannot mistake this for the whole table.
+    for name in sorted(tables):
+        import torch
+
+        spec = tables[name]
+        payload, st_dtype, shape = _read_table_rows(
+            calls.checkpoint_root() / spec["shard"], spec["key"], table_rows.tolist())
+        torch_name = {"F8_E4M3": "float8_e4m3fn", "F8_E8M0": "float8_e8m0fnu",
+                      "BF16": "bfloat16", "F16": "float16", "F32": "float32",
+                      "I64": "int64", "I32": "int32", "U8": "uint8"}.get(st_dtype)
+        dtype = getattr(torch, torch_name, None) if torch_name else None
+        if dtype is None:
+            raise MaterializeError(f"{spec['key']} has dtype {st_dtype}, which is not mapped")
+        flat = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        tensor = (flat if dtype is torch.uint8 else flat.view(dtype)).reshape(shape)
+        record = _write_tensor(
+            directory=repo, name=name, role="weight", tensor=tensor,
+            source=f"{spec['shard']} rows {len(shape and table_rows)} of {spec['shape'][0]}",
+        )
+        record.note = (
+            f"COMPACTED: {spec['shape'][0]} rows in the checkpoint, {shape[0]} here — the rows "
+            f"the recorded pass indexes. The index input is remapped onto them, so the values "
+            f"gathered are identical; the address space is not the model's."
+        )
+        records.append(record)
+
     tolerance = _tolerance_for(artifact.joinpath(*NUMERICS_SOURCE), records, reference_max)
 
     # Non-tensor arguments (a decode position, a flag) are values, not files. They belong

@@ -52,11 +52,16 @@ def bootstrap() -> None:
 @click.option("--no-state", "include_state", is_flag=True, default=True, flag_value=False,
               help="Omit recorded cross-module state. For a group that publishes it rather "
                    "than reads it, where the snapshot is only its own output and stale residue")
+@click.option("--compact-tables", is_flag=True,
+              help="Materialize only the rows of an oversized lookup table that the recorded "
+                   "pass indexes, and remap the index input onto them. For a module whose "
+                   "weight does not fit host or device memory (the n-gram tables are 91.55 GiB)")
 @click.option("--force", is_flag=True,
               help="Clear a non-empty target directory first, git history included")
 def init(
     repo: Path, artifact: Path, module_id: str, group: str | None, sample: str | None,
-    step: int | None, call_index: int, include_state: bool, force: bool,
+    step: int | None, call_index: int, include_state: bool, compact_tables: bool,
+    force: bool,
 ) -> None:
     """Materialize a module of ARTIFACT into REPO as a git repo to bootstrap in.
 
@@ -88,7 +93,7 @@ def init(
         result = mat.materialize(
             artifact=artifact.resolve(), group=resolved_group, module_id=module_id, repo=repo,
             sample_id=sample, step=step, call_index=call_index,
-            include_state=include_state,
+            include_state=include_state, compact_tables=compact_tables,
         )
         manifest_path = mat.write_manifest(result)
         head = mat.git_init(repo)
@@ -100,6 +105,10 @@ def init(
     click.echo(f"  chain    : {' -> '.join(s for s in result.submodules if s)}")
     click.echo(f"  tensors  : {len(result.tensors)} file(s), "
                f"{result.total_bytes / (1 << 20):.1f} MiB")
+    compacted = [t for t in result.tensors if "COMPACTED" in (t.note or "")]
+    for tensor in compacted:
+        click.echo(f"  compacted: {tensor.name} -> {tuple(tensor.shape)} "
+                   f"({tensor.nbytes / (1 << 20):.2f} MiB of the checkpoint's rows)")
     state_count = sum(1 for t in result.tensors if t.role == "state")
     if not result.state_included:
         click.echo("  state    : omitted (--no-state), so the kernel is not handed values "

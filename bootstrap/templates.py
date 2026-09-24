@@ -224,7 +224,7 @@ Total: {total_mib:.1f} MiB across {tensor_count} file(s).
 produced and what your result is compared against. `weight` entries are parameters;
 `buffer` entries are non-persistent state the module registered.
 
-`state` entries are cross-module state: tensors the recorded forward read off a shared
+{compaction_section}`state` entries are cross-module state: tensors the recorded forward read off a shared
 object rather than through its arguments, so they reach your kernel as arguments instead.
 Read them with care, because they are a *snapshot of that object* taken as this group was
 entered, not a list of what it reads:
@@ -359,6 +359,32 @@ def render_inference_stub(result: "Materialized") -> str:
     )
 
 
+def _compaction_section(result: "Materialized") -> str:
+    """What `init --compact-tables` did, stated where the agent cannot miss it."""
+    rows = [t for t in result.tensors if "COMPACTED" in (t.note or "")]
+    if not rows:
+        return ""
+    lines = [
+        "**This module's lookup table is compacted, and one input is remapped onto it.**",
+        "",
+    ]
+    for t in rows:
+        lines.append(f"- `{t.name}` holds {t.shape[0]:,} rows here. {t.note}")
+    lines += [
+        "",
+        "The table does not fit host or device memory at its recorded size, so the rows the",
+        "recorded pass indexes were read out of the checkpoint and the integer input was",
+        "replaced by positions in the compacted table. Every value gathered is the value the",
+        "recorded forward gathered, and `reference` is unchanged — so the comparison is the",
+        "real one. What this repo does *not* exercise is the model's full address space.",
+        "",
+        "Write the kernel against the shapes in the table above, not against the",
+        "`num_embeddings` in `config.json`.",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_readme(result: "Materialized") -> str:
     table = "\n".join(
         f"| `{t.name}` | {t.role} | `{t.file}` | {t.dtype} | {tuple(t.shape)} | {t.nbytes:,} |"
@@ -400,6 +426,7 @@ def render_readme(result: "Materialized") -> str:
         chain=chain or "(none recorded)",
         scalar_section=scalar_section,
         tensor_table=table,
+        compaction_section=_compaction_section(result),
         total_mib=result.total_bytes / (1 << 20),
         tensor_count=len(result.tensors),
         notes_section=notes_section,
