@@ -468,6 +468,10 @@ def _sample_order(directory: Path) -> list[str]:
 #: missing an argument the recorded forward was given.
 UNSUPPORTED_KEY = "__unsupported__"
 
+#: How the artifact encodes a returned tuple or list. A single-key wrapper around a list,
+#: carrying no information of its own, so it is transparent when naming what is inside it.
+ENCODING_WRAPPERS = ("__tuple__", "__list__")
+
 
 def _holders_read(directory: Path, holders: set[str]) -> set[str]:
     """Which of `holders` the group's own implementation reads an attribute from.
@@ -546,6 +550,12 @@ def _flatten_tensors(
     def walk(node: Any, name: str) -> None:
         if _is_tensor(node):
             found.append((name, _decode(reader, directory, node), _bin_of(node)))
+        elif (isinstance(node, dict) and len(node) == 1
+              and next(iter(node)) in ENCODING_WRAPPERS):
+            # The artifact wraps a returned tuple or list as `{"__tuple__": [...]}`. That is
+            # encoding, not structure, so pass through it: the index below supplies the name,
+            # giving `reference_0` rather than `reference___tuple___0`.
+            walk(next(iter(node.values())), name)
         elif isinstance(node, (list, tuple)):
             for index, item in enumerate(node):
                 walk(item, f"{name}_{index}")

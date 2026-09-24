@@ -442,13 +442,20 @@ def check_self_containment(
         for text, line in _string_literals(tree):
             if not _path_like(text):
                 continue
-            for marker in FORBIDDEN_PATH_MARKERS:
-                if marker in text:
-                    findings.append(
-                        f"{name}:{line}: path '{text}' contains '{marker}' — this repo must "
-                        f"not reach outside itself for code or data"
-                    )
-                    break
+            # One of this repo's own recorded tensors is never an escape from it, whatever its
+            # name happens to contain. A module returning a tuple materializes its goldens as
+            # `reference_0.bin`, and `reference_` is on the marker list to catch the frozen
+            # `reference_*.py` — so this fired on the very file check (f) requires be read,
+            # and no iteration could satisfy both. Two modules spent five iterations each
+            # there with a correct kernel and (b) as their only failure.
+            if text not in allowed_bins:
+                for marker in FORBIDDEN_PATH_MARKERS:
+                    if marker in text:
+                        findings.append(
+                            f"{name}:{line}: path '{text}' contains '{marker}' — this repo "
+                            f"must not reach outside itself for code or data"
+                        )
+                        break
             if text.endswith(".bin") and _names_one_bin(text) and text not in allowed_bins:
                 findings.append(
                     f"{name}:{line}: reads '{text}', which is not one of this repo's tensors"

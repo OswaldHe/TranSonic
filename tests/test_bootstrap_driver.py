@@ -615,3 +615,51 @@ def test_a_bin_literal_that_names_no_file_is_not_checked_against_the_manifest() 
     # And one reaching outside the repo is caught twice over.
     escaping = chk.check_self_containment(empty, _ast.parse('p = "../../trace/x.bin"'), allowed)
     assert any("outside" in f for f in escaping.findings)
+
+
+def test_the_repos_own_golden_is_not_mistaken_for_an_escape() -> None:
+    """(f) requires reading the golden; (b) must not forbid its name. Both, or the gate deadlocks.
+
+    A module returning a tuple materializes its goldens as `reference_0.bin`, and
+    `reference_` is on the forbidden-marker list to catch the frozen `reference_*.py`. Two
+    modules spent five iterations each with a correct kernel and (b) as their only failure.
+    """
+    import ast as _ast
+
+    allowed = {
+        "tensors/input.bin",
+        "tensors/reference_0.bin",
+        "tensors/reference___tuple___0.bin",   # the name older repos already carry
+    }
+    reads = "\n".join(f'x{i} = open("{n}", "rb").read()' for i, n in enumerate(sorted(allowed)))
+    r = chk.check_self_containment(_ast.parse("x = 1"), _ast.parse(reads), allowed)
+    assert r.findings == [], r.findings
+
+    # The markers still do their job for anything that is not a recorded tensor.
+    escapes = (
+        'a = open("reference_torch.py").read()',
+        'b = open("../../trace/activations/x.bin", "rb").read()',
+        'c = open("vendor/kernel.py").read()',
+    )
+    for code in escapes:
+        bad = chk.check_self_containment(_ast.parse("x = 1"), _ast.parse(code), allowed)
+        assert bad.findings, code
+
+
+def test_a_tuple_output_is_named_by_position_not_by_its_encoding() -> None:
+    """`{"__tuple__": [...]}` is how the artifact encodes a returned tuple, not structure."""
+    from pathlib import Path
+
+    from bootstrap.materialize import _flatten_tensors
+
+    class _Reader:
+        def decode(self, directory, value, device):
+            return value["__tensor__"]["bin"]
+
+    encoded = {"__tuple__": [{"__tensor__": {"bin": f"x{i}.bin"}} for i in range(4)]}
+    names = [n for n, _, _ in _flatten_tensors(_Reader(), Path("."), encoded, "reference")]
+    assert names == ["reference_0", "reference_1", "reference_2", "reference_3"], names
+
+    # A lone tensor still reads unsuffixed, and a dict still names by key.
+    single = {"__tensor__": {"bin": "s.bin"}}
+    assert [n for n, _, _ in _flatten_tensors(_Reader(), Path("."), single, "reference")] == ["reference"]
