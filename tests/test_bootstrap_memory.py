@@ -183,3 +183,41 @@ def test_a_different_invocation_of_one_module_is_its_own_entry(tmp_path: Path) -
         manifest.write_text(json.dumps(payload))
         mem.record(repo, passed=True, iterations=1, summary="ok")
     assert len(mem.entries(mem.location(repo))) == 2
+
+
+def test_state_is_dropped_for_a_group_that_cannot_reach_the_holder(tmp_path: Path) -> None:
+    """The tracer photographs the whole holder, so an FFN was handed four attention caches.
+
+    Whether a *given entry* is a read or a write needs the model's wiring, but whether the
+    group touches the holder at all is answerable from the implementation it ships.
+    """
+    from bootstrap.materialize import _holders_read
+
+    group = tmp_path / "group"
+    group.mkdir()
+
+    # A module whose implementation only instantiates the holder never reads it.
+    (group / "source.py").write_text(
+        "class SharedAttentionRuntime:\n    pass\n\n"
+        "shared_attn = SharedAttentionRuntime()\n\n"
+        "class MoE:\n    def forward(self, x):\n        return x\n"
+    )
+    assert _holders_read(group, {"shared_attn"}) == set()
+
+    # One that reads it through any class in the file keeps it.
+    (group / "source.py").write_text(
+        "shared_attn = object()\n\n"
+        "class Indexer:\n    def forward(self, x):\n        return shared_attn.index_k\n"
+    )
+    assert _holders_read(group, {"shared_attn"}) == {"shared_attn"}
+
+
+def test_unreadable_source_keeps_the_state_rather_than_guessing(tmp_path: Path) -> None:
+    """Extra state is untidy; missing state makes a correct kernel impossible."""
+    from bootstrap.materialize import _holders_read
+
+    group = tmp_path / "group"
+    group.mkdir()
+    assert _holders_read(group, {"shared_attn"}) == {"shared_attn"}   # no source at all
+    (group / "source.py").write_text("def broken(:\n")
+    assert _holders_read(group, {"shared_attn"}) == {"shared_attn"}   # unparseable

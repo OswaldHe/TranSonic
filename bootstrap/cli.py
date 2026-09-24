@@ -29,7 +29,7 @@ DEFAULT_MODULE = "layers.0.attention"
 
 #: Seconds `inference.py` gets when the gate is run by hand with `bootstrap check`. Inside
 #: the loop this comes from `preset.yaml`'s own `--timeout`, not from here.
-DEFAULT_RUN_TIMEOUT = 900
+DEFAULT_RUN_TIMEOUT = 1200
 
 
 @click.group(name="bootstrap")

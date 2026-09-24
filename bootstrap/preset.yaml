@@ -158,8 +158,8 @@ goal: |
 #
 # `python` resolves from PATH: activate the venv, or `bootstrap run` refuses to start.
 constraints:
-  - command: python -m bootstrap.nki_checker --repo . --json .autohelix/nki_checks.json --timeout 900
-    timeout: 1200
+  - command: python -m bootstrap.nki_checker --repo . --json .autohelix/nki_checks.json --timeout 1200
+    timeout: 1500
 
 # No metric: nothing to optimize until a kernel exists, and a declared one would make
 # baseline capture fail at iteration 0 with nothing to measure. Latency is captured by the

@@ -21,6 +21,7 @@ bootstrapping is the work of making it pass.
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import subprocess
@@ -353,7 +354,16 @@ def materialize(
         # Last call wins, as `apply_state` does: it replays every call in order onto the
         # same holder, so the final write is the value the group ran on.
         state.update(call.get("state") or {})
+    # The snapshot holds every tensor on the holder, including holders this group cannot
+    # reach: an FFN was being handed four attention caches because `shared_attn` is a global
+    # and the tracer photographs all of it. Which *entry* is a read and which a write still
+    # needs the model's wiring, but whether the group touches the holder **at all** is
+    # answerable from the group's own recorded implementation, so drop what it provably
+    # cannot read.
+    reachable = _holders_read(directory, {d.split(".", 1)[0] for d in state})
     for dotted in sorted(state):
+        if dotted.split(".", 1)[0] not in reachable:
+            continue
         for name, tensor, origin in _flatten_tensors(
             reader, directory, state[dotted], f"state.{dotted}",
         ):
@@ -457,6 +467,37 @@ def _sample_order(directory: Path) -> list[str]:
 #: it would be recorded as a *scalar literal* and `init` would succeed while the kernel is
 #: missing an argument the recorded forward was given.
 UNSUPPORTED_KEY = "__unsupported__"
+
+
+def _holders_read(directory: Path, holders: set[str]) -> set[str]:
+    """Which of `holders` the group's own implementation reads an attribute from.
+
+    The group ships the implementation it was extracted from, so this is a question about
+    recorded code rather than about the model: a module whose source never evaluates
+    `<holder>.<something>` cannot read that state, whatever the tracer photographed.
+
+    File scope, not class scope, on purpose — `Attention` reads `shared_attn` through its own
+    methods but `Indexer`, a separate class in the same group, reads `shared_attn.index_k`,
+    and both are this group's implementation.
+
+    Errs towards keeping: an unreadable or unparseable source returns everything, because a
+    kernel handed state it cannot use is untidy while one missing state it needs is impossible.
+    """
+    source = directory / "source.py"
+    if not holders or not source.is_file():
+        return set(holders)
+    try:
+        tree = ast.parse(source.read_text())
+    except (SyntaxError, OSError, UnicodeDecodeError):
+        return set(holders)
+    found = {
+        node.value.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in holders
+    }
+    return found
 
 
 def _is_tensor(value: Any) -> bool:

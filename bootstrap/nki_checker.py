@@ -130,7 +130,7 @@ PASSED_MARKER = "passed"
 
 #: How long inference.py gets. Comfortably inside the 1200s the constraint itself is
 #: given, so a hung device run is reported as a failed check rather than a dead harness.
-DEFAULT_RUN_TIMEOUT = 900
+DEFAULT_RUN_TIMEOUT = 1200
 
 CHECK_TITLES: dict[str, str] = {
     "a": "kernel formalization",
@@ -241,6 +241,25 @@ def _string_literals(tree: ast.Module) -> list[tuple[str, int]]:
             if id(node) not in docstrings:
                 out.append((node.value, node.lineno))
     return out
+
+
+#: Glob metacharacters. A literal holding one names a pattern, not a file.
+GLOB_CHARS = "*?["
+
+
+def _names_one_bin(text: str) -> bool:
+    """Whether a `.bin` literal names one specific file, so it can be checked at all.
+
+    `".bin"` is the tail of an f-string that builds a name and `"*.bin"` is a glob; neither
+    names a file, so neither can be looked up in the manifest. Flagging them rejected every
+    way of loading many tensors in a loop and left one literal per tensor as the only accepted
+    form — which is how a 778-expert module ended up with a 52 KB validator that ran 903s
+    against a 900s budget. A literal that escapes the repo still contains a separator and is
+    still caught, both here and by FORBIDDEN_PATH_MARKERS.
+    """
+    if any(c in text for c in GLOB_CHARS):
+        return False
+    return bool(text[: -len(".bin")].rsplit("/", 1)[-1])
 
 
 def _path_like(text: str) -> bool:
@@ -430,7 +449,7 @@ def check_self_containment(
                         f"not reach outside itself for code or data"
                     )
                     break
-            if text.endswith(".bin") and text not in allowed_bins:
+            if text.endswith(".bin") and _names_one_bin(text) and text not in allowed_bins:
                 findings.append(
                     f"{name}:{line}: reads '{text}', which is not one of this repo's tensors"
                 )

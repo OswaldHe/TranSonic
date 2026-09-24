@@ -586,3 +586,32 @@ def test_a_non_finite_worst_error_does_not_clear_the_ceiling() -> None:
     assert any("not a number" in f for f in findings("inf")), findings("inf")
     # A real value inside the ceiling still passes, so the guard is not over-broad.
     assert not any("not a number" in f or "past the" in f for f in findings("0.09"))
+
+
+def test_a_bin_literal_that_names_no_file_is_not_checked_against_the_manifest() -> None:
+    """Building a filename in a loop has to be allowed, or many-tensor modules cannot load.
+
+    `".bin"` is an f-string tail and `"*.bin"` is a glob; neither names a file, so neither can
+    be looked up. Rejecting them left one literal per tensor as the only accepted form, which
+    is how a 778-expert validator grew to 52 KB and ran 903s against a 900s budget.
+    """
+    import ast as _ast
+
+    allowed = {"tensors/input.bin", "tensors/w.bin"}
+    empty = _ast.parse("x = 1")
+
+    def manifest_findings(code: str) -> list[str]:
+        r = chk.check_self_containment(empty, _ast.parse(code), allowed)
+        return [f for f in r.findings if "not one of this repo's tensors" in f]
+
+    # Forms that name no single file: allowed.
+    assert manifest_findings('p = f"tensors/{n}.bin"') == []
+    assert manifest_findings('from pathlib import Path\nPath("tensors").glob("*.bin")') == []
+    assert manifest_findings('SUF = ".bin"') == []
+
+    # A literal that does name a file is still held to the manifest.
+    assert manifest_findings('p = "tensors/input.bin"') == []
+    assert len(manifest_findings('p = "tensors/not_recorded.bin"')) == 1
+    # And one reaching outside the repo is caught twice over.
+    escaping = chk.check_self_containment(empty, _ast.parse('p = "../../trace/x.bin"'), allowed)
+    assert any("outside" in f for f in escaping.findings)
