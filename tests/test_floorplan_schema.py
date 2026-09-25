@@ -358,7 +358,8 @@ def test_layer_split_needs_a_multi_layer_module():
             "splits": [{"dim": "layer", "factor": 2}],
         },
     ]))
-    with pytest.raises(FloorplanError, match="spanning two or more layers"):
+    # Caught by the cardinality bound: a 1-layer module has one layer to split.
+    with pytest.raises(FloorplanError, match="has only 1 of them"):
         plan.validate_against(system, modules)
 
 
@@ -409,3 +410,123 @@ def test_every_compute_peak_reaches_the_hardware_model():
     assert hardware.compute["fp8_flops"] == pytest.approx(1.299e15)
     # fp4 is explicitly null in the YAML and must stay absent rather than defaulting.
     assert hardware.compute.get("fp4_flops") is None
+
+
+# ---------------------------------------------------------------------------------------
+# Communication-free splits (PR #5 review, comment 5)
+# ---------------------------------------------------------------------------------------
+def test_collective_none_is_rejected_across_logical_cores():
+    """`none` deletes real communication, so it has to be earned.
+
+    Without this a head or expert split declared `none` across the torus cost nothing to
+    rejoin and would win the metrics with a deployment that cannot run.
+    """
+    for dim in ("head", "hidden", "expert", "vocab", "ngram", "seq"):
+        placement = Placement(
+            module="layers.0.attention",
+            units=[Address(0, 0), Address(1, 0)],
+            splits=[Split(dim, 2, "none")],
+        )
+        with pytest.raises(FloorplanError, match="only free for a"):
+            placement.validate("p")
+
+
+def test_collective_none_is_free_for_batch_and_within_one_core():
+    # Data parallelism needs no exchange.
+    Placement(
+        module="layers.0.attention",
+        units=[Address(0, 0), Address(1, 0)],
+        splits=[Split("batch", 2, "none")],
+    ).validate("p")
+    # And the two physical cores of one logical core share an address space.
+    Placement(
+        module="layers.0.attention",
+        units=[Address(0, 0, 0), Address(0, 0, 1)],
+        splits=[Split("head", 2, "none")],
+    ).validate("p")
+
+
+# ---------------------------------------------------------------------------------------
+# Split factors bounded by dimension cardinality (comment 12)
+# ---------------------------------------------------------------------------------------
+CONFIG = {
+    "dim": 5120, "n_heads": 64, "n_routed_experts": 384, "vocab_size": 129280,
+    "max_seq_len": 16384, "engram_num_embeddings": [384006168, 384016682],
+    "engram_n_heads": 8,
+}
+
+
+@pytest.mark.parametrize("dim,entry_kind,factor,ok", [
+    ("head", "attention", 64, True),
+    ("head", "attention", 128, False),
+    ("expert", "mlp", 384, True),
+    ("expert", "mlp", 512, False),
+    ("vocab", "lm_head", 129280, True),
+    ("vocab", "lm_head", 200000, False),
+])
+def test_split_factor_cannot_exceed_the_dimension(dim, entry_kind, factor, ok):
+    system = load_system("trn2-16device", apply_probes=False)
+    modules = {
+        "m": {"id": "m", "kind": entry_kind, "layer_indices": [0], "param_bytes": 1,
+              "inputs": [], "outputs": []},
+    }
+    plan = Floorplan.from_dict(_minimal(placements=[{
+        "module": "m",
+        "units": [f"d{i // 4}.l{i % 4}" for i in range(min(factor, 64))],
+        "splits": [{"dim": dim, "factor": min(factor, 64)}],
+    }]))
+    # Keep the unit count legal and test the bound directly instead.
+    from floorplan.schema import dimension_extent
+
+    extent = dimension_extent(dim, modules["m"], CONFIG)
+    assert extent is not None
+    assert (factor <= extent) is ok
+
+
+def test_a_two_layer_module_cannot_split_64_ways():
+    from floorplan.schema import dimension_extent
+
+    entry = {"id": "layers.0.attention", "kind": "attention", "layer_indices": [0, 1]}
+    assert dimension_extent("layer", entry, CONFIG) == 2
+
+
+def test_batch_splits_are_impossible_at_the_fixed_batch_of_one():
+    """The workloads are batch 1, so any batch split has more shards than batch members."""
+    from floorplan.schema import dimension_extent
+
+    assert dimension_extent("batch", {"id": "m", "kind": "mlp"}, CONFIG) == 1
+
+
+def test_engram_head_extent_uses_the_engram_head_count():
+    from floorplan.schema import dimension_extent
+
+    engram = {"id": "layers.1.engram", "kind": "other"}
+    attention = {"id": "layers.0.attention", "kind": "attention"}
+    assert dimension_extent("head", engram, CONFIG) == 8
+    assert dimension_extent("head", attention, CONFIG) == 64
+
+
+def test_unknown_extents_return_none_rather_than_a_guess():
+    from floorplan.schema import dimension_extent
+
+    assert dimension_extent("hidden", {"id": "m", "kind": "mlp"}, None) is None
+
+
+# ---------------------------------------------------------------------------------------
+# backing_device (comment 14)
+# ---------------------------------------------------------------------------------------
+def test_backing_device_round_trips_and_is_peer_hbm_only(tmp_path):
+    plan = Floorplan.from_dict(_minimal(placements=[{
+        "module": "embed", "units": ["d0.l0"],
+        "weights": {"tier": "peer_hbm", "backing_device": 7},
+    }]))
+    assert plan.placements[0].residency.backing_device == 7
+    path = tmp_path / "fp.yaml"
+    plan.dump(path)
+    assert Floorplan.load(path).placements[0].residency.backing_device == 7
+
+    with pytest.raises(FloorplanError, match="only means something for tier 'peer_hbm'"):
+        Floorplan.from_dict(_minimal(placements=[{
+            "module": "embed", "units": ["d0.l0"],
+            "weights": {"tier": "hbm_bank", "backing_device": 3},
+        }]))

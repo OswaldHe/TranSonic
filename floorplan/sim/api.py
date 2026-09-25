@@ -35,6 +35,11 @@ from floorplan.sim import collectives
 from floorplan.sim.engine import Op, Schedule
 from floorplan.sim.memory import MemoryLedger, scope_key_for
 
+#: Tiers whose bandwidth figures are a fraction of *datasheet* peak, so the probed DMA
+#: coefficients apply to them. `host_dram` and `nvme` are deliberately absent: their numbers
+#: are achieved rates the probes measured, and scaling them again double-counts.
+HBM_TIERS = frozenset({"hbm_bank", "device_hbm", "peer_hbm"})
+
 #: Bytes per element, by the dtype names the model config and partition graph use.
 DTYPE_BYTES: dict[str, int] = {
     "float8_e4m3fn": 1, "float8_e5m2": 1, "float8_e8m0fnu": 1, "fp8": 1, "fp4": 1,
@@ -243,8 +248,15 @@ class Context:
     def dma_seconds(self, nbytes: int, tier: str = "hbm_bank", accesses: int = 1) -> float:
         """Move ``nbytes`` from ``tier`` into SBUF, in ``accesses`` transfers.
 
-        Tiers reached only *through* another (NVMe through host DRAM) are charged both
-        legs, which is text constraint 6.
+        Tiers reached only *through* another (NVMe through host DRAM) are charged both legs,
+        which is text constraint 6. A ``peer_hbm`` read additionally pays its torus distance.
+
+        The HBM DMA coefficients apply **only to on-device HBM**. They are a fraction of the
+        *datasheet* bank bandwidth, whereas the host-DRAM and NVMe figures are achieved rates
+        the PCIe and storage probes measured directly. Dividing a measured rate by them again
+        double-counts, and severely: ``dma_small_strided`` is about 0.003, so a random NVMe read
+        came out more than 300x slower than the 30 us the device was observed to take. That
+        inflation is what made every off-HBM residency look unusable.
         """
         if nbytes <= 0:
             return 0.0
@@ -253,11 +265,38 @@ class Context:
         for name in chain:
             if name not in self.hardware.tiers:
                 raise CostModelError(f"no tier '{name}' on target '{self.hardware.name}'")
-            seconds += self.hardware.tiers[name].transfer_seconds(nbytes, accesses)
-        strided = self.hardware.require_efficiency(
-            "dma_small_strided" if accesses > 1 else "dma_large_contiguous"
-        )
-        return seconds / strided
+            leg = self.hardware.tiers[name].transfer_seconds(nbytes, accesses)
+            if name in HBM_TIERS:
+                leg /= self.hardware.require_efficiency(
+                    "dma_small_strided" if accesses > 1 else "dma_large_contiguous"
+                )
+            seconds += leg
+        if tier == "peer_hbm":
+            seconds += self._peer_hop_seconds(nbytes, accesses)
+        return seconds
+
+    def _peer_hop_seconds(self, nbytes: int, accesses: int) -> float:
+        """The torus cost of reaching another device's HBM.
+
+        The tier's own bandwidth and latency describe the link; what they cannot describe is
+        *distance*, and the system YAML says explicitly that peer-HBM cost scales with it.
+        Without this term a remote placement cost the same whether the data sat on a neighbour
+        or across the instance, so the torus was invisible to every residency decision.
+
+        The owning device comes from ``residency.backing_device`` when the plan names one. When
+        it does not, the mean hop distance from this shard to all devices is used, which is
+        neutral rather than flattering — it keeps an unlocated peer read from looking local.
+        """
+        _bandwidth, latency_us = self.hardware.require_link("inter_device")
+        owner = self.shard.residency.backing_device
+        if owner is None:
+            others = [d.index for d in self.hardware.devices if d.index != self.shard.unit.device]
+            if not others:
+                return 0.0
+            hops = sum(self.hardware.hops(self.shard.unit.device, d) for d in others) / len(others)
+        else:
+            hops = self.hardware.hops(self.shard.unit.device, owner)
+        return accesses * hops * latency_us * 1e-6
 
     def gather_seconds(self, rows: int, row_bytes: int, tier: str = "hbm_bank") -> float:
         """A gather of ``rows`` scattered rows of ``row_bytes`` each, on GPSIMD.

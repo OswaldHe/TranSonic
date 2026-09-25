@@ -45,6 +45,34 @@
   command naming the checker is never in the worktree. The reviewer additionally
   performs an anti-reward-hacking read of each iteration.
 
+### Fixed
+
+- `floorplan`: seventeen findings from the review of #5, several of which changed the
+  simulator's numbers materially. The cost-model corrections: `stage` now constrains the
+  schedule instead of being an inert label, so pipeline depth can move a metric;
+  `overlap_collectives` governs whether a collective blocks the unit's compute engines, rather
+  than only contending with other collectives; weight bytes are divided only by
+  weight-partitioning dimensions, so a batch or sequence split no longer understates residency;
+  `p2p` charges its whole payload instead of a ring's `(N-1)/N` share; the probed `host_dram`
+  and `nvme` rates are no longer re-scaled by the HBM DMA coefficient, which had inflated a
+  measured 30 us NVMe read by over 300x; `peer_hbm` pays its torus distance via a new
+  `weights.backing_device`; activations count as a concurrent peak per scope rather than a sum
+  across sequentially-executing modules; and KV/activation peaks are keyed per shard, so two
+  shards sharing a bank are charged separately.
+- `floorplan`: the gate now verifies the *installed* framework's bytes as well as the project's.
+  The framework is no longer copied into a project, because the simulator runs out of the
+  package — a copy was read by the agent, hashed by the gate, and executed by nobody.
+- `floorplan`: candidate plans are archived by the gate during the iteration (`--archive`),
+  before AutoHelix deletes the worktree. The previous post-hoc git recovery guessed at branch
+  names and fell back to `HEAD`, which filed the final plan under every iteration's metrics.
+- `floorplan`: the schema rejects `collective: none` on a split that crosses logical cores
+  (legal only for `batch`, or within one logical core), and bounds split factors by the
+  dimension's real cardinality.
+- `floorplan`: the build reviewer is held read-only by snapshot-and-restore, and a final
+  `VERDICT: circumventing` prevents the freeze. The hardware read-only invariant fingerprints
+  the effective model, not only its source YAML. `rank` parses an explicit `RANKING:` line and
+  honours `--count`.
+
 ## 0.1.1 — 2026-09-02
 
 ### Added

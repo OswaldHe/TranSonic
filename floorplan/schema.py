@@ -44,6 +44,24 @@ COLLECTIVES = frozenset({
     "none", "allreduce", "allgather", "reduce_scatter", "all_to_all", "p2p",
 })
 
+#: Dimensions that partition the *weights*. Splitting along one of these divides the parameter
+#: bytes each unit holds; splitting along any other dimension divides only the activations and
+#: leaves every participant holding the module's full weights.
+#:
+#: The distinction is load-bearing for capacity. Dividing weight bytes by a batch or sequence
+#: factor made a batch-64 placement account for 1/64 of its real weights, so a plan that
+#: overflowed a bank passed the gate and data parallelism looked nearly free.
+WEIGHT_PARTITION_DIMS = frozenset({"head", "hidden", "expert", "layer", "vocab", "ngram"})
+
+#: Dimensions along which a split genuinely needs no communication to rejoin. Data parallelism
+#: is the only one: each participant computes a complete result for its own batch members.
+#:
+#: ``collective: none`` is otherwise only legal when every participant shares one logical
+#: NeuronCore, since the two physical cores at LNC=2 share an address space. Without this
+#: check a plan could declare a head or expert split across the whole torus as `none`, delete
+#: all of its communication, and win the metrics with a deployment that cannot run.
+COMMUNICATION_FREE_DIMS = frozenset({"batch"})
+
 #: Tiers a module's weights may be resident in. Must name a tier the system YAML declares
 #: with ``inference_path`` unset or true.
 WEIGHT_TIERS = frozenset({"hbm_bank", "device_hbm", "peer_hbm", "host_dram", "nvme"})
@@ -145,6 +163,10 @@ class Residency:
     #: For a tiered lookup table, the fraction of accesses the cache is assumed to serve.
     #: An assumption, not a measurement — the report is required to say so.
     hit_rate: float | None = None
+    #: Which device owns the weights, for ``tier: peer_hbm``. Optional but consequential: it is
+    #: what lets a remote read be charged its actual torus distance instead of a flat cost, so
+    #: that reaching a neighbour and reaching the far corner stop looking identical.
+    backing_device: int | None = None
 
     def validate(self, where: str) -> None:
         if self.tier not in WEIGHT_TIERS:
@@ -171,6 +193,16 @@ class Residency:
                 )
             if not 0.0 <= self.hit_rate <= 1.0:
                 raise FloorplanError(f"{where}: hit_rate must be in [0, 1], got {self.hit_rate}")
+        if self.backing_device is not None:
+            if self.tier != "peer_hbm":
+                raise FloorplanError(
+                    f"{where}: backing_device only means something for tier 'peer_hbm', "
+                    f"not '{self.tier}'"
+                )
+            if self.backing_device < 0:
+                raise FloorplanError(
+                    f"{where}: backing_device must be a device index, got {self.backing_device}"
+                )
 
 
 @dataclass
@@ -222,6 +254,26 @@ class Placement:
             if split.dim in seen:
                 raise FloorplanError(f"{where}: splits the '{split.dim}' dim twice")
             seen.add(split.dim)
+
+        # `collective: none` is free, so it has to be earned. It is legal for a batch split,
+        # and legal for any split whose participants all share one logical NeuronCore (the two
+        # physical cores at LNC=2 share an address space). Anywhere else it would delete real
+        # communication: a head or expert split declared `none` across the torus would cost
+        # nothing to rejoin and win the metrics with a deployment that cannot run.
+        shares_one_core = len({u.logical() for u in self.units}) <= 1
+        for index, split in enumerate(self.splits):
+            if split.collective != "none":
+                continue
+            if split.dim in COMMUNICATION_FREE_DIMS or shares_one_core:
+                continue
+            raise FloorplanError(
+                f"{where}.splits[{index}]: 'collective: none' is only free for a "
+                f"{'/'.join(sorted(COMMUNICATION_FREE_DIMS))} split, or when every unit shares "
+                f"one logical NeuronCore. This splits '{split.dim}' across "
+                f"{len({u.logical() for u in self.units})} logical core(s), which has to be "
+                f"rejoined — name the collective that does it"
+            )
+
         if self.stage < 0:
             raise FloorplanError(f"{where}: stage must be >= 0, got {self.stage}")
 
@@ -344,7 +396,7 @@ class Floorplan:
             if not isinstance(raw_weights, dict):
                 raise FloorplanError(f"{where}: 'weights' must be a mapping")
             weights_unknown = set(raw_weights) - {
-                "tier", "resident_fraction", "cache_tier", "hit_rate",
+                "tier", "resident_fraction", "cache_tier", "hit_rate", "backing_device",
             }
             if weights_unknown:
                 raise FloorplanError(
@@ -357,6 +409,8 @@ class Floorplan:
                 cache_tier=(None if raw_weights.get("cache_tier") is None
                             else str(raw_weights["cache_tier"])),
                 hit_rate=None if hit_rate is None else float(hit_rate),
+                backing_device=(None if raw_weights.get("backing_device") is None
+                                else int(raw_weights["backing_device"])),
             )
 
             placements.append(Placement(
@@ -420,13 +474,15 @@ class Floorplan:
         self,
         system: dict[str, Any],
         graph_modules: dict[str, dict[str, Any]] | None = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
         """Check the plan against the hardware it targets and the model it deploys.
 
         ``system`` is a resolved system YAML (see ``parser.load_system``); ``graph_modules``
-        maps module id to its partition-graph entry. Both optional-by-argument rather than
-        optional-in-effect: the checker always passes them, and the tests exercise the
-        structural half alone.
+        maps module id to its partition-graph entry; ``config`` is the model's ``config.json``,
+        which is what makes a split factor checkable against the dimension's real size. All
+        optional-by-argument rather than optional-in-effect: the checker always passes them,
+        and the tests exercise the structural half alone.
         """
         devices = int(system["hierarchy"]["device"]["count"])
         logical_per_device = int(system["hierarchy"]["logical_nc"]["count"])
@@ -488,11 +544,14 @@ class Floorplan:
                             f"{where}: cannot split a '{entry.get('kind')}' module along "
                             f"'{split.dim}'. Legal here: {', '.join(sorted(legal))}"
                         )
-                    if split.dim == "layer" and len(entry.get("layer_indices") or []) < 2:
+                    limit = dimension_extent(split.dim, entry, config)
+                    if limit is not None and split.factor > limit:
                         raise FloorplanError(
-                            f"{where}: split along 'layer' needs a module spanning two or "
-                            f"more layers; this one spans "
-                            f"{len(entry.get('layer_indices') or [])}"
+                            f"{where}: {split.factor}-way split along '{split.dim}', but this "
+                            f"module has only {limit} of them. A split cannot have more shards "
+                            f"than the dimension has elements — the surplus shards would hold "
+                            f"nothing while the framework still divided the work by "
+                            f"{split.factor}"
                         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -523,6 +582,8 @@ class Floorplan:
                 weights["resident_fraction"] = placement.residency.resident_fraction
                 weights["cache_tier"] = placement.residency.cache_tier
                 weights["hit_rate"] = placement.residency.hit_rate
+            if placement.residency.backing_device is not None:
+                weights["backing_device"] = placement.residency.backing_device
             entry["weights"] = weights
             entry["stage"] = placement.stage
             if placement.overlap_collectives:
@@ -535,6 +596,54 @@ class Floorplan:
         body = yaml.safe_dump(self.to_dict(), sort_keys=False, default_flow_style=False)
         text = f"{header.rstrip()}\n\n{body}" if header else body
         Path(path).write_text(text)
+
+
+def dimension_extent(
+    dim: str, entry: dict[str, Any], config: dict[str, Any] | None,
+) -> int | None:
+    """How many elements this module has along ``dim``, or None when it cannot be determined.
+
+    The upper bound on a legal split factor. Without it a two-layer module could declare a
+    64-way ``layer`` split, and the framework would dutifully present 64 shards and divide the
+    parameters and the work by 64 while 62 of them had no layer to execute — a 64x speedup
+    from arithmetic alone.
+
+    ``batch`` is bounded by the workloads, which are fixed at batch 1 (see
+    ``sim/runner.WORKLOADS``), so any batch split is invalid rather than merely useless. None
+    is returned for dimensions whose extent this artifact does not state, which is honest: a
+    bound that has to be guessed is worse than no bound.
+    """
+    if dim == "layer":
+        return max(len(entry.get("layer_indices") or []), 1)
+    if dim == "batch":
+        return 1
+    if config is None:
+        return None
+    if dim == "head":
+        return _positive(config.get("engram_n_heads") if "engram" in str(entry.get("id", ""))
+                         else config.get("n_heads"))
+    if dim == "expert":
+        return _positive(config.get("n_routed_experts"))
+    if dim == "vocab":
+        return _positive(config.get("vocab_size"))
+    if dim == "hidden":
+        return _positive(config.get("dim"))
+    if dim == "seq":
+        return _positive(config.get("max_seq_len"))
+    if dim == "ngram":
+        rows = config.get("engram_num_embeddings")
+        if isinstance(rows, list):
+            rows = min(rows) if rows else None
+        return _positive(rows)
+    return None
+
+
+def _positive(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def legal_dims(module_id: str, entry: dict[str, Any]) -> frozenset[str]:

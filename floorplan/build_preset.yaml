@@ -42,6 +42,10 @@ goal: |
 
   You decide what work exists. The framework decides what it costs.
 
+  `sim/FRAMEWORK.md` says where the framework is installed — it is not copied into this
+  project, because the simulator runs out of the package and a second copy here would be the
+  one you read while a different one computed the metrics.
+
   `sim/api.py` gives you `matmul_seconds`, `elementwise_seconds`, `dma_seconds`,
   `gather_seconds` and `collective_cost`. They read their rates from the system YAML and
   their achieved efficiencies from measurements taken on real hardware. **Use them.** Do not

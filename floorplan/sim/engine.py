@@ -28,6 +28,11 @@ from dataclasses import dataclass, field
 #: cores, which are a per-device pool rather than a per-unit engine.
 ENGINES = frozenset({"tensor", "vector", "scalar", "gpsimd", "dma", "cc"})
 
+#: The engines a non-overlapped collective blocks. Everything that does arithmetic or moves
+#: data on the unit — i.e. all of ``ENGINES`` except the CC queue itself, which the collective
+#: occupies directly.
+COMPUTE_ENGINES = frozenset({"tensor", "vector", "scalar", "gpsimd", "dma"})
+
 #: Exclusive resources an op may hold on its unit. ``sbuf`` is the one the platform's text
 #: constraints need: GPSIMD and the tensor engine cannot both be in SBUF, so ops that
 #: declare it serialize against one another even though their engines differ.
@@ -192,19 +197,30 @@ class Schedule:
         for dep in op.deps:
             start = max(start, self._finish[dep])
 
-        # An overlapped collective runs on the CC cores and does not wait for, or block,
-        # the unit's compute engines. Its dependents still wait for it to finish, which is
-        # constraint 4: overlap is real, but a collective and the compute consuming it
-        # cannot overlap with each other.
+        # A collective always occupies its own CC queue on the unit. What `overlapped`
+        # controls is whether it *also* blocks that unit's compute engines.
+        #
+        # The first version gated the engine reservation on `overlapped`, which got this
+        # backwards. A `cc` op only ever serialized against other `cc` ops — it never blocked
+        # tensor or vector work in the first place — so clearing the flag changed almost
+        # nothing, every plan received compute/collective overlap for free, and the tradeoff
+        # the flag exists to expose could not be measured. Now a non-overlapped collective
+        # holds the unit's compute engines for its duration, which is what "no overlap" means,
+        # and text constraint 4 still applies either way: dependents wait regardless.
         engine_key = (op.unit, op.engine)
-        if not op.overlapped:
-            start = max(start, self._engine_free[engine_key])
+        start = max(start, self._engine_free[engine_key])
+        blocked = (
+            COMPUTE_ENGINES if op.engine == "cc" and not op.overlapped else frozenset()
+        )
+        for engine in blocked:
+            start = max(start, self._engine_free[(op.unit, engine)])
         for resource in op.holds:
             start = max(start, self._resource_free[(op.unit, resource)])
 
         finish = start + op.seconds
-        if not op.overlapped:
-            self._engine_free[engine_key] = finish
+        self._engine_free[engine_key] = finish
+        for engine in blocked:
+            self._engine_free[(op.unit, engine)] = finish
         for resource in op.holds:
             self._resource_free[(op.unit, resource)] = finish
 

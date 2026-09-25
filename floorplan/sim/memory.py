@@ -46,6 +46,12 @@ class Entry:
     nbytes: int
     kind: str  # weights | kv | activation
     module: str
+    #: Which shard of ``module`` this belongs to. Part of the peak-coalescing key, so two
+    #: shards sharing a bank are charged separately while repeated chunk updates for the *same*
+    #: shard coalesce. Without it, a module split across ``d0.l0.p0`` and ``d0.l0.p1`` — both in
+    #: the same HBM-bank scope, each holding a different piece of the KV cache — had only the
+    #: larger piece charged, so a plan could overflow the shared bank while the gate said it fit.
+    shard: int = 0
 
 
 @dataclass
@@ -62,39 +68,66 @@ class MemoryLedger:
     def add_weights(self, tier: str, scope_key: str, nbytes: int, module: str) -> None:
         self._add(tier, scope_key, nbytes, "weights", module)
 
-    def add_kv(self, tier: str, scope_key: str, nbytes: int, module: str) -> None:
-        self._add(tier, scope_key, nbytes, "kv", module)
+    def add_kv(self, tier: str, scope_key: str, nbytes: int, module: str,
+               shard: int = 0) -> None:
+        self._add(tier, scope_key, nbytes, "kv", module, shard)
 
-    def add_activation(self, tier: str, scope_key: str, nbytes: int, module: str) -> None:
-        self._add(tier, scope_key, nbytes, "activation", module)
+    def add_activation(self, tier: str, scope_key: str, nbytes: int, module: str,
+                       shard: int = 0) -> None:
+        self._add(tier, scope_key, nbytes, "activation", module, shard)
 
-    def _add(self, tier: str, scope_key: str, nbytes: int, kind: str, module: str) -> None:
+    def _add(self, tier: str, scope_key: str, nbytes: int, kind: str, module: str,
+             shard: int = 0) -> None:
         if nbytes < 0:
             raise ValueError(f"{module}: negative {kind} bytes ({nbytes})")
         if not nbytes:
             return
         if kind == "weights":
-            self.entries.append(Entry(tier, scope_key, int(nbytes), kind, module))
+            self.entries.append(Entry(tier, scope_key, int(nbytes), kind, module, shard))
             return
-        # KV and activations are a *peak*, not an accumulation. A chunked prefill calls a
-        # cost model once per chunk with a growing context, so summing would report four
-        # KV caches for a four-chunk prompt. Keeping the largest per
-        # (tier, scope, kind, module) lets a cost model charge naively every chunk and
-        # still have the ledger mean what it says.
+        # KV and activations are a *peak*, not an accumulation. A chunked prefill calls a cost
+        # model once per chunk with a growing context, so summing would report four KV caches
+        # for a four-chunk prompt. Keeping the largest per
+        # (tier, scope, kind, module, shard) lets a cost model charge naively every chunk and
+        # still have the ledger mean what it says — while two distinct shards on one bank stay
+        # separate, which they must, since they hold different pieces.
         for entry in self.entries:
-            if (entry.tier, entry.scope_key, entry.kind, entry.module) == (
-                tier, scope_key, kind, module
+            if (entry.tier, entry.scope_key, entry.kind, entry.module, entry.shard) == (
+                tier, scope_key, kind, module, shard
             ):
                 entry.nbytes = max(entry.nbytes, int(nbytes))
                 return
-        self.entries.append(Entry(tier, scope_key, int(nbytes), kind, module))
+        self.entries.append(Entry(tier, scope_key, int(nbytes), kind, module, shard))
 
     # ------------------------------------------------------------------
     def totals(self) -> dict[tuple[str, str], int]:
-        """Bytes per (tier, scope_key)."""
-        out: dict[tuple[str, str], int] = defaultdict(int)
+        """Bytes per (tier, scope_key), with activations counted as a concurrent peak.
+
+        Weights and KV are persistent: every module's share occupies the scope for the whole
+        run, so they sum. Activations are a *working set* — modules on a pipeline stage execute
+        one after another and reuse the same scratch — so summing them across the dozens of
+        layers sharing a bank reported the total of every workspace ever used rather than the
+        largest live at once. That rejected feasible floorplans and pushed the search toward
+        needless distribution.
+
+        The rule here is the conservative approximation available without lifetime analysis:
+        activations contribute the single largest per-scope entry, weights and KV contribute
+        their sum. A schedule-aware peak would be better and needs the timeline, which this
+        ledger does not see.
+        """
+        persistent: dict[tuple[str, str], int] = defaultdict(int)
+        activation_peak: dict[tuple[str, str], int] = defaultdict(int)
         for entry in self.entries:
-            out[(entry.tier, entry.scope_key)] += entry.nbytes
+            key = (entry.tier, entry.scope_key)
+            if entry.kind == "activation":
+                activation_peak[key] = max(activation_peak[key], entry.nbytes)
+            else:
+                persistent[key] += entry.nbytes
+        out: dict[tuple[str, str], int] = defaultdict(int)
+        for key, nbytes in persistent.items():
+            out[key] += nbytes
+        for key, nbytes in activation_peak.items():
+            out[key] += nbytes
         return dict(out)
 
     def by_kind(self) -> dict[str, int]:

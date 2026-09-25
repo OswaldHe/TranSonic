@@ -34,7 +34,7 @@ from typing import Any
 import yaml
 
 from floorplan.parser import Hardware, ceil_div, load_system
-from floorplan.schema import Floorplan
+from floorplan.schema import WEIGHT_PARTITION_DIMS, Floorplan
 from floorplan.sim import api
 from floorplan.sim.api import Context, CostModelError, Shard, Workload
 from floorplan.sim.engine import Schedule, Trace
@@ -216,6 +216,22 @@ def deployable_modules(modules: dict[str, dict[str, Any]]) -> set[str]:
 # ---------------------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------------------
+def weight_divisor(placement: Any) -> int:
+    """How many ways this placement's *parameters* are actually divided.
+
+    Only the weight-partitioning dimensions count. A batch or sequence split partitions the
+    activations and leaves every participant holding the module's full weights, so dividing by
+    its factor understates residency: a batch-64 placement was charged 1/64 of its real
+    weights, which let a plan overflow a bank while the capacity gate reported that it fit, and
+    made data parallelism look almost free.
+    """
+    divisor = 1
+    for split in placement.splits:
+        if split.dim in WEIGHT_PARTITION_DIMS:
+            divisor *= split.factor
+    return divisor
+
+
 def charge_weights(plan: Floorplan, modules: dict[str, dict[str, Any]], ledger: MemoryLedger) -> None:
     """Account every placement's parameter bytes. Deterministic — no cost model involved.
 
@@ -230,7 +246,7 @@ def charge_weights(plan: Floorplan, modules: dict[str, dict[str, Any]], ledger: 
                 f"placement names '{placement.module}', which is not in the partition graph"
             )
         total = int(entry.get("param_bytes") or 0) * placement.fraction
-        per_shard = ceil_div(int(total), placement.shard_count())
+        per_shard = ceil_div(int(total), weight_divisor(placement))
         for unit in placement.units:
             residency = placement.residency
             ledger.add_weights(
@@ -296,6 +312,9 @@ def simulate_workload(
             for module_id, entry in modules.items()
             for tensor in (entry.get("outputs") or [])
         }
+        # Op indices that closed each pipeline stage, so a later stage can wait on an earlier
+        # one even where no tensor connects them.
+        stage_completions: dict[int, list[int]] = {}
 
         for module_id in order:
             placements = placed.get(module_id)
@@ -307,6 +326,18 @@ def simulate_workload(
                 producer = produced_by.get(str(tensor))
                 if producer and producer != module_id:
                     deps.extend(completions.get(producer, []))
+
+            # `stage` is a real ordering constraint, not a label. Without this it was inert:
+            # ordering came only from data dependencies and unit contention, so changing the
+            # documented control for pipeline depth could not move any metric, and two plans
+            # with 4 and 16 stages on the same units were scheduled identically.
+            #
+            # A placement in stage N waits for every stage below N to have closed. That is what
+            # makes a deep pipeline cost something at decode, where one token in flight leaves
+            # every stage boundary a bubble with nothing to fill it.
+            earliest_stage = min(p.stage for p in placements)
+            for stage in sorted(s for s in stage_completions if s < earliest_stage):
+                deps.extend(stage_completions[stage])
 
             model = api.resolve(module_id, entry)
             emitted: list[int] = []
@@ -322,7 +353,7 @@ def simulate_workload(
                         shard_count=placement.shard_count(),
                         splits=tuple(placement.splits),
                         fraction=placement.fraction,
-                        param_bytes=ceil_div(int(total), placement.shard_count()),
+                        param_bytes=ceil_div(int(total), weight_divisor(placement)),
                         module_activation_bytes=int(entry.get("activation_bytes") or 0),
                         residency=placement.residency,
                         stage=placement.stage,
@@ -358,6 +389,8 @@ def simulate_workload(
                         )
                     emitted.extend(int(i) for i in produced)
             completions[module_id] = emitted
+            for placement in placements:
+                stage_completions.setdefault(placement.stage, []).extend(emitted)
 
     return WorkloadResult(
         workload=workload,
@@ -390,7 +423,7 @@ def simulate(
 
     modules, _graph = load_graph(artifact)
     config = load_model_config(artifact)
-    plan.validate_against(system, modules)
+    plan.validate_against(system, modules, config)
 
     required = deployable_modules(modules)
     missing = sorted(required - plan.modules())

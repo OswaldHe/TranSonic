@@ -3,7 +3,7 @@
 
 """The four stages, and the state that carries between them.
 
-    init    materialize a project: the frozen framework, the platform and model briefs,
+    init    materialize a project: the platform and model briefs,
             the generated baseline floorplan, and the manifest the gate reads
     build   two agent iterations that write the per-module cost models, gated by the
             invariant suite
@@ -43,14 +43,16 @@ from floorplan.sim.runner import EXCLUDED_KINDS, deployable_modules, load_graph
 #: Where per-project state lives, relative to the project root.
 STATE_DIR = Path(".autohelix") / "floorplan"
 
-#: The framework copied into a project. Frozen after `build`; check (d) hashes all of it.
-FRAMEWORK_FILES = (
-    "sim/__init__.py",
+#: The framework modules a project reads but does not contain. Their bytes are hashed into the
+#: manifest by `freeze()` and verified by gate check (d), because these are the files that
+#: actually compute the metrics.
+FRAMEWORK_MODULES = (
     "sim/engine.py",
     "sim/collectives.py",
     "sim/memory.py",
     "sim/api.py",
     "sim/runner.py",
+    "parser.py",
 )
 
 #: Feasible candidates are archived here regardless of whether they beat the metric gate, so
@@ -71,6 +73,9 @@ class Manifest:
     systems_dir: str
     created: str
     hashes: dict[str, str] = field(default_factory=dict)
+    #: Hashes of the *installed* framework modules — the code that computes the metrics. Kept
+    #: separately from `hashes` because those are project-relative and these are absolute.
+    framework_hashes: dict[str, str] = field(default_factory=dict)
     frozen_at: str = ""
     build_iterations: int = 0
 
@@ -81,6 +86,7 @@ class Manifest:
             "systems_dir": self.systems_dir,
             "created": self.created,
             "hashes": self.hashes,
+            "framework_hashes": self.framework_hashes,
             "frozen_at": self.frozen_at,
             "build_iterations": self.build_iterations,
         }
@@ -97,6 +103,7 @@ class Manifest:
             systems_dir=data.get("systems_dir", ""),
             created=data.get("created", ""),
             hashes=data.get("hashes") or {},
+            framework_hashes=data.get("framework_hashes") or {},
             frozen_at=data.get("frozen_at", ""),
             build_iterations=int(data.get("build_iterations", 0)),
         )
@@ -119,9 +126,8 @@ def init(
 ) -> Manifest:
     """Materialize a floorplan project.
 
-    Materialized rather than pointed at: the project gets its own copy of the framework and
-    its own git history, so `git log` afterwards is the record of how the floorplan arrived —
-    and so the hashes in the manifest describe files that cannot move underneath it.
+    Materialized rather than pointed at: the project gets its own briefs, baseline and git
+    history, so `git log` afterwards is the record of how the floorplan arrived.
     """
     project = project.resolve()
     if project.exists() and any(project.iterdir()):
@@ -139,16 +145,17 @@ def init(
     system = load_system(target, resolved_systems)
     hardware = Hardware.from_system(system)
 
-    # The framework, copied file by file so the manifest's hashes name real paths.
-    for relative in FRAMEWORK_FILES:
-        source = package / relative
-        destination = project / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
+    # The project holds only what the agent writes. The framework is *not* copied here: the
+    # simulator runs as `python -m floorplan.sim.runner` out of the installed package, so a
+    # copy in the project would be read by the agent, hashed by the gate, and executed by
+    # nobody — three ways of looking frozen while the code computing every metric drifted
+    # underneath. `freeze()` hashes the installed files instead, and `sim/FRAMEWORK.md` tells
+    # the agent where to read them.
     (project / "sim" / "modules").mkdir(parents=True, exist_ok=True)
     (project / "sim" / "modules" / "__init__.py").write_text(
         '"""Agent-written cost models, one per module archetype. See ../../README.md."""\n'
     )
+    write_framework_pointer(project, package)
 
     # The systems directory travels with the project: the gate re-reads it every iteration,
     # and a project whose platform description could change under it is not reproducible.
@@ -180,8 +187,37 @@ def init(
     _git(project, "add", "-A")
     _git(project, "-c", "user.email=floorplan@localhost", "-c", "user.name=floorplan",
          "commit", "-q", "-m",
-         f"Floorplan project for {hardware.name}: framework, briefs and generated baseline")
+         f"Floorplan project for {hardware.name}: briefs and generated baseline")
     return manifest
+
+
+def write_framework_pointer(project: Path, package: Path) -> None:
+    """`sim/FRAMEWORK.md` — where to read the simulator, since the project has no copy."""
+    lines = [
+        "# The simulator framework",
+        "",
+        "This project holds only the parts you write: `sim/modules/*.py` and",
+        "`sim/constraints.py`. The framework itself is not copied here, deliberately — it runs",
+        "out of the installed package, and a second copy in the project would be the one you",
+        "read while a different one computed the metrics.",
+        "",
+        "Read it at:",
+        "",
+    ]
+    for relative in FRAMEWORK_MODULES:
+        lines.append(f"- `{package / relative}`")
+    lines += [
+        "",
+        "`sim/api.py` is the contract your cost models are written against — start there.",
+        "`sim/engine.py` is the timeline, `sim/collectives.py` prices communication,",
+        "`sim/memory.py` decides whether a plan fits, and `sim/runner.py` walks the module DAG.",
+        "",
+        "These files are hashed into `.autohelix/floorplan/manifest.json` when the simulator is",
+        "frozen, and the exploration gate verifies them every iteration. If they change, metrics",
+        "from before and after the change are not comparable and the gate says so.",
+        "",
+    ]
+    (project / "sim" / "FRAMEWORK.md").write_text("\n".join(lines))
 
 
 def _git(project: Path, *args: str) -> None:
@@ -589,6 +625,13 @@ def build_loop(
             outcome.error = f"{type(exc).__name__}: {exc}"
 
         emit("running the reviewer")
+        # The reviewer is held to being read-only by snapshot-and-restore, not by instruction.
+        # It gets the same writable project and is required to write a report into it, so
+        # nothing stops it editing `sim/` too — and those edits would land after the invariant
+        # suite had already passed, get committed, and be frozen on the strength of a green
+        # result describing different code. The verdict recorded beside a commit has to
+        # describe the simulator that actually landed.
+        snapshot = _snapshot_sim(project)
         try:
             review_log = state / f"build-review-{iteration}.log"
             reviewer.run(
@@ -603,6 +646,15 @@ def build_loop(
             previous_review = outcome.review
         except Exception as exc:                        # noqa: BLE001
             outcome.error = (outcome.error + f" reviewer: {exc}").strip()
+        finally:
+            reverted = _restore_sim(project, snapshot)
+            if reverted:
+                outcome.error = (
+                    outcome.error
+                    + f" reviewer edited the simulator and was reverted: "
+                      f"{', '.join(reverted[:4])}"
+                ).strip()
+                emit(f"reverted {len(reverted)} reviewer edit(s) to sim/")
 
         _commit_build(project, iteration, outcome)
         outcomes.append(outcome)
@@ -661,6 +713,45 @@ def _reviewer_prompt(config: Any, iteration: int, state: Path) -> str:
     ])
 
 
+def _snapshot_sim(project: Path) -> dict[Path, str]:
+    """Contents of every agent-writable simulator file, for restoring after the reviewer."""
+    snapshot: dict[Path, str] = {}
+    for path in sorted((project / "sim").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            snapshot[path] = path.read_text()
+        except OSError:
+            continue
+    return snapshot
+
+
+def _restore_sim(project: Path, snapshot: dict[Path, str]) -> list[str]:
+    """Put back anything the reviewer changed. Returns the paths it had to restore."""
+    reverted: list[str] = []
+    for path, content in snapshot.items():
+        try:
+            if path.read_text() != content:
+                path.write_text(content)
+                reverted.append(str(path.relative_to(project)))
+        except FileNotFoundError:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            reverted.append(str(path.relative_to(project)))
+        except OSError:
+            continue
+    # A file the reviewer *added* is also an edit to the simulator.
+    for path in sorted((project / "sim").rglob("*.py")):
+        if "__pycache__" in path.parts or path in snapshot:
+            continue
+        try:
+            path.unlink()
+            reverted.append(str(path.relative_to(project)))
+        except OSError:
+            continue
+    return reverted
+
+
 def _parse_verdict(review: str) -> str:
     """The `VERDICT:` line the reviewer is asked to end with."""
     for line in reversed(review.splitlines()):
@@ -696,7 +787,11 @@ def _commit_build(project: Path, iteration: int, outcome: BuildOutcome) -> None:
 # freeze
 # ---------------------------------------------------------------------------------------
 def freeze(project: Path, iterations: int = 0) -> Manifest:
-    """Hash `sim/` into the manifest. After this, only `floorplan.yaml` may change.
+    """Hash the simulator into the manifest. After this, only `floorplan.yaml` may change.
+
+    Two sets of hashes, because the simulator lives in two places: the agent-written cost
+    models and platform YAML in the project, and the framework in the installed package.
+    Recording only the first would leave the code that computes every metric unverified.
 
     The moment the build loop hands over to the exploration loop. Separated into its own
     function because `build` calls it on success and an operator may need to call it by hand
@@ -704,6 +799,7 @@ def freeze(project: Path, iterations: int = 0) -> Manifest:
     """
     manifest = Manifest.load(project)
     manifest.hashes = checker.hash_tree(project)
+    manifest.framework_hashes = checker.hash_framework()
     manifest.frozen_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     manifest.build_iterations = iterations or manifest.build_iterations
     manifest.save(project)

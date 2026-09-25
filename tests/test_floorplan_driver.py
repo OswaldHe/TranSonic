@@ -51,8 +51,14 @@ def test_freeze_records_hashes_and_a_timestamp(tmp_path):
     assert set(frozen.hashes) == {"sim/engine.py", "systems/probed.yaml"}
     assert frozen.frozen_at
     assert frozen.build_iterations == 2
-    # And the gate agrees the tree is unchanged.
-    assert checker.check_frozen(tmp_path, {"hashes": frozen.hashes}).passed
+    # The framework that actually computes the metrics is hashed too, by absolute path.
+    assert frozen.framework_hashes
+    assert all(path.endswith(".py") for path in frozen.framework_hashes)
+    assert any(path.endswith("sim/runner.py") for path in frozen.framework_hashes)
+    # And the gate agrees nothing has changed.
+    assert checker.check_frozen(tmp_path, {
+        "hashes": frozen.hashes, "framework_hashes": frozen.framework_hashes,
+    }).passed
 
 
 # ---------------------------------------------------------------------------------------
@@ -284,3 +290,142 @@ def test_appendix_surfaces_the_derived_link_as_a_caveat(project, tmp_path):
     assert "derived, not measured" in appendix
     assert "first thing to measure on real 16-device hardware" in appendix
     assert "links.inter_device" in appendix
+
+
+# ---------------------------------------------------------------------------------------
+# The reviewer is read-only (PR #5 review, comment 9)
+# ---------------------------------------------------------------------------------------
+def test_reviewer_edits_to_the_simulator_are_reverted(tmp_path):
+    """The reviewer runs after the invariants and shares the writable project.
+
+    Nothing stops it editing `sim/` too, and those edits would land after the suite had passed,
+    be committed, and be frozen on the strength of a green result describing different code.
+    """
+    (tmp_path / "sim" / "modules").mkdir(parents=True)
+    model = tmp_path / "sim" / "modules" / "attention.py"
+    model.write_text("ORIGINAL = 1\n")
+    constraints = tmp_path / "sim" / "constraints.py"
+    constraints.write_text("def check(hardware, plan):\n    return []\n")
+
+    snapshot = driver._snapshot_sim(tmp_path)
+
+    # The reviewer edits a cost model, adds a file, and deletes another.
+    model.write_text("ORIGINAL = 999\n")
+    (tmp_path / "sim" / "modules" / "sneaky.py").write_text("X = 1\n")
+    constraints.unlink()
+
+    reverted = driver._restore_sim(tmp_path, snapshot)
+    assert model.read_text() == "ORIGINAL = 1\n"
+    assert constraints.exists()
+    assert not (tmp_path / "sim" / "modules" / "sneaky.py").exists()
+    assert len(reverted) == 3
+
+
+def test_an_untouched_simulator_reports_nothing_reverted(tmp_path):
+    (tmp_path / "sim").mkdir()
+    (tmp_path / "sim" / "m.py").write_text("A = 1\n")
+    snapshot = driver._snapshot_sim(tmp_path)
+    assert driver._restore_sim(tmp_path, snapshot) == []
+
+
+# ---------------------------------------------------------------------------------------
+# Verdict parsing, for the freeze condition (comment 10)
+# ---------------------------------------------------------------------------------------
+@pytest.mark.parametrize("review,expected", [
+    ("all good\n\nVERDICT: clean\n", "clean"),
+    ("hmm\nVERDICT: suspicious", "suspicious"),
+    ("VERDICT: circumventing\n", "circumventing"),
+    ("no verdict here", ""),
+])
+def test_verdict_is_parsed_from_the_last_verdict_line(review, expected):
+    assert driver._parse_verdict(review) == expected
+
+
+def test_build_refuses_to_freeze_a_circumventing_final_iteration():
+    """Exhausting the iteration budget must not promote a rejected cost model.
+
+    `build_loop` moves on when a reviewer says `circumventing`, but the last allowed iteration
+    has nowhere to move on to — and checking only the invariant flag would freeze it anyway.
+    """
+    source = (
+        suite_path := __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "floorplan" / "cli.py"
+    ).read_text()
+    assert 'final.verdict == "circumventing"' in source, (
+        f"{suite_path} no longer gates the freeze on the reviewer's verdict"
+    )
+    assert "NOT frozen" in source
+
+
+# ---------------------------------------------------------------------------------------
+# Explicit ranking line (PR #5 review, comment 16)
+# ---------------------------------------------------------------------------------------
+def test_an_explicit_ranking_line_beats_prose_order(tmp_path):
+    """The failure mode: an ordinary report introduces all three, then chooses.
+
+    First-mention order would publish introduction order as the ranking, contradicting the
+    report's own conclusion in the files it writes.
+    """
+    report = tmp_path / "REPORT.md"
+    report.write_text(
+        "# Analysis\n\n"
+        "We consider scheme-a, scheme-b and scheme-c in turn.\n\n"
+        "scheme-a pipelines deeply. scheme-b tiers Engram. scheme-c replicates experts.\n\n"
+        "## Conclusion\n\nscheme-c is the best deployment.\n\n"
+        "RANKING: scheme-c > scheme-b > scheme-a\n"
+    )
+    labels = ["scheme-a", "scheme-b", "scheme-c"]
+    assert rank_module.parse_ranking(report, labels) == ["scheme-c", "scheme-b", "scheme-a"]
+    assert rank_module.ranking_was_explicit(report)
+
+
+@pytest.mark.parametrize("line", [
+    "RANKING: scheme-b > scheme-a > scheme-c",
+    "ranking: scheme-b, scheme-a, scheme-c",
+    "RANKING:  scheme-b -> scheme-a -> scheme-c ",
+    "**RANKING**: scheme-b > scheme-a > scheme-c",
+])
+def test_ranking_line_separators_and_case(tmp_path, line):
+    report = tmp_path / "REPORT.md"
+    report.write_text(f"prose mentioning scheme-c first\n\n{line}\n")
+    order = rank_module.parse_ranking(report, ["scheme-a", "scheme-b", "scheme-c"])
+    assert order[:2] == ["scheme-b", "scheme-a"]
+
+
+def test_a_ranking_line_omitting_a_scheme_appends_it(tmp_path):
+    report = tmp_path / "REPORT.md"
+    report.write_text("scheme-a is mentioned first.\n\nRANKING: scheme-c > scheme-b\n")
+    order = rank_module.parse_ranking(report, ["scheme-a", "scheme-b", "scheme-c"])
+    assert order == ["scheme-c", "scheme-b", "scheme-a"]
+
+
+def test_no_ranking_line_falls_back_and_says_so(tmp_path):
+    report = tmp_path / "REPORT.md"
+    report.write_text("scheme-b wins, then scheme-a, then scheme-c.\n")
+    assert not rank_module.ranking_was_explicit(report)
+    assert rank_module.parse_ranking(report, ["scheme-a", "scheme-b", "scheme-c"]) == [
+        "scheme-b", "scheme-a", "scheme-c",
+    ]
+
+
+def test_the_brief_demands_the_ranking_line(project, tmp_path):
+    staged = rank_module.stage(project, tmp_path / "sandbox", seed=0)
+    task = (staged.directory / "TASK.md").read_text()
+    assert "RANKING:" in task
+    assert "parsed" in task
+
+
+# ---------------------------------------------------------------------------------------
+# --count is honoured (comment 17)
+# ---------------------------------------------------------------------------------------
+def test_count_limits_how_many_schemes_are_staged(project, tmp_path):
+    for count in (1, 2, 3):
+        staged = rank_module.stage(project, tmp_path / f"s{count}", seed=0, count=count)
+        assert len(staged.mapping) == count
+        assert len(list((staged.directory / "schemes").glob("*.yaml"))) == count
+
+
+def test_an_unsupported_count_is_rejected_rather_than_ignored(project, tmp_path):
+    for count in (0, 4, -1):
+        with pytest.raises(ValueError, match="count must be between"):
+            rank_module.stage(project, tmp_path / "bad", seed=0, count=count)

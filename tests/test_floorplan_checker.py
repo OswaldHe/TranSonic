@@ -83,7 +83,10 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
     (tmp_path / "systems").mkdir()
     probed = tmp_path / "systems" / "probed.yaml"
     probed.write_text("shared:\n  efficiency:\n    matmul_bf16: 0.2959\n")
-    manifest = {"hashes": checker.hash_tree(tmp_path)}
+    manifest = {
+        "hashes": checker.hash_tree(tmp_path),
+        "framework_hashes": checker.hash_framework(),
+    }
     assert checker.check_frozen(tmp_path, manifest).passed
 
     probed.write_text("shared:\n  efficiency:\n    matmul_bf16: 0.9000\n")
@@ -95,7 +98,10 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
 def test_frozen_detects_edit_addition_and_removal(tmp_path):
     (tmp_path / "sim").mkdir()
     (tmp_path / "sim" / "engine.py").write_text("x = 1\n")
-    manifest = {"hashes": checker.hash_tree(tmp_path)}
+    manifest = {
+        "hashes": checker.hash_tree(tmp_path),
+        "framework_hashes": checker.hash_framework(),
+    }
 
     assert checker.check_frozen(tmp_path, manifest).passed
 
@@ -119,7 +125,9 @@ def test_frozen_detects_edit_addition_and_removal(tmp_path):
 
 def test_unfrozen_manifest_fails_rather_than_passing_vacuously(tmp_path):
     """An empty hash set must not read as "nothing changed"."""
-    check = checker.check_frozen(tmp_path, {"hashes": {}})
+    check = checker.check_frozen(
+        tmp_path, {"hashes": {}, "framework_hashes": checker.hash_framework()},
+    )
     assert not check.passed
     assert "never frozen" in check.findings[0]
 

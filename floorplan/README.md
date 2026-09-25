@@ -249,15 +249,21 @@ scope, or the phrases the goal has to contain.
 | a | plan well-formed | parses, and is legal for this hardware and this model |
 | b | coverage | every module placed, fractions summing to 1, nothing off-path |
 | c | dependencies | every placed module's producers are placed too |
-| d | **frozen platform** | `sim/` byte-identical to the build manifest |
+| d | **frozen platform** | `sim/`, `systems/` **and the installed framework** byte-identical to the build |
 | e | capacity | no tier over capacity, at any of the four workloads |
 | f | simulates | all four workloads complete and publish a metric |
 | g | deterministic | a second run produces identical metrics |
 
-(d) is the load-bearing one for honesty. Scope enforcement already reverts out-of-scope edits,
-but that depends on git noticing; (d) verifies the bytes against hashes recorded when the
-simulator was frozen. A cost model quietly made cheaper is the one change that would make every
-metric in the run meaningless.
+(d) is the load-bearing one for honesty, and it covers **two** sets of bytes. Scope enforcement
+already reverts out-of-scope edits, but that depends on git noticing; (d) verifies hashes
+recorded at the freeze. The project's half is the agent-written cost models plus
+`systems/probed.yaml` — raising `matmul_bf16` from 0.30 to 0.90 would make every plan three
+times faster without touching a line of `sim/`. The other half is the **installed framework**,
+because the simulator runs as `python -m floorplan.sim.runner` out of the package: hashing only
+the project would have left the code that computes every metric unverified, and an upgrade or a
+local edit could change results while (d) still passed. That is also why the framework is *not*
+copied into the project — a copy would be the one the agent read while a different one did the
+arithmetic. `sim/FRAMEWORK.md` points at the real thing.
 
 (g) is cheap and catches the one class of bug that would invalidate a whole run silently: a
 cost model that reads the clock or iterates an unordered collection. Without it a 3%

@@ -114,9 +114,17 @@ def cost(
         return CollectiveCost(0.0, 0, "none", 0, participants)
 
     byte_factor, step_factor = _ALGORITHMS[kind]
-    share = (participants - 1) / participants
-    bytes_on_wire = int(bytes_per_participant * byte_factor * share)
-    steps = step_factor * (participants - 1)
+    if kind == "p2p":
+        # A point-to-point handoff is not a ring. The whole activation travels from sender to
+        # receiver, so the `(N-1)/N` share does not apply — for the usual two-participant stage
+        # boundary it charged half the payload and underpriced every cross-device pipeline
+        # handoff by about 2x.
+        bytes_on_wire = int(bytes_per_participant)
+        steps = 1
+    else:
+        share = (participants - 1) / participants
+        bytes_on_wire = int(bytes_per_participant * byte_factor * share)
+        steps = step_factor * (participants - 1)
 
     bandwidth, latency_us = hardware.require_link(link_class)
     efficiency = hardware.require_efficiency(

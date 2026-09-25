@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from floorplan.parser import Hardware, Tier, load_system
-from floorplan.schema import Address
+from floorplan.schema import Address, Placement, Split
 from floorplan.sim import collectives
 from floorplan.sim.engine import ENGINES, Op, Schedule, ScheduleError
 from floorplan.sim.memory import MemoryLedger, scope_key_for
@@ -103,18 +103,40 @@ def test_sbuf_exclusion_serializes_gpsimd_against_tensor():
     assert other.trace.makespan() == 1.0
 
 
-def test_overlapped_collective_frees_the_engine_but_not_dependents():
+def test_overlap_flag_governs_collective_compute_contention():
+    """What `overlap_collectives` actually controls: whether a collective blocks compute.
+
+    The first version gated the *engine reservation* on the flag, which got it backwards. A
+    `cc` op only ever serialized against other `cc` ops — it never blocked tensor or vector
+    work — so clearing the flag changed almost nothing and every plan got overlap for free.
+    """
+    overlapped = Schedule()
+    overlapped.submit(Op("ar", "d0.l0", "cc", 1.0, overlapped=True))
+    overlapped.submit(Op("gemm", "d0.l0", "tensor", 1.0))
+    assert overlapped.trace.makespan() == 1.0, "an overlapped collective must free compute"
+
+    serial = Schedule()
+    serial.submit(Op("ar", "d0.l0", "cc", 1.0, overlapped=False))
+    serial.submit(Op("gemm", "d0.l0", "tensor", 1.0))
+    assert serial.trace.makespan() == 2.0, "a non-overlapped collective must block compute"
+
+
+def test_dependents_wait_whether_or_not_the_collective_overlaps():
     """Text constraint 4: overlap is real, but a collective and its consumer cannot overlap."""
+    for overlapped in (True, False):
+        schedule = Schedule()
+        collective = schedule.submit(Op("ar", "d0.l0", "cc", 1.0, overlapped=overlapped))
+        dependent = schedule.submit(
+            Op("use", "d0.l0", "tensor", 1.0, deps=(collective,)),
+        )
+        assert schedule.finish_of(dependent) == 2.0
+
+
+def test_collectives_share_one_cc_queue_per_unit():
     schedule = Schedule()
-    collective = schedule.submit(
-        Op("ar", "d0.l0", "cc", 1.0, overlapped=True),
-    )
-    # Unrelated compute on the same unit is not blocked.
-    unrelated = schedule.submit(Op("other", "d0.l0", "cc", 1.0))
-    assert schedule.finish_of(unrelated) == 1.0
-    # A dependent still waits.
-    dependent = schedule.submit(Op("use", "d0.l0", "tensor", 1.0, deps=(collective,)))
-    assert schedule.finish_of(dependent) == 2.0
+    schedule.submit(Op("a", "d0.l0", "cc", 1.0, overlapped=True))
+    schedule.submit(Op("b", "d0.l0", "cc", 1.0, overlapped=True))
+    assert schedule.trace.makespan() == 2.0
 
 
 def test_forward_dependency_is_rejected():
@@ -306,3 +328,92 @@ def test_scope_keys(tier, expected):
 def test_nvme_is_charged_through_host_dram(hardware):
     """Text constraint 6: there is no direct accelerator-to-NVMe path."""
     assert hardware.tiers["nvme"].via == ("host_dram",)
+
+
+# ---------------------------------------------------------------------------------------
+# Weight replication for activation-only splits (PR #5 review, comment 6)
+# ---------------------------------------------------------------------------------------
+@pytest.mark.parametrize("dim,divides", [
+    ("head", True), ("hidden", True), ("expert", True), ("vocab", True),
+    ("ngram", True), ("layer", True),
+    ("batch", False), ("seq", False),
+])
+def test_only_weight_partitioning_dims_divide_the_weights(dim, divides):
+    """A batch or sequence split replicates the weights; it does not shard them.
+
+    Dividing by a batch factor charged a batch-64 placement 1/64 of its real weights, so a
+    plan that overflowed a bank passed the capacity gate and data parallelism looked free.
+    """
+    from floorplan.sim.runner import weight_divisor
+
+    placement = Placement(module="m", units=[Address(0, i) for i in range(4)],
+                  splits=[Split(dim, 4, "allreduce" if divides else "none")])
+    assert weight_divisor(placement) == (4 if divides else 1)
+
+
+def test_mixed_splits_divide_only_by_the_weight_dims():
+    from floorplan.sim.runner import weight_divisor
+
+    placement = Placement(
+        module="m", units=[Address(0, i) for i in range(4)],
+        splits=[Split("head", 2, "allreduce"), Split("seq", 2, "allgather")],
+    )
+    assert placement.shard_count() == 4
+    assert weight_divisor(placement) == 2
+
+
+# ---------------------------------------------------------------------------------------
+# p2p byte volume (comment 11)
+# ---------------------------------------------------------------------------------------
+def test_p2p_charges_the_whole_payload(hardware):
+    """A pipeline handoff is not a ring: the entire activation crosses the link.
+
+    The ring `(N-1)/N` share charged half of it for the usual two-participant boundary,
+    underpricing every cross-device stage transfer by about 2x.
+    """
+    payload = 1 << 20
+    p2p = collectives.cost(hardware, "p2p", payload, ["d0.l0", "d1.l0"])
+    assert p2p.bytes_on_wire == payload
+
+    allgather = collectives.cost(hardware, "allgather", payload, ["d0.l0", "d1.l0"])
+    assert allgather.bytes_on_wire == payload // 2
+    assert p2p.seconds > allgather.seconds
+
+
+# ---------------------------------------------------------------------------------------
+# Memory peaks per shard, and activations as a concurrent set (comments 8 and 15)
+# ---------------------------------------------------------------------------------------
+def test_two_shards_on_one_bank_are_charged_separately():
+    """Both physical cores of a logical core share its bank and hold different KV pieces."""
+    ledger = MemoryLedger()
+    ledger.add_kv("hbm_bank", "d0.l0", 1 << 20, "layers.0.attention", shard=0)
+    ledger.add_kv("hbm_bank", "d0.l0", 1 << 20, "layers.0.attention", shard=1)
+    assert ledger.totals()[("hbm_bank", "d0.l0")] == 2 << 20
+
+
+def test_repeated_chunks_for_one_shard_still_coalesce():
+    ledger = MemoryLedger()
+    for nbytes in (1 << 20, 4 << 20, 2 << 20):
+        ledger.add_kv("hbm_bank", "d0.l0", nbytes, "layers.0.attention", shard=0)
+    assert ledger.totals()[("hbm_bank", "d0.l0")] == 4 << 20
+
+
+def test_activations_are_a_concurrent_peak_not_a_sum():
+    """Layers on a stage run in sequence and reuse the same scratch.
+
+    Summing every module's workspace across the dozens of layers sharing a bank reported the
+    total ever used rather than the largest live at once, which rejected feasible plans.
+    """
+    ledger = MemoryLedger()
+    for layer in range(40):
+        ledger.add_activation("hbm_bank", "d0.l0", 1 << 20, f"layers.{layer}.ffn")
+    assert ledger.totals()[("hbm_bank", "d0.l0")] == 1 << 20
+
+
+def test_weights_and_kv_still_sum_because_they_are_persistent():
+    ledger = MemoryLedger()
+    ledger.add_weights("hbm_bank", "d0.l0", 3 << 20, "a")
+    ledger.add_weights("hbm_bank", "d0.l0", 5 << 20, "b")
+    ledger.add_kv("hbm_bank", "d0.l0", 1 << 20, "a", shard=0)
+    ledger.add_activation("hbm_bank", "d0.l0", 2 << 20, "a")
+    assert ledger.totals()[("hbm_bank", "d0.l0")] == (3 + 5 + 1 + 2) << 20

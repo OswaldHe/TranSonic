@@ -369,15 +369,41 @@ def check_costs_derived(project: Path) -> Check:
     return check
 
 
+def hardware_fingerprint(hardware: Hardware) -> str:
+    """Everything a cost model could mutate and thereby change a later cost.
+
+    Not just ``raw``. ``Hardware.from_system`` builds fresh mutable mappings — ``efficiency``,
+    ``compute``, ``tiers`` — and writing to one of those through ``ctx.hardware`` leaves the
+    source YAML untouched. A model could raise ``matmul_bf16`` mid-run, speed up every shard
+    evaluated afterwards, and pass the check meant to catch exactly that.
+    """
+    return json.dumps(
+        {
+            "raw": hardware.raw,
+            "efficiency": hardware.efficiency,
+            "compute": hardware.compute,
+            "tiers": {name: vars(tier) for name, tier in hardware.tiers.items()},
+            "links": [
+                hardware.intra_device_bandwidth_bytes_per_s,
+                hardware.intra_device_latency_us,
+                hardware.inter_device_bandwidth_bytes_per_s,
+                hardware.inter_device_hop_latency_us,
+            ],
+            "topology": [hardware.topology_kind, hardware.topology_shape, hardware.topology_wrap],
+        },
+        sort_keys=True, default=str,
+    )
+
+
 def check_hardware_readonly(hardware: Hardware, before: str) -> Check:
     """(i) Simulating did not mutate the platform model."""
     check = Check("i", "hardware read-only", True)
-    after = json.dumps(hardware.raw, sort_keys=True, default=str)
-    if after != before:
+    if hardware_fingerprint(hardware) != before:
         check.fail(
             "the platform model changed during simulation. A cost model has written to "
-            "ctx.hardware; it is shared across every shard and workload, so a mutation "
-            "makes results depend on evaluation order"
+            "ctx.hardware — its efficiency coefficients, compute rates, tiers or links — and "
+            "that object is shared across every shard and workload, so a mutation makes "
+            "results depend on evaluation order"
         )
     return check
 
@@ -433,7 +459,7 @@ def run(project: Path, artifact: Path, systems_dir: Path | None = None,
         )
 
     order = topological_order(modules)
-    before = json.dumps(hardware.raw, sort_keys=True, default=str)
+    before = hardware_fingerprint(hardware)
 
     results: dict[str, Any] | None = {}
     error = ""

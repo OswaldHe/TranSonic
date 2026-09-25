@@ -172,6 +172,20 @@ def build(path: Path, iterations: int, no_freeze: bool) -> None:
             "deliberately with --no-freeze off after fixing by hand."
         )
         raise SystemExit(1)
+    # A green suite is necessary and not sufficient. `build_loop` moves on when a reviewer says
+    # `circumventing`, but if the *last* allowed iteration says it there is nowhere to move on
+    # to, and checking only the invariant flag would freeze a simulator the reviewer explicitly
+    # rejected — turning an exhausted budget into the metric the whole search is scored by.
+    if final.verdict == "circumventing":
+        click.echo(
+            f"\nthe invariant suite is green but the reviewer's verdict on the final "
+            f"iteration is `circumventing`; the simulator is NOT frozen."
+        )
+        click.echo(
+            "Read reports/build-review-*.md. Exhausting the iteration budget is not a reason "
+            "to accept a cost model the reviewer judged to be gaming its own checks."
+        )
+        raise SystemExit(1)
     if not no_freeze:
         frozen = driver.freeze(project, iterations=len(outcomes))
         click.echo(f"\nsimulator frozen: {len(frozen.hashes)} file(s) hashed at "
@@ -218,9 +232,16 @@ def _archive_from_history(project: Path) -> int:
     """Archive every gate-passing iteration's floorplan from the AutoHelix history.
 
     Done after the loop rather than during it because AutoHelix discards a rejected
-    iteration's worktree — so the plan has to be recovered from the iteration's git branch,
-    which survives. This is what makes a rejected-but-feasible scheme available to `rank`
-    instead of lost.
+    iteration's worktree, so each plan has to be recovered from git afterwards. That is what
+    makes a rejected-but-feasible scheme available to `rank` instead of lost.
+
+    Recovered by the **commit sha the history records for that iteration**. The first version
+    of this guessed at branch names (`autohelix/iter-N`, `iter-N`) and fell back to `HEAD`,
+    which was silently catastrophic: AutoHelix merges an accepted iteration and deletes its
+    branch, so no guess ever resolved and every candidate got the *final* plan. Six archived
+    files, six different sets of metrics in their headers, one identical floorplan — and
+    `rank` then ranked the same scheme three times without anything noticing. A plan that
+    cannot be recovered is now skipped, which loses a candidate instead of inventing one.
     """
     history = project / ".autohelix" / "history.jsonl"
     if not history.exists():
@@ -241,8 +262,20 @@ def _archive_from_history(project: Path) -> int:
         destination = project / driver.CANDIDATES_DIR / f"iter-{iteration}.yaml"
         if destination.exists():
             continue
-        text = _plan_at_iteration(project, iteration)
+        # Iteration 0 is the baseline, which has no commit of its own: `init` committed it as
+        # the project's root commit. Any *other* entry without a commit was rejected and never
+        # merged, so its plan is not in git at all — the gate's own `--archive` is what captures
+        # those, during the iteration, before the worktree is deleted. Falling back to the root
+        # commit here would file the baseline under a rejected iteration's metrics, which is the
+        # same class of mistake as the `HEAD` fallback this replaced.
+        commit = entry.get("commit") or (_root_commit(project) if iteration == 0 else None)
+        text = _plan_at_commit(project, commit) if commit else None
         if text is None:
+            click.echo(
+                f"  note: iteration {iteration}'s floorplan is not in git "
+                f"({'rejected, never merged' if not entry.get('commit') else 'commit missing'}); "
+                f"relying on the gate's own archive for it"
+            )
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         header = [f"# Candidate from iteration {iteration}"
@@ -261,16 +294,31 @@ def _archive_from_history(project: Path) -> int:
     return archived
 
 
-def _plan_at_iteration(project: Path, iteration: int) -> str | None:
-    """`floorplan.yaml` as it stood at an iteration, from git. None if unrecoverable."""
-    for ref in (f"autohelix/iter-{iteration}", f"iter-{iteration}", "HEAD"):
-        completed = subprocess.run(
-            ["git", "show", f"{ref}:floorplan.yaml"],
-            cwd=project, capture_output=True, text=True, timeout=120,
-        )
-        if completed.returncode == 0 and completed.stdout.strip():
-            return completed.stdout
+def _plan_at_commit(project: Path, commit: str) -> str | None:
+    """`floorplan.yaml` as of one commit. None if that commit has no such file.
+
+    Deliberately no fallback: an unrecoverable plan must read as absent, never as some other
+    iteration's plan.
+    """
+    completed = subprocess.run(
+        ["git", "show", f"{commit}:floorplan.yaml"],
+        cwd=project, capture_output=True, text=True, timeout=120,
+    )
+    if completed.returncode == 0 and completed.stdout.strip():
+        return completed.stdout
     return None
+
+
+def _root_commit(project: Path) -> str | None:
+    """The project's first commit, which is the one `init` made with the baseline."""
+    completed = subprocess.run(
+        ["git", "rev-list", "--max-parents=0", "HEAD"],
+        cwd=project, capture_output=True, text=True, timeout=120,
+    )
+    if completed.returncode != 0:
+        return None
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else None
 
 
 # ---------------------------------------------------------------------------------------
@@ -279,8 +327,11 @@ def _plan_at_iteration(project: Path, iteration: int) -> str | None:
               show_default=True)
 @click.option("--count", type=int, default=3, show_default=True,
               help="how many schemes to rank")
-@click.option("--model", default="claude", help="the agent to run the ranking with")
-def rank(path: Path, count: int, model: str) -> None:
+@click.option("--model", default=None,
+              help="model id for the ranking agent (default: the CLI's own default). "
+                   "Note this is a *model id* like claude-opus-5, not an AutoHelix agent "
+                   "type — passing 'claude' here is rejected by the CLI as an invalid model.")
+def rank(path: Path, count: int, model: str | None) -> None:
     """Rank the top schemes with a blind agent, then attach the simulator's numbers.
 
     The agent runs in a sandbox that physically lacks the simulator, its traces and every
@@ -290,7 +341,7 @@ def rank(path: Path, count: int, model: str) -> None:
     project = path.resolve()
     manifest = driver.Manifest.load(project)
     sandbox = project / "reports" / "ranking"
-    staged = rank_module.stage(project, sandbox)
+    staged = rank_module.stage(project, sandbox, count=count)
     key = project / ".autohelix" / "floorplan" / "ranking_key.json"
     staged.save_key(key)
 
@@ -305,10 +356,10 @@ def rank(path: Path, count: int, model: str) -> None:
         f"You have no performance data and that is deliberate; TASK.md explains why. Rank by "
         f"reasoning about the hardware."
     )
-    command = [
-        "claude", "-p", prompt, "--permission-mode", "acceptEdits",
-        "--model", model, "--add-dir", manifest.artifact,
-    ]
+    command = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
+               "--add-dir", manifest.artifact]
+    if model:
+        command += ["--model", model]
     click.echo("\nrunning the blind ranking agent...\n")
     completed = subprocess.run(command, cwd=str(sandbox))
 
@@ -372,7 +423,7 @@ def run_all(ctx: click.Context, project: Path, artifact: Path, target: str,
         ctx.invoke(run, path=project, config=None)
     except SystemExit:
         pass
-    ctx.invoke(rank, path=project, count=3, model="claude")
+    ctx.invoke(rank, path=project, count=3, model=None)
 
 
 # ---------------------------------------------------------------------------------------

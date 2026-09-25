@@ -131,6 +131,31 @@ def hash_tree(root: Path, trees: tuple[str, ...] = FROZEN_TREES) -> dict[str, st
     return out
 
 
+def framework_paths() -> list[Path]:
+    """The installed simulator framework modules — the code that actually runs.
+
+    This exists because freezing the project's files alone was not the promise it looked like.
+    The project holds the agent-written cost models, but `run_simulation` invokes
+    ``python -m floorplan.sim.runner``, which imports the framework from the *installed
+    package*. Hashing only the project meant check (d) could pass while the code producing the
+    metrics had changed underneath it — an upgrade, a local edit, a different venv — and the
+    reproducibility and tamper-protection the gate advertises would not have held.
+    """
+    from floorplan import parser as parser_module
+    from floorplan.sim import api, collectives, engine, memory, runner
+
+    return sorted(
+        Path(module.__file__).resolve()
+        for module in (engine, collectives, memory, api, runner, parser_module)
+        if getattr(module, "__file__", None)
+    )
+
+
+def hash_framework() -> dict[str, str]:
+    """``{absolute path: sha256}`` for the installed framework."""
+    return {str(path): hash_file(path) for path in framework_paths()}
+
+
 # ---------------------------------------------------------------------------------------
 # The checks
 # ---------------------------------------------------------------------------------------
@@ -244,7 +269,12 @@ def check_dependencies(plan: Any, modules: Any) -> Check:
 
 
 def check_frozen(repo: Path, manifest: dict[str, Any]) -> Check:
-    """(d) The simulator and the platform description are byte-identical to the build."""
+    """(d) The simulator and the platform description are byte-identical to the build.
+
+    Two sets, because the simulator lives in two places: the agent-written cost models and the
+    platform YAML inside the project, and the framework inside the installed package. Verifying
+    only the first would leave the code that computes every metric unchecked.
+    """
     check = Check("d", "frozen platform", True)
     recorded = manifest.get("hashes") or {}
     if not recorded:
@@ -264,6 +294,29 @@ def check_frozen(repo: Path, manifest: dict[str, Any]) -> Check:
             )
     for relative in sorted(set(current) - set(recorded)):
         check.fail(f"{relative} was added after the platform was frozen")
+
+    framework = manifest.get("framework_hashes") or {}
+    if not framework:
+        check.fail(
+            "the manifest records no framework hashes, so the code that actually computes the "
+            "metrics is unverified. Re-freeze with a current `floorplan build`"
+        )
+    else:
+        live = hash_framework()
+        for path, digest in sorted(framework.items()):
+            actual = live.get(path)
+            if actual is None:
+                check.fail(
+                    f"{path} is no longer part of the installed framework — the simulator "
+                    f"that runs is not the one that was frozen"
+                )
+            elif actual != digest:
+                check.fail(
+                    f"{path} has changed since the freeze. This is the framework the metrics "
+                    f"are computed by; results are not comparable to earlier iterations"
+                )
+        for path in sorted(set(live) - set(framework)):
+            check.fail(f"{path} was added to the framework after the freeze")
     return check
 
 
@@ -407,6 +460,48 @@ def run(repo: Path, timeout: int = 1200, trace: Path | None = None) -> Report:
     )
 
 
+def archive_candidate(repo: Path, report: Report) -> Path | None:
+    """Copy the plan the gate just validated into the project's durable archive.
+
+    Done here, from inside the iteration worktree, because this is the only moment the plan
+    exists in a place that survives. AutoHelix deletes the worktree and its branch in a
+    ``finally`` block, and a rejected iteration is never committed — so recovering it
+    afterwards from git is impossible, and the first attempt to do so silently archived the
+    final accepted plan for every iteration instead.
+
+    Writes to the *project*, which the checker locates by walking up to the manifest, so a
+    worktree's plan lands outside the worktree. Named by content hash: an iteration that
+    changes nothing does not accumulate duplicates, and the same plan validated twice is one
+    entry.
+    """
+    if not report.metrics:
+        return None
+    plan_path = repo / EDITABLE[0]
+    if not plan_path.exists():
+        return None
+    try:
+        project = find_manifest(repo).parent.parent.parent
+    except FileNotFoundError:
+        return None
+
+    digest = hash_file(plan_path)[:12]
+    destination = project / "schemes" / "candidates" / f"plan-{digest}.yaml"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    header = ["# Captured by the gate after this plan passed every feasibility check.", "#"]
+    for name, value in sorted(report.metrics.items()):
+        header.append(f"#   {name}: {value:.4f}")
+    header.append("#")
+    header.append("# Whether the metric gate then accepted it is recorded in the sidecar JSON.")
+    destination.write_text("\n".join(header) + "\n\n" + plan_path.read_text())
+    destination.with_suffix(".json").write_text(json.dumps({
+        "plan_sha256": hash_file(plan_path),
+        "metrics": report.metrics,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "passed_gate": report.passed,
+    }, indent=2, sort_keys=True))
+    return destination
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m floorplan.checker",
@@ -419,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds one simulator run may take (default: 1200)")
     parser.add_argument("--trace", type=Path, default=None,
                         help="have the simulator write its trace here")
+    parser.add_argument("--archive", action="store_true",
+                        help="copy a plan that passes into the project's candidate archive, "
+                             "before the iteration worktree is discarded")
     args = parser.parse_args(argv)
 
     try:
@@ -426,6 +524,11 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as exc:
         print(f"floorplan checker: {exc}", file=sys.stderr)
         return 2
+
+    if args.archive and report.passed:
+        kept = archive_candidate(args.repo.resolve(), report)
+        if kept is not None:
+            print(f"  archived {kept}")
 
     for check in report.checks:
         mark = "PASS" if check.passed else "FAIL"

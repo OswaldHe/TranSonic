@@ -378,3 +378,150 @@ def _any_shard(hardware, graph):
         residency=Residency(), stage=0, overlap_collectives=False,
         graph_entry=graph["embed"], group=(Address(0, 0),),
     )
+
+
+# ---------------------------------------------------------------------------------------
+# `stage` is a real ordering constraint (PR #5 review, comment 3)
+# ---------------------------------------------------------------------------------------
+@pytest.fixture
+def parallel_graph() -> dict[str, dict[str, Any]]:
+    """Two independent branches joining at a sink.
+
+    Needed because a linear chain cannot show what `stage` does: the data dependencies already
+    force the order, so stage ordering is redundant there. `left` and `right` both consume
+    `tokens` and could run concurrently, which is exactly the case a pipeline boundary changes.
+    """
+    return {
+        "left": {"kind": "mlp", "inputs": ["tokens"], "outputs": ["l"],
+                 "param_bytes": 1 << 26, "activation_bytes": 1 << 20, "layer_indices": [0]},
+        "right": {"kind": "mlp", "inputs": ["tokens"], "outputs": ["r"],
+                  "param_bytes": 1 << 26, "activation_bytes": 1 << 20, "layer_indices": [1]},
+        "sink": {"kind": "lm_head", "inputs": ["l", "r"], "outputs": ["logits"],
+                 "param_bytes": 1 << 20, "activation_bytes": 1 << 20},
+    }
+
+
+def _branch_plan(left_stage: int, right_stage: int) -> Floorplan:
+    return Floorplan.from_dict({
+        "version": 1, "target": "trn2-16device",
+        "placements": [
+            {"module": "left", "units": ["d0.l0"], "stage": left_stage},
+            {"module": "right", "units": ["d1.l0"], "stage": right_stage},
+            {"module": "sink", "units": ["d2.l0"], "stage": max(left_stage, right_stage) + 1},
+        ],
+    })
+
+
+def test_stage_changes_the_timeline(hardware, parallel_graph, config):
+    """Pipeline depth is the documented control, so it has to move a metric.
+
+    It used to be inert: `stage` was copied into `Shard` and never consulted, so ordering came
+    only from data dependencies and unit contention. Two plans differing only in their stage
+    numbers produced byte-identical timelines, and the pipeline-depth question — the one both
+    decode metrics are most sensitive to — was unmeasurable.
+    """
+    order = topological_order(parallel_graph)
+    concurrent = _branch_plan(0, 0)
+    pipelined = _branch_plan(0, 1)
+
+    together = simulate_workload(
+        concurrent, hardware, parallel_graph, config, WORKLOADS[2], order)
+    apart = simulate_workload(
+        pipelined, hardware, parallel_graph, config, WORKLOADS[2], order)
+    assert apart.seconds > together.seconds, (
+        "putting two independent branches in different stages must serialize them"
+    )
+
+
+def test_a_later_stage_waits_for_an_earlier_one(hardware, parallel_graph, config):
+    """Even where no tensor connects them — that is what a pipeline boundary means."""
+    plan = _branch_plan(0, 1)
+    result = simulate_workload(
+        plan, hardware, parallel_graph, config, WORKLOADS[2], topological_order(parallel_graph),
+    )
+    left_finish = max(e.finish for e in result.trace.scheduled if e.op.module == "left")
+    right_start = min(e.start for e in result.trace.scheduled if e.op.module == "right")
+    assert right_start >= left_finish - 1e-12
+
+
+# ---------------------------------------------------------------------------------------
+# HBM efficiency is not reapplied to probed tiers (comment 13)
+# ---------------------------------------------------------------------------------------
+def _context(hardware, graph, config, tier="hbm_bank"):
+    from floorplan.schema import Address, Residency
+    from floorplan.sim.engine import Schedule as S
+    from floorplan.sim.memory import MemoryLedger as L
+
+    shard = api.Shard(
+        module="layers.1.engram", kind="other", unit=Address(0, 0), shard_index=0,
+        shard_count=1, splits=(), fraction=1.0, param_bytes=1 << 20,
+        module_activation_bytes=1 << 20, residency=Residency(tier=tier), stage=0,
+        overlap_collectives=False, graph_entry=graph["embed"], group=(Address(0, 0),),
+    )
+    return api.Context(
+        hardware=hardware, schedule=S(), ledger=L(),
+        workload=Workload("t", "decode", 8192, 1), shard=shard, deps=(), config=config,
+    )
+
+
+def test_probed_tiers_are_not_scaled_by_the_hbm_dma_coefficient(hardware, graph, config):
+    """`host_dram` and `nvme` rates are measured achieved values, not fractions of peak.
+
+    Dividing them by `dma_small_strided` (~0.003) again inflated an already-measured 30 us
+    NVMe read by over 300x, which is what made every off-HBM residency look unusable.
+    """
+    ctx = _context(hardware, graph, config, tier="nvme")
+    rows, row_bytes = 32, 256
+    modelled = ctx.dma_seconds(rows * row_bytes, tier="nvme", accesses=rows)
+
+    nvme = hardware.tiers["nvme"]
+    host = hardware.tiers["host_dram"]
+    raw = (nvme.transfer_seconds(rows * row_bytes, rows)
+           + host.transfer_seconds(rows * row_bytes, rows))
+    assert modelled == pytest.approx(raw, rel=1e-9)
+    # And it is nowhere near the 300x the old double-count produced.
+    assert modelled < raw * 2
+
+
+def test_hbm_tiers_still_get_the_coefficient(hardware, graph, config):
+    ctx = _context(hardware, graph, config)
+    nbytes = 1 << 20
+    modelled = ctx.dma_seconds(nbytes, tier="hbm_bank", accesses=1)
+    raw = hardware.tiers["hbm_bank"].transfer_seconds(nbytes, 1)
+    assert modelled == pytest.approx(raw / 0.277, rel=1e-6)
+
+
+def test_nvme_is_charged_both_legs(hardware, graph, config):
+    """Text constraint 6: no direct accelerator-to-NVMe path."""
+    ctx = _context(hardware, graph, config, tier="nvme")
+    nbytes, accesses = 1 << 20, 16
+    through = ctx.dma_seconds(nbytes, tier="nvme", accesses=accesses)
+    host_only = ctx.dma_seconds(nbytes, tier="host_dram", accesses=accesses)
+    assert through > host_only
+
+
+# ---------------------------------------------------------------------------------------
+# peer_hbm pays its torus distance (comment 14)
+# ---------------------------------------------------------------------------------------
+def test_peer_hbm_cost_depends_on_hop_count(hardware, graph, config):
+    """A remote read from a neighbour and from the far corner must not cost the same."""
+    from floorplan.schema import Address, Residency
+    from floorplan.sim.engine import Schedule as S
+    from floorplan.sim.memory import MemoryLedger as L
+
+    def seconds(owner: int) -> float:
+        shard = api.Shard(
+            module="m", kind="mlp", unit=Address(0, 0), shard_index=0, shard_count=1,
+            splits=(), fraction=1.0, param_bytes=1 << 20, module_activation_bytes=0,
+            residency=Residency(tier="peer_hbm", backing_device=owner), stage=0,
+            overlap_collectives=False, graph_entry=graph["embed"], group=(Address(0, 0),),
+        )
+        ctx = api.Context(
+            hardware=hardware, schedule=S(), ledger=L(),
+            workload=Workload("t", "decode", 128, 1), shard=shard, deps=(), config=config,
+        )
+        return ctx.dma_seconds(1 << 16, tier="peer_hbm", accesses=8)
+
+    assert hardware.hops(0, 1) == 1 and hardware.hops(0, 15) == 2
+    assert seconds(15) > seconds(1)
+    assert seconds(0) < seconds(1)          # same device, no hop

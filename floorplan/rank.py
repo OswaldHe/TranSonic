@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,13 +73,19 @@ class Staged:
         }, indent=2, sort_keys=True))
 
 
-def stage(project: Path, destination: Path, seed: int | None = None) -> Staged:
+def stage(project: Path, destination: Path, seed: int | None = None,
+          count: int = len(LABELS)) -> Staged:
     """Build the blind sandbox.
 
     ``seed`` exists for the tests; leaving it None shuffles from the system entropy, which is
     what a real run wants — a fixed shuffle that the agent could learn would be no shuffle.
     """
-    schemes = top_schemes(project, count=len(LABELS))
+    if not 1 <= count <= len(LABELS):
+        raise ValueError(
+            f"count must be between 1 and {len(LABELS)} (there are only that many labels), "
+            f"got {count}"
+        )
+    schemes = top_schemes(project, count=count)
     if not schemes:
         raise RuntimeError(
             f"no feasible candidates archived under {project / 'schemes' / 'candidates'}. "
@@ -206,26 +213,73 @@ One file, `REPORT.md`, in readable but technical prose. It has to answer, clearl
 Be direct and technical. Do not hedge every claim, and do not pad. If two schemes are
 substantially the same deployment with a cosmetic difference, say so rather than manufacturing
 a distinction.
+
+## Required: state your ranking on one line
+
+Somewhere in `REPORT.md`, put a line in exactly this form, best first:
+
+    RANKING: scheme-b > scheme-a > scheme-c
+
+This is parsed to decide which plan is published as rank 1, 2 and 3. Without it the ordering
+has to be guessed from the order your prose happens to mention the schemes in, which for a
+report that introduces all three before choosing is simply wrong.
 """)
 
 
 # ---------------------------------------------------------------------------------------
 # Attaching the measurements afterwards
 # ---------------------------------------------------------------------------------------
-def parse_ranking(report: Path, labels: list[str]) -> list[str]:
-    """The agent's ranking, read out of its report.
+#: The line the ranking report must contain, e.g. `RANKING: scheme-b > scheme-a > scheme-c`.
+#:
+#: Leading markdown noise is tolerated — `**RANKING**:`, `## RANKING:`, `- RANKING:` — because
+#: the report is prose written by an agent told to emphasize its conclusion, and rejecting a
+#: bolded heading would silently fall back to guessing the order from first mentions.
+RANKING_LINE = re.compile(
+    r"^[\s>#*_\-]*RANKING[\s*_]*:\s*(.+)$", re.MULTILINE | re.IGNORECASE,
+)
 
-    Looks for the first occurrence of each label, ordered by position, which is robust to the
-    report's shape: whether it declares a winner up front or builds to one, the winner is
-    named before the runners-up. A label never mentioned goes last.
+
+def parse_ranking(report: Path, labels: list[str]) -> list[str]:
+    """The agent's ranking, read out of an explicit `RANKING:` line.
+
+    Explicit because inferring it from first mentions was wrong for the most ordinary report
+    structure there is. A report that introduces all three schemes, compares them, and *then*
+    states a winner would have been read in introduction order — publishing the wrong plans as
+    `rank1.yaml`..`rank3.yaml` while the prose above them said something else.
+
+    Falls back to first-mention order when the line is absent, so a report that ignores the
+    instruction still produces something, but the caller is told the ranking was not explicit.
     """
     if not report.exists():
         return list(labels)
-    text = report.read_text().lower()
+    text = report.read_text()
+    match = RANKING_LINE.search(text)
+    if match:
+        declared = [
+            token.strip().lower().strip(".,`*")
+            for token in re.split(r">|,|→|->", match.group(1))
+        ]
+        ordered = [label for label in declared if label in labels]
+        # Any label the line omitted keeps its relative order from the prose.
+        for label in _first_mention_order(text, labels):
+            if label not in ordered:
+                ordered.append(label)
+        if ordered:
+            return ordered
+    return _first_mention_order(text, labels)
+
+
+def ranking_was_explicit(report: Path) -> bool:
+    """Whether the report stated its ranking on a `RANKING:` line rather than implying it."""
+    return bool(report.exists() and RANKING_LINE.search(report.read_text()))
+
+
+def _first_mention_order(text: str, labels: list[str]) -> list[str]:
+    lowered = text.lower()
     positions = []
     for label in labels:
-        index = text.find(label)
-        positions.append((index if index >= 0 else len(text) + 1, label))
+        index = lowered.find(label)
+        positions.append((index if index >= 0 else len(lowered) + 1, label))
     return [label for _, label in sorted(positions)]
 
 
