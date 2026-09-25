@@ -32,6 +32,9 @@ uv pip install -e ".[dev]"
 - `partition/model_partition/` - model partitioning, tracing and verification
   (`autohelix partition`); its own specialized loop in `loop/driver.py`. See
   `partition/README.md`
+- `bootstrap/` - the NKI bootstrap loop (`autohelix bootstrap`): materializes one module of a
+  partition artifact into a standalone git repo and loops on it against a fixed
+  Trainium NKI constraint instead of a metric. See `bootstrap/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -50,6 +53,7 @@ autohelix watch        # Live-tail agent output (second terminal)
 autohelix hint         # Send a hint to the running agent (picked up next iteration)
 autohelix report       # Agent-written analysis of the run
 autohelix partition    # Model partitioning / tracing / verification (see partition/)
+autohelix bootstrap    # Bootstrap a Trainium NKI kernel for one module (see bootstrap/)
 ```
 
 ## Testing
@@ -57,6 +61,7 @@ autohelix partition    # Model partitioning / tracing / verification (see partit
 ```bash
 pytest                    # run all fast tests
 pytest -k partition       # just the model-partitioning suite (no network, no GPU)
+pytest -m bootstrap       # just the NKI bootstrap suite (no network, no device)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers

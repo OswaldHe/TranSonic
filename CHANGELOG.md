@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `autohelix bootstrap`: a loop for bootstrapping a Trainium NKI kernel for one
+  module of a partition artifact. `init` materializes the module into a
+  self-contained git repo (raw `.bin` tensors, three frozen references — what to
+  compute, how the reference was run, how it was judged — and failing
+  `source.py`/`inference.py` stubs); `run` loops an agent on it against a
+  fixed six-part NKI constraint rather than a metric. Unlike `autohelix run`,
+  every iteration is merged whether or not the constraint passes, the reviewer
+  runs on every iteration, a failing constraint never ends the run, and a passing
+  one does. See `bootstrap/README.md`.
+- `bootstrap/preset.yaml` is the loop's config: one fixed, reviewable file read
+  directly for every module repo, with nothing generated and no copy written into
+  the repo. `bootstrap/prompt.md` is the agent's prompt template on the same
+  terms.
+- The numerical bar is derived from the reference tensor's dtype and recorded in the
+  repo's manifest, rather than fixed at bfloat16 globally, so a module whose
+  boundary is fp8 or float32 is held to the tolerance its reference was actually
+  accepted at.
+- The constraint is hidden from the agent: the preset's `goal` states all six
+  requirements in prose, and because the preset never lands in the repo, the
+  command naming the checker is never in the worktree. The reviewer additionally
+  performs an anti-reward-hacking read of each iteration.
+
 ## 0.1.1 — 2026-09-02
 
 ### Added
