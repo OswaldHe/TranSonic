@@ -17,7 +17,7 @@ tensor parallelism does not reduce per-shard compute cannot rank tensor-parallel
 all, however well calibrated its matmul rate is.
 
   a  models present       every module on the inference path has a cost model
-  b  baseline simulates    the generated baseline runs and publishes four positive metrics
+  b  baseline simulates    the baseline runs and publishes a positive metric per point
   c  deterministic         two identical runs produce identical metrics
   d  no free modules       every placed module contributes measurable work
   e  splits scale          doubling a split halves per-shard compute and adds communication
@@ -53,17 +53,24 @@ from floorplan.sim.runner import (
     load_model_config,
     simulate_workload,
     topological_order,
+    workload,
 )
 
 #: Constructs a cost model may not contain. The interface hands out seconds through
 #: `matmul_seconds`, `elementwise_seconds`, `dma_seconds`, `gather_seconds` and
 #: `collective_cost`; a model that reaches past them is either fabricating a duration or
 #: making itself non-deterministic, and either one quietly invalidates the run.
+#: Anchored at a statement position, because an unanchored `\bimport\s+time\b` matches the
+#: English phrase "at import time" — which appears in a docstring and made this check fail on
+#: prose. A banned-construct scanner that fires on comments is worse than none: it trains the
+#: next iteration to work around a phantom.
 BANNED_PATTERNS: tuple[tuple[str, str], str] | tuple = (
-    (r"\bimport\s+time\b|\btime\s*\.\s*(time|perf_counter|monotonic)\b",
+    (r"^\s*(?:import\s+time\b|from\s+time\s+import)|\btime\s*\.\s*(time|perf_counter|monotonic)\s*\(",
      "reads the clock — a cost model must be a pure function of shapes"),
-    (r"\bimport\s+random\b|\brandom\s*\.\s*\w+", "uses randomness — runs must be reproducible"),
-    (r"\bnumpy\s*\.\s*random\b", "uses randomness — runs must be reproducible"),
+    (r"^\s*(?:import\s+random\b|from\s+random\s+import)|\brandom\s*\.\s*\w+\s*\(",
+     "uses randomness — runs must be reproducible"),
+    (r"\bnumpy\s*\.\s*random\b|\bnp\s*\.\s*random\b",
+     "uses randomness — runs must be reproducible"),
     (r"\.autohelix/memory|loop-\d+-|latency_ms", "reads recorded kernel latencies, which are "
                                                  "measurements of unoptimized kernels"),
     (r"\bDeepSeek-V4\.1-Flash-Trainium\b", "reads the bootstrapped kernels, which are "
@@ -85,8 +92,17 @@ def _simulate(
     workload_name: str,
     order: list[str],
 ):
-    workload = next(w for w in WORKLOADS if w.name == workload_name)
-    return simulate_workload(plan, hardware, modules, config, workload, order)
+    """Run one named workload.
+
+    Goes through ``runner.workload`` so a stale name fails with the name in the message. It
+    used to be ``next(w for w in WORKLOADS if ...)``, which raises a bare ``StopIteration`` —
+    and when the workloads gained the batch suffix, two checks here kept their old names and
+    the whole suite crashed with no indication of which string was wrong. A build iteration was
+    recorded as failing for that reason rather than for anything the agent had done.
+    """
+    return simulate_workload(
+        plan, hardware, modules, config, workload(workload_name), order,
+    )
 
 
 def check_models(modules: dict[str, dict[str, Any]]) -> Check:
@@ -118,12 +134,12 @@ def check_baseline(results: dict[str, Any] | None, error: str) -> Check:
     check = Check("b", "baseline simulates", True)
     if results is None:
         return check.fail(f"the baseline did not simulate: {error}")
-    for workload in WORKLOADS:
-        result = results.get(workload.name)
+    for point in WORKLOADS:
+        result = results.get(point.name)
         if result is None:
-            check.fail(f"{workload.name} produced no result")
+            check.fail(f"{point.name} produced no result")
         elif result.seconds <= 0:
-            check.fail(f"{workload.name} took {result.seconds}s; a latency must be positive")
+            check.fail(f"{point.name} took {result.seconds}s; a latency must be positive")
     if check.passed:
         check.findings.append(", ".join(
             f"{w.name} {results[w.name].milliseconds:.2f}ms" for w in WORKLOADS
@@ -139,12 +155,12 @@ def check_determinism(
     check = Check("c", "deterministic", True)
     if results is None:
         return check.fail("not checked: the baseline did not simulate")
-    for workload in WORKLOADS:
-        again = _simulate(plan, hardware, modules, config, workload.name, order)
-        before, after = results[workload.name].seconds, again.seconds
+    for point in WORKLOADS:
+        again = _simulate(plan, hardware, modules, config, point.name, order)
+        before, after = results[point.name].seconds, again.seconds
         if before != after:
             check.fail(
-                f"{workload.name} changed between identical runs: "
+                f"{point.name} changed between identical runs: "
                 f"{before * 1e3:.6f}ms -> {after * 1e3:.6f}ms"
             )
     return check
@@ -214,7 +230,7 @@ def check_split_scaling(
             ]
             placement.units = list(target.units[:factor])
         variant.validate()
-        result = _simulate(variant, hardware, modules, config, "prefill_8192", order)
+        result = _simulate(variant, hardware, modules, config, HEAVIEST, order)
         compute = sum(
             entry.op.seconds
             for entry in result.trace.scheduled
@@ -259,41 +275,65 @@ def check_split_scaling(
 
 
 def check_context_scaling(results: dict[str, Any] | None) -> Check:
-    """(f) A longer context costs more, and superlinearly in prefill.
+    """(f) A longer context costs the attention modules more, superlinearly in prefill.
 
-    64x the tokens through an attention stack is at least 64x the work and, with any
-    quadratic term at all, appreciably more. Requiring only 8x leaves room for a chunked
-    prefill — which flattens the quadratic within a chunk — while still failing a cost model
-    that ignores sequence length, which is the mistake that would make every
-    context-parallel scheme look pointless.
+    Measured on the attention modules' own busy time, not on the end-to-end latency. The
+    end-to-end comparison was wrong and failed a correct simulator: on a 16-stage baseline a
+    128-token prefill is almost entirely pipeline fill — 16 stage traversals for one chunk — so
+    it is expensive for reasons that have nothing to do with context, and the 8192-token case
+    came out only 3.9x more expensive for 64x the tokens. That measures the baseline's pipeline
+    geometry, not whether the cost models read ``workload.context_tokens``.
+
+    Attention busy time isolates the thing under test: it is where the quadratic term lives, it
+    is summed across units so parallel execution does not hide it, and it is unaffected by how
+    many stages the plan happens to use.
     """
     check = Check("f", "context costs", True)
     if results is None:
         return check.fail("not checked: the baseline did not simulate")
-    short_prefill = results["prefill_128"].seconds
-    long_prefill = results["prefill_8192"].seconds
-    short_decode = results["decode_128"].seconds
-    long_decode = results["decode_8192"].seconds
+    short, long = min(CONTEXT_LENGTHS), max(CONTEXT_LENGTHS)
+    batch = min(BATCH_SIZES)
+
+    def attention_seconds(name: str) -> float:
+        return sum(
+            seconds for module, seconds in results[name].trace.by_module().items()
+            if "attention" in module
+        )
+
+    short_prefill = attention_seconds(f"prefill_{short}_b{batch}")
+    long_prefill = attention_seconds(f"prefill_{long}_b{batch}")
+    short_decode = attention_seconds(f"decode_{short}_b{batch}")
+    long_decode = attention_seconds(f"decode_{long}_b{batch}")
+    tokens_ratio = long / short
+
+    if not short_prefill or not short_decode:
+        return check.fail(
+            "the attention modules used no time at the short context, so there is nothing to "
+            "compare — either no module id contains 'attention' or its cost model emits nothing"
+        )
 
     if long_prefill <= short_prefill:
         check.fail(
-            f"prefill_8192 ({long_prefill * 1e3:.3f}ms) is not slower than prefill_128 "
-            f"({short_prefill * 1e3:.3f}ms)"
+            f"attention at {long} tokens ({long_prefill * 1e3:.3f}ms) is not slower than at "
+            f"{short} ({short_prefill * 1e3:.3f}ms) in prefill"
         )
-    elif long_prefill < short_prefill * 8:
+    elif long_prefill < short_prefill * tokens_ratio * 0.5:
         check.fail(
-            f"prefill_8192 is only {long_prefill / short_prefill:.1f}x prefill_128 for 64x "
-            f"the tokens; the cost models are nearly insensitive to sequence length"
+            f"attention in prefill is only {long_prefill / short_prefill:.1f}x from {short} to "
+            f"{long} tokens, against {tokens_ratio:.0f}x the tokens. Prefill attention is at "
+            f"least linear in tokens and quadratic in context, so the cost models are not "
+            f"reading workload.context_tokens"
         )
     if long_decode <= short_decode:
         check.fail(
-            f"decode_8192 ({long_decode * 1e3:.3f}ms) is not slower than decode_128 "
-            f"({short_decode * 1e3:.3f}ms) — a longer KV cache costs more to attend over"
+            f"attention at {long} tokens ({long_decode * 1e3:.3f}ms) is not slower than at "
+            f"{short} ({short_decode * 1e3:.3f}ms) in decode — a longer KV cache costs more to "
+            f"attend over"
         )
     if check.passed:
         check.findings.append(
-            f"prefill {long_prefill / short_prefill:.1f}x, "
-            f"decode {long_decode / short_decode:.2f}x"
+            f"attention busy time {short}->{long} tokens: "
+            f"prefill {long_prefill / short_prefill:.1f}x, decode {long_decode / short_decode:.2f}x"
         )
     return check
 
@@ -389,10 +429,25 @@ def check_constraints_covered(project: Path, hardware: Hardware) -> Check:
     return check
 
 
+def agent_written_sources(project: Path) -> list[Path]:
+    """The files the agent writes, and only those.
+
+    `sim/framework/` holds read-only copies of the framework, and scanning them polices the
+    wrong code: the framework may legitimately do things a cost model may not, and it is frozen
+    anyway. The first version globbed all of `sim/`, so the reference copy of `api.py` failed the
+    banned-construct check on a docstring phrase.
+    """
+    sources = sorted((project / "sim" / "modules").glob("*.py"))
+    constraints = project / "sim" / "constraints.py"
+    if constraints.exists():
+        sources.append(constraints)
+    return [path for path in sources if path.name != "__init__.py"]
+
+
 def check_costs_derived(project: Path) -> Check:
     """(h) No cost model fabricates a duration or reads the clock."""
     check = Check("h", "costs are derived", True)
-    paths = sorted((project / "sim").rglob("*.py"))
+    paths = agent_written_sources(project)
     if not paths:
         return check.fail("no cost models to scan")
     for path in paths:
@@ -518,9 +573,9 @@ def run(project: Path, artifact: Path, systems_dir: Path | None = None,
     results: dict[str, Any] | None = {}
     error = ""
     try:
-        for workload in WORKLOADS:
-            results[workload.name] = _simulate(
-                plan, hardware, modules, config, workload.name, order,
+        for point in WORKLOADS:
+            results[point.name] = _simulate(
+                plan, hardware, modules, config, point.name, order,
             )
     except (SimulationError, api.CostModelError) as exc:
         results, error = None, f"{type(exc).__name__}: {exc}"

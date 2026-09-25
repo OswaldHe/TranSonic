@@ -614,3 +614,33 @@ def test_a_batch_split_divides_the_samples_not_the_weights(hardware, graph, conf
     assert sorted(samples(1, i) for i in range(4)) == [0, 0, 0, 1]
     # Batch 4 over 4 shards divides evenly.
     assert [samples(4, i) for i in range(4)] == [1, 1, 1, 1]
+
+
+def test_every_workload_name_the_framework_references_exists():
+    """A hardcoded workload name is a silent landmine when an axis gains a value.
+
+    Adding the batch suffix left `invariants.py` naming `"prefill_8192"`, which no longer
+    existed; `next(w for w in WORKLOADS if ...)` then raised a bare `StopIteration` and the
+    whole suite crashed. A build iteration was recorded as failing for that rather than for
+    anything the agent did. This scans the framework for workload-shaped string literals and
+    asserts each one resolves.
+    """
+    import re
+
+    from floorplan.sim.runner import WORKLOADS_BY_NAME
+
+    root = suite_root = __import__("pathlib").Path(__file__).resolve().parents[1] / "floorplan"
+    pattern = re.compile(r'"((?:prefill|decode)_\d+(?:_b\d+)?)"')
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for name in pattern.findall(path.read_text()):
+            if name not in WORKLOADS_BY_NAME:
+                offenders.append(f"{path.relative_to(suite_root)}: {name}")
+    assert not offenders, "stale workload names: " + ", ".join(offenders)
+
+
+def test_an_unknown_workload_name_fails_with_the_name():
+    from floorplan.sim.runner import SimulationError
+
+    with pytest.raises(SimulationError, match="prefill_8192.*Known"):
+        workload("prefill_8192")
