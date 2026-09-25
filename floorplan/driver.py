@@ -145,17 +145,15 @@ def init(
     system = load_system(target, resolved_systems)
     hardware = Hardware.from_system(system)
 
-    # The project holds only what the agent writes. The framework is *not* copied here: the
-    # simulator runs as `python -m floorplan.sim.runner` out of the installed package, so a
-    # copy in the project would be read by the agent, hashed by the gate, and executed by
-    # nobody — three ways of looking frozen while the code computing every metric drifted
-    # underneath. `freeze()` hashes the installed files instead, and `sim/FRAMEWORK.md` tells
-    # the agent where to read them.
+    # `sim/modules/` is the agent's; `sim/framework/` is a read-only copy of the code that
+    # computes the metrics, so the project is self-contained for reading and the agent has no
+    # reason to go looking in the installed package — where it would find the gates. See
+    # `write_framework_reference` for why it is a copy *and* hashed against the installed files.
     (project / "sim" / "modules").mkdir(parents=True, exist_ok=True)
     (project / "sim" / "modules" / "__init__.py").write_text(
         '"""Agent-written cost models, one per module archetype. See ../../README.md."""\n'
     )
-    write_framework_pointer(project, package)
+    write_framework_reference(project, package)
 
     # The systems directory travels with the project: the gate re-reads it every iteration,
     # and a project whose platform description could change under it is not reproducible.
@@ -191,33 +189,57 @@ def init(
     return manifest
 
 
-def write_framework_pointer(project: Path, package: Path) -> None:
-    """`sim/FRAMEWORK.md` — where to read the simulator, since the project has no copy."""
+def write_framework_reference(project: Path, package: Path) -> None:
+    """Copy the framework into `sim/framework/` for reading, and write an index for it.
+
+    Two requirements pull against each other here, and both have bitten.
+
+    Pointing the agent at the *installed package* — which the first version of this did, by
+    listing absolute paths — hands it the whole package directory, and an agent that lists that
+    directory finds `checker.py` and `invariants.py`: the exploration gate and the build gate,
+    both of which the design depends on it not reading. A build run confirmed this immediately.
+
+    Copying the framework and hashing only the copy is the other failure: the simulator runs out
+    of the package, so a project-local copy would be the one the agent reads while a different
+    one computes every metric.
+
+    So: copy for reading, and have gate check (d) verify all three of the copy, the installed
+    files, and that they are byte-identical. The agent then has no reason to look outside the
+    project, and nothing can drift.
+
+    This is "no reason to look", not "cannot look" — a determined agent can still import the
+    package and read `__file__`. A hard guarantee needs the filesystem isolation `bootstrap/`
+    gets from materializing a repo with no package imports at all; this is the honest middle,
+    and `README.md` says so.
+    """
+    destination = project / "sim" / "framework"
+    destination.mkdir(parents=True, exist_ok=True)
+    for relative in FRAMEWORK_MODULES:
+        target = destination / Path(relative).name
+        shutil.copyfile(package / relative, target)
+
     lines = [
         "# The simulator framework",
         "",
-        "This project holds only the parts you write: `sim/modules/*.py` and",
-        "`sim/constraints.py`. The framework itself is not copied here, deliberately — it runs",
-        "out of the installed package, and a second copy in the project would be the one you",
-        "read while a different one computed the metrics.",
+        "Read-only reference copies of the code that computes your metrics. You write",
+        "`sim/modules/*.py` and `sim/constraints.py`; everything here is frozen.",
         "",
-        "Read it at:",
+        "| file | what it does |",
+        "|---|---|",
+        "| `api.py` | **the contract your cost models are written against — start here** |",
+        "| `engine.py` | the timeline: engines, dependencies, SBUF exclusion |",
+        "| `collectives.py` | what rejoining a split costs, by group shape |",
+        "| `memory.py` | where the bytes are, and whether the plan fits |",
+        "| `runner.py` | walks the module DAG, once per workload |",
+        "| `parser.py` | turns the system YAML into the hardware model |",
         "",
-    ]
-    for relative in FRAMEWORK_MODULES:
-        lines.append(f"- `{package / relative}`")
-    lines += [
-        "",
-        "`sim/api.py` is the contract your cost models are written against — start there.",
-        "`sim/engine.py` is the timeline, `sim/collectives.py` prices communication,",
-        "`sim/memory.py` decides whether a plan fits, and `sim/runner.py` walks the module DAG.",
-        "",
-        "These files are hashed into `.autohelix/floorplan/manifest.json` when the simulator is",
-        "frozen, and the exploration gate verifies them every iteration. If they change, metrics",
-        "from before and after the change are not comparable and the gate says so.",
+        "These are copies. The simulator executes the installed package, and the gate verifies",
+        "that these bytes, those bytes, and the hashes recorded at freeze time all agree — so",
+        "what you read here is what runs, and a change to either is reported rather than",
+        "silently altering results.",
         "",
     ]
-    (project / "sim" / "FRAMEWORK.md").write_text("\n".join(lines))
+    (destination / "INDEX.md").write_text("\n".join(lines))
 
 
 def _git(project: Path, *args: str) -> None:

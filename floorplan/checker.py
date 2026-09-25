@@ -317,6 +317,22 @@ def check_frozen(repo: Path, manifest: dict[str, Any]) -> Check:
                 )
         for path in sorted(set(live) - set(framework)):
             check.fail(f"{path} was added to the framework after the freeze")
+
+        # And the project's reading copy must equal what executes. Without this the agent could
+        # be reading one simulator while another computed every metric — the exact failure that
+        # made copying the framework a bad idea in the first place.
+        for path in framework_paths():
+            mirror = repo / "sim" / "framework" / path.name
+            if not mirror.exists():
+                check.fail(
+                    f"sim/framework/{path.name} is missing, so the framework you can read is "
+                    f"not the framework that runs"
+                )
+            elif hash_file(mirror) != live.get(str(path)):
+                check.fail(
+                    f"sim/framework/{path.name} differs from the installed {path.name}. The "
+                    f"reference copy and the executing code have diverged"
+                )
     return check
 
 

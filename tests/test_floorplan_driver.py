@@ -46,9 +46,13 @@ def test_freeze_records_hashes_and_a_timestamp(tmp_path):
     (tmp_path / "sim" / "engine.py").write_text("x = 1\n")
     (tmp_path / "systems").mkdir()
     (tmp_path / "systems" / "probed.yaml").write_text("efficiency: {}\n")
+    for path in checker.framework_paths():
+        mirror = tmp_path / "sim" / "framework"
+        mirror.mkdir(parents=True, exist_ok=True)
+        (mirror / path.name).write_bytes(path.read_bytes())
 
     frozen = driver.freeze(tmp_path, iterations=2)
-    assert set(frozen.hashes) == {"sim/engine.py", "systems/probed.yaml"}
+    assert {"sim/engine.py", "systems/probed.yaml"} <= set(frozen.hashes)
     assert frozen.frozen_at
     assert frozen.build_iterations == 2
     # The framework that actually computes the metrics is hashed too, by absolute path.

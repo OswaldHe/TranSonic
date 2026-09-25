@@ -9,7 +9,7 @@ Target: **{{TARGET}}** — {{DEVICES}} devices, {{PER_DEVICE}} logical NeuronCor
 HBM bank.
 
 Read `PLATFORM.md` for the hardware and `MODEL.md` for what has to go on it. Read `sim/` for
-what your choices will cost — `sim/FRAMEWORK.md` says where the framework is installed, and the
+what your choices will cost — `sim/framework/` holds it, indexed by `sim/framework/INDEX.md`, and the
 cost model for a module is the fastest way to learn what drives its time.
 
 ## Shape of the file

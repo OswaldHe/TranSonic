@@ -276,16 +276,29 @@ scope, or the phrases the goal has to contain.
 | f | simulates | every workload completes and publishes a metric |
 | g | deterministic | a second run produces identical metrics |
 
-(d) is the load-bearing one for honesty, and it covers **two** sets of bytes. Scope enforcement
+(d) is the load-bearing one for honesty, and it covers **three** things. Scope enforcement
 already reverts out-of-scope edits, but that depends on git noticing; (d) verifies hashes
-recorded at the freeze. The project's half is the agent-written cost models plus
+recorded at the freeze. First, the project's own files: the agent-written cost models plus
 `systems/probed.yaml` — raising `matmul_bf16` from 0.30 to 0.90 would make every plan three
-times faster without touching a line of `sim/`. The other half is the **installed framework**,
+times faster without touching a line of `sim/modules/`. Second, the **installed framework**,
 because the simulator runs as `python -m floorplan.sim.runner` out of the package: hashing only
-the project would have left the code that computes every metric unverified, and an upgrade or a
-local edit could change results while (d) still passed. That is also why the framework is *not*
-copied into the project — a copy would be the one the agent read while a different one did the
-arithmetic. `sim/FRAMEWORK.md` points at the real thing.
+the project would leave the code that computes every metric unverified. Third, that the
+read-only copies in `sim/framework/` are byte-identical to those installed files, so what the
+agent reads is what runs.
+
+That third one exists because of a mistake worth recording. An earlier version did not copy the
+framework at all and pointed the build agent at the installed package by absolute path, on the
+reasoning that a copy nobody executes is worse than no copy. A build run then read the *entire*
+package — including `checker.py` and `invariants.py`, the exploration gate and the build gate,
+both of which the design depends on the agent not reading. Copying for reading and hashing all
+three ways gets both properties: the project is self-contained, so there is no reason to look
+outside it, and the copy cannot drift from what executes.
+
+Note what that is and is not. It is "no reason to look", not "cannot look" — a determined agent
+can still import the package and read `__file__`. A hard guarantee needs the filesystem
+isolation `bootstrap/` gets from materializing a repo with no package imports at all, which this
+pipeline cannot have while the simulator is a library. Treat the gate's secrecy as a
+speed bump backed by the reviewer, not as a sandbox.
 
 (g) is cheap and catches the one class of bug that would invalidate a whole run silently: a
 cost model that reads the clock or iterates an unordered collection. Without it a 3%

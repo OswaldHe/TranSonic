@@ -59,10 +59,10 @@ goal: |
     3. `MODEL.md`            the 271 modules you must place, their parameter and activation
                              sizes, their data dependencies, and which dimensions each one
                              may be split along.
-    4. `sim/`                the cost models, and `sim/FRAMEWORK.md` for where the framework
-                             itself is installed. It is the definition of what your floorplan
-                             will cost, and reading the cost model for a module is the fastest
-                             way to learn what actually drives its time.
+    4. `sim/`                the cost models, with the framework they are written against in
+                             `sim/framework/`. It is the definition of what your floorplan will
+                             cost, and reading the cost model for a module is the fastest way to
+                             learn what actually drives its time.
     5. `reports/trace.json`  the last iteration's timeline: per-engine utilization, per-link
                              volume, the critical path, and the memory high-water mark per
                              tier. This is where you find out *why* a floorplan is slow.

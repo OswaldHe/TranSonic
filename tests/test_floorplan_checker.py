@@ -59,6 +59,14 @@ def test_missing_manifest_says_what_writes_it(tmp_path):
 # ---------------------------------------------------------------------------------------
 # Hashing
 # ---------------------------------------------------------------------------------------
+def _mirror_framework(root):
+    """Give a temp project the reference copy check (d) now requires."""
+    destination = root / "sim" / "framework"
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in checker.framework_paths():
+        (destination / path.name).write_bytes(path.read_bytes())
+
+
 def test_hash_tree_covers_sim_and_systems_but_ignores_pycache(tmp_path):
     (tmp_path / "sim" / "modules").mkdir(parents=True)
     (tmp_path / "sim" / "engine.py").write_text("x = 1\n")
@@ -83,6 +91,7 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
     (tmp_path / "systems").mkdir()
     probed = tmp_path / "systems" / "probed.yaml"
     probed.write_text("shared:\n  efficiency:\n    matmul_bf16: 0.2959\n")
+    _mirror_framework(tmp_path)
     manifest = {
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
@@ -98,6 +107,7 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
 def test_frozen_detects_edit_addition_and_removal(tmp_path):
     (tmp_path / "sim").mkdir()
     (tmp_path / "sim" / "engine.py").write_text("x = 1\n")
+    _mirror_framework(tmp_path)
     manifest = {
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
@@ -453,3 +463,50 @@ def test_baseline_keeps_tensor_parallel_groups_inside_a_device():
     plan = baseline.build(graph, hardware)
     devices = {unit.device for unit in plan.placements[0].units}
     assert len(devices) == 1
+
+
+# ---------------------------------------------------------------------------------------
+# The framework the agent reads is the framework that runs
+# ---------------------------------------------------------------------------------------
+def test_a_diverged_reference_copy_is_caught(tmp_path):
+    """`sim/framework/` is what the agent reads; the package is what executes.
+
+    Pointing the agent at the package instead let a build run read `checker.py` and
+    `invariants.py` — both gates. Copying fixes that only if the copy cannot drift, so (d)
+    checks the copy against the installed bytes.
+    """
+    (tmp_path / "systems").mkdir()
+    (tmp_path / "systems" / "probed.yaml").write_text("x: 1\n")
+    _mirror_framework(tmp_path)
+    manifest = {
+        "hashes": checker.hash_tree(tmp_path),
+        "framework_hashes": checker.hash_framework(),
+    }
+    assert checker.check_frozen(tmp_path, manifest).passed
+
+    mirror = tmp_path / "sim" / "framework" / "api.py"
+    mirror.write_text(mirror.read_text() + "\n# drift\n")
+    check = checker.check_frozen(tmp_path, manifest)
+    assert not check.passed
+    assert any("diverged" in f or "differs" in f for f in check.findings), check.findings
+
+
+def test_a_missing_reference_copy_is_caught(tmp_path):
+    (tmp_path / "systems").mkdir()
+    (tmp_path / "systems" / "probed.yaml").write_text("x: 1\n")
+    _mirror_framework(tmp_path)
+    manifest = {
+        "hashes": checker.hash_tree(tmp_path),
+        "framework_hashes": checker.hash_framework(),
+    }
+    (tmp_path / "sim" / "framework" / "runner.py").unlink()
+    check = checker.check_frozen(tmp_path, manifest)
+    assert not check.passed
+
+
+def test_no_brief_points_at_the_installed_package():
+    """A path into the package is an invitation to read the gates beside it."""
+    for name in ("preset.yaml", "build_preset.yaml", "templates/project_readme.md"):
+        text = (PACKAGE / name).read_text()
+        assert "FRAMEWORK.md" not in text, f"{name} still references the old pointer file"
+        assert str(PACKAGE) not in text, f"{name} embeds the installed package path"
