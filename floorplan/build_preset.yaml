@@ -1,0 +1,196 @@
+# The config `autohelix floorplan build` reads directly.
+#
+# Step 2 of four: an agent writes the per-module cost models and the executable form of the
+# platform's prose constraints. Two iterations by design — the first builds, the second fixes
+# what the invariant suite and the reviewer found.
+#
+# This is the *only* loop allowed to write `sim/`. When it finishes, `driver.freeze()` hashes
+# every file under `sim/` into the manifest and the exploration loop's gate verifies those
+# hashes on every iteration. The separation is the point: an agent that could both write the
+# cost model and be scored by it would have every incentive to make the model cheap rather
+# than the plan good.
+#
+# Like `bootstrap`, failing iterations are merged anyway. There is no working simulator at
+# iteration 0 — the registry is empty and nothing can be costed — so a discarded worktree
+# would restart from nothing forever. This loop ratchets; `run` does not, because by then the
+# baseline is green.
+
+goal: |
+  Write the simulator's cost models for DeepSeek V4.1 Flash on Trainium2.
+
+  A later loop will search for the best way to deploy this model across 16 Trainium2 devices,
+  and it will be scored entirely by what you write here. Your job is to make the simulator
+  tell that loop the truth about which deployment is better.
+
+  ## What you are writing
+
+  Two things, both under `sim/`:
+
+  `sim/modules/*.py` — one cost model per module archetype. For one shard of one module in
+  one workload, a cost model says *what work exists*: a matmul of these dimensions in this
+  dtype, an elementwise pass over these bytes, a gather of this many rows, a collective over
+  this tensor. Group them however the model's structure suggests — one file per archetype
+  (attention, MoE, engram, hyper-connection, embedding, norm, head) is the obvious cut, and
+  272 files would be absurd.
+
+  `sim/constraints.py` — the platform's prose constraints, made executable. `PLATFORM.md`
+  lists them numbered. Implement each as a check or a cost term, and **cite the item number**
+  in a comment where you do. An item you believe needs no code still needs a comment saying
+  why, or the invariant suite reports it as uncovered.
+
+  ## Where the boundary is
+
+  You decide what work exists. The framework decides what it costs.
+
+  `sim/api.py` gives you `matmul_seconds`, `elementwise_seconds`, `dma_seconds`,
+  `gather_seconds` and `collective_cost`. They read their rates from the system YAML and
+  their achieved efficiencies from measurements taken on real hardware. **Use them.** Do not
+  compute a duration yourself and hand it to `ctx.op()` — the invariant suite rejects a
+  literal duration, and a cost model that invents its own rates is unreviewable.
+
+  So the thing you are actually deciding, for each module, is: what are the shapes? That is a
+  question about the model, and the answer is in the model's own source.
+
+  ## Where to find what each module computes
+
+  Read them in this order and stop when your question is answered:
+
+    1. `MODEL.md`                         which modules exist, their sizes, their dependencies
+    2. `<artifact>/modules/<group>/source.py`  the module's real PyTorch implementation,
+                                          verbatim from the vendor. This is the authority on
+                                          what it computes.
+    3. `<artifact>/modules/<group>/README.md`  its tensors, dtypes and shapes
+    4. `<artifact>/modules/<group>/config.json` the model's real hyperparameters
+    5. `<artifact>/vendor/model.py`        the whole model, for when a slice does not say how
+                                          a value reaching it was produced
+    6. `<artifact>/vendor/kernel.py`      the primitives the slices import: `act_quant`,
+                                          `fp8_gemm`, `fp4_act_quant`, `fp4_gemm`,
+                                          `sparse_attn`
+    7. `<artifact>/compat/*.py`           **outranks `vendor/kernel.py`** for any name it
+                                          rebinds — those replaced vendor kernels before
+                                          tracing
+
+  The artifact path is in `.autohelix/floorplan/manifest.json`.
+
+  **What you may not read.** There are bootstrapped NKI kernels for some of these modules
+  elsewhere on this machine, with measured latencies in log files. Do not use them — not the
+  kernels, not the timings, not as a sanity check. Those kernels are unoptimized baselines, so
+  anchoring a cost model to their latency would bake their inefficiency into the simulator as
+  if it were a property of the silicon. Derive costs from the computation and the measured
+  *primitive* rates, which is what the api helpers already give you.
+
+  ## What a cost model has to get right
+
+  Not the absolute number — nothing here can check that, and the report will say so. What
+  matters is that the simulator is right about the *direction* of a change, because that is
+  the only thing the search uses it for. Specifically:
+
+  - **Work divides by the split factor.** A 4-way head split must cost a quarter per shard.
+    `ctx.shard_of()` and `ctx.shard.factor(dim)` are there for this.
+  - **Sequence length shows up.** Attention is quadratic in context during prefill and linear
+    during decode. A cost model insensitive to `ctx.workload.context_tokens` makes every
+    context-parallel scheme look pointless.
+  - **The dtypes are real.** Weights are fp8 with block scales, compute is bf16, so a matmul
+    is a dequantization pass plus a GEMM. `matmul_small_k` is measured at roughly a seventh
+    of the streaming rate, which matters enormously for MoE — pass the true K.
+  - **Gathers land on GPSIMD and hold SBUF.** `ctx.op_gather` does this. It is what makes text
+    constraint 1 bite on exactly the modules that need it.
+  - **KV cache and activation peaks are charged.** `ctx.charge_kv` and `ctx.charge_activation`.
+    Capacity failures are how the loop learns a plan is infeasible; a model that charges
+    nothing makes every plan fit.
+  - **Every module costs something.** A module whose `emit` returns without submitting an op
+    can be placed anywhere for free, and the search will find that.
+
+  ## Determinism
+
+  A cost model is a pure function of shapes. No clock, no randomness, no iteration over an
+  unordered collection, no state carried between workloads. The suite simulates twice and
+  compares, because a 3% "improvement" that is really dictionary ordering would waste the
+  entire search.
+
+  ## How you are judged
+
+  `floorplan/invariants.py` — you do not see it, but you see its findings. Nine checks: every
+  module has a model; the generated baseline simulates and publishes four positive latencies;
+  two runs agree exactly; no module is free; doubling a split halves per-shard compute and
+  adds communication; longer contexts cost more and superlinearly in prefill; every numbered
+  constraint is cited; no duration is fabricated; the hardware model is not mutated.
+
+  You have two iterations. The first will not pass everything — build the archetypes, get the
+  baseline simulating, and write down in your notes what you were unsure about. Both
+  iterations' work is kept whether or not the suite is green, so build on what is there.
+
+constraints:
+  - command: python -m floorplan.invariants --project . --artifact $FLOORPLAN_ARTIFACT --systems systems --json .autohelix/floorplan_invariants.json
+    timeout: 2400
+
+# No metric. There is nothing to optimize until the cost models exist, and a declared metric
+# would make baseline capture fail at iteration 0 with nothing to simulate.
+metrics: []
+
+scope:
+  editable:
+    - sim/modules
+    - sim/constraints.py
+
+agent:
+  type: claude
+
+reviewer:
+  auto_memory: false
+  model: claude-sonnet-5
+  prompt: |
+    You are reviewing one iteration of a loop that is writing the cost models for a
+    deployment simulator. You change nothing: you read, and you write one review.
+
+    The invariant suite's machine-readable verdict is at
+    `.autohelix/floorplan_invariants.json` — nine checks, each passed or failed, with
+    findings. Read it first.
+
+    The question you are answering is not "are these numbers accurate" — there is no ground
+    truth available, deliberately, and the report will say so. It is **"will this simulator
+    tell the search the truth about which deployment is better?"** A cost model that is
+    uniformly 2x slow is fine. A cost model that is insensitive to sequence length, or that
+    does not divide work by the split factor, is not fine at any accuracy, because the search
+    will conclude that context parallelism and tensor parallelism do not work.
+
+    Read `sim/modules/*.py` against the module's real implementation at
+    `<artifact>/modules/<group>/source.py` (the artifact path is in
+    `.autohelix/floorplan/manifest.json`). `sim/api.py` is frozen and defines what the cost
+    model may do.
+
+    Write two sections.
+
+    **What is left.** For each failing check, what the next iteration must do — the specific
+    file, the specific shape, the specific missing term. Order by what unblocks the most: a
+    baseline that does not simulate makes every other check unknowable. If a finding is
+    misleading about the real problem, say what the real problem is.
+
+    **Is the model honest?** Read the cost models as an adversary would. Things that count:
+
+    - a duration that is really a constant: a shape that does not depend on the workload, a
+      matmul whose dimensions are hardcoded rather than derived from `config.json`
+    - a module made cheap by omission — the FFN's second matmul missing, the attention score
+      matmul missing, a gather costed as a contiguous read
+    - work not divided by the split factor, or divided twice
+    - `charge_kv`/`charge_activation` omitted, so every plan fits in memory
+    - a model that claims a module and then emits almost nothing for it, which lets the
+      search place it anywhere for free
+    - any use of the bootstrapped NKI kernels or their recorded latencies, which are
+      explicitly out of bounds: they are unoptimized, so a cost model calibrated to them
+      encodes their inefficiency as hardware
+
+    Check the arithmetic on at least the two largest modules by parameter count. An FFN with
+    384 experts, 6 activated and an intermediate dim of 2304 has a specific FLOP count per
+    token; say whether the model computes it.
+
+    End the review with a verdict on a line of its own, in exactly this form:
+
+        VERDICT: clean
+
+    where the value is `clean`, `suspicious` or `circumventing`. Quote the lines that justify
+    it. If it is clean, say so in one line and do not manufacture doubt.
+
+budget:
+  iterations: 2
+  iteration_time: 2h

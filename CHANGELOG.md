@@ -4,6 +4,25 @@
 
 ### Added
 
+- `autohelix floorplan`: a four-stage pipeline that decides how to distribute a
+  partitioned model across a Trainium instance's hierarchy — which of the 64 logical
+  NeuronCores on a trn2.48xlarge holds each module, how each is split and along which
+  dimension, which memory tier holds its weights, and in what order. `probe` measures
+  the primitives on real silicon; `init` materializes a project with a deterministically
+  generated baseline; `build` runs two agent iterations that write the per-module cost
+  models, gated by a nine-check invariant suite, then freezes the simulator by hashing it;
+  `run` runs five one-hour iterations that edit only `floorplan.yaml`, gated by a hidden
+  seven-check gate and ranked by four latencies with a per-metric 10% regression gate;
+  `rank` hands the top three schemes to an agent that cannot see the simulator and appends
+  the numbers afterwards. See `floorplan/README.md` and `docs/floorplan.md`.
+- `floorplan/systems/*.yaml` describe the platform with `source:` and `confidence:` on
+  every number, plus a `constraints_text` block carrying the hardware features that are
+  not numbers (engine exclusions, tier reachability, torus non-uniformity) as numbered
+  prose the build agent must implement and cite.
+- `floorplan/probe/` measures matmul, elementwise, gather, DMA, PCIe and raw NVMe rates
+  through NKI and writes `systems/probed.yaml` with provenance. The simulator refuses to
+  run while any coefficient is unmeasured, so a missing measurement is never silently
+  replaced by datasheet peak.
 - `autohelix bootstrap`: a loop for bootstrapping a Trainium NKI kernel for one
   module of a partition artifact. `init` materializes the module into a
   self-contained git repo (raw `.bin` tensors, three frozen references — what to

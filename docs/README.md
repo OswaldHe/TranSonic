@@ -18,3 +18,10 @@ See the [main README](../README.md) for an overview, quick start, and the config
 - **[Model Partitioning](../partition/README.md)** — `autohelix partition`: split a model
   into locally-runnable modules, trace real per-module IO, verify each module, and
   emulate end-to-end inference for accelerator bring-up
+- **[NKI Bootstrapping](../bootstrap/README.md)** — `autohelix bootstrap`: turn one module
+  of a partition artifact into a standalone repo and loop until it holds a working
+  Trainium NKI kernel with a validator that proves it reproduces the reference
+- **[Floorplanning](floorplan.md)** — `autohelix floorplan`: decide how to distribute a
+  partitioned model across a Trainium instance's device / logical-NeuronCore hierarchy,
+  by probing the hardware, building a simulator, searching for a deployment, and ranking
+  the results
