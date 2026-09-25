@@ -71,7 +71,7 @@ Builds a self-contained git repository:
 | | |
 |---|---|
 | `floorplan.yaml` | **the one editable file** — the generated baseline to begin with |
-| `sim/` | the simulation framework, copied in. Agent-written cost models land in `sim/modules/` |
+| `sim/` | agent-written cost models (`sim/modules/`) plus `sim/FRAMEWORK.md`, which points at the installed framework — not copied in, so the code you read is the code that runs |
 | `systems/` | the platform description, so the project cannot have it change underneath it |
 | `PLATFORM.md` | the hardware, rendered from the YAML rather than restated |
 | `MODEL.md` | what has to be placed, how big it is, what it depends on |
@@ -89,9 +89,10 @@ autohelix floorplan build --path my-floorplan
 
 Two agent iterations that write `sim/modules/*.py` — one cost model per module archetype — and
 `sim/constraints.py`, the executable form of the platform's prose constraints. Gated by a
-nine-check invariant suite.
+ten-check invariant suite.
 
-On success the simulator is **frozen**: `sim/` is hashed into the manifest, and from then on the
+On success the simulator is **frozen**: the project's files *and the installed framework* are
+hashed into the manifest, and from then on the
 exploration loop may only edit `floorplan.yaml`. If the suite is not green, nothing is frozen and
 the command tells you so — a simulator that fails its own invariants would mislead the search,
 so `floorplan all` stops here rather than continuing.
@@ -111,14 +112,18 @@ autohelix floorplan run --path my-floorplan
 ```
 
 Five iterations, an hour each. An ordinary AutoHelix loop: the agent edits `floorplan.yaml`, a
-hidden gate checks the plan is deployable, and four metrics rank it:
+hidden gate checks the plan is deployable, and sixteen metrics rank it — every combination of
+phase, context length and batch size:
 
 ```
-prefill_128_ms   prefill_8192_ms   decode_128_ms   decode_8192_ms
+prefill_128_b{1,4,8,32}_ms    prefill_8192_b{1,4,8,32}_ms
+decode_128_b{1,4,8,32}_ms     decode_8192_b{1,4,8,32}_ms
 ```
 
-All at batch 1, lower better, each with a **10% regression gate against its own best-so-far**.
-A change that wins on decode and loses 15% on prefill is rejected.
+Lower better, each with a **10% regression gate against its own best-so-far**. A change that
+wins on decode and loses 15% on prefill is rejected, and so is one that wins at batch 32 by
+losing at batch 1 — which matters because pipeline depth is pure cost at batch 1 decode and
+nearly free at batch 32, and the KV cache grows 32× across the axis.
 
 Every gate-passing iteration's floorplan is archived to `schemes/candidates/` whether or not it
 beat the metric gate, so the ranking step has something to choose from even if most iterations
@@ -139,17 +144,21 @@ autohelix floorplan rank --path my-floorplan
 
 Takes the best three archived schemes and hands them to an agent that **cannot see the
 simulator, its traces, or any predicted latency** — the sandbox does not contain them, and the
-schemes are anonymized and shuffled. It ranks them on architectural reasoning alone.
+schemes are anonymized and shuffled. It ranks them on architectural reasoning alone, and gives
+both an overall order and **one ranking per configuration**, since a scheme can be right for
+long-context prefill at batch 32 and wrong for short-context decode at batch 1.
 
-Then a script appends the simulator's numbers and an agreement table. Outputs:
+Then a script appends the simulator's numbers and two agreement tables — overall, and per
+configuration. Outputs:
 
 | | |
 |---|---|
-| `REPORT.md` | the ranking, the winning deployment, why it wins, and the decomposition recipes |
-| `schemes/rank{1,2,3}.yaml` | the three schemes in the agent's ranked order |
+| `REPORT.md` | the rankings, the winning deployment, why it wins, per-configuration calls, and the decomposition recipes |
+| `schemes/rank{1,2,3}.yaml` | the three schemes in the agent's overall ranked order |
 
-Nothing is discarded. Where the two rankings disagree, the appendix says so and leaves it to a
-reader — that disagreement is the most informative thing the pipeline produces.
+Nothing is discarded. Where the two rankings disagree the appendix says so and leaves it to a
+reader — and a disagreement concentrated in one region of the grid is a specific claim about
+which effect one side is missing, which is the most informative thing the pipeline produces.
 
 ## Inspecting things by hand
 
@@ -170,8 +179,8 @@ python -m floorplan.sim.runner \
     --trace reports/trace.json
 ```
 
-That prints the four latencies, per-engine utilization and the memory table, and writes the full
-timeline — critical path, per-link volume, per-tier high-water mark — as JSON.
+That prints all sixteen latencies, per-engine utilization and the memory table, and writes the
+full timeline — critical path, per-link volume, per-tier high-water mark — as JSON.
 
 ## Editing the floorplan yourself
 

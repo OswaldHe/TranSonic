@@ -73,6 +73,29 @@
   the effective model, not only its source YAML. `rank` parses an explicit `RANKING:` line and
   honours `--count`.
 
+### Changed
+
+- `floorplan`: batch size is a metric axis. The workload grid is now phase x context length x
+  batch size — 1, 4, 8 and 32 samples — so sixteen metrics named
+  `{phase}_{context}_b{batch}_ms`, each with its own 10% regression gate. Batch is an axis
+  because the decisions reverse along it: a deep pipeline is pure cost at batch-1 decode, where
+  one token is in flight and every stage boundary is a bubble, and nearly free at batch 32; the
+  KV cache grows linearly with batch, so a residency choice that fits at batch 1 can be
+  infeasible at batch 32; and a batch-32 decode step touches far more of the 384 routed experts
+  than a batch-1 step. `ctx.tokens()` is divided by any batch split, `ctx.kv_tokens()` scales
+  the cache with it, and `ctx.batch_per_shard()` reports the idleness of a split wider than the
+  batch rather than pretending the work got cheaper. A tenth invariant checks that a larger
+  batch costs more and that prefill scales roughly with it.
+- `floorplan`: the ranking report gives an overall ranking *and* one per configuration, on
+  `RANKING[<name>]:` lines, because a single order hides the case a deployment faces — one
+  scheme can be right for long-context prefill at batch 32 and another for short-context decode
+  at batch 1. The appendix compares the agent's call against the simulator's for every point, so
+  a disagreement concentrated in one region of the grid becomes a specific, checkable claim.
+- `floorplan`: removed dead code (`log2_ceil`, `shard_bytes`, `Schedule.last_index`,
+  `Engine.peak_flops`, `WorkloadResult.metric_name`, an unused `BUILD_PRESET` and `WITHHELD`, and
+  a no-op branch in the memory ledger) and corrected comments and docs left stale by the change
+  from four metrics to sixteen.
+
 ## 0.1.1 — 2026-09-02
 
 ### Added

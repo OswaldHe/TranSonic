@@ -94,6 +94,13 @@ goal: |
   - **Sequence length shows up.** Attention is quadratic in context during prefill and linear
     during decode. A cost model insensitive to `ctx.workload.context_tokens` makes every
     context-parallel scheme look pointless.
+  - **Batch shows up too.** The plan is measured at batch 1, 4, 8 and 32, and a model blind to
+    `ctx.workload.batch` collapses those four columns into four copies of one number — which
+    would look like evidence that batch does not matter. Use `ctx.tokens()` (already divided by
+    any batch split) for work, and `ctx.kv_tokens()` for the KV cache, which grows with batch
+    and is what makes batch a *capacity* axis as well as a throughput one. `ctx.batch_per_shard()`
+    is this shard's share of the samples; a batch split wider than the batch leaves shards idle
+    rather than making the work cheaper.
   - **The dtypes are real.** Weights are fp8 with block scales, compute is bf16, so a matmul
     is a dequantization pass plus a GEMM. `matmul_small_k` is measured at roughly a seventh
     of the streaming rate, which matters enormously for MoE — pass the true K.
@@ -114,11 +121,12 @@ goal: |
 
   ## How you are judged
 
-  `floorplan/invariants.py` — you do not see it, but you see its findings. Nine checks: every
-  module has a model; the generated baseline simulates and publishes four positive latencies;
-  two runs agree exactly; no module is free; doubling a split halves per-shard compute and
-  adds communication; longer contexts cost more and superlinearly in prefill; every numbered
-  constraint is cited; no duration is fabricated; the hardware model is not mutated.
+  `floorplan/invariants.py` — you do not see it, but you see its findings. Ten checks: every
+  module has a model; the generated baseline simulates and publishes a positive latency at every
+  point of the grid; two runs agree exactly; no module is free; doubling a split halves per-shard
+  compute and adds communication; longer contexts cost more and superlinearly in prefill; a
+  larger batch costs more, and prefill scales roughly with it; every numbered constraint is
+  cited; no duration is fabricated; the hardware model is not mutated.
 
   You have two iterations. The first will not pass everything — build the archetypes, get the
   baseline simulating, and write down in your notes what you were unsure about. Both

@@ -33,7 +33,6 @@ from floorplan.schema import Floorplan
 #: Where the presets live. Fixed files read straight from the package, like bootstrap's — so
 #: the preset you read in a diff is the one that runs, and editing it changes the next run.
 PACKAGE = Path(__file__).resolve().parent
-BUILD_PRESET = PACKAGE / "build_preset.yaml"
 RUN_PRESET = PACKAGE / "preset.yaml"
 SYSTEMS = PACKAGE / "systems"
 
@@ -200,7 +199,7 @@ def build(path: Path, iterations: int, no_freeze: bool) -> None:
 @click.option("--config", type=click.Path(exists=True, path_type=Path), default=None,
               help="an alternative run preset")
 def run(path: Path, config: Path | None) -> None:
-    """Five agent iterations that edit floorplan.yaml, ranked by four latencies."""
+    """Five agent iterations that edit floorplan.yaml, ranked across the workload grid."""
     project = path.resolve()
     manifest = driver.Manifest.load(project)
     if not manifest.hashes:

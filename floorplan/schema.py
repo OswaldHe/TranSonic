@@ -66,6 +66,18 @@ COMMUNICATION_FREE_DIMS = frozenset({"batch"})
 #: with ``inference_path`` unset or true.
 WEIGHT_TIERS = frozenset({"hbm_bank", "device_hbm", "peer_hbm", "host_dram", "nvme"})
 
+#: The batch sizes every floorplan is measured at. Lives here rather than in ``sim/runner.py``
+#: because it bounds the design space: the largest of these is the most ways a ``batch`` split
+#: can usefully divide, and a plan is one file evaluated at *all* of them.
+#:
+#: A batch split by F is legal up to ``max(BATCH_SIZES)`` and simply leaves shards idle at
+#: smaller batches — which is what really happens, and which the simulator reports as no gain
+#: rather than as an error.
+BATCH_SIZES = (1, 4, 8, 32)
+
+#: The context lengths every floorplan is measured at: a short prompt and a long one.
+CONTEXT_LENGTHS = (128, 8192)
+
 #: Which dimensions make sense for which module kind, keyed by the ``kind`` field of the
 #: partition graph. A split along a dimension the module does not have is not a bad idea,
 #: it is a meaningless one, and it would silently produce shards of size zero.
@@ -608,15 +620,17 @@ def dimension_extent(
     parameters and the work by 64 while 62 of them had no layer to execute — a 64x speedup
     from arithmetic alone.
 
-    ``batch`` is bounded by the workloads, which are fixed at batch 1 (see
-    ``sim/runner.WORKLOADS``), so any batch split is invalid rather than merely useless. None
-    is returned for dimensions whose extent this artifact does not state, which is honest: a
-    bound that has to be guessed is worse than no bound.
+None is returned for dimensions whose extent this artifact does not state, which is
+    honest: a bound that has to be guessed is worse than no bound.
     """
     if dim == "layer":
         return max(len(entry.get("layer_indices") or []), 1)
     if dim == "batch":
-        return 1
+        # The largest batch the plan is measured at. A wider split than this has shards with
+        # no sample to process at *any* workload, which is meaningless rather than merely
+        # wasteful; a split between 2 and 32 is legal and goes partly idle at the small
+        # batches, which is what data parallelism actually does.
+        return max(BATCH_SIZES)
     if config is None:
         return None
     if dim == "head":

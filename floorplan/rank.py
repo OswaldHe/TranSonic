@@ -44,9 +44,6 @@ from floorplan.driver import top_schemes
 #: Files the blind agent may see, copied into the sandbox.
 VISIBLE = ("PLATFORM.md", "MODEL.md", "README.md")
 
-#: Directories that must NOT reach the sandbox. The simulator and anything it wrote.
-WITHHELD = ("sim", "reports", "schemes", ".autohelix", "systems/probed.yaml")
-
 #: Anonymized names, assigned in shuffled order.
 LABELS = ("scheme-a", "scheme-b", "scheme-c")
 
@@ -214,15 +211,72 @@ Be direct and technical. Do not hedge every claim, and do not pad. If two scheme
 substantially the same deployment with a cosmetic difference, say so rather than manufacturing
 a distinction.
 
-## Required: state your ranking on one line
+## Required: state your rankings on their own lines
 
-Somewhere in `REPORT.md`, put a line in exactly this form, best first:
+Somewhere in `REPORT.md`, put the overall ranking in exactly this form, best first:
 
     RANKING: scheme-b > scheme-a > scheme-c
 
 This is parsed to decide which plan is published as rank 1, 2 and 3. Without it the ordering
 has to be guessed from the order your prose happens to mention the schemes in, which for a
 report that introduces all three before choosing is simply wrong.
+
+Then give **one ranking per configuration**, in the same form with the configuration in
+brackets:
+
+    RANKING[prefill_128_b1]: scheme-a > scheme-c > scheme-b
+    RANKING[prefill_128_b4]: scheme-a > scheme-c > scheme-b
+
+...and so on for every configuration listed in section 6 below. Rank each one on its own
+merits: these are genuinely different problems, and a scheme that wins overall need not win
+everywhere.
+
+## 6. Which scheme wins each configuration, and why
+
+The deployment is measured at every combination of three axes:
+
+    phase             prefill (ingest a prompt) or decode (produce one token)
+    context length    128 or 8192 tokens
+    batch size        1, 4, 8 or 32 samples
+
+For each, say which scheme you expect to win and give the reason in a sentence or two. You are
+not being asked to guess latencies — you are being asked which scheme's structure suits that
+regime, and the axes interact in ways that should drive your answer:
+
+- **Batch reverses the pipeline-depth argument.** At batch 1 a decode step has one token in
+  flight, so every stage boundary is a bubble and depth is pure cost. At batch 32 there are 32
+  tokens to fill it and the same depth is nearly free. A deeply pipelined scheme should lose the
+  batch-1 decode points and may win the batch-32 ones.
+- **Batch multiplies the KV cache.** 8192 tokens at batch 32 is 32x the KV of batch 1. A scheme
+  that spends its HBM on resident weights has less room for it, and one that tiers a table has
+  more.
+- **Batch changes expert routing.** At batch 1 a decode step touches a few of the 384 routed
+  experts; at batch 32 it touches many more, which shifts the balance between expert
+  parallelism and replication.
+- **Context length decides whether attention or weight movement dominates**, and that in turn
+  decides whether a sequence split or a head split is the better cut.
+
+Where two schemes are effectively identical for a configuration, say so and pick either —
+manufacturing a distinction is worse than admitting a tie.
+
+The configurations, by name:
+
+    prefill_128_b1
+    prefill_128_b4
+    prefill_128_b8
+    prefill_128_b32
+    prefill_8192_b1
+    prefill_8192_b4
+    prefill_8192_b8
+    prefill_8192_b32
+    decode_128_b1
+    decode_128_b4
+    decode_128_b8
+    decode_128_b32
+    decode_8192_b1
+    decode_8192_b4
+    decode_8192_b8
+    decode_8192_b32
 """)
 
 
@@ -236,6 +290,14 @@ report that introduces all three before choosing is simply wrong.
 #: bolded heading would silently fall back to guessing the order from first mentions.
 RANKING_LINE = re.compile(
     r"^[\s>#*_\-]*RANKING[\s*_]*:\s*(.+)$", re.MULTILINE | re.IGNORECASE,
+)
+
+#: The per-configuration form, e.g. `RANKING[decode_8192_b32]: scheme-c > scheme-a > scheme-b`.
+#: One per workload the agent is asked to call, so the report says not only which scheme is best
+#: overall but where each one wins — which is the question a deployment actually faces.
+PER_CONFIG_LINE = re.compile(
+    r"^[\s>#*_\-]*RANKING\s*\[\s*([a-z0-9_]+)\s*\][\s*_]*:\s*(.+)$",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 
@@ -274,6 +336,29 @@ def ranking_was_explicit(report: Path) -> bool:
     return bool(report.exists() and RANKING_LINE.search(report.read_text()))
 
 
+def parse_per_config_rankings(report: Path, labels: list[str]) -> dict[str, list[str]]:
+    """The agent's per-workload rankings, keyed by workload name.
+
+    Absent keys mean the report did not call that configuration, which is reported rather than
+    filled in: a missing opinion and an opinion that happens to match the overall order are
+    different things, and only one of them is evidence.
+    """
+    if not report.exists():
+        return {}
+    text = report.read_text()
+    out: dict[str, list[str]] = {}
+    for match in PER_CONFIG_LINE.finditer(text):
+        configuration = match.group(1).strip().lower()
+        declared = [
+            token.strip().lower().strip(".,`*")
+            for token in re.split(r">|,|→|->", match.group(2))
+        ]
+        ordered = [label for label in declared if label in labels]
+        if ordered:
+            out[configuration] = ordered
+    return out
+
+
 def _first_mention_order(text: str, labels: list[str]) -> list[str]:
     lowered = text.lower()
     positions = []
@@ -281,6 +366,93 @@ def _first_mention_order(text: str, labels: list[str]) -> list[str]:
         index = lowered.find(label)
         positions.append((index if index >= 0 else len(lowered) + 1, label))
     return [label for _, label in sorted(positions)]
+
+
+def _ordered_metrics(key: dict[str, Any]) -> list[str]:
+    """Metric names in workload order, not alphabetical.
+
+    Alphabetical puts `b1, b32, b4, b8` next to each other, which is the one ordering that
+    makes a batch sweep unreadable.
+    """
+    from floorplan.sim.runner import WORKLOADS
+
+    present = {name for entry in key.values() for name in (entry.get("metrics") or {})}
+    ordered = [f"{w.name}_ms" for w in WORKLOADS if f"{w.name}_ms" in present]
+    return ordered + sorted(present - set(ordered))
+
+
+def simulator_ranking_for(key: dict[str, Any], metric: str, labels: list[str]) -> list[str]:
+    """The schemes ordered by one metric, best first. Absent values sort last."""
+    def value(label: str) -> float:
+        metrics = key[label].get("metrics") or {}
+        return float(metrics.get(metric, float("inf")))
+
+    return sorted(labels, key=value)
+
+
+def _per_config_section(
+    key: dict[str, Any], metric_names: list[str],
+    per_config: dict[str, list[str]], labels: list[str],
+) -> list[str]:
+    """The per-configuration comparison: who the agent says wins each point, and who does.
+
+    This is what the batch axis is for. A single overall ranking hides the case the deployment
+    actually faces — that one scheme is best for long-context prefill at batch 32 and another
+    for short-context decode at batch 1 — and the agent is asked to call each point so its
+    architectural reasoning can be checked where it is most likely to be regime-dependent.
+    """
+    lines = [
+        "## Per-configuration rankings",
+        "",
+        "The agent's call for each point beside the simulator's, best first. `—` means the",
+        "report did not rank that configuration; a missing opinion and an opinion that happens",
+        "to agree are different things and are not conflated here.",
+        "",
+        "| configuration | architectural analysis | simulator | agree |",
+        "|---|---|---|---|",
+    ]
+    matched = considered = 0
+    for metric in metric_names:
+        configuration = metric[:-3] if metric.endswith("_ms") else metric
+        simulated = simulator_ranking_for(key, metric, labels)
+        claimed = per_config.get(configuration)
+        if claimed:
+            considered += 1
+            agrees = claimed[0] == simulated[0]
+            matched += int(agrees)
+            mark = "✓" if agrees else "✗"
+            rendered = " > ".join(f"`{label}`" for label in claimed)
+        else:
+            mark = "—"
+            rendered = "—"
+        lines.append(
+            f"| `{configuration}` | {rendered} | "
+            + " > ".join(f"`{label}`" for label in simulated)
+            + f" | {mark} |"
+        )
+
+    lines.append("")
+    if considered:
+        lines.append(
+            f"**The agent called {considered} of {len(metric_names)} configurations and picked "
+            f"the simulator's winner in {matched} of them.**"
+        )
+        if matched < considered:
+            lines.append("")
+            lines.append(
+                "Where they differ, neither is authoritative. The simulator's constants are "
+                "uncalibrated, and the architectural reading cannot see queueing or pipeline "
+                "fill — but a disagreement concentrated in one region of the grid (all the "
+                "batch-32 points, say, or only long context) is a specific and checkable claim "
+                "about which effect is being missed."
+            )
+    else:
+        lines.append(
+            "The report ranked no individual configuration, so there is nothing to compare "
+            "point by point. `TASK.md` asks for a `RANKING[<configuration>]:` line per point."
+        )
+    lines.append("")
+    return lines
 
 
 def attach_measurements(
@@ -298,9 +470,8 @@ def attach_measurements(
     order = agent_order or parse_ranking(report, labels)
     simulator_order = sorted(labels, key=lambda label: key[label].get("score") or float("inf"))
 
-    metric_names = sorted({
-        name for entry in key.values() for name in (entry.get("metrics") or {})
-    })
+    metric_names = _ordered_metrics(key)
+    per_config = parse_per_config_rankings(report, labels)
 
     lines = [
         "",
@@ -310,13 +481,14 @@ def attach_measurements(
         "",
         "*Appended by `floorplan/rank.py` after the ranking above was written. The ranking",
         "agent did not see any of this — it had no access to the simulator, its traces or",
-        "these latencies. Two independent judgements of the same three schemes.*",
+        "these latencies. Two independent judgements of the same schemes.*",
         "",
         "## Simulated latencies",
         "",
-        "All milliseconds, batch 1, lower is better. **Uncalibrated**: the simulator was built",
-        "without access to any measured latency for this model, so these numbers are useful for",
-        "comparing schemes against each other and not as predictions of wall-clock time.",
+        "All milliseconds, lower is better, across phase x context length x batch size.",
+        "**Uncalibrated**: the simulator was built without access to any measured latency for",
+        "this model, so these numbers are useful for comparing schemes against each other and",
+        "not as predictions of wall-clock time.",
         "",
         "| scheme | " + " | ".join(metric_names) + " | score | iteration |",
         "|---" * (len(metric_names) + 3) + "|",
@@ -336,11 +508,11 @@ def attach_measurements(
 
     lines += [
         "",
-        "The score is the mean of the four latencies each normalized against the best value",
-        "any scheme achieved for that metric, so it rewards being near the frontier on all",
-        "four rather than winning one.",
+        "The score is the mean of every latency normalized against the best value any scheme",
+        "achieved for that metric, so it rewards being near the frontier across the whole grid",
+        "rather than winning one point.",
         "",
-        "## Where the two rankings agree",
+        "## Where the two overall rankings agree",
         "",
         "| rank | architectural analysis | simulator |",
         "|---|---|---|",
@@ -360,6 +532,7 @@ def attach_measurements(
         f"**{agreement} of {len(labels)} positions agree.**",
         "",
     ]
+    lines += _per_config_section(key, metric_names, per_config, labels)
     if order and simulator_order and order[0] == simulator_order[0]:
         lines.append(
             "The two methods pick the same winner. That is a genuine cross-check: an "

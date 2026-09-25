@@ -17,8 +17,8 @@ simulator has been edited cannot be trusted to report capacity honestly.
   b  coverage             every module on the tokens -> logits path is placed, fractions to 1
   c  dependencies         every placed module's producers are placed too
   d  frozen platform      sim/ and systems/ are byte-identical to the build manifest
-  e  capacity             no memory tier over capacity, in any of the four workloads
-  f  simulates            all four workloads complete and publish a metric
+  e  capacity             no memory tier over capacity, at any point of the workload grid
+  f  simulates            every workload completes and publishes a metric
   g  deterministic        a second run produces identical metrics
 
 Check (d) is the load-bearing one for honesty. The exploration loop's editable scope is
@@ -362,7 +362,7 @@ def run_simulation(
 def check_simulates(
     repo: Path, manifest: dict[str, Any], timeout: int, trace: Path | None,
 ) -> tuple[Check, dict[str, float], str]:
-    """(f) All four workloads complete and publish a metric."""
+    """(f) Every workload completes and publishes a metric."""
     from floorplan.sim.runner import WORKLOADS
 
     check = Check("f", "simulates", True)

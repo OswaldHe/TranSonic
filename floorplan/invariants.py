@@ -25,6 +25,7 @@ all, however well calibrated its matmul rate is.
   g  constraints covered   every numbered item in constraints_text is implemented
   h  costs are derived     no cost model fabricates a duration or reads the clock
   i  hardware read-only    simulating does not mutate the platform model
+  j  batch costs more      a larger batch is slower, and prefill scales with it
 """
 
 from __future__ import annotations
@@ -40,9 +41,10 @@ from typing import Any
 
 from floorplan.checker import Check, Report
 from floorplan.parser import Hardware, load_system
-from floorplan.schema import Floorplan, Split
+from floorplan.schema import BATCH_SIZES, CONTEXT_LENGTHS, Floorplan, Split
 from floorplan.sim import api
 from floorplan.sim.runner import (
+    HEAVIEST,
     WORKLOADS,
     SimulationError,
     deployable_modules,
@@ -112,7 +114,7 @@ def check_models(modules: dict[str, dict[str, Any]]) -> Check:
 
 
 def check_baseline(results: dict[str, Any] | None, error: str) -> Check:
-    """(b) The generated baseline runs and publishes four positive metrics."""
+    """(b) The generated baseline runs and publishes a positive metric at every point."""
     check = Check("b", "baseline simulates", True)
     if results is None:
         return check.fail(f"the baseline did not simulate: {error}")
@@ -160,7 +162,7 @@ def check_no_free_modules(plan: Floorplan, results: dict[str, Any] | None) -> Ch
     check = Check("d", "no free modules", True)
     if results is None:
         return check.fail("not checked: the baseline did not simulate")
-    worst = results[WORKLOADS[1].name]           # prefill_8192, where everything runs
+    worst = results[HEAVIEST]      # the longest, largest point: everything runs there
     by_module = worst.trace.by_module()
 
     free = sorted(module for module, seconds in by_module.items() if seconds <= 0)
@@ -293,6 +295,58 @@ def check_context_scaling(results: dict[str, Any] | None) -> Check:
             f"prefill {long_prefill / short_prefill:.1f}x, "
             f"decode {long_decode / short_decode:.2f}x"
         )
+    return check
+
+
+def check_batch_scaling(results: dict[str, Any] | None) -> Check:
+    """(j) A larger batch costs more, and the two phases respond to it differently.
+
+    Batch is an axis precisely because the answers reverse along it, so a cost model blind to
+    ``ctx.workload.batch`` would make every point in a batch column identical and the four
+    batch sizes would be four copies of one measurement. That is worse than not having the
+    axis: it would look like evidence that batch does not matter.
+
+    Prefill is required to scale roughly with batch — 32x the samples is 32x the tokens, so a
+    sublinear result means the model is ignoring batch somewhere. Decode is only required to be
+    monotone, because per-step decode work is dominated by weight movement that is amortized
+    across the batch, so its growth is genuinely much slower than linear.
+    """
+    check = Check("j", "batch costs more", True)
+    if results is None:
+        return check.fail("not checked: the baseline did not simulate")
+
+    for phase, context in (("prefill", max(CONTEXT_LENGTHS)), ("decode", max(CONTEXT_LENGTHS))):
+        series = [
+            (batch, results[f"{phase}_{context}_b{batch}"].seconds)
+            for batch in BATCH_SIZES
+            if f"{phase}_{context}_b{batch}" in results
+        ]
+        if len(series) < 2:
+            check.fail(f"{phase}_{context}: fewer than two batch sizes produced a result")
+            continue
+        for (small, fast), (large, slow) in zip(series, series[1:]):
+            if slow <= fast:
+                check.fail(
+                    f"{phase}_{context}: batch {large} ({slow * 1e3:.3f}ms) is not slower than "
+                    f"batch {small} ({fast * 1e3:.3f}ms). The cost models are insensitive to "
+                    f"batch, so the four batch columns are four copies of one measurement"
+                )
+                break
+        else:
+            smallest, largest = series[0], series[-1]
+            ratio = largest[1] / smallest[1] if smallest[1] else 0.0
+            if phase == "prefill":
+                expected = largest[0] / smallest[0]
+                if ratio < expected * 0.5:
+                    check.fail(
+                        f"prefill_{context}: batch {largest[0]} is only {ratio:.1f}x batch "
+                        f"{smallest[0]} for {expected:.0f}x the samples. Prefill work is "
+                        f"proportional to tokens, so this is sublinear by too much to be "
+                        f"pipeline fill"
+                    )
+            check.findings.append(
+                f"{phase}_{context}: batch {smallest[0]}->{largest[0]} costs {ratio:.2f}x"
+            )
     return check
 
 
@@ -479,6 +533,7 @@ def run(project: Path, artifact: Path, systems_dir: Path | None = None,
         (check_split_scaling(plan, hardware, modules, config, order) if results
          else Check("e", "splits scale", False, ["not checked: the baseline did not simulate"])),
         check_context_scaling(results),
+        check_batch_scaling(results),
         check_constraints_covered(project, hardware),
         check_costs_derived(project),
         check_hardware_readonly(hardware, before),

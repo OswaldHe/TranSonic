@@ -239,11 +239,6 @@ class Schedule:
     def finish_of(self, index: int) -> float:
         return self._finish[index]
 
-    def last_index(self) -> int:
-        if not self._ops:
-            raise ScheduleError("no ops submitted")
-        return len(self._ops) - 1
-
     def record_bytes(self, link: str, nbytes: int) -> None:
         """Attribute moved bytes to a link class, for the trace's communication table."""
         self.trace.link_bytes[link] += int(nbytes)

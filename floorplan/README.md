@@ -206,25 +206,47 @@ to behave, whatever its constants are.
 | g | every numbered `constraints_text` item is cited |
 | h | no duration is fabricated and no clock is read |
 | i | simulating does not mutate the hardware model |
+| j | **a larger batch costs more, and prefill scales roughly with it** |
 
-(e) and (f) are the load-bearing ones. A simulator where a 4-way split does not quarter
+(e), (f) and (j) are the load-bearing ones. A simulator where a 4-way split does not quarter
 per-shard work cannot rank tensor-parallel schemes at all, however well calibrated its matmul
-rate is; one insensitive to sequence length makes every context-parallel scheme look pointless.
-A red invariant means the simulator would mislead the search about the *direction* of a change,
-which is the only thing the search uses it for.
+rate is; one insensitive to sequence length makes every context-parallel scheme look pointless;
+and one blind to batch collapses the four batch columns into four copies of one measurement,
+which would read as evidence that batch does not matter. A red invariant means the simulator
+would mislead the search about the *direction* of a change, which is the only thing the search
+uses it for.
 
 ## The exploration loop
 
-An ordinary AutoHelix run: green baseline, four metrics, a hidden gate.
+An ordinary AutoHelix run: green baseline, sixteen metrics, a hidden gate.
+
+The workload grid is phase × context length × batch size — `{phase}_{context}_b{batch}_ms`:
 
 ```
-prefill_128_ms   prefill_8192_ms   decode_128_ms   decode_8192_ms
+prefill_128_b{1,4,8,32}_ms    prefill_8192_b{1,4,8,32}_ms
+decode_128_b{1,4,8,32}_ms     decode_8192_b{1,4,8,32}_ms
 ```
 
-All at batch 1, all lower-is-better, each with a **10% regression gate against its own
-best-so-far**. So the frontier only moves outward and a scheme cannot buy decode with prefill.
-That is `acceptance.metric_gates` in `preset.yaml` — AutoHelix already compares each metric
+All lower-is-better, each with a **10% regression gate against its own best-so-far**. So the
+frontier only moves outward and a scheme cannot buy decode with prefill, or batch 32 with batch
+1. That is `acceptance.metric_gates` in `preset.yaml` — AutoHelix already compares each metric
 against the best accepted value, so the rule is declarative rather than code.
+
+**Batch is an axis because the answers reverse along it**, which a single-batch benchmark hides:
+
+- **Pipeline depth.** At batch 1 a decode step has one token in flight, so every stage boundary
+  is a bubble and depth is pure cost. At batch 32 there are 32 tokens to fill it and the same
+  depth is nearly free. A plan tuned only at batch 1 is tuned for the worst case of a decision
+  that flips.
+- **KV capacity.** The cache grows linearly with batch, so 8192 tokens at batch 32 holds 32× the
+  KV of batch 1. A residency choice that fits at batch 1 can be infeasible at batch 32, and
+  capacity is checked at every point.
+- **Expert routing.** A batch-1 decode step touches a handful of the 384 routed experts; a
+  batch-32 step touches many more, moving the balance between expert parallelism and replication.
+
+Sixteen gates is stricter than four but not four times stricter — the four batch columns of a
+given phase and length move largely together. Where they diverge is exactly the tradeoff worth
+gating.
 
 Unlike `bootstrap`, a rejected iteration is **discarded** and the next starts from the
 best-so-far floorplan. Bootstrap ratchets because its baseline is red by construction; here
@@ -250,8 +272,8 @@ scope, or the phrases the goal has to contain.
 | b | coverage | every module placed, fractions summing to 1, nothing off-path |
 | c | dependencies | every placed module's producers are placed too |
 | d | **frozen platform** | `sim/`, `systems/` **and the installed framework** byte-identical to the build |
-| e | capacity | no tier over capacity, at any of the four workloads |
-| f | simulates | all four workloads complete and publish a metric |
+| e | capacity | no tier over capacity, at any point of the workload grid |
+| f | simulates | every workload completes and publishes a metric |
 | g | deterministic | a second run produces identical metrics |
 
 (d) is the load-bearing one for honesty, and it covers **two** sets of bytes. Scope enforcement
@@ -314,13 +336,22 @@ distributed, each scheme's first limiting factor, and for every module the winne
 decomposition recipe — which dimension, how the tensors divide, what must be communicated, and
 which level of the hierarchy each piece lands on.
 
-Then a script appends the simulator's latencies and an **agreement table**: the architectural
-ranking beside the simulated one. That comparison is the most informative artifact the pipeline
-produces and it costs nothing to compute. Agreement is a real cross-check, since a datasheet
-argument and a discrete-event simulation are not the same evidence. Disagreement is not
-resolved automatically — the appendix says why, and leaves it to a reader.
+It also gives **one ranking per configuration** — sixteen of them, on `RANKING[<name>]:` lines —
+because a single overall order hides the case a deployment actually faces. One scheme can be
+right for long-context prefill at batch 32 and another for short-context decode at batch 1, and
+asking the agent to call each point is what makes its architectural reasoning checkable where it
+is most likely to be regime-dependent.
 
-The agent's ranking decides `schemes/rank{1,2,3}.yaml`. Nothing is discarded; all three ship.
+Then a script appends the simulator's latencies and two **agreement tables**: the overall
+architectural ranking beside the simulated one, and the same per configuration. That comparison
+is the most informative artifact the pipeline produces and it costs nothing to compute.
+Agreement is a real cross-check, since a datasheet argument and a discrete-event simulation are
+not the same evidence. Disagreement is not resolved automatically — and a disagreement
+*concentrated* in one region of the grid (all the batch-32 points, say) is a specific, checkable
+claim about which effect one side is missing.
+
+The agent's overall ranking decides `schemes/rank{1,2,3}.yaml`. Nothing is discarded; all three
+ship.
 
 ## Layout
 

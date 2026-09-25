@@ -21,11 +21,13 @@ from floorplan.schema import Floorplan
 from floorplan.sim import api
 from floorplan.sim.api import Workload
 from floorplan.sim.runner import (
+    HEAVIEST,
     WORKLOADS,
     charge_weights,
     deployable_modules,
     simulate_workload,
     topological_order,
+    workload,
 )
 
 pytestmark = pytest.mark.floorplan
@@ -106,7 +108,9 @@ class Synthetic:
             context = ctx.workload.context_tokens
             scores = tokens * context if ctx.workload.is_prefill() else context
             last = ctx.op("scores", "vector", ctx.elementwise_seconds(scores * 2), deps=[last])
-            ctx.charge_kv(context * dim * 2 * 2)
+            # `kv_tokens()` is context x this shard's share of the batch, which is what makes
+            # batch a capacity axis and not only a throughput one.
+            ctx.charge_kv(ctx.kv_tokens() * dim * 2 * 2)
         if ctx.shard.kind == "mlp":
             last = ctx.op_gather(
                 "experts", rows=6, row_bytes=width * 2,
@@ -158,17 +162,17 @@ def _plan(**overrides) -> Floorplan:
 def test_all_four_workloads_produce_a_positive_latency(hardware, graph, config):
     plan = _plan()
     order = topological_order(graph)
-    for workload in WORKLOADS:
-        result = simulate_workload(plan, hardware, graph, config, workload, order)
-        assert result.seconds > 0, workload.name
+    for point in WORKLOADS:
+        result = simulate_workload(plan, hardware, graph, config, point, order)
+        assert result.seconds > 0, point.name
         assert result.trace.scheduled
 
 
 def test_simulation_is_deterministic(hardware, graph, config):
     plan = _plan()
     order = topological_order(graph)
-    first = simulate_workload(plan, hardware, graph, config, WORKLOADS[1], order)
-    second = simulate_workload(plan, hardware, graph, config, WORKLOADS[1], order)
+    first = simulate_workload(plan, hardware, graph, config, workload("prefill_8192_b1"), order)
+    second = simulate_workload(plan, hardware, graph, config, workload("prefill_8192_b1"), order)
     assert first.seconds == second.seconds
     assert first.trace.by_module() == second.trace.by_module()
 
@@ -176,7 +180,7 @@ def test_simulation_is_deterministic(hardware, graph, config):
 def test_every_placed_module_contributes_work(hardware, graph, config):
     plan = _plan()
     result = simulate_workload(
-        plan, hardware, graph, config, WORKLOADS[1], topological_order(graph),
+        plan, hardware, graph, config, workload("prefill_8192_b1"), topological_order(graph),
     )
     assert set(result.trace.by_module()) == plan.modules()
     assert all(seconds > 0 for seconds in result.trace.by_module().values())
@@ -185,7 +189,7 @@ def test_every_placed_module_contributes_work(hardware, graph, config):
 def test_the_vision_module_is_neither_required_nor_run(hardware, graph, config):
     assert "vision" not in deployable_modules(graph)
     result = simulate_workload(
-        _plan(), hardware, graph, config, WORKLOADS[1], topological_order(graph),
+        _plan(), hardware, graph, config, workload("prefill_8192_b1"), topological_order(graph),
     )
     assert "vision" not in result.trace.by_module()
 
@@ -193,7 +197,7 @@ def test_the_vision_module_is_neither_required_nor_run(hardware, graph, config):
 def test_dependencies_order_the_dag(hardware, graph, config):
     """lm_head cannot start before the ffn that produces its input has finished."""
     result = simulate_workload(
-        _plan(), hardware, graph, config, WORKLOADS[0], topological_order(graph),
+        _plan(), hardware, graph, config, workload("prefill_128_b1"), topological_order(graph),
     )
     ffn_finish = max(
         entry.finish for entry in result.trace.scheduled
@@ -221,7 +225,7 @@ def test_a_wider_split_costs_less_per_shard(hardware, graph, config):
             {"module": "layers.0.ffn", "units": ["d1.l0"], "stage": 2},
             {"module": "lm_head", "units": ["d15.l0"], "stage": 3},
         ])
-        result = simulate_workload(plan, hardware, graph, config, WORKLOADS[1], order)
+        result = simulate_workload(plan, hardware, graph, config, workload("prefill_8192_b1"), order)
         tensor = sum(
             entry.op.seconds for entry in result.trace.scheduled
             if entry.op.module == "layers.0.attention" and entry.op.engine == "tensor"
@@ -235,20 +239,20 @@ def test_longer_context_costs_more_in_both_phases(hardware, graph, config):
     plan = _plan()
     order = topological_order(graph)
     results = {
-        workload.name: simulate_workload(plan, hardware, graph, config, workload, order)
-        for workload in WORKLOADS
+        point.name: simulate_workload(plan, hardware, graph, config, point, order)
+        for point in WORKLOADS
     }
-    assert results["prefill_8192"].seconds > results["prefill_128"].seconds * 8
-    assert results["decode_8192"].seconds > results["decode_128"].seconds
+    assert results["prefill_8192_b1"].seconds > results["prefill_128_b1"].seconds * 8
+    assert results["decode_8192_b1"].seconds > results["decode_128_b1"].seconds
 
 
 def test_prefill_is_chunked_and_decode_is_not(hardware, graph, config):
     """Where pipeline parallelism earns its keep, and where it cannot."""
     plan = _plan(runtime={"prefill_chunk_tokens": 2048, "pipeline_chunks": True})
     order = topological_order(graph)
-    long_prefill = simulate_workload(plan, hardware, graph, config, WORKLOADS[1], order)
-    short_prefill = simulate_workload(plan, hardware, graph, config, WORKLOADS[0], order)
-    decode = simulate_workload(plan, hardware, graph, config, WORKLOADS[3], order)
+    long_prefill = simulate_workload(plan, hardware, graph, config, workload("prefill_8192_b1"), order)
+    short_prefill = simulate_workload(plan, hardware, graph, config, workload("prefill_128_b1"), order)
+    decode = simulate_workload(plan, hardware, graph, config, workload("decode_8192_b1"), order)
 
     assert long_prefill.chunks == 4          # 8192 / 2048
     assert short_prefill.chunks == 1         # 128 is one short chunk
@@ -258,7 +262,7 @@ def test_prefill_is_chunked_and_decode_is_not(hardware, graph, config):
 def test_chunking_can_be_turned_off(hardware, graph, config):
     plan = _plan(runtime={"prefill_chunk_tokens": 2048, "pipeline_chunks": False})
     result = simulate_workload(
-        plan, hardware, graph, config, WORKLOADS[1], topological_order(graph),
+        plan, hardware, graph, config, workload("prefill_8192_b1"), topological_order(graph),
     )
     assert result.chunks == 1
 
@@ -267,7 +271,7 @@ def test_kv_is_charged_once_despite_four_chunks(hardware, graph, config):
     """A chunked prefill calls the cost model per chunk; the ledger keeps the peak."""
     plan = _plan()
     result = simulate_workload(
-        plan, hardware, graph, config, WORKLOADS[1], topological_order(graph),
+        plan, hardware, graph, config, workload("prefill_8192_b1"), topological_order(graph),
     )
     kv_entries = [e for e in result.ledger.entries if e.kind == "kv"]
     # One entry per (tier, scope, module), not one per chunk.
@@ -343,7 +347,7 @@ def test_a_missing_cost_model_is_a_clear_error(hardware, graph, config):
     api.register(OnlyEmbed())
     with pytest.raises(api.CostModelError, match="no cost model claims"):
         simulate_workload(
-            _plan(), hardware, graph, config, WORKLOADS[0], topological_order(graph),
+            _plan(), hardware, graph, config, workload("prefill_128_b1"), topological_order(graph),
         )
 
 
@@ -351,7 +355,7 @@ def test_small_k_matmuls_are_charged_at_the_measured_small_k_rate(hardware, grap
     """A K below the stationary limit of 128 cannot fill the array. 8x on this hardware."""
     plan = _plan()
     result = simulate_workload(
-        plan, hardware, graph, config, WORKLOADS[0], topological_order(graph),
+        plan, hardware, graph, config, workload("prefill_128_b1"), topological_order(graph),
     )
     context = next(
         api.Context(
@@ -425,9 +429,9 @@ def test_stage_changes_the_timeline(hardware, parallel_graph, config):
     pipelined = _branch_plan(0, 1)
 
     together = simulate_workload(
-        concurrent, hardware, parallel_graph, config, WORKLOADS[2], order)
+        concurrent, hardware, parallel_graph, config, workload("decode_128_b1"), order)
     apart = simulate_workload(
-        pipelined, hardware, parallel_graph, config, WORKLOADS[2], order)
+        pipelined, hardware, parallel_graph, config, workload("decode_128_b1"), order)
     assert apart.seconds > together.seconds, (
         "putting two independent branches in different stages must serialize them"
     )
@@ -437,7 +441,7 @@ def test_a_later_stage_waits_for_an_earlier_one(hardware, parallel_graph, config
     """Even where no tensor connects them — that is what a pipeline boundary means."""
     plan = _branch_plan(0, 1)
     result = simulate_workload(
-        plan, hardware, parallel_graph, config, WORKLOADS[2], topological_order(parallel_graph),
+        plan, hardware, parallel_graph, config, workload("decode_128_b1"), topological_order(parallel_graph),
     )
     left_finish = max(e.finish for e in result.trace.scheduled if e.op.module == "left")
     right_start = min(e.start for e in result.trace.scheduled if e.op.module == "right")
@@ -525,3 +529,88 @@ def test_peer_hbm_cost_depends_on_hop_count(hardware, graph, config):
     assert hardware.hops(0, 1) == 1 and hardware.hops(0, 15) == 2
     assert seconds(15) > seconds(1)
     assert seconds(0) < seconds(1)          # same device, no hop
+
+
+# ---------------------------------------------------------------------------------------
+# Batch as a metric axis
+# ---------------------------------------------------------------------------------------
+def test_the_grid_spans_phase_context_and_batch():
+    from floorplan.schema import BATCH_SIZES, CONTEXT_LENGTHS
+
+    assert len(WORKLOADS) == 2 * len(CONTEXT_LENGTHS) * len(BATCH_SIZES) == 16
+    assert {w.batch for w in WORKLOADS} == set(BATCH_SIZES)
+    assert {w.context_tokens for w in WORKLOADS} == set(CONTEXT_LENGTHS)
+    assert HEAVIEST == "prefill_8192_b32"
+
+
+def test_a_larger_batch_costs_more_in_both_phases(hardware, graph, config):
+    order = topological_order(graph)
+    plan = _plan()
+    for phase in ("prefill", "decode"):
+        series = [
+            simulate_workload(
+                plan, hardware, graph, config, workload(f"{phase}_8192_b{batch}"), order,
+            ).seconds
+            for batch in (1, 4, 8, 32)
+        ]
+        assert series == sorted(series), f"{phase} is not monotone in batch: {series}"
+        assert series[-1] > series[0]
+
+
+def test_prefill_scales_roughly_with_batch(hardware, graph, config):
+    """32x the samples is 32x the tokens, so prefill must scale close to linearly."""
+    order = topological_order(graph)
+    plan = _plan()
+    one = simulate_workload(
+        plan, hardware, graph, config, workload("prefill_128_b1"), order).seconds
+    many = simulate_workload(
+        plan, hardware, graph, config, workload("prefill_128_b32"), order).seconds
+    assert many / one > 16
+
+
+def test_kv_grows_with_batch_and_pressures_capacity(hardware, graph, config):
+    """Why batch is a capacity axis: 8192 tokens at batch 32 holds 32x the KV."""
+    order = topological_order(graph)
+    plan = _plan()
+    small = simulate_workload(
+        plan, hardware, graph, config, workload("decode_8192_b1"), order)
+    large = simulate_workload(
+        plan, hardware, graph, config, workload("decode_8192_b32"), order)
+    assert large.ledger.by_kind()["kv"] > small.ledger.by_kind()["kv"] * 8
+
+
+def test_a_batch_split_divides_the_samples_not_the_weights(hardware, graph, config):
+    """`batch_per_shard` is the samples; `weight_divisor` stays 1 for a batch split."""
+    from floorplan.schema import Address, Placement, Residency, Split
+    from floorplan.sim.engine import Schedule as S
+    from floorplan.sim.memory import MemoryLedger as L
+    from floorplan.sim.runner import weight_divisor
+
+    placement = Placement(
+        module="m", units=[Address(0, i) for i in range(4)],
+        splits=[Split("batch", 4, "none")],
+    )
+    assert weight_divisor(placement) == 1
+
+    def samples(batch: int, shard_index: int) -> int:
+        shard = api.Shard(
+            module="m", kind="mlp", unit=Address(0, shard_index), shard_index=shard_index,
+            shard_count=4, splits=(Split("batch", 4, "none"),), fraction=1.0,
+            param_bytes=1 << 20, module_activation_bytes=0, residency=Residency(),
+            stage=0, overlap_collectives=False, graph_entry=graph["embed"],
+            group=tuple(Address(0, i) for i in range(4)),
+        )
+        ctx = api.Context(
+            hardware=hardware, schedule=S(), ledger=L(),
+            workload=Workload("t", "decode", 128, 1, batch=batch), shard=shard,
+            deps=(), config=config,
+        )
+        return ctx.batch_per_shard()
+
+    # Batch 32 over 4 shards: 8 each.
+    assert [samples(32, i) for i in range(4)] == [8, 8, 8, 8]
+    # Batch 1 over 4 shards: one shard does the work, three idle. Data parallelism wider than
+    # the batch leaves units idle rather than making the work four times cheaper.
+    assert sorted(samples(1, i) for i in range(4)) == [0, 0, 0, 1]
+    # Batch 4 over 4 shards divides evenly.
+    assert [samples(4, i) for i in range(4)] == [1, 1, 1, 1]

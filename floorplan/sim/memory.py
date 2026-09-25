@@ -160,12 +160,7 @@ class MemoryLedger:
             if not scoped:
                 continue
             worst = max(scoped, key=lambda k: scoped[k])
-            capacity = tier.capacity_bytes
-            if TIER_SCOPE.get(tier_name) == "instance" and tier_name == "peer_hbm":
-                # peer_hbm is the whole instance's device memory pooled; its capacity is
-                # already the 1,536 GiB total.
-                pass
-            out[tier_name] = (worst, scoped[worst], capacity)
+            out[tier_name] = (worst, scoped[worst], tier.capacity_bytes)
         return out
 
     def violations(self, hardware: Hardware) -> list[str]:

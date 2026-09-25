@@ -436,9 +436,36 @@ class Context:
         return ceil_div(total, self.shard.shard_count) if self.shard.shard_count > 1 else total
 
     def tokens(self) -> int:
-        """Tokens this step processes: the prompt in prefill, or the batch in decode."""
+        """Tokens this shard processes: the prompt in prefill, or one per sample in decode.
+
+        Already divided by any ``batch`` split, because data parallelism is the one dimension
+        that partitions the *samples* rather than the tensors — a batch-4 split at batch 32
+        gives each shard 8 samples' worth of tokens to move.
+        """
         workload = self.workload
-        return (
-            workload.new_tokens * workload.batch if workload.is_prefill()
-            else workload.batch
-        )
+        samples = self.batch_per_shard()
+        return workload.new_tokens * samples if workload.is_prefill() else samples
+
+    def batch_per_shard(self) -> int:
+        """Samples this shard handles: the workload's batch divided by any ``batch`` split.
+
+        Rounded up, and never below zero-work: a batch-4 split at batch 1 gives one shard the
+        single sample and the other three nothing. That asymmetry is real — data parallelism
+        wider than the batch leaves units idle — and it is why a plan cannot win at batch 1 by
+        declaring a wide batch split. The framework reports the idleness rather than dividing
+        the work by a factor that is not there.
+        """
+        factor = self.shard.factor("batch")
+        if factor <= 1:
+            return self.workload.batch
+        full, remainder = divmod(self.workload.batch, factor)
+        return full + (1 if self.shard.shard_index % factor < remainder else 0)
+
+    def kv_tokens(self) -> int:
+        """KV-cache entries this shard holds: context length times its share of the batch.
+
+        The reason batch is a capacity axis and not only a throughput one. At 8192 tokens and
+        batch 32 a plan holds 32x the KV of the same plan at batch 1, which is where an
+        otherwise sound residency choice stops fitting.
+        """
+        return self.workload.context_tokens * self.batch_per_shard()

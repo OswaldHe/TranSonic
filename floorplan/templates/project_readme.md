@@ -9,8 +9,8 @@ Target: **{{TARGET}}** — {{DEVICES}} devices, {{PER_DEVICE}} logical NeuronCor
 HBM bank.
 
 Read `PLATFORM.md` for the hardware and `MODEL.md` for what has to go on it. Read `sim/` for
-what your choices will cost — it is the definition, and the cost model for a module is the
-fastest way to learn what actually drives that module's time.
+what your choices will cost — `sim/FRAMEWORK.md` says where the framework is installed, and the
+cost model for a module is the fastest way to learn what drives its time.
 
 ## Shape of the file
 
@@ -99,9 +99,9 @@ Seven checks. You do not see the checker, but you see its findings.
 | a | the floorplan parses and is legal for this hardware and this model |
 | b | every module placed, fractions summing to 1, nothing off-path placed |
 | c | every placed module's producers are placed too |
-| d | `sim/` and `systems/` byte-identical to the build — only this file may change |
+| d | `sim/`, `systems/` and the installed framework byte-identical to the build — only this file may change |
 | e | no memory tier over capacity, at any workload |
-| f | all four workloads simulate and publish a metric |
+| f | all sixteen workloads simulate and publish a metric |
 | g | a second run produces identical metrics |
 
 Capacity is the one that catches people, and it is checked **per bank**: {{BANK}} per logical
@@ -110,12 +110,24 @@ tokens can fail at 8192 when the KV cache is 64x larger.
 
 ## The metrics
 
-```
-prefill_128_ms     prefill_8192_ms     decode_128_ms     decode_8192_ms
-```
+Sixteen points — every combination of phase, context length and batch size, named
+`{phase}_{context}_b{batch}_ms`:
 
-Lower is better on all four. An iteration is **rejected** if any metric is more than 10%
-worse than the best that metric has reached — so a change cannot buy decode with prefill.
+| | 128 tokens | 8192 tokens |
+|---|---|---|
+| prefill | `prefill_128_b{1,4,8,32}_ms` | `prefill_8192_b{1,4,8,32}_ms` |
+| decode | `decode_128_b{1,4,8,32}_ms` | `decode_8192_b{1,4,8,32}_ms` |
+
+Lower is better on all of them. An iteration is **rejected** if any metric is more than 10%
+worse than the best that metric has reached — so a change cannot buy decode with prefill, or
+batch 32 with batch 1.
+
+The batch axis exists because the answers reverse along it. A deep pipeline is pure cost at
+batch 1 decode, where one token is in flight and every stage boundary is a bubble, and nearly
+free at batch 32 where there are 32 tokens to fill it. The KV cache grows linearly with batch,
+so 8192 tokens at batch 32 holds 32x the KV of batch 1 and capacity is checked at every point.
+And a batch-1 decode step touches a handful of the 384 experts where a batch-32 step touches
+many, which moves the balance between expert parallelism and replication.
 
 They are simulated. The absolute numbers are uncalibrated; comparisons between floorplans on
 the same simulator are what they are for.
@@ -139,6 +151,6 @@ Change one thing at a time. This is a {{MODULES}}-entry file; a rewrite touching
 placements will move the metrics without telling you which change did it, and if the result
 regresses past 10% the whole iteration is discarded and you learn nothing.
 
-Write down what you tried and what it did to each of the four metrics — including what made
-things worse. A later iteration reading "deeper pipeline cost 3x on decode_128" is saved an
-hour.
+Write down what you tried and what it did to the metrics — including what made things worse,
+and *which points* moved. A later iteration reading "deeper pipeline cost 3x on decode_128_b1
+and won 20% on decode_8192_b32" is saved an hour and given the shape of the tradeoff.

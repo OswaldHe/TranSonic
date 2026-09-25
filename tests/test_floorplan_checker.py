@@ -314,13 +314,15 @@ def test_all_cited_passes(tmp_path):
 # ---------------------------------------------------------------------------------------
 # Preset / checker agreement — the pair that must not drift
 # ---------------------------------------------------------------------------------------
-def test_run_preset_declares_the_four_metrics():
+def test_run_preset_declares_the_whole_workload_grid():
+    """One metric per point of phase x context length x batch size, all lower-is-better."""
+    from floorplan.sim.runner import WORKLOADS
+
     declared = set()
     for entry in RUN_PRESET["metrics"]:
         declared |= set(entry["values"])
-    assert declared == {
-        "prefill_128_ms", "prefill_8192_ms", "decode_128_ms", "decode_8192_ms",
-    }
+    assert declared == {f"{w.name}_ms" for w in WORKLOADS}
+    assert len(declared) == 16
     assert all(
         direction == "lower"
         for entry in RUN_PRESET["metrics"] for direction in entry["values"].values()
@@ -328,12 +330,20 @@ def test_run_preset_declares_the_four_metrics():
 
 
 def test_every_metric_has_a_ten_percent_gate():
+    """"for each" in the spec means each — sixteen points, sixteen ratchets."""
+    from floorplan.sim.runner import WORKLOADS
+
     gates = {gate["metric"]: gate["max_regression_pct"]
              for gate in RUN_PRESET["acceptance"]["metric_gates"]}
-    assert set(gates) == {
-        "prefill_128_ms", "prefill_8192_ms", "decode_128_ms", "decode_8192_ms",
-    }
+    assert set(gates) == {f"{w.name}_ms" for w in WORKLOADS}
     assert set(gates.values()) == {10}
+
+
+def test_the_goal_names_the_batch_axis_and_its_reversal():
+    """The agent has to be told batch is an axis, and that the answers flip along it."""
+    goal = RUN_PRESET["goal"]
+    for phrase in ("batch size", "1, 4, 8 or 32", "decode_8192_b32_ms", "reverse"):
+        assert phrase in goal, f"preset.yaml's goal does not mention {phrase!r}"
 
 
 def test_run_scope_is_only_the_floorplan():

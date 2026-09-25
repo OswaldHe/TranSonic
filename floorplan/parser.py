@@ -24,7 +24,6 @@ Two mechanisms keep the YAML honest:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -175,9 +174,6 @@ class Engine:
 
     name: str
     role: str
-    #: Peak rate for this engine's characteristic work, or None when the YAML gives only a
-    #: device total (which is the case for all four compute engines).
-    peak_flops: float | None = None
     bandwidth_bytes_per_s: float | None = None
     stationary_max: int | None = None
     moving_max: int | None = None
@@ -577,15 +573,3 @@ def ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-def shard_bytes(total: int, factor: int) -> int:
-    """Bytes in the largest shard when ``total`` is split ``factor`` ways.
-
-    The largest, not the average: a capacity check has to hold for the worst shard, and
-    384 experts over 5 units is 77 on one of them.
-    """
-    return ceil_div(total, factor) if factor > 1 else total
-
-
-def log2_ceil(value: int) -> int:
-    """Rounds up, for the tree depth a collective takes over ``value`` participants."""
-    return 0 if value <= 1 else int(math.ceil(math.log2(value)))

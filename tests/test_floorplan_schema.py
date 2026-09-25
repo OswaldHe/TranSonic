@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from floorplan.parser import Hardware, SystemError_, ceil_div, load_system, shard_bytes
+from floorplan.parser import Hardware, SystemError_, ceil_div, load_system
 from floorplan.schema import (
     Address,
     Floorplan,
@@ -363,10 +363,10 @@ def test_layer_split_needs_a_multi_layer_module():
         plan.validate_against(system, modules)
 
 
-def test_shard_bytes_rounds_up():
+def test_ceil_div_rounds_up():
+    """384 experts over 5 units is 77 on one of them, which is what a capacity check needs."""
     assert ceil_div(384, 5) == 77
-    assert shard_bytes(384, 5) == 77
-    assert shard_bytes(384, 1) == 384
+    assert ceil_div(384, 1) == 384
 
 
 # ---------------------------------------------------------------------------------------
@@ -490,11 +490,16 @@ def test_a_two_layer_module_cannot_split_64_ways():
     assert dimension_extent("layer", entry, CONFIG) == 2
 
 
-def test_batch_splits_are_impossible_at_the_fixed_batch_of_one():
-    """The workloads are batch 1, so any batch split has more shards than batch members."""
-    from floorplan.schema import dimension_extent
+def test_batch_splits_are_bounded_by_the_largest_batch_measured():
+    """A batch split wider than the largest batch has shards with no sample at any workload.
 
-    assert dimension_extent("batch", {"id": "m", "kind": "mlp"}, CONFIG) == 1
+    Narrower splits are legal and go partly idle at the small batches, which is what data
+    parallelism does — the simulator reports that as no gain rather than as an error.
+    """
+    from floorplan.schema import BATCH_SIZES, dimension_extent
+
+    assert dimension_extent("batch", {"id": "m", "kind": "mlp"}, CONFIG) == max(BATCH_SIZES)
+    assert max(BATCH_SIZES) == 32
 
 
 def test_engram_head_extent_uses_the_engram_head_count():

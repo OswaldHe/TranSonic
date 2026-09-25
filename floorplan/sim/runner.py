@@ -1,23 +1,28 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a floorplan against a system and report the four latencies.
+"""Run a floorplan against a system and report a latency for each workload.
 
 This is the executable the exploration loop measures. It loads the floorplan, the system
 YAML, the partition graph and the agent-written cost models, walks the module DAG once per
 workload, and prints the metrics the harness reads.
 
-The four workloads are fixed here rather than in the floorplan, because they are what the
-run is being judged on — a scheme that could choose its own benchmark would choose an easy
-one. Batch is 1 throughout: the question is latency, and every parallelism decision that
-looks good at batch 1 for a 64-core instance is a decision about how to spend cores on one
-token rather than how to amortize them over many.
+The workload grid is fixed here rather than in the floorplan, because it is what the run is
+being judged on — a scheme that could choose its own benchmark would choose an easy one. It
+spans three axes: phase (prefill/decode) x context length (128/8192) x batch size
+(1/4/8/32), so sixteen points.
+
+Batch is an axis rather than a constant because the two phases respond to it in opposite
+directions, and the decisions that follow reverse with it. A 1-token decode step has nothing
+in flight to fill a pipeline with, so every stage boundary is a bubble and depth is pure
+cost; at batch 32 the same pipeline fills and the same depth is nearly free. Meanwhile the
+KV cache grows linearly with batch, so a residency choice that fits at batch 1 and 8192
+tokens can be infeasible at batch 32. Measuring only at batch 1 optimizes the worst case of
+a tradeoff instead of the tradeoff.
 
 Prefill is chunked and decode is not, which is where pipeline parallelism earns or loses its
-keep. A 4-chunk prefill lets stage 0 start chunk 1 while stage 1 works on chunk 0, so the
-pipeline fills; a 1-token decode step has nothing to fill it with, so every stage boundary
-is a bubble. The simulator does not special-case this — it falls out of running the DAG once
-per chunk and letting engine occupancy serialize what shares a unit.
+keep. The simulator does not special-case any of this — it falls out of running the DAG once
+per chunk and letting engine occupancy and stage ordering serialize what shares a unit.
 """
 
 from __future__ import annotations
@@ -34,19 +39,62 @@ from typing import Any
 import yaml
 
 from floorplan.parser import Hardware, ceil_div, load_system
-from floorplan.schema import WEIGHT_PARTITION_DIMS, Floorplan
+from floorplan.schema import (
+    BATCH_SIZES,
+    CONTEXT_LENGTHS,
+    WEIGHT_PARTITION_DIMS,
+    Floorplan,
+)
 from floorplan.sim import api
 from floorplan.sim.api import Context, CostModelError, Shard, Workload
 from floorplan.sim.engine import Schedule, Trace
 from floorplan.sim.memory import MemoryLedger, scope_key_for
 
-#: The four points the loop is measured at, and the metric each one publishes.
-WORKLOADS: tuple[Workload, ...] = (
-    Workload("prefill_128", "prefill", context_tokens=128, new_tokens=128, batch=1),
-    Workload("prefill_8192", "prefill", context_tokens=8192, new_tokens=8192, batch=1),
-    Workload("decode_128", "decode", context_tokens=128, new_tokens=1, batch=1),
-    Workload("decode_8192", "decode", context_tokens=8192, new_tokens=1, batch=1),
-)
+
+def _workloads() -> tuple[Workload, ...]:
+    """The grid every floorplan is measured on: phase x context length x batch size.
+
+    Sixteen points, built rather than listed so the three axes stay in one place. Batch is an
+    axis because the two phases respond to it in opposite directions, and a single-batch
+    benchmark hides that: at batch 1 a decode step has one token in flight and every pipeline
+    stage boundary is a bubble, while at batch 32 the same pipeline fills and the same plan
+    looks entirely different. A scheme tuned only at batch 1 is tuned for the worst case of a
+    decision that reverses.
+    """
+    points: list[Workload] = []
+    for phase in ("prefill", "decode"):
+        for context in CONTEXT_LENGTHS:
+            for batch in BATCH_SIZES:
+                points.append(Workload(
+                    name=f"{phase}_{context}_b{batch}",
+                    phase=phase,
+                    context_tokens=context,
+                    new_tokens=context if phase == "prefill" else 1,
+                    batch=batch,
+                ))
+    return tuple(points)
+
+
+#: The sixteen points the loop is measured at, and the metric each one publishes.
+WORKLOADS: tuple[Workload, ...] = _workloads()
+
+#: By name, because positional indexing into a grid breaks the moment an axis gains a value.
+WORKLOADS_BY_NAME: dict[str, Workload] = {w.name: w for w in WORKLOADS}
+
+#: The workload that exercises the most: longest context, largest batch, prefill. Used wherever
+#: a single representative point is wanted (the memory report, the invariant suite's spot
+#: checks) so those follow the grid instead of hardcoding a position in it.
+HEAVIEST = f"prefill_{max(CONTEXT_LENGTHS)}_b{max(BATCH_SIZES)}"
+
+
+def workload(name: str) -> Workload:
+    """One workload by name, with the available names in the error."""
+    try:
+        return WORKLOADS_BY_NAME[name]
+    except KeyError:
+        raise SimulationError(
+            f"no workload '{name}'. Known: {', '.join(sorted(WORKLOADS_BY_NAME))}"
+        ) from None
 
 #: Module kinds outside the text-only inference path. The vision tower is present in the
 #: partition graph and is not part of `tokens -> logits`, so a floorplan neither places it
@@ -71,10 +119,6 @@ class WorkloadResult:
     @property
     def milliseconds(self) -> float:
         return self.seconds * 1e3
-
-    @property
-    def metric_name(self) -> str:
-        return f"{self.workload.name}_ms"
 
 
 # ---------------------------------------------------------------------------------------
@@ -407,7 +451,7 @@ def simulate(
     project: Path,
     systems_dir: Path | None = None,
 ) -> tuple[dict[str, WorkloadResult], Hardware]:
-    """Run all four workloads. Raises if the plan is not deployable."""
+    """Run every workload. Raises if the plan is not deployable."""
     plan = Floorplan.load(plan_path)
     system = load_system(plan.target, systems_dir)
     hardware = Hardware.from_system(system)
@@ -525,7 +569,7 @@ def write_trace(results: dict[str, WorkloadResult], hardware: Hardware, out: Pat
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m floorplan.sim.runner",
-        description="Simulate a floorplan and report the four latencies.",
+        description="Simulate a floorplan and report a latency per workload.",
     )
     parser.add_argument("--plan", type=Path, default=Path("floorplan.yaml"),
                         help="the floorplan to simulate (default: floorplan.yaml)")
@@ -564,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
                     + "  ".join(f"{k} {v * 100:.0f}%" for k, v in sorted(util.items()))
                 )
         print()
-        print(results[WORKLOADS[1].name].ledger.report(hardware))
+        print(results[HEAVIEST].ledger.report(hardware))
         print()
 
     # The harness reads these. One per workload, and the names match preset.yaml's metrics.

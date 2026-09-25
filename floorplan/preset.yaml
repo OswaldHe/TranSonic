@@ -21,17 +21,31 @@ goal: |
 
   ## What you are being measured on
 
-  Four latencies, all in milliseconds, all at batch 1:
+  Sixteen latencies, all in milliseconds — every combination of three axes:
 
-    prefill_128_ms     ingest a 128-token prompt
-    prefill_8192_ms    ingest an 8192-token prompt
-    decode_128_ms      produce one token with 128 tokens of context
-    decode_8192_ms     produce one token with 8192 tokens of context
+    phase             prefill (ingest a prompt) or decode (produce one token)
+    context length    128 or 8192 tokens
+    batch size        1, 4, 8 or 32 samples
 
-  All four matter. An iteration is **rejected** if any metric comes out more than 10% worse
-  than the best value that metric has reached so far — so a change that wins big on decode
-  and loses 15% on prefill does not count as progress, and you will not get to keep it. Aim
-  for the frontier, not for one number.
+  named `{phase}_{context}_b{batch}_ms`, so `decode_8192_b32_ms` is one decode step at an
+  8192-token context with 32 samples in flight.
+
+  **All sixteen matter.** An iteration is **rejected** if any metric comes out more than 10%
+  worse than the best value that metric has reached so far — so a change that wins big on one
+  point and loses 15% on another does not count as progress, and you will not get to keep it.
+  Aim for the frontier, not for one number.
+
+  The batch axis is there because the interesting decisions *reverse* along it, and a plan tuned
+  at one batch size is tuned for the wrong thing at another:
+
+  - **Pipeline depth.** At batch 1 a decode step has a single token in flight, so every stage
+    boundary is a bubble and depth is pure cost. At batch 32 there are 32 tokens to fill it with
+    and the same depth is nearly free.
+  - **KV capacity.** The cache grows linearly with batch, so an 8192-token context at batch 32
+    holds 32x the KV of the same plan at batch 1. A residency choice that fits at batch 1 can be
+    infeasible at batch 32 — and capacity is checked at every point.
+  - **Expert routing.** At batch 1 a decode step touches a handful of the 384 experts; at batch
+    32 it touches many more, which changes whether expert parallelism or replication wins.
 
   These are simulated, not measured on hardware. The absolute values are uncalibrated; what
   they are good for is comparing one floorplan against another on the same simulator.
@@ -67,7 +81,7 @@ goal: |
     context is where a plan that fits at 128 tokens stops fitting.
   - **Legal splits.** A dimension has to exist for the module you are splitting. The schema
     will tell you which are legal where.
-  - **The simulator exits cleanly** on all four workloads.
+  - **The simulator exits cleanly** at every point of the grid.
 
   ## The design space
 
@@ -104,9 +118,10 @@ goal: |
   which change did it — and if it regresses, the whole iteration is discarded and you learn
   nothing. The trace names the critical path; start there.
 
-  Write down in your notes what you tried and what it did to each of the four metrics,
-  including the things that made it worse. A later iteration reading "deeper pipeline cost
-  3x on decode_128" is saved an hour.
+  Write down in your notes what you tried and what it did to the metrics — including the
+  things that made it worse, and *which points* moved. A later iteration reading "deeper
+  pipeline cost 3x on decode_128_b1 and won 20% on decode_8192_b32" is saved an hour and given
+  the shape of the tradeoff.
 
 # The gate. Seven checks, all of which must pass; the agent never sees it. Runs with the
 # iteration worktree as its working directory, so `--repo .` is the candidate, and the
@@ -120,28 +135,71 @@ constraints:
   - command: python -m floorplan.checker --repo . --json .autohelix/floorplan_checks.json --trace reports/trace.json --archive --timeout 900
     timeout: 2100
 
-# Lower is better on all four, and each gets its own 10% gate below.
+# Sixteen points: phase x context length x batch size. Lower is better on all of them, and
+# each gets its own 10% gate below.
 metrics:
   - command: python -m floorplan.checker --repo . --timeout 900
     values:
-      prefill_128_ms: lower
-      prefill_8192_ms: lower
-      decode_128_ms: lower
-      decode_8192_ms: lower
+      prefill_128_b1_ms: lower
+      prefill_128_b4_ms: lower
+      prefill_128_b8_ms: lower
+      prefill_128_b32_ms: lower
+      prefill_8192_b1_ms: lower
+      prefill_8192_b4_ms: lower
+      prefill_8192_b8_ms: lower
+      prefill_8192_b32_ms: lower
+      decode_128_b1_ms: lower
+      decode_128_b4_ms: lower
+      decode_128_b8_ms: lower
+      decode_128_b32_ms: lower
+      decode_8192_b1_ms: lower
+      decode_8192_b4_ms: lower
+      decode_8192_b8_ms: lower
+      decode_8192_b32_ms: lower
     timeout: 2100
 
-# The per-metric ratchet. AutoHelix compares each metric against the best value it has
-# reached in an accepted iteration, so the frontier only moves outward and a scheme cannot
-# buy decode with prefill.
+# The per-metric ratchet, one gate per point. AutoHelix compares each metric against the best
+# value it has reached in an accepted iteration, so the frontier only moves outward and a scheme
+# cannot buy decode with prefill, or batch 32 with batch 1.
+#
+# Sixteen gates is stricter than four but not four times stricter: the four batch columns of a
+# given phase and length move largely together, so an iteration that helps one usually helps its
+# neighbours. Where they *do* diverge is exactly the tradeoff worth gating — pipeline depth helps
+# batch 32 decode and hurts batch 1 — and an iteration that trades one for the other should not
+# count as progress.
 acceptance:
   metric_gates:
-    - metric: prefill_128_ms
+    - metric: prefill_128_b1_ms
       max_regression_pct: 10
-    - metric: prefill_8192_ms
+    - metric: prefill_128_b4_ms
       max_regression_pct: 10
-    - metric: decode_128_ms
+    - metric: prefill_128_b8_ms
       max_regression_pct: 10
-    - metric: decode_8192_ms
+    - metric: prefill_128_b32_ms
+      max_regression_pct: 10
+    - metric: prefill_8192_b1_ms
+      max_regression_pct: 10
+    - metric: prefill_8192_b4_ms
+      max_regression_pct: 10
+    - metric: prefill_8192_b8_ms
+      max_regression_pct: 10
+    - metric: prefill_8192_b32_ms
+      max_regression_pct: 10
+    - metric: decode_128_b1_ms
+      max_regression_pct: 10
+    - metric: decode_128_b4_ms
+      max_regression_pct: 10
+    - metric: decode_128_b8_ms
+      max_regression_pct: 10
+    - metric: decode_128_b32_ms
+      max_regression_pct: 10
+    - metric: decode_8192_b1_ms
+      max_regression_pct: 10
+    - metric: decode_8192_b4_ms
+      max_regression_pct: 10
+    - metric: decode_8192_b8_ms
+      max_regression_pct: 10
+    - metric: decode_8192_b32_ms
       max_regression_pct: 10
 
 # The one editable file. Everything else is reverted if touched — and check (d) verifies the
@@ -173,7 +231,7 @@ reviewer:
 
     Write two sections.
 
-    **What the numbers say.** Which of the four metrics moved, and why — grounded in the
+    **What the numbers say.** Which metrics moved, and why — grounded in the
     trace, not in plausibility. Name the critical path. If a metric regressed, say what in the
     floorplan caused it. If the iteration was rejected by the 10% gate, say which metric and
     what the iteration should have protected. Be specific enough that the next iteration does

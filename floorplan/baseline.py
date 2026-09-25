@@ -150,10 +150,10 @@ HEADER = """\
 # residency, schedule order and the runtime knobs. Everything else — the simulator, the cost
 # models, the system description — is frozen.
 #
-# The four metrics measured against this file are prefill_128_ms, prefill_8192_ms,
-# decode_128_ms and decode_8192_ms. An iteration is rejected if any of them is more than 10%
-# worse than the best value that metric has reached, so an improvement in one that wrecks
-# another does not count.
+# The metrics measured against this file are the sixteen points of phase x context length x
+# batch size, named {phase}_{context}_b{batch}_ms. An iteration is rejected if any of them is
+# more than 10% worse than the best value that metric has reached, so an improvement in one
+# that wrecks another does not count.
 #
 # Addresses are d<device>.l<logical_nc>: 16 devices, 4 logical NeuronCores each, 64 in all.
 # A logical core has a 24 GiB HBM bank, not 96 — the 96 GiB is the device's four banks.

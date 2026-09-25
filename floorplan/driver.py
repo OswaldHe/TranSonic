@@ -8,7 +8,7 @@
     build   two agent iterations that write the per-module cost models, gated by the
             invariant suite
     run     five agent iterations that edit `floorplan.yaml`, gated by `checker.py` and
-            ranked by four latencies — an ordinary AutoHelix loop
+            ranked across the workload grid — an ordinary AutoHelix loop
     rank    one blind agent ranks the top three schemes, then a script appends the numbers
 
 The interesting seam is between `build` and `run`. `build` ends by hashing `sim/` into the
