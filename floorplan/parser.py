@@ -146,7 +146,16 @@ def load_system(
                     f"which has no '{section}'"
                 )
             extra = {k: v for k, v in block.items() if k != "inherit"}
-            data[section] = _deep_merge(inherited, extra) if extra else inherited
+            if isinstance(inherited, str):
+                # `constraints_text` inherits *prose*, and the override is a mapping such as
+                # `{not_applicable: [5]}`. Deep-merging a mapping over a string replaced the
+                # text outright, leaving no `text` key at all, so `trn2-1device` produced an
+                # empty constraints block and invariant (g) failed with "no numbered
+                # constraints" on a system file that plainly has nine. The inherited prose is
+                # preserved under `text` and the override adds to it.
+                data[section] = {"text": inherited, **extra} if extra else inherited
+            else:
+                data[section] = _deep_merge(inherited, extra) if extra else inherited
         elif isinstance(block, str):
             # `constraints_text: {inherit: x}` is a mapping; a bare string is prose.
             continue

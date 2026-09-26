@@ -96,6 +96,7 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
     }
+    _write_token(tmp_path, manifest)
     assert checker.check_frozen(tmp_path, manifest).passed
 
     probed.write_text("shared:\n  efficiency:\n    matmul_bf16: 0.9000\n")
@@ -103,6 +104,19 @@ def test_editing_a_probed_coefficient_is_caught(tmp_path):
     assert not check.passed
     assert "systems/probed.yaml" in check.findings[0]
 
+
+def _write_token(project, manifest):
+    """The integrity token `driver.freeze()` writes, so check (d) can trust the manifest.
+
+    Check (d) now refuses a manifest it cannot tie to the tracked tree, because the manifest
+    is git-ignored and reachable from an iteration worktree. Tests that hand-build a manifest
+    have to hand-build the token with it.
+    """
+    token = project / checker.FROZEN_TOKEN
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text(json.dumps({
+        "manifest_digest": checker.manifest_digest(manifest),
+    }))
 
 def test_frozen_detects_edit_addition_and_removal(tmp_path):
     (tmp_path / "sim").mkdir()
@@ -112,6 +126,7 @@ def test_frozen_detects_edit_addition_and_removal(tmp_path):
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
     }
+    _write_token(tmp_path, manifest)
 
     assert checker.check_frozen(tmp_path, manifest).passed
 
@@ -361,7 +376,14 @@ def test_run_scope_is_only_the_floorplan():
 
 
 def test_build_scope_is_only_the_cost_models():
-    assert BUILD_PRESET["scope"]["editable"] == ["sim/modules", "sim/constraints.py"]
+    editable = BUILD_PRESET["scope"]["editable"]
+    assert "sim/modules" in editable
+    assert "sim/constraints.py" in editable
+    # What matters is what is absent: the agent's own inputs. Letting it edit the probe
+    # overlay, the plan it is graded on, or the framework copy would mean the invariant suite
+    # and the baseline both ran against numbers it chose.
+    for forbidden in ("systems", "systems/probed.yaml", "floorplan.yaml", "sim/framework"):
+        assert forbidden not in editable
     assert BUILD_PRESET["metrics"] == []
 
 
@@ -482,6 +504,7 @@ def test_a_diverged_reference_copy_is_caught(tmp_path):
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
     }
+    _write_token(tmp_path, manifest)
     assert checker.check_frozen(tmp_path, manifest).passed
 
     mirror = tmp_path / "sim" / "framework" / "api.py"
@@ -499,6 +522,7 @@ def test_a_missing_reference_copy_is_caught(tmp_path):
         "hashes": checker.hash_tree(tmp_path),
         "framework_hashes": checker.hash_framework(),
     }
+    _write_token(tmp_path, manifest)
     (tmp_path / "sim" / "framework" / "runner.py").unlink()
     check = checker.check_frozen(tmp_path, manifest)
     assert not check.passed

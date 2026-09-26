@@ -810,6 +810,18 @@ def run(
                 overlay.setdefault(target, {})["tiers"] = merge_tier_patch(path, tier_patch)
 
     destination = systems_dir / "probed.yaml"
+    # Merge over whatever is already there rather than replacing it. Re-running with a group
+    # skipped — `--skip device` to retry only storage, say — produced an overlay containing
+    # only the groups that ran, and an unconditional write then deleted every previously
+    # measured coefficient, leaving the simulator unresolvable until a full re-probe. Retrying
+    # one group must not cost the others.
+    if destination.exists():
+        try:
+            existing = yaml.safe_load(destination.read_text()) or {}
+        except yaml.YAMLError:
+            existing = {}
+        if isinstance(existing, dict):
+            overlay = _merge_overlay(existing, overlay)
     destination.write_text(
         "# Written by `autohelix floorplan probe`. Do not hand-edit: re-run the probe.\n"
         "#\n"
@@ -819,6 +831,17 @@ def run(
         + yaml.safe_dump(overlay, sort_keys=False, default_flow_style=False)
     )
     return results
+
+
+def _merge_overlay(old: dict, new: dict) -> dict:
+    """``new`` over ``old``, recursing into mappings so a fresh group replaces only itself."""
+    merged = dict(old)
+    for key, value in new.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_overlay(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _host_description() -> str:

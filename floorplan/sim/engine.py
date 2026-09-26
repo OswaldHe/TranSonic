@@ -38,6 +38,38 @@ COMPUTE_ENGINES = frozenset({"tensor", "vector", "scalar", "gpsimd", "dma"})
 #: declare it serialize against one another even though their engines differ.
 RESOURCES = frozenset({"sbuf", "psum"})
 
+#: The address scope each engine and resource is contended at.
+#:
+#: Keying everything by the full unit string was wrong in two directions, and both let a plan
+#: buy concurrency the silicon does not have. ``d0.l0.p0`` and ``d0.l0.p1`` are the two
+#: physical NeuronCores of *one* logical core: the schema permits splitting across them, but
+#: they share that logical core's single SBUF and PSUM, so independent timelines let their
+#: tensor/GPSIMD work overlap in a buffer only one of them can own. And the CC cores are a
+#: pool of 16 per *device* (``Device.cc_cores``), not per logical core, so two collectives on
+#: ``d0.l0`` and ``d0.l1`` were both charged a full private pool.
+#:
+#: Anything absent from this mapping is contended at the full unit address, which is right for
+#: the five per-core compute engines.
+ENGINE_SCOPE = {"cc": "device"}
+RESOURCE_SCOPE = {"sbuf": "logical_nc", "psum": "logical_nc"}
+
+
+def scope_of(unit: str, scope: str) -> str:
+    """``unit`` reduced to the address level a resource is shared at.
+
+    Parsing is deliberately tolerant: cost models build unit strings and a malformed one
+    should surface as a capacity or placement error from the schema, not as a scheduling
+    crash here.
+    """
+    if scope == "unit":
+        return unit
+    head = unit.split(".")
+    if scope == "device":
+        return head[0]
+    if scope == "logical_nc":
+        return ".".join(head[:2])
+    return unit
+
 
 class ScheduleError(RuntimeError):
     """An op cannot be scheduled: bad engine, bad resource, or a dependency not yet run."""
@@ -94,6 +126,10 @@ class Trace:
     collective_seconds: float = 0.0
     #: Seconds of collective time that was credited as overlapped with compute.
     overlapped_seconds: float = 0.0
+    #: Per op index, the op whose engine/resource hold delayed its start, or -1 if nothing did.
+    #: Parallel to ``scheduled``; a resource conflict is as real a predecessor as a data
+    #: dependency, and a critical path that omits it points the reader at the wrong thing.
+    blocked_by: list[int] = field(default_factory=list)
 
     def makespan(self) -> float:
         """Wall-clock seconds from the first start to the last finish."""
@@ -102,19 +138,32 @@ class Trace:
     def critical_path(self) -> list[Scheduled]:
         """The chain of ops that sets the makespan, latest-finishing first then unwound.
 
-        Walks back through whichever dependency finished last, which is the chain a reader
+        Walks back through whichever predecessor finished last, which is the chain a reader
         of the report wants: it is the list of things that would have to get faster.
+
+        "Predecessor" includes the op that was *holding the engine or the buffer*, not only
+        the ops in ``deps``. Walking data dependencies alone produced chains that began at an
+        op starting well after zero with nothing explaining the gap, and on a plan whose
+        makespan is set by engine contention — which is most of them — it named the wrong
+        ops entirely.
         """
         if not self.scheduled:
             return []
         by_index = {s.index: s for s in self.scheduled}
         current = max(self.scheduled, key=lambda s: s.finish)
         chain = [current]
-        while current.op.deps:
-            predecessors = [by_index[d] for d in current.op.deps if d in by_index]
-            if not predecessors:
+        seen = {current.index}
+        while True:
+            candidates = [by_index[d] for d in current.op.deps if d in by_index]
+            if current.index < len(self.blocked_by):
+                blocker = self.blocked_by[current.index]
+                if blocker >= 0 and blocker in by_index:
+                    candidates.append(by_index[blocker])
+            candidates = [c for c in candidates if c.index not in seen]
+            if not candidates:
                 break
-            current = max(predecessors, key=lambda s: s.finish)
+            current = max(candidates, key=lambda s: s.finish)
+            seen.add(current.index)
             chain.append(current)
         chain.reverse()
         return chain
@@ -166,6 +215,11 @@ class Schedule:
         self._finish: list[float] = []
         self._engine_free: dict[tuple[str, str], float] = defaultdict(float)
         self._resource_free: dict[tuple[str, str], float] = defaultdict(float)
+        #: Which op last held each engine/resource, so a start delayed by contention can name
+        #: the op that caused it. Without this the critical path silently skipped the real
+        #: predecessor whenever the makespan was set by serialization rather than by data.
+        self._engine_holder: dict[tuple[str, str], int] = {}
+        self._resource_holder: dict[tuple[str, str], int] = {}
         self.trace = Trace()
 
     def __len__(self) -> int:
@@ -207,26 +261,45 @@ class Schedule:
         # the flag exists to expose could not be measured. Now a non-overlapped collective
         # holds the unit's compute engines for its duration, which is what "no overlap" means,
         # and text constraint 4 still applies either way: dependents wait regardless.
-        engine_key = (op.unit, op.engine)
-        start = max(start, self._engine_free[engine_key])
+        # Each engine and resource is contended at its own address scope: the CC pool per
+        # device, SBUF/PSUM per logical core, the compute engines per unit. See ENGINE_SCOPE.
+        engine_key = (scope_of(op.unit, ENGINE_SCOPE.get(op.engine, "unit")), op.engine)
+        blocker = -1
+        if self._engine_free[engine_key] > start:
+            start = self._engine_free[engine_key]
+            blocker = self._engine_holder.get(engine_key, -1)
         blocked = (
             COMPUTE_ENGINES if op.engine == "cc" and not op.overlapped else frozenset()
         )
         for engine in blocked:
-            start = max(start, self._engine_free[(op.unit, engine)])
-        for resource in op.holds:
-            start = max(start, self._resource_free[(op.unit, resource)])
+            key = (scope_of(op.unit, ENGINE_SCOPE.get(engine, "unit")), engine)
+            if self._engine_free[key] > start:
+                start = self._engine_free[key]
+                blocker = self._engine_holder.get(key, -1)
+        resource_keys = [
+            (scope_of(op.unit, RESOURCE_SCOPE.get(resource, "unit")), resource)
+            for resource in op.holds
+        ]
+        for key in resource_keys:
+            if self._resource_free[key] > start:
+                start = self._resource_free[key]
+                blocker = self._resource_holder.get(key, -1)
 
         finish = start + op.seconds
-        self._engine_free[engine_key] = finish
-        for engine in blocked:
-            self._engine_free[(op.unit, engine)] = finish
-        for resource in op.holds:
-            self._resource_free[(op.unit, resource)] = finish
-
         index = len(self._ops)
+        self._engine_free[engine_key] = finish
+        self._engine_holder[engine_key] = index
+        for engine in blocked:
+            key = (scope_of(op.unit, ENGINE_SCOPE.get(engine, "unit")), engine)
+            self._engine_free[key] = finish
+            self._engine_holder[key] = index
+        for key in resource_keys:
+            self._resource_free[key] = finish
+            self._resource_holder[key] = index
+
         self._ops.append(op)
         self._finish.append(finish)
+        self.trace.blocked_by.append(blocker)
 
         self.trace.scheduled.append(Scheduled(index=index, op=op, start=start, finish=finish))
         self.trace.engine_busy[engine_key] += op.seconds

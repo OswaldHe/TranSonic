@@ -59,6 +59,11 @@ FRAMEWORK_MODULES = (
 #: `rank` has something to choose from even if four of five iterations regressed.
 CANDIDATES_DIR = Path("schemes") / "candidates"
 
+#: The verdicts a reviewer is allowed to return. Anything else — including the empty string
+#: `_parse_verdict()` yields when the reviewer crashes or omits its `VERDICT:` line — means the
+#: adversarial review did not happen, which is not the same as passing it.
+REVIEW_VERDICTS = frozenset({"clean", "suspicious", "circumventing"})
+
 
 class DriverError(RuntimeError):
     """The project is not in a state the requested stage can run from."""
@@ -76,6 +81,8 @@ class Manifest:
     #: Hashes of the *installed* framework modules — the code that computes the metrics. Kept
     #: separately from `hashes` because those are project-relative and these are absolute.
     framework_hashes: dict[str, str] = field(default_factory=dict)
+    #: Hashes of the partition-artifact files a simulation reads. Artifact-relative.
+    artifact_hashes: dict[str, str] = field(default_factory=dict)
     frozen_at: str = ""
     build_iterations: int = 0
 
@@ -87,6 +94,7 @@ class Manifest:
             "created": self.created,
             "hashes": self.hashes,
             "framework_hashes": self.framework_hashes,
+            "artifact_hashes": self.artifact_hashes,
             "frozen_at": self.frozen_at,
             "build_iterations": self.build_iterations,
         }
@@ -104,6 +112,7 @@ class Manifest:
             created=data.get("created", ""),
             hashes=data.get("hashes") or {},
             framework_hashes=data.get("framework_hashes") or {},
+            artifact_hashes=data.get("artifact_hashes") or {},
             frozen_at=data.get("frozen_at", ""),
             build_iterations=int(data.get("build_iterations", 0)),
         )
@@ -633,6 +642,20 @@ def build_loop(
             error=result.error or "",
         )
 
+        # The build agent runs directly in the project rather than in a worktree, so the
+        # harness code that calls `revert_out_of_scope()` never sees it and `scope.editable`
+        # in build_preset.yaml was documentation rather than a rule. An agent that edited
+        # `systems/probed.yaml`, `floorplan.yaml` or `sim/framework/` would have the invariant
+        # suite and the baseline capture run against its own modified inputs — and the result
+        # frozen.
+        out_of_scope = _revert_out_of_scope(project, config.scope.editable)
+        if out_of_scope:
+            outcome.error = (
+                outcome.error
+                + f" reverted out-of-scope edit(s): {', '.join(out_of_scope[:4])}"
+            ).strip()
+            emit(f"reverted {len(out_of_scope)} out-of-scope edit(s)")
+
         emit("running the invariant suite")
         try:
             report = invariants.run(
@@ -684,8 +707,17 @@ def build_loop(
             f"invariants {'PASS' if outcome.invariants_passed else 'FAIL'}"
             + (f", verdict {outcome.verdict}" if outcome.verdict else "")
         )
-        if outcome.invariants_passed and outcome.verdict != "circumventing":
+        # A missing verdict is not an endorsement. `_parse_verdict()` returns "" when the
+        # reviewer command fails, writes no report, or omits its `VERDICT:` line, and treating
+        # that as acceptable ended the loop and froze a simulator that had never actually been
+        # reviewed — the adversarial check silently skipped whenever it broke.
+        if outcome.invariants_passed and outcome.verdict == "clean":
             break
+        if outcome.invariants_passed and outcome.verdict not in REVIEW_VERDICTS:
+            emit(
+                f"reviewer returned no usable verdict "
+                f"({outcome.verdict or 'empty'}); not treating this build as reviewed"
+            )
 
     return outcomes
 
@@ -733,6 +765,47 @@ def _reviewer_prompt(config: Any, iteration: int, state: Path) -> str:
         "",
         f"Write your review to `reports/build-review-{iteration}.md` and change nothing else.",
     ])
+
+
+def _revert_out_of_scope(project: Path, editable: list[str]) -> list[str]:
+    """Undo changes outside ``editable``, and return what had to be undone.
+
+    The same rule `autohelix.sandbox.revert_out_of_scope()` applies to an iteration worktree,
+    applied to the project directory the build loop works in. Tracked files are restored from
+    HEAD; files the agent added outside scope are deleted. Notes and run state are exempt —
+    they are how an iteration talks to the next one.
+    """
+    exempt = (".autohelix", ".git", "reports")
+
+    def run_git(*args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(project), *args], capture_output=True, text=True,
+        )
+        return completed.stdout.strip()
+
+    from autohelix.sandbox import path_in_scope
+
+    changed = set(filter(None, run_git("diff", "--relative", "--name-only", "HEAD").split("\n")))
+    untracked = set(filter(
+        None, run_git("ls-files", "--others", "--exclude-standard").split("\n"),
+    ))
+    reverted: list[str] = []
+    for relative in sorted(changed):
+        if relative.startswith(exempt) or path_in_scope(relative, editable):
+            continue
+        subprocess.run(
+            ["git", "-C", str(project), "checkout", "HEAD", "--", relative],
+            capture_output=True, text=True,
+        )
+        reverted.append(relative)
+    for relative in sorted(untracked):
+        if relative.startswith(exempt) or path_in_scope(relative, editable):
+            continue
+        target = project / relative
+        if target.is_file():
+            target.unlink()
+            reverted.append(relative)
+    return reverted
 
 
 def _snapshot_sim(project: Path) -> dict[Path, str]:
@@ -822,9 +895,25 @@ def freeze(project: Path, iterations: int = 0) -> Manifest:
     manifest = Manifest.load(project)
     manifest.hashes = checker.hash_tree(project)
     manifest.framework_hashes = checker.hash_framework()
+    # The partition artifact is an input to every simulation — each one reloads
+    # `plan/partition_graph.yaml` and the per-module configs for parameter sizes, dependencies
+    # and shapes. Leaving it unhashed meant regenerating or editing the artifact after freezing
+    # could change every metric while check (d) stayed green, so metrics from before and after
+    # were silently incomparable.
+    manifest.artifact_hashes = checker.hash_artifact(Path(manifest.artifact))
     manifest.frozen_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     manifest.build_iterations = iterations or manifest.build_iterations
     manifest.save(project)
+    # The manifest is git-ignored and reachable from an iteration worktree, so its hashes alone
+    # are not tamper-evident. The token ties them to the tracked, scope-protected tree.
+    token = project / checker.FROZEN_TOKEN
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text(json.dumps({
+        "_comment": "Integrity token for .autohelix/floorplan/manifest.json. Written by "
+                    "`floorplan build`; verified by gate check (d). Do not edit.",
+        "frozen_at": manifest.frozen_at,
+        "manifest_digest": checker.manifest_digest(manifest.to_dict()),
+    }, indent=2) + "\n")
     return manifest
 
 
@@ -863,13 +952,37 @@ def archive_candidate(
 
 
 def candidates(project: Path) -> list[dict[str, Any]]:
-    """Every archived candidate, with its metrics, newest last."""
+    """Every archived candidate, with its metrics, newest last.
+
+    Two sources, and the second is the one that matters for ranking quality. `iter-*.json` is
+    written per accepted iteration from git. `plan-*.json` is written by the gate itself while
+    an iteration is still running, which is the only record of a plan that was *feasible and
+    faster* but rejected by the per-metric ratchet — `_archive_from_history()` cannot recover
+    those, because a rejected iteration's worktree and branch are deleted. Reading only
+    `iter-*` meant a run whose best plans were all ratchet-rejected ranked the few accepted
+    ones and never saw them.
+    """
     out: list[dict[str, Any]] = []
-    for path in sorted((project / CANDIDATES_DIR).glob("iter-*.json")):
+    directory = project / CANDIDATES_DIR
+    for path in sorted(directory.glob("iter-*.json")) + sorted(directory.glob("plan-*.json")):
+        plan_path = path.with_suffix(".yaml")
+        if not plan_path.exists():
+            continue
         payload = json.loads(path.read_text())
-        payload["plan"] = str(path.with_suffix(".yaml"))
+        payload["plan"] = str(plan_path)
+        payload.setdefault("iteration", -1)
         out.append(payload)
-    return sorted(out, key=lambda entry: entry["iteration"])
+    # Deduplicate on measured metrics: the gate archives the plan an iteration ended with, and
+    # if that iteration was then accepted the same plan arrives again as `iter-N`. Ranking the
+    # same scheme twice under two labels is the failure this had before.
+    seen: dict[str, dict[str, Any]] = {}
+    for entry in out:
+        fingerprint = json.dumps(entry.get("metrics") or {}, sort_keys=True)
+        previous = seen.get(fingerprint)
+        # Prefer the `iter-N` record, which carries the real iteration number.
+        if previous is None or entry.get("iteration", -1) > previous.get("iteration", -1):
+            seen[fingerprint] = entry
+    return sorted(seen.values(), key=lambda entry: entry.get("iteration", -1))
 
 
 def rank_score(metrics: dict[str, float], best: dict[str, float]) -> float:

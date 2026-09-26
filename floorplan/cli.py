@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -175,10 +177,15 @@ def build(path: Path, iterations: int, no_freeze: bool) -> None:
     # `circumventing`, but if the *last* allowed iteration says it there is nowhere to move on
     # to, and checking only the invariant flag would freeze a simulator the reviewer explicitly
     # rejected — turning an exhausted budget into the metric the whole search is scored by.
-    if final.verdict == "circumventing":
+    if final.verdict != "clean":
+        detail = (
+            f"is `{final.verdict}`" if final.verdict
+            else "is missing — the reviewer produced no `VERDICT:` line, so the adversarial "
+                 "review did not happen"
+        )
         click.echo(
             f"\nthe invariant suite is green but the reviewer's verdict on the final "
-            f"iteration is `circumventing`; the simulator is NOT frozen."
+            f"iteration {detail}; the simulator is NOT frozen."
         )
         click.echo(
             "Read reports/build-review-*.md. Exhausting the iteration budget is not a reason "
@@ -339,7 +346,13 @@ def rank(path: Path, count: int, model: str | None) -> None:
     """
     project = path.resolve()
     manifest = driver.Manifest.load(project)
-    sandbox = project / "reports" / "ranking"
+    # The sandbox lives *outside* the project. Nesting it at `<project>/reports/ranking` gave
+    # the agent no isolation at all: `cwd` is not a filesystem boundary, so `../../sim`,
+    # `../trace.json` and `../../schemes/candidates` were all one relative path away, along with
+    # the de-anonymization key. An agent that simply looked around its working directory could
+    # read the simulator and the measured latencies the blind ranking exists to withhold.
+    sandbox_root = Path(tempfile.mkdtemp(prefix="floorplan-ranking-"))
+    sandbox = sandbox_root / "ranking"
     staged = rank_module.stage(project, sandbox, count=count)
     key = project / ".autohelix" / "floorplan" / "ranking_key.json"
     staged.save_key(key)
@@ -388,6 +401,13 @@ def rank(path: Path, count: int, model: str | None) -> None:
         )
     final = project / "REPORT.md"
     final.write_text(report.read_text())
+    # Keep the sandbox's inputs as evidence of what the agent was and was not shown, now that
+    # it is no longer a directory the agent can write to.
+    archive = project / "reports" / "ranking"
+    if archive.exists():
+        shutil.rmtree(archive)
+    shutil.copytree(sandbox, archive)
+    shutil.rmtree(sandbox_root, ignore_errors=True)
     click.echo(f"\nranking: {' > '.join(order)}")
     click.echo(f"  {final}")
     for position in range(1, len(order) + 1):
@@ -484,7 +504,11 @@ def show(path: Path, plan: Path | None) -> None:
     by_tier: dict[str, int] = {}
     by_dim: dict[str, int] = {}
     for placement in parsed.placements:
-        nbytes = int((modules.get(placement.module) or {}).get("param_bytes") or 0)
+        whole = int((modules.get(placement.module) or {}).get("param_bytes") or 0)
+        # This placement's share, not the whole module. A module decomposed into four
+        # placements at fraction 0.25 was reported as four full copies — 4x the real weight
+        # bytes, with a complete copy attributed to each tier the parts landed in.
+        nbytes = int(whole * placement.fraction)
         by_tier[placement.residency.tier] = by_tier.get(placement.residency.tier, 0) + nbytes
         for split in placement.splits:
             by_dim[f"{split.dim} x{split.factor}"] = by_dim.get(

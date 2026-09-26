@@ -141,9 +141,15 @@ constraints:
 metrics: []
 
 scope:
+  # Enforced, not advisory: `build_loop` reverts anything changed outside this list before the
+  # invariant suite runs. `systems/`, `floorplan.yaml` and `sim/framework/` are deliberately
+  # absent — an agent that could edit its own inputs would be graded against them.
   editable:
     - sim/modules
     - sim/constraints.py
+    # Inert markdown, and the place the cost models' reasoning gets recorded. Listed so scope
+    # enforcement does not throw the notes away; it cannot affect a metric.
+    - sim/NOTES.md
 
 agent:
   type: claude

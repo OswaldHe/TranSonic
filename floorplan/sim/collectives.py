@@ -115,6 +115,17 @@ def cost(
 
     byte_factor, step_factor = _ALGORITHMS[kind]
     if kind == "p2p":
+        if participants > 2:
+            # `p2p` describes one sender and one receiver. Charging a single payload and a
+            # single latency step for a wider group let a 64-way head or expert split declare
+            # its multi-party rejoin as a point-to-point transfer and pay a 2-participant
+            # price for it — the cheapest possible way to make a badly-communicating plan look
+            # good, and nothing in the schema stopped it.
+            raise ValueError(
+                f"collective 'p2p' needs exactly 2 logical participants, got {participants}. "
+                f"A split rejoining across more than two units is a multi-party collective: "
+                f"use allgather, allreduce, reduce_scatter or all_to_all"
+            )
         # A point-to-point handoff is not a ring. The whole activation travels from sender to
         # receiver, so the `(N-1)/N` share does not apply — for the usual two-participant stage
         # boundary it charged half the payload and underpriced every cross-device pipeline

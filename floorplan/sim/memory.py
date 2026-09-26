@@ -147,10 +147,22 @@ class MemoryLedger:
         totals = self.totals()
         rolled = dict(totals)
         for (tier, scope_key), nbytes in totals.items():
-            if tier != "hbm_bank":
-                continue
-            device = f"d{Address.parse(scope_key).device}"
-            rolled[("device_hbm", device)] = rolled.get(("device_hbm", device), 0) + nbytes
+            if tier == "hbm_bank":
+                device = f"d{Address.parse(scope_key).device}"
+                rolled[("device_hbm", device)] = rolled.get(("device_hbm", device), 0) + nbytes
+            elif tier == "peer_hbm" and scope_key.startswith("d"):
+                # Peer-HBM bytes are physically in the owning device's 96 GiB, so they are
+                # charged there as well as against the instance-wide peer pool. Without the
+                # first, the only limit was the 1,536 GiB aggregate and any number of
+                # placements could pile onto one device; without the second, the pool itself
+                # went unchecked.
+                rolled[("device_hbm", scope_key)] = (
+                    rolled.get(("device_hbm", scope_key), 0) + nbytes
+                )
+                rolled[("peer_hbm", "instance")] = (
+                    rolled.get(("peer_hbm", "instance"), 0) + nbytes
+                )
+                rolled.pop((tier, scope_key), None)
 
         out: dict[str, tuple[str, int, int]] = {}
         for tier_name, tier in hardware.tiers.items():
@@ -201,11 +213,20 @@ class MemoryLedger:
         return "\n".join(lines)
 
 
-def scope_key_for(tier: str, unit: Address) -> str:
-    """Which scope a placement on ``unit`` charges its bytes to in ``tier``."""
+def scope_key_for(tier: str, unit: Address, backing_device: int | None = None) -> str:
+    """Which scope a placement on ``unit`` charges its bytes to in ``tier``.
+
+    ``backing_device`` is the device that *owns* ``peer_hbm`` weights. Charging peer HBM to a
+    single instance-wide pool meant several placements could name the same backing device and
+    together put far more than its 96 GiB there while staying under the 1,536 GiB aggregate —
+    the capacity gate saw a total that no device had to hold. With the owner named, the bytes
+    land on that device's budget, which is the one that has to be big enough.
+    """
     scope = TIER_SCOPE.get(tier, "instance")
     if scope == "logical_nc":
         return str(unit.logical())
     if scope == "device":
         return f"d{unit.device}"
+    if tier == "peer_hbm" and backing_device is not None:
+        return f"d{backing_device}"
     return "instance"

@@ -417,3 +417,61 @@ def test_weights_and_kv_still_sum_because_they_are_persistent():
     ledger.add_kv("hbm_bank", "d0.l0", 1 << 20, "a", shard=0)
     ledger.add_activation("hbm_bank", "d0.l0", 2 << 20, "a")
     assert ledger.totals()[("hbm_bank", "d0.l0")] == (3 + 5 + 1 + 2) << 20
+
+
+# ---------------------------------------------------------------------------------------
+# PR #5, second and third review batches. Each of these passed before the fix because
+# nothing exercised the behaviour, which is why they were worth writing down.
+# ---------------------------------------------------------------------------------------
+def test_cc_cores_are_a_device_pool_not_a_per_core_engine():
+    """Two collectives on different logical cores of one device cannot both own the CC pool.
+
+    `Device.cc_cores` is 16 per device. Keying the engine by the full unit address gave
+    `d0.l0` and `d0.l1` independent pools, so a plan could run four collectives on one device
+    concurrently and pay for one.
+    """
+    schedule = Schedule()
+    first = Op(name="cc0", unit="d0.l0", engine="cc", seconds=1.0, overlapped=True)
+    second = Op(name="cc1", unit="d0.l1", engine="cc", seconds=1.0, overlapped=True)
+    schedule.submit(first)
+    schedule.submit(second)
+    assert schedule.finish_of(1) == pytest.approx(2.0)
+
+    # A different device is a different pool, so those do overlap.
+    other = Schedule()
+    other.submit(Op(name="cc0", unit="d0.l0", engine="cc", seconds=1.0, overlapped=True))
+    other.submit(Op(name="cc1", unit="d1.l0", engine="cc", seconds=1.0, overlapped=True))
+    assert other.finish_of(1) == pytest.approx(1.0)
+
+
+def test_sbuf_is_shared_by_the_two_physical_cores_of_a_logical_core():
+    """`d0.l0.p0` and `d0.l0.p1` share one SBUF, so declared holds must serialize."""
+    schedule = Schedule()
+    schedule.submit(Op(name="a", unit="d0.l0.p0", engine="tensor", seconds=1.0,
+                       holds=frozenset({"sbuf"})))
+    schedule.submit(Op(name="b", unit="d0.l0.p1", engine="gpsimd", seconds=1.0,
+                       holds=frozenset({"sbuf"})))
+    assert schedule.finish_of(1) == pytest.approx(2.0)
+
+
+def test_critical_path_includes_the_op_that_held_the_engine():
+    """A serialization predecessor is as real as a data dependency.
+
+    Walking `deps` alone produced a one-element chain here, starting at an op whose own start
+    was 1.0 with nothing in the report explaining the gap.
+    """
+    schedule = Schedule()
+    schedule.submit(Op(name="first", unit="d0.l0", engine="tensor", seconds=1.0))
+    schedule.submit(Op(name="second", unit="d0.l0", engine="tensor", seconds=1.0))
+    chain = [s.op.name for s in schedule.trace.critical_path()]
+    assert chain == ["first", "second"]
+
+
+def test_p2p_is_refused_for_more_than_two_participants(hardware):
+    """A multi-party rejoin priced as one point-to-point transfer is the cheapest cheat."""
+    units = ["d0.l0", "d0.l1", "d0.l2", "d0.l3"]
+    with pytest.raises(ValueError, match="exactly 2 logical participants"):
+        collectives.cost(hardware, "p2p", 1 << 20, units)
+    # Two is the legitimate case and still charges the whole payload.
+    pair = collectives.cost(hardware, "p2p", 1 << 20, units[:2])
+    assert pair.bytes_on_wire == 1 << 20

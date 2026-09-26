@@ -59,10 +59,22 @@ def test_freeze_records_hashes_and_a_timestamp(tmp_path):
     assert frozen.framework_hashes
     assert all(path.endswith(".py") for path in frozen.framework_hashes)
     assert any(path.endswith("sim/runner.py") for path in frozen.framework_hashes)
-    # And the gate agrees nothing has changed.
-    assert checker.check_frozen(tmp_path, {
-        "hashes": frozen.hashes, "framework_hashes": frozen.framework_hashes,
-    }).passed
+    # The artifact a simulation reads is hashed as well, so regenerating it after the freeze
+    # cannot silently change every metric.
+    assert "artifact_hashes" in frozen.to_dict()
+    # And the integrity token ties the (git-ignored) manifest to the tracked tree.
+    assert (tmp_path / checker.FROZEN_TOKEN).exists()
+
+    # The gate agrees nothing has changed. The *whole* manifest is passed, because the token
+    # covers the artifact and target as well as the hashes.
+    assert checker.check_frozen(tmp_path, frozen.to_dict()).passed
+
+    # Rewriting the expected hashes without re-freezing is what the token exists to catch.
+    tampered = frozen.to_dict()
+    tampered["hashes"] = dict(tampered["hashes"], **{"sim/engine.py": "0" * 64})
+    caught = checker.check_frozen(tmp_path, tampered)
+    assert not caught.passed
+    assert any("FROZEN.json" in finding for finding in caught.findings)
 
 
 # ---------------------------------------------------------------------------------------
@@ -357,10 +369,15 @@ def test_build_refuses_to_freeze_a_circumventing_final_iteration():
         suite_path := __import__("pathlib").Path(__file__).resolve().parents[1]
         / "floorplan" / "cli.py"
     ).read_text()
-    assert 'final.verdict == "circumventing"' in source, (
+    # The gate requires an explicit `clean`, not merely "not circumventing". An empty or
+    # malformed verdict — the reviewer crashed, wrote no report, or omitted its VERDICT: line —
+    # used to satisfy the old condition and freeze a simulator that was never reviewed.
+    assert 'final.verdict != "clean"' in source, (
         f"{suite_path} no longer gates the freeze on the reviewer's verdict"
     )
     assert "NOT frozen" in source
+    assert "clean" in driver.REVIEW_VERDICTS
+    assert "" not in driver.REVIEW_VERDICTS
 
 
 # ---------------------------------------------------------------------------------------

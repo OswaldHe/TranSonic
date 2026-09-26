@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from floorplan.parser import Hardware, ceil_div
-from floorplan.schema import Address, Residency, Split
+from floorplan.schema import COMMUNICATION_FREE_DIMS, Address, Residency, Split
 from floorplan.sim import collectives
 from floorplan.sim.engine import Op, Schedule
 from floorplan.sim.memory import MemoryLedger, scope_key_for
@@ -68,9 +68,19 @@ class Workload:
     context_tokens: int   # tokens already in the KV cache (decode) or being ingested (prefill)
     new_tokens: int       # tokens produced this step: the whole prompt, or 1
     batch: int = 1
+    #: Samples whose KV cache is resident, which is the *whole* batch even when ``batch`` above
+    #: has been narrowed to one decode micro-batch. Splitting a batch-32 decode into 8
+    #: micro-batches of 4 changes how much work each pass does; it does not evict the other 28
+    #: samples' caches. Keeping these separate is what stops micro-batching from looking like a
+    #: capacity win. Defaults to ``batch`` for the prefill case, where they coincide.
+    resident_batch: int | None = None
 
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
+
+    def batch_resident(self) -> int:
+        """Samples holding a KV cache concurrently."""
+        return self.batch if self.resident_batch is None else self.resident_batch
 
 
 @dataclass(frozen=True)
@@ -403,17 +413,31 @@ class Context:
     # Recording memory.
     # ------------------------------------------------------------------
     def charge_kv(self, nbytes: int, tier: str | None = None) -> None:
-        """Charge KV-cache bytes for this shard to the tier its weights live in."""
-        chosen = tier or self.shard.residency.tier
+        """Charge KV-cache bytes for this shard.
+
+        The default tier is the *bank*, not the tier holding the weights. ``residency.tier``
+        is a weight-placement decision and the schema offers no KV-offload control, so
+        inheriting it let a plan delete its whole batch- and context-dependent KV footprint
+        from HBM just by moving the weights to host DRAM — a free win the hardware does not
+        offer, since the cache is written and read every step. A cost model that genuinely
+        models KV offload can still pass ``tier`` explicitly.
+        """
+        chosen = tier or "hbm_bank"
         self.ledger.add_kv(
             chosen, scope_key_for(chosen, self.shard.unit), nbytes, self.shard.module,
+            shard=self.shard.shard_index,
         )
 
     def charge_activation(self, nbytes: int, tier: str | None = None) -> None:
-        """Charge this shard's peak activation working set."""
-        chosen = tier or self.shard.residency.tier
+        """Charge this shard's peak activation working set.
+
+        Activations live on-chip for the same reason: they are produced and consumed within
+        the step regardless of where the weights were staged from.
+        """
+        chosen = tier or "hbm_bank"
         self.ledger.add_activation(
             chosen, scope_key_for(chosen, self.shard.unit), nbytes, self.shard.module,
+            shard=self.shard.shard_index,
         )
 
     # ------------------------------------------------------------------
@@ -427,13 +451,29 @@ class Context:
             )
         return width
 
-    def shard_of(self, total: int) -> int:
-        """``total`` divided by this shard's split, rounded up.
+    def shard_of(self, total: int, dim: str | None = None) -> int:
+        """``total`` divided by the split factors that actually partition tensors.
 
         Up, not nearest: the largest shard is what a capacity check and a critical path
         both care about, and 384 experts over 5 units is 77 somewhere.
+
+        ``shard_count`` is the product of *every* split factor, including ``batch``, and
+        dividing tensor widths by it double-counted data parallelism: a 4-way head split
+        combined with a 4-way batch split made the head width 16x narrower, when only 4 of
+        that belongs to heads and ``tokens()`` has already applied the other 4. Communication-
+        free dimensions are therefore excluded here.
+
+        Pass ``dim`` to divide by one dimension alone — the honest way to ask for "my share of
+        the experts" on a placement that also splits something else.
         """
-        return ceil_div(total, self.shard.shard_count) if self.shard.shard_count > 1 else total
+        factor = 1
+        for split in self.shard.splits:
+            if dim is not None:
+                if split.dim == dim:
+                    factor *= split.factor
+            elif split.dim not in COMMUNICATION_FREE_DIMS:
+                factor *= split.factor
+        return ceil_div(total, factor) if factor > 1 else total
 
     def tokens(self) -> int:
         """Tokens this shard processes: the prompt in prefill, or one per sample in decode.
@@ -467,5 +507,13 @@ class Context:
         The reason batch is a capacity axis and not only a throughput one. At 8192 tokens and
         batch 32 a plan holds 32x the KV of the same plan at batch 1, which is where an
         otherwise sound residency choice stops fitting.
+
+        Counted against the *resident* batch, so a decode micro-batch does not shrink it.
         """
-        return self.workload.context_tokens * self.batch_per_shard()
+        factor = self.shard.factor("batch")
+        resident = self.workload.batch_resident()
+        if factor <= 1:
+            return self.workload.context_tokens * resident
+        full, remainder = divmod(resident, factor)
+        share = full + (1 if self.shard.shard_index % factor < remainder else 0)
+        return self.workload.context_tokens * share

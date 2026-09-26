@@ -23,6 +23,7 @@ instance store's 2.45 GB/s and 33,238 IOPS. Both numbers wrong, in opposite dire
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import random
@@ -70,13 +71,49 @@ def find_instance_store() -> Path | None:
         return any(mounted(child) for child in node.get("children") or [])
 
     candidates = [
-        (int(node.get("size") or 0), node["name"])
+        (int(node.get("size") or 0), node["name"], str(node.get("model") or ""))
         for node in tree.get("blockdevices", [])
         if node.get("type") == "disk" and node["name"].startswith("nvme") and not mounted(node)
     ]
     if not candidates:
         return None
-    return Path("/dev") / max(candidates)[1]
+
+    # Prefer a disk that *identifies* as instance store. On a host with an extra unmounted EBS
+    # volume, picking the largest unmounted NVMe selected the EBS disk whenever it was bigger,
+    # and its bandwidth and IOPS were then published as the target's local-NVMe coefficients —
+    # recreating by a different route the exact measurement error the O_DIRECT rewrite fixed.
+    # AWS reports "Amazon EC2 NVMe Instance Storage" as the model for instance store and
+    # "Amazon Elastic Block Store" for EBS.
+    instance_store = [c for c in candidates if "instance storage" in c[2].lower()]
+    if instance_store:
+        return Path("/dev") / max(instance_store)[1]
+    ebs = {c[1] for c in candidates if "elastic block store" in c[2].lower()}
+    unlabelled = [c for c in candidates if c[1] not in ebs]
+    if not unlabelled:
+        # Every unmounted NVMe on this host is EBS. Measuring one would publish a network
+        # volume's numbers as local storage, so decline instead and let the caller record the
+        # tier as unresolved.
+        return None
+    return Path("/dev") / max(unlabelled)[1]
+
+
+#: Alignment O_DIRECT requires of the *memory address*, not just the offset and length.
+DIRECT_ALIGN = 4096
+
+
+def _aligned(nbytes: int) -> memoryview:
+    """A writable buffer whose address is ``DIRECT_ALIGN``-aligned.
+
+    `O_DIRECT` requires the destination address to be block-aligned, and a plain `bytearray`
+    only happens to be. For the 4 KiB random-read buffer it usually is not, so `os.preadv()`
+    failed with `EINVAL`, the probe recorded a failure, and NVMe bandwidth, latency and IOPS
+    were left unresolved — which then blocked the simulator from costing the tier at all.
+    Over-allocating and slicing to the next aligned boundary is the portable fix.
+    """
+    raw = bytearray(nbytes + DIRECT_ALIGN)
+    address = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+    offset = (-address) % DIRECT_ALIGN
+    return memoryview(raw)[offset:offset + nbytes]
 
 
 def benchmark(device: Path, seed: int = 0) -> dict:
@@ -89,7 +126,7 @@ def benchmark(device: Path, seed: int = 0) -> dict:
 
         import time
 
-        buffer = bytearray(SEQ_BLOCK)
+        buffer = _aligned(SEQ_BLOCK)
         start = time.perf_counter()
         for index in range(SEQ_COUNT):
             os.preadv(handle, [buffer], index * SEQ_BLOCK)
@@ -100,7 +137,7 @@ def benchmark(device: Path, seed: int = 0) -> dict:
             generator.randrange(0, size - BLOCK) // BLOCK * BLOCK
             for _ in range(RANDOM_COUNT)
         ]
-        small = bytearray(BLOCK)
+        small = _aligned(BLOCK)
         latencies: list[float] = []
         start = time.perf_counter()
         for offset in offsets:

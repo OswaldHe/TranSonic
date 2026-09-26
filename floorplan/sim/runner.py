@@ -295,14 +295,14 @@ def charge_weights(plan: Floorplan, modules: dict[str, dict[str, Any]], ledger: 
             residency = placement.residency
             ledger.add_weights(
                 residency.tier,
-                scope_key_for(residency.tier, unit),
+                scope_key_for(residency.tier, unit, residency.backing_device),
                 per_shard,
                 placement.module,
             )
             if residency.resident_fraction < 1.0 and residency.cache_tier:
                 ledger.add_weights(
                     residency.cache_tier,
-                    scope_key_for(residency.cache_tier, unit),
+                    scope_key_for(residency.cache_tier, unit, residency.backing_device),
                     int(per_shard * residency.resident_fraction),
                     f"{placement.module} (cache)",
                 )
@@ -331,7 +331,18 @@ def simulate_workload(
         if workload.is_prefill() and plan.runtime.pipeline_chunks
         else workload.new_tokens
     )
-    chunks = ceil_div(workload.new_tokens, chunk_tokens) if workload.is_prefill() else 1
+    if workload.is_prefill():
+        chunks = ceil_div(workload.new_tokens, chunk_tokens)
+        micro_batch = workload.batch
+    else:
+        # A decode step has one token per sample, so the only way to put more than one item in
+        # a deep pipeline is to split the *batch* into micro-batches — which is what
+        # `runtime.decode_micro_batch` is for. It was never read, so every decode ran as a
+        # single item walking all 43 layers, the stages stayed serialized at batch 32 exactly
+        # as at batch 1, and the batch-dependent pipeline tradeoff the metric grid was added to
+        # expose could not appear in any measurement.
+        micro_batch = min(plan.runtime.decode_micro_batch, workload.batch)
+        chunks = ceil_div(workload.batch, micro_batch)
 
     scratch: dict[str, Any] = {}
     # Completion indices per module, carried across the DAG so a consumer waits on its
@@ -340,6 +351,12 @@ def simulate_workload(
     for chunk_index in range(chunks):
         consumed_before = chunk_index * chunk_tokens
         this_chunk = min(chunk_tokens, workload.new_tokens - consumed_before)
+        # In decode the chunk index walks the batch, not the prompt: each pass carries one
+        # micro-batch of samples through every stage.
+        this_batch = (
+            workload.batch if workload.is_prefill()
+            else min(micro_batch, workload.batch - chunk_index * micro_batch)
+        )
         chunk_workload = Workload(
             name=workload.name,
             phase=workload.phase,
@@ -348,7 +365,8 @@ def simulate_workload(
                 else workload.context_tokens
             ),
             new_tokens=this_chunk if workload.is_prefill() else 1,
-            batch=workload.batch,
+            batch=this_batch,
+            resident_batch=workload.batch,
         )
         completions: dict[str, list[int]] = {}
         produced_by = {
@@ -365,28 +383,34 @@ def simulate_workload(
             if not placements:
                 continue
             entry = modules[module_id]
-            deps: list[int] = []
+            data_deps: list[int] = []
             for tensor in entry.get("inputs") or []:
                 producer = produced_by.get(str(tensor))
                 if producer and producer != module_id:
-                    deps.extend(completions.get(producer, []))
-
-            # `stage` is a real ordering constraint, not a label. Without this it was inert:
-            # ordering came only from data dependencies and unit contention, so changing the
-            # documented control for pipeline depth could not move any metric, and two plans
-            # with 4 and 16 stages on the same units were scheduled identically.
-            #
-            # A placement in stage N waits for every stage below N to have closed. That is what
-            # makes a deep pipeline cost something at decode, where one token in flight leaves
-            # every stage boundary a bubble with nothing to fill it.
-            earliest_stage = min(p.stage for p in placements)
-            for stage in sorted(s for s in stage_completions if s < earliest_stage):
-                deps.extend(stage_completions[stage])
+                    data_deps.extend(completions.get(producer, []))
 
             model = api.resolve(module_id, entry)
             emitted: list[int] = []
             for placement in placements:
+                # `stage` is a real ordering constraint, not a label. Without this it was
+                # inert: ordering came only from data dependencies and unit contention, so
+                # changing the documented control for pipeline depth could not move any
+                # metric, and two plans with 4 and 16 stages on the same units were scheduled
+                # identically.
+                #
+                # A placement in stage N waits for every stage below N to have closed. That is
+                # what makes a deep pipeline cost something at decode, where one item in
+                # flight leaves every stage boundary a bubble with nothing to fill it.
+                #
+                # Per placement, not per module: taking the minimum stage across a module's
+                # placements let the fractional-placement form — parts of one module on
+                # different stages — hand a later part the earliest part's dependencies, so it
+                # started too soon and paid for none of the depth it declared.
+                deps = list(data_deps)
+                for stage in sorted(s for s in stage_completions if s < placement.stage):
+                    deps.extend(stage_completions[stage])
                 group = tuple(placement.units)
+                placement_ops: list[int] = []
                 for shard_index, unit in enumerate(placement.units):
                     total = int(entry.get("param_bytes") or 0) * placement.fraction
                     shard = Shard(
@@ -431,10 +455,14 @@ def simulate_workload(
                             f"for {module_id}; emit() must return the op indices "
                             f"downstream modules wait on"
                         )
-                    emitted.extend(int(i) for i in produced)
+                    placement_ops.extend(int(i) for i in produced)
+                emitted.extend(placement_ops)
+                # Each placement's ops close *its* stage. Recording every op under every stage
+                # a module touched made a module spanning stages 3 and 7 appear to have
+                # completed stage 3 only once its stage-7 work was done, so the two stages
+                # could never overlap.
+                stage_completions.setdefault(placement.stage, []).extend(placement_ops)
             completions[module_id] = emitted
-            for placement in placements:
-                stage_completions.setdefault(placement.stage, []).extend(emitted)
 
     return WorkloadResult(
         workload=workload,

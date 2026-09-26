@@ -103,6 +103,33 @@ def find_manifest(start: Path) -> Path:
     )
 
 
+#: Where the manifest's integrity token lives, project-relative.
+#:
+#: `find_manifest()` deliberately walks *out* of an iteration worktree into the main project,
+#: and the manifest is git-ignored — so it is reachable by an agent process, invisible to scope
+#: enforcement, and invisible to the main-repo cleanliness check. An agent that edited `sim/`
+#: and then rewrote the expected hashes beside it would pass check (d) with a simulator nobody
+#: froze.
+#:
+#: This token closes that hole by binding the untracked manifest to the tracked tree: it holds
+#: a digest of the manifest's frozen fields, it lives inside `sim/`, and `sim/` is both
+#: verified by check (d) and outside every stage's editable scope. Forging the pair requires a
+#: sha256 fixed point rather than an edit.
+FROZEN_TOKEN = Path("sim") / "FROZEN.json"
+
+#: The manifest fields the token covers: everything that decides what "unchanged" means.
+TOKEN_FIELDS = ("artifact", "target", "systems_dir", "hashes", "framework_hashes",
+                "artifact_hashes")
+
+
+def manifest_digest(manifest: dict[str, Any]) -> str:
+    """A digest over the manifest fields the gate trusts."""
+    material = {key: manifest.get(key) for key in TOKEN_FIELDS}
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -123,6 +150,10 @@ def hash_tree(root: Path, trees: tuple[str, ...] = FROZEN_TREES) -> dict[str, st
         if not base.exists():
             continue
         for path in sorted(base.rglob("*")):
+            # The integrity token is excluded because it is a digest *of* this mapping;
+            # including it would make the two mutually defining and impossible to write.
+            if path == root / FROZEN_TOKEN:
+                continue
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
             if path.suffix not in {".py", ".yaml", ".yml", ".json", ".md"}:
@@ -142,11 +173,17 @@ def framework_paths() -> list[Path]:
     reproducibility and tamper-protection the gate advertises would not have held.
     """
     from floorplan import parser as parser_module
+    from floorplan import schema as schema_module
     from floorplan.sim import api, collectives, engine, memory, runner
 
+    # `schema` belongs here even though it looks like a pure data definition: the runner imports
+    # `Floorplan`, the split definitions and `WEIGHT_PARTITION_DIMS` from it to validate every
+    # plan and to decide which dimensions divide weights. Changing the installed copy after a
+    # freeze would alter which plans pass and how weights are counted while check (d) stayed
+    # green, which is exactly the drift the hash list exists to prevent.
     return sorted(
         Path(module.__file__).resolve()
-        for module in (engine, collectives, memory, api, runner, parser_module)
+        for module in (engine, collectives, memory, api, runner, parser_module, schema_module)
         if getattr(module, "__file__", None)
     )
 
@@ -154,6 +191,27 @@ def framework_paths() -> list[Path]:
 def hash_framework() -> dict[str, str]:
     """``{absolute path: sha256}`` for the installed framework."""
     return {str(path): hash_file(path) for path in framework_paths()}
+
+
+#: The artifact files every simulation reads. Not the whole artifact: traces, NEFFs and logs
+#: are large, are regenerated freely, and do not affect a cost.
+ARTIFACT_INPUTS = ("plan/partition_graph.yaml",)
+ARTIFACT_GLOBS = ("modules/*/config.json",)
+
+
+def hash_artifact(artifact: Path) -> dict[str, str]:
+    """``{relative path: sha256}`` for the artifact inputs a simulation depends on."""
+    out: dict[str, str] = {}
+    artifact = Path(artifact)
+    for relative in ARTIFACT_INPUTS:
+        path = artifact / relative
+        if path.is_file():
+            out[relative] = hash_file(path)
+    for pattern in ARTIFACT_GLOBS:
+        for path in sorted(artifact.glob(pattern)):
+            if path.is_file():
+                out[str(path.relative_to(artifact))] = hash_file(path)
+    return out
 
 
 # ---------------------------------------------------------------------------------------
@@ -282,6 +340,30 @@ def check_frozen(repo: Path, manifest: dict[str, Any]) -> Check:
             "the manifest records no hashes; the platform was never frozen. "
             "`floorplan build` writes them when it finishes"
         )
+
+    # Before trusting the manifest's hashes, check that the manifest itself is the one the
+    # freeze wrote. It lives outside git and outside every editable scope, so nothing else
+    # would notice an agent rewriting the expected hashes to match its own edits.
+    token_path = repo / FROZEN_TOKEN
+    if not token_path.exists():
+        check.fail(
+            f"{FROZEN_TOKEN} is missing, so the manifest's hashes cannot be shown to be the "
+            f"ones the build froze. Re-freeze with `floorplan build`"
+        )
+    else:
+        try:
+            token = json.loads(token_path.read_text())
+        except json.JSONDecodeError as exc:
+            token = {}
+            check.fail(f"{FROZEN_TOKEN} is not valid JSON ({exc})")
+        expected = token.get("manifest_digest")
+        actual = manifest_digest(manifest)
+        if expected and expected != actual:
+            check.fail(
+                f"the manifest does not match {FROZEN_TOKEN}: its frozen fields digest to "
+                f"{actual[:12]} but the token records {str(expected)[:12]}. The expected "
+                f"hashes, artifact or target have been changed since the freeze"
+            )
     current = hash_tree(repo)
     for relative, digest in sorted(recorded.items()):
         actual = current.get(relative)
@@ -332,6 +414,26 @@ def check_frozen(repo: Path, manifest: dict[str, Any]) -> Check:
                 check.fail(
                     f"sim/framework/{path.name} differs from the installed {path.name}. The "
                     f"reference copy and the executing code have diverged"
+                )
+
+    # The partition artifact is the third input. Older manifests have no `artifact_hashes`, so
+    # its absence is not a failure — but a mismatch is, because the parameter sizes and
+    # dependencies every cost model reads would have changed under the frozen simulator.
+    artifact_recorded = manifest.get("artifact_hashes") or {}
+    if artifact_recorded:
+        artifact_live = hash_artifact(Path(manifest["artifact"]))
+        for relative, digest in sorted(artifact_recorded.items()):
+            actual = artifact_live.get(relative)
+            if actual is None:
+                check.fail(
+                    f"artifact file {relative} is missing; the model being costed is not the "
+                    f"one the simulator was built against"
+                )
+            elif actual != digest:
+                check.fail(
+                    f"artifact file {relative} has changed since the freeze. Parameter sizes "
+                    f"and dependencies feed every cost model, so metrics across this change "
+                    f"are not comparable"
                 )
     return check
 
