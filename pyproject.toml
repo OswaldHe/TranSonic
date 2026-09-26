@@ -60,7 +60,7 @@ partition = [
 autohelix = "autohelix.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/autohelix", "partition/model_partition", "bootstrap", "floorplan"]
+packages = ["src/autohelix", "partition/model_partition", "bootstrap", "floorplan", "optimization"]
 
 # The bundled model specs, loop defaults and sample inputs are data the CLI reads
 # at runtime (`autohelix partition list/run`), and the specs reference the input
@@ -84,7 +84,7 @@ packages = ["src/autohelix", "partition/model_partition", "bootstrap", "floorpla
 # sdist stays as clean as the wheel. The PyPI readme/LICENSE/NOTICE are added
 # via force-include since they live outside the only-included paths.
 [tool.hatch.build.targets.sdist]
-only-include = ["src/autohelix", "partition/model_partition", "partition/config", "partition/inputs", "partition/compat", "partition/scripts", "bootstrap", "floorplan"]
+only-include = ["src/autohelix", "partition/model_partition", "partition/config", "partition/inputs", "partition/compat", "partition/scripts", "bootstrap", "floorplan", "optimization"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "assets/README-pypi.md" = "assets/README-pypi.md"
@@ -97,4 +97,5 @@ markers = [
     "slow: marks tests as slow (run with: pytest -m slow)",
     "bootstrap: the NKI bootstrap gate and repo materialization (no device, no network)",
     "floorplan: the floorplan schema, parser, simulator and gate (no device, no network)",
+    "optimization: the projection, constraint schedule, recipe verifier and the two gates (no device, no network)",
 ]

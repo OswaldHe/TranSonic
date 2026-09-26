@@ -1,0 +1,250 @@
+# ======================================================================================
+#  autohelix optimize — pipeline configuration
+# ======================================================================================
+#
+#  Copy this to `optimization.yaml`, fill in every `<FILL IN>`, and run:
+#
+#      autohelix optimize all --config optimization.yaml
+#
+#  or one stage at a time (see `optimization/README.md`):
+#
+#      autohelix optimize init      --config optimization.yaml
+#      autohelix optimize submodule --config optimization.yaml   # agent cuts the module down
+#      autohelix optimize run       --config optimization.yaml   # 10 iterations on one rank
+#      autohelix optimize assemble  --config optimization.yaml   # agent rebuilds all 4 ranks
+#      autohelix optimize run-full  --config optimization.yaml   # 5 iterations on the whole module
+#
+#  Anything not marked `<FILL IN>` has a default that is deliberate and documented; change
+#  those only when you mean to. Lines marked  ### EDIT ME  are the ones written for you to
+#  extend — the per-iteration constraint text and the two reviewer prompts.
+#
+# ======================================================================================
+
+
+# --------------------------------------------------------------------------------------
+#  1. What is being optimized
+# --------------------------------------------------------------------------------------
+module:
+  # The module id, exactly as it appears in the partition graph and the floorplan scheme.
+  # e.g. layers.1.ffn
+  id: <FILL IN>
+
+  # The bootstrapped module repo: a `autohelix bootstrap` project whose gate went green.
+  # Its source.py, inference.py, README.md and tensors/ are the ground truth for everything
+  # downstream — the golden, the numerical bar, and the latency to beat all come from here.
+  # e.g. /home/ubuntu/workspace/bootstrap-runs/01-MoE
+  bootstrap_repo: <FILL IN>
+
+  # The partition artifact the module came from. Supplies the frozen references
+  # (reference_torch.py, reference_numerics.py, vendor/, compat/) the stage-2 agent reads to
+  # work out what one rank computes.
+  # e.g. /home/ubuntu/workspace/partition-artifact
+  artifact: <FILL IN>
+
+
+# --------------------------------------------------------------------------------------
+#  2. Which floorplan decides how the module is split
+# --------------------------------------------------------------------------------------
+floorplan:
+  # The ranked scheme to read the module's planned placement out of.
+  # e.g. /home/ubuntu/workspace/floorplan-deepseek/schemes/rank1.yaml
+  scheme: <FILL IN>
+
+  # How many logical NeuronCores one device of this host has, and therefore the width every
+  # placement is projected onto. 4 on a trn2.3xlarge. This is also the rank count of the
+  # assembly and the value of NEURON_RT_NUM_CORES in stage 5.
+  target_units: 4
+
+  # What to do when the scheme places this module wider than `target_units`, which it does for
+  # every .ffn, every .attention and both engrams in the DeepSeek V4.1 schemes:
+  #   project  — narrow the split to fit one device and record what was given up (default)
+  #   error    — refuse to run. Only the hyper-connection modules, the norms and embed pass.
+  on_oversized: project
+
+
+# --------------------------------------------------------------------------------------
+#  3. Where the work happens
+# --------------------------------------------------------------------------------------
+workspace:
+  # Two repos are created under here: <root>/<module>-rank0 (stage 3) and
+  # <root>/<module>-full (stage 5). Both are git repos with their own .autohelix/ state.
+  root: /home/ubuntu/workspace/optimization-runs
+
+  # `python` on PATH must be able to import optimization, torch and torch_neuronx, and
+  # `torchrun` and `neuron-explorer` must be on PATH. The preflight refuses to start otherwise
+  # rather than failing four minutes into an iteration.
+  venv: /home/ubuntu/workspace/.venv
+
+
+# --------------------------------------------------------------------------------------
+#  4. Stage 3 — optimizing one rank
+# --------------------------------------------------------------------------------------
+submodule:
+  goal: |
+    Make this single-rank kernel as fast as you can without making it wrong.
+
+    The validator is frozen and it is the only judge: it loads the recorded tensors, traces the
+    kernel, measures the latency from a real profile, and compares against this rank's golden at
+    a bar that is not yours to move. Your job is everything between the arguments coming in and
+    the result going out.
+
+    Read `SUBMODULE.md` for what one rank computes and `FLOORPLAN.md` for why the split is the
+    width it is. Profile before you optimize — the `neuron-nki-profile-analysis-agent` will tell
+    you which engine is the bottleneck, and guessing at it is how iterations get wasted.
+
+  budget:
+    iterations: 10
+    iteration_time: 2h
+
+  # Lower is better. 5% of slack against the best accepted iteration, so a change that looks
+  # worse but opens a door is not thrown away, while the frontier cannot slide backwards.
+  acceptance:
+    max_regression_pct: 5
+
+  # ### EDIT ME ########################################################################
+  #
+  #  The per-iteration constraint schedule. Each range's `text` is prose: it goes into that
+  #  iteration's prompt verbatim, and — before the loop starts — a constraint-compiler agent
+  #  turns it into a checker script the optimizing agent never sees. A candidate that does not
+  #  follow its slot is rejected before the device run, and the iteration is spent.
+  #
+  #  Ranges may not overlap. A range with no text leaves those iterations unconstrained. Set
+  #  `enforce: false` to have text appear in the prompt as guidance without being checked.
+  #
+  #  Add module-specific guidance to any `text:` below — that is what the space is for.
+  #
+  iteration_constraints:
+    - from: 1
+      to: 3
+      text: |
+        **NKI only. No torch.** `source.py` may import and reference `nki` and the Python
+        standard library, and nothing else — no torch, no numpy, no scipy, not imported, not
+        referenced, not named. The arithmetic happens in NKI so it runs on the device.
+
+        These three iterations exist to establish that the fast path is reachable in NKI at all.
+        Reaching for torch here would answer a different question.
+
+        # <FILL IN: module-specific guidance for iterations 1-3, if any. For example, which
+        # engine to target first, a tiling to try, a dtype to keep, an idiom the notes from
+        # bootstrapping say did or did not compile.>
+
+    - from: 4
+      to: 6
+      text: |
+        **NKI and torch-xla are both allowed.** Mix them however serves the kernel: a torch
+        operation the compiler already fuses well is a legitimate answer, and so is replacing one
+        with NKI because it does not.
+
+        The work must still happen in the traced graph on the device. Computing on the host and
+        returning the answer is not a fast kernel, it is a slow one with the timer moved.
+
+        # <FILL IN: module-specific guidance for iterations 4-6, if any.>
+
+    - from: 7
+      to: 8
+      text: |
+        **No constraints.** Explore aggressively. If there is a restructuring the disciplined
+        iterations could not reach — a different decomposition, a different memory layout, a
+        different dtype through the middle, a different engine doing the reduction — this is
+        where it belongs.
+
+        Both of these iterations' candidates are archived whether or not they are accepted, so an
+        experiment that lands slower is still worth running and still worth writing up.
+
+        # <FILL IN: module-specific ideas worth trying in the free iterations, if any.>
+      enforce: false
+
+    - from: 9
+      to: 10
+      text: |
+        **NKI and torch-xla are both allowed.** Consolidate: take what iterations 7-8 learned and
+        land it as something that holds up. Prefer a change you can attribute to a profile over
+        one that happened to measure well once.
+
+        # <FILL IN: module-specific guidance for iterations 9-10, if any.>
+  #
+  # ####################################################################################
+
+  # ### EDIT ME ########################################################################
+  #
+  #  The stage-3 reviewer. Runs every iteration on `source.py` after the gate, reads nothing it
+  #  may write, and its output reaches both the next iteration and you. Write whatever you want
+  #  it to look for. Two things worth including, because the loop relies on them:
+  #
+  #    - an `## I/O format recommendation` section: the validator is frozen, so the agent cannot
+  #      change the kernel's input layout even when that is what is holding it back. The reviewer
+  #      is the only channel by which that reaches you.
+  #    - a final `VERDICT: clean|suspicious|circumventing` line, if you want the loop to record
+  #      one. A `circumventing` verdict on the last iteration blocks declaring the stage finished.
+  #
+  reviewer:
+    model: claude-sonnet-5
+    prompt: |
+      <FILL IN>
+
+  #
+  # ####################################################################################
+
+
+# --------------------------------------------------------------------------------------
+#  5. Stage 5 — optimizing the whole module across all four ranks
+# --------------------------------------------------------------------------------------
+full:
+  goal: |
+    Make the whole module, distributed across all four ranks of this device, as fast as you can.
+
+    The validator is frozen. It runs four ranks under torchrun, compares rank 0's post-collective
+    output against the module's recorded golden, and reports the fastest rank's latency from a
+    real collective profile. Two bounds hold throughout: faster than the bootstrapped module, and
+    within 10% of the submodule this was built from.
+
+    The collective is usually where the time is. `cc_op_time` in the profile summary isolates it.
+    Overlapping it with compute, coalescing several tensors into one collective, and moving it to
+    a cheaper point in the graph are the three things worth trying before anything else.
+
+  budget:
+    iterations: 5
+    iteration_time: 2h
+
+  acceptance:
+    max_regression_pct: 5
+
+  #  No per-iteration constraints by default. The mechanism is here so ranges can be added
+  #  without a code change — same shape as `submodule.iteration_constraints` above.
+  iteration_constraints: []      ### EDIT ME (optional)
+
+  # ### EDIT ME ########################################################################
+  #
+  #  The stage-5 reviewer. Reviewing a distributed kernel, so it is a different job from stage 3:
+  #  whether the collective is the right one, whether it sits at the right point in the graph,
+  #  whether the ranks are balanced, and whether rank 0's comparison really covers the whole
+  #  module rather than one rank's share of it.
+  #
+  reviewer:
+    model: claude-sonnet-5
+    prompt: |
+      <FILL IN>
+
+  #
+  # ####################################################################################
+
+
+# --------------------------------------------------------------------------------------
+#  6. Agents
+# --------------------------------------------------------------------------------------
+agent:
+  type: claude
+
+# The one-shot preparation agents. Not loops: a failed materialization is re-run from scratch,
+# because a half-built repo is worse than no repo. After `retries` failures the stage stops and
+# reports, rather than handing a loop a baseline that does not hold.
+preparation:
+  retries: 3
+  timeout: 4h
+
+# The constraint compiler. Runs once, before stage 3's iteration 1, and writes one checker per
+# slot. A cheaper model than the optimizing agent: turning one sentence into an `ast` walk is not
+# the job that needs the strong model, and the operator reads what it wrote.
+constraint_compiler:
+  model: claude-sonnet-5
+  timeout: 1h

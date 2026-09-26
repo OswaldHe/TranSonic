@@ -4,6 +4,38 @@
 
 ### Added
 
+- `autohelix optimize`: a five-stage pipeline that makes one bootstrapped module fast on a
+  single Trainium device. `init` projects the module's floorplan placement onto the one
+  device available and records what that cost; `submodule` has an agent cut the module down
+  to the part one NeuronCore runs, accepted by a seven-check module-agnostic gate; `run`
+  loops on that rank under a per-iteration constraint schedule; `assemble` has an agent
+  rejoin the ranks with `nki.collectives`, accepted by a nine-check gate that compares the
+  reassembled output against the bootstrapped module's own recorded golden and holds it to
+  two latency bounds; `run-full` loops on the whole module. See `optimization/README.md`.
+- Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` ranges
+  of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
+  unconstrained for aggressive exploration, and the last ones returned to the disciplined
+  regime — because ten iterations of "do whatever you like" converge on whatever the first
+  one happened to try. A *constraint compiler* agent runs once before the loop and turns
+  each range's prose into a checker script the optimizing agent never sees; the prose goes
+  into that iteration's prompt, and a candidate that does not follow it is rejected by a
+  static check before the device run rather than after it.
+- `optimization/recipe.py` checks a declared cut arithmetically without knowing what the
+  module computes: the per-rank goldens the stage-2 agent dumped, combined the way it
+  declared, must reproduce the module's recorded output. That catches a cut which drops a
+  shard, double-counts a shared path or shards along the wrong axis — the class of error
+  that would otherwise survive a whole optimization loop — while leaving *how* to cut the
+  module entirely to the agent, so the pipeline is not shaped around one architecture.
+- `optimization/projection.py` narrows an oversized floorplan placement to what one device
+  holds, dropping activation-only factors before narrowing weight-partitioning ones. Needed
+  because in the shipped DeepSeek schemes only 182 of 271 placements fit one device: all 43
+  `.ffn`, all 43 `.attention` and `lm_head` span two, and both Engram tables span four. The
+  projection is reported as a divergence from the ranked plan, with the per-core weight
+  residency it costs.
+- In both loop stages the agent may edit `source.py` alone; `inference.py` is written once
+  by the preparation agent, gated, then frozen, so one iteration's latency is comparable to
+  another's. The metric is read back from the gate's verdict rather than measured again, so
+  the gate is the only thing that runs the candidate.
 - `autohelix floorplan`: a four-stage pipeline that decides how to distribute a
   partitioned model across a Trainium instance's hierarchy — which of the 64 logical
   NeuronCores on a trn2.48xlarge holds each module, how each is split and along which

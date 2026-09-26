@@ -25,3 +25,7 @@ See the [main README](../README.md) for an overview, quick start, and the config
   partitioned model across a Trainium instance's device / logical-NeuronCore hierarchy,
   by probing the hardware, building a simulator, searching for a deployment, and ranking
   the results
+- **[Module Optimization](../optimization/README.md)** — `autohelix optimize`: make one
+  bootstrapped module fast on a single device, by cutting it down to what one NeuronCore
+  runs, optimizing that under a per-iteration constraint schedule, and rejoining the ranks
+  with `nki.collectives`

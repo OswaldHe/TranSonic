@@ -1,0 +1,511 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The whole-module gate: the only place this pipeline checks semantics.
+
+Everything upstream is advisory by design. The agent chooses how to cut the module; the submodule
+gate asks only module-agnostic questions; ten iterations of optimization are measured against a
+golden the agent itself derived. That is deliberate — a script that knew how to shard an MoE would
+work for MoE and nothing else — and it is safe only because of what happens here: the four ranks
+are reassembled, and the result has to be the bootstrapped module's recorded output, at the
+bootstrapped module's own bar, faster than the bootstrapped module, and within 10% of the
+submodule it was built from.
+
+A cut that was wrong cannot pass. A submodule that was fast because it did a quarter of the work
+and dropped the rest cannot pass. A collective that quietly reduced over one rank cannot pass. The
+looseness upstream is bounded by this gate, which is why it can be loose.
+
+    a  frozen validator  `inference.py` is the one stage 4 wrote, and it drives `source.py`
+    b  self-contained    neither file reaches outside its allowlist or this repository
+    c  nki collectives   the reduction is `nki.collectives`, not `torch.distributed` or XLA
+    d  four ranks        `torchrun --nproc_per_node=4`, every rank exits 0
+    e  matches           the post-collective output equals the module's recorded output
+    f  measured          a fresh 4-rank collective profile, and the latency is read from it
+    g  provenance        the input, weights and golden are the recorded bytes
+    h  faster            quicker than the bootstrapped single-core module
+    i  overhead bounded  no slower than 1.1x the submodule it is made of
+
+(c) exists because `torch.distributed.all_reduce` would work and would measure the wrong thing:
+the point of the exercise is a kernel whose collective is inside the traced graph, where the
+compiler can overlap it. Verified feasible before this gate was written — a 4-rank
+`nki.collectives.all_reduce` and `all_to_all` both compile and run on this toolchain at LNC=2, and
+`neuron-explorer capture --collectives-profile-id all` reports the collective separately as
+`cc_op_time`.
+
+(h) and (i) are constraints, not metrics, and they are checked here rather than left to
+`acceptance.metric_gates` because they compare against numbers measured *outside* this run. A
+metric gate can only compare an iteration against the best iteration of the same loop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from bootstrap.nki_checker import CheckResult
+from optimization import gate
+from optimization.gate import (
+    CEILING_NAME,
+    INFERENCE_FILE,
+    LATENCY_MARKER,
+    MAX_ABS_ERR_MARKER,
+    PASSED_MARKER,
+    SOURCE_FILE,
+    TOLERANCE_NAMES,
+    CheckerError,
+    RunOutcome,
+)
+
+CHECK_TITLES: dict[str, str] = {
+    "a": "frozen validator",
+    "b": "self-containment",
+    "c": "nki collectives",
+    "d": "four ranks",
+    "e": "matches the module",
+    "f": "measurement",
+    "g": "data provenance",
+    "h": "faster than the bootstrap",
+    "i": "collective overhead bounded",
+}
+
+MANIFEST_REL = ".autohelix/optimization/module.json"
+
+#: The number of ranks the assembly runs, and the value of `NEURON_RT_NUM_CORES`. Four: the logical
+#: NeuronCores of one trn2 device, which is what `PROJECTION_TARGET_UNITS` projected onto.
+RANKS = 4
+
+#: How the validator is launched. `torchrun` for the correctness run — `torch.distributed` only
+#: bootstraps the process group, and every reduction happens in `nki.collectives` on device.
+LAUNCH = ["torchrun", "--nproc_per_node", str(RANKS), INFERENCE_FILE]
+
+#: Per-rank latency markers the validator must print, on top of the fastest-rank `latency_ms`.
+#: Required rather than optional: without them "the fastest rank" is the candidate's unverifiable
+#: claim, and load imbalance — the thing that makes a fastest-rank number optimistic — is invisible.
+RANK_LATENCY_MARKER = "latency_rank_{rank}_ms"
+
+#: What the collective must come from, and what it must not. The banned forms all work; they just
+#: measure a different machine than the one the floorplan is about.
+COLLECTIVE_MODULE = "nki.collectives"
+COLLECTIVE_OPS = ("all_reduce", "all_gather", "all_to_all", "reduce_scatter", "collective_permute")
+BANNED_COLLECTIVES = (
+    "torch.distributed.all_reduce", "torch.distributed.all_gather",
+    "torch.distributed.reduce_scatter", "torch.distributed.all_to_all",
+    "dist.all_reduce", "dist.all_gather", "dist.reduce_scatter", "dist.all_to_all",
+    "xm.all_reduce", "xm.all_gather", "xm.mesh_reduce", "xm.reduce_scatter",
+    "xm.all_to_all",
+)
+
+#: `torch.distributed` calls that are legitimate: they organize processes, they do not reduce data.
+ALLOWED_DIST_CALLS = frozenset({
+    "init_process_group", "destroy_process_group", "barrier", "get_rank", "get_world_size",
+    "is_initialized", "new_group",
+})
+
+SOURCE_ALLOWED_IMPORTS = frozenset({
+    "nki", "neuronxcc", "torch", "torch_neuronx", "torch_xla", "numpy",
+})
+INFERENCE_ALLOWED_IMPORTS = SOURCE_ALLOWED_IMPORTS | {"source"}
+
+#: Longer than the submodule's: four ranks, each compiling its own graph on a cold cache, then a
+#: separate `neuron-explorer capture` pass over the result.
+DEFAULT_RUN_TIMEOUT = 4800
+
+#: How much of the submodule's latency the collective may add. The bound that makes a lazy cut fail.
+OVERHEAD_ALLOWANCE = 1.10
+
+
+def find_manifest(repo: Path) -> Path:
+    for candidate in [repo, *repo.parents]:
+        path = candidate / MANIFEST_REL
+        if path.is_file():
+            return path
+    raise CheckerError(
+        f"no {MANIFEST_REL} at or above {repo} — was this repo made by `autohelix optimize assemble`?"
+    )
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CheckerError(f"{path} is unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CheckerError(f"{path} is not a JSON object")
+    return data
+
+
+def expected_tolerance(manifest: dict[str, Any]) -> dict[str, float]:
+    """The bootstrapped module's own five constants, unchanged.
+
+    Not re-derived and not loosened. The golden is the same `tensors/reference.bin` the bootstrap
+    loop matched, so the bar that admitted that kernel is the bar that admits this one. The 4-rank
+    reduction order differs from the reference's single `dist.all_reduce`, so accumulation order
+    shifts slightly — and absorbing that is what a bar with a pass fraction and a cosine is for.
+    """
+    recorded = manifest.get("tolerance") or {}
+    missing = [n for n in (*TOLERANCE_NAMES, CEILING_NAME) if n not in recorded]
+    if missing:
+        raise CheckerError(f"the manifest records no {', '.join(missing)}")
+    return {n: float(recorded[n]) for n in (*TOLERANCE_NAMES, CEILING_NAME)}
+
+
+# --------------------------------------------------------------------------------------
+# the checks
+# --------------------------------------------------------------------------------------
+
+
+def check_frozen_validator(repo: Path, manifest: dict[str, Any]) -> CheckResult:
+    """(a) `inference.py` is byte-identical to what stage 4 froze, and it drives `source.py`.
+
+    Scope enforcement already reverts an edit to `inference.py`, but that depends on git noticing.
+    This verifies the hash recorded at the freeze — the same belt-and-braces reasoning as the
+    floorplan gate's frozen-platform check, and for the same reason: the validator is the only
+    thing standing between a fast kernel and a wrong one.
+    """
+    findings: list[str] = []
+    recorded = (manifest.get("frozen") or {}).get(INFERENCE_FILE)
+    path = repo / INFERENCE_FILE
+    if not path.is_file():
+        return CheckResult("a", CHECK_TITLES["a"], False, "missing",
+                           [f"{INFERENCE_FILE} is gone"])
+    if recorded:
+        actual = _sha256(path)
+        if actual != recorded:
+            findings.append(
+                f"{INFERENCE_FILE} has changed since stage 4 froze it "
+                f"(recorded {recorded[:12]}, found {actual[:12]}). It is the validator, not the "
+                f"candidate — an edit here changes what passing means"
+            )
+    else:
+        findings.append("the manifest records no hash for the frozen validator")
+
+    entry = str(manifest.get("entry_point") or "kernel")
+    source = gate._parse(repo / SOURCE_FILE)
+    if entry not in gate.top_level_functions(source):
+        findings.append(f"{SOURCE_FILE} defines no top-level '{entry}'")
+    inference = gate._parse(path)
+    if "source" not in gate._import_roots(inference):
+        findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
+    return CheckResult("a", CHECK_TITLES["a"], not findings,
+                       f"frozen, drives '{entry}'" if not findings
+                       else f"{len(findings)} problem(s)", findings)
+
+
+def check_self_contained(repo: Path) -> CheckResult:
+    """(b) Neither file reaches outside its allowlist or outside this repository."""
+    findings: list[str] = []
+    for filename, allowed in ((SOURCE_FILE, SOURCE_ALLOWED_IMPORTS),
+                              (INFERENCE_FILE, INFERENCE_ALLOWED_IMPORTS)):
+        tree = gate._parse(repo / filename)
+        findings += gate.import_findings(tree, allowed, filename)
+        findings += gate.path_findings(tree, filename)
+    source = gate._parse(repo / SOURCE_FILE)
+    for dotted, line in sorted(gate.called_attributes(source).items(), key=lambda kv: kv[1]):
+        if dotted.rsplit(".", 1)[-1] in gate.FILE_IO_NAMES:
+            findings.append(
+                f"{SOURCE_FILE}:{line} calls '{dotted}' — the kernel receives its tensors as "
+                f"arguments and may not read files"
+            )
+    return CheckResult("b", CHECK_TITLES["b"], not findings,
+                       "both files are self-contained" if not findings
+                       else f"{len(findings)} problem(s)", findings)
+
+
+def check_nki_collectives(repo: Path) -> CheckResult:
+    """(c) The reduction is `nki.collectives`, and no host-side collective stands in for it."""
+    findings: list[str] = []
+    source = gate._parse(repo / SOURCE_FILE)
+    calls = gate.called_attributes(source)
+    inference_calls = gate.called_attributes(gate._parse(repo / INFERENCE_FILE))
+
+    used = [d for d in calls if any(d.endswith(f".{op}") or d == op for op in COLLECTIVE_OPS)]
+    from_nki = [
+        d for d in used
+        if d.startswith(COLLECTIVE_MODULE) or d.startswith("ncc.") or d.startswith("collectives.")
+    ]
+    imports = gate._import_roots(source)
+    has_import = "nki" in imports
+    if not used:
+        findings.append(
+            f"{SOURCE_FILE} calls no collective at all. Four ranks each holding part of the "
+            f"module cannot produce the whole module's output without one"
+        )
+    elif not from_nki and not has_import:
+        findings.append(
+            f"{SOURCE_FILE} calls {', '.join(sorted(used))} but does not take it from "
+            f"{COLLECTIVE_MODULE}"
+        )
+
+    for where, found in ((SOURCE_FILE, calls), (INFERENCE_FILE, inference_calls)):
+        for dotted, line in sorted(found.items(), key=lambda kv: kv[1]):
+            if dotted in BANNED_COLLECTIVES:
+                findings.append(
+                    f"{where}:{line} calls '{dotted}'. The reduction has to happen inside the "
+                    f"traced graph via {COLLECTIVE_MODULE} — a host-side or XLA collective works "
+                    f"and measures a different machine"
+                )
+            elif dotted.startswith(("dist.", "torch.distributed.")):
+                tail = dotted.rsplit(".", 1)[-1]
+                if tail not in ALLOWED_DIST_CALLS:
+                    findings.append(
+                        f"{where}:{line} calls '{dotted}'. torch.distributed may organize the "
+                        f"four processes ({', '.join(sorted(ALLOWED_DIST_CALLS))}) but may not "
+                        f"move tensor data"
+                    )
+    return CheckResult("c", CHECK_TITLES["c"], not findings,
+                       f"reduction via {', '.join(sorted(from_nki or used))}" if not findings
+                       else f"{len(findings)} problem(s)", findings)
+
+
+def check_four_ranks(run: RunOutcome) -> CheckResult:
+    """(d) All four ranks ran and all four exited 0."""
+    findings: list[str] = []
+    if not run.ran:
+        findings.append(f"the validator did not start: {run.detail}")
+    else:
+        if run.detail:
+            findings.append(run.detail)
+        if run.return_code != 0:
+            tail = "\n".join(run.output.strip().splitlines()[-15:])
+            findings.append(
+                f"torchrun exited {run.return_code}. With four ranks this is usually one rank "
+                f"failing and taking the others down\nlast output:\n{tail}"
+            )
+    seen = [r for r in range(RANKS)
+            if gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r)) is not None]
+    if len(seen) != RANKS:
+        absent = sorted(set(range(RANKS)) - set(seen))
+        findings.append(
+            f"no ##autohelix[{RANK_LATENCY_MARKER.format(rank='N')}=...] for rank(s) {absent}. "
+            f"Every rank has to report, or 'the fastest rank' is an unverifiable claim"
+        )
+    return CheckResult("d", CHECK_TITLES["d"], not findings,
+                       f"{RANKS} ranks, all exit 0" if not findings
+                       else f"{len(findings)} problem(s)", findings)
+
+
+def check_matches(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckResult:
+    """(e) The reassembled output matches the module's recorded output at the pinned bar."""
+    findings: list[str] = []
+    findings += gate.pinned_constants(gate._parse(repo / INFERENCE_FILE), bar, INFERENCE_FILE)
+
+    passed = gate.marker_value(run.output, PASSED_MARKER)
+    if passed is None:
+        findings.append(f"the run printed no ##autohelix[{PASSED_MARKER}=...] line")
+    elif passed != 1:
+        findings.append(
+            f"the run reported {PASSED_MARKER}={passed:g}: the reassembled output does not match "
+            f"the module's recorded output"
+        )
+    worst = gate.marker_value(run.output, MAX_ABS_ERR_MARKER)
+    ceiling = bar[CEILING_NAME]
+    if worst is None:
+        findings.append(
+            f"the run printed no ##autohelix[{MAX_ABS_ERR_MARKER}=...] line, so the "
+            f"{CEILING_NAME} ceiling could not be checked"
+        )
+    elif worst > ceiling:
+        findings.append(
+            f"worst element off by {worst:g}, over the {CEILING_NAME} ceiling of {ceiling:g}"
+        )
+    return CheckResult("e", CHECK_TITLES["e"], not findings,
+                       f"matches at the module's bar (worst {worst:g})" if not findings and worst
+                       else ("matches" if not findings else f"{len(findings)} problem(s)"),
+                       findings)
+
+
+def check_measurement(run: RunOutcome) -> CheckResult:
+    """(f) A fresh 4-rank collective profile, and the reported latency is the fastest rank of it."""
+    findings: list[str] = []
+    if not run.artifacts.get("neff"):
+        findings.append("the run left no fresh .neff behind")
+    ntffs = run.artifacts.get("ntff") or []
+    per_rank = [n for n in ntffs if "_rank_" in Path(n).name]
+    if len(per_rank) < RANKS:
+        findings.append(
+            f"the run left {len(per_rank)} fresh per-rank .ntff file(s), expected {RANKS} from "
+            f"`neuron-explorer capture --collectives-worker-count {RANKS} "
+            f"--collectives-profile-id all`"
+        )
+
+    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    if reported is None:
+        findings.append(f"the run printed no ##autohelix[{LATENCY_MARKER}=...] line")
+        return CheckResult("f", CHECK_TITLES["f"], False, f"{len(findings)} problem(s)", findings)
+    if reported <= 0:
+        findings.append(f"the reported latency is {reported:g} ms, which is not a measurement")
+
+    rank_latencies = {
+        r: gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
+        for r in range(RANKS)
+    }
+    known = {r: v for r, v in rank_latencies.items() if v is not None}
+    if known:
+        fastest = min(known.values())
+        if abs(reported - fastest) > max(1e-6, 0.001 * fastest):
+            findings.append(
+                f"{LATENCY_MARKER} is {reported:g} ms but the fastest rank reported "
+                f"{fastest:g} ms (rank {min(known, key=lambda r: known[r])}). The metric is the "
+                f"fastest rank, and it has to be one of the numbers the ranks actually printed"
+            )
+    summary = f"{reported:g} ms (fastest of {len(known)} ranks)"
+    if len(known) == RANKS:
+        spread = max(known.values()) - min(known.values())
+        summary += f", spread {spread:g} ms"
+    return CheckResult("f", CHECK_TITLES["f"], not findings,
+                       summary if not findings else f"{len(findings)} problem(s)", findings)
+
+
+def check_provenance(repo: Path, manifest: dict[str, Any]) -> CheckResult:
+    """(g) The input, weights and golden are the bootstrapped module's recorded bytes."""
+    findings: list[str] = []
+    inference = gate._parse(repo / INFERENCE_FILE)
+    findings += gate.fabrication_findings(inference, INFERENCE_FILE)
+
+    recorded = manifest.get("tensors") or {}
+    if not recorded:
+        findings.append("the manifest lists no tensors, so provenance cannot be established")
+    checked = 0
+    for name, entry in sorted(recorded.items()):
+        rel = str(entry.get("file") or "")
+        path = repo / rel
+        if not path.is_file():
+            findings.append(f"{rel} is missing from the repo")
+            continue
+        want = entry.get("sha256")
+        if want:
+            checked += 1
+            if _sha256(path) != want:
+                findings.append(f"{rel} has been edited since the repo was built")
+    return CheckResult("g", CHECK_TITLES["g"], not findings,
+                       f"{checked} tensor(s) match the record" if not findings
+                       else f"{len(findings)} problem(s)", findings)
+
+
+def check_faster(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
+    """(h) Faster than the bootstrapped single-core module."""
+    baseline = (manifest.get("baselines") or {}).get("bootstrap_latency_ms")
+    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    if baseline is None:
+        return CheckResult("h", CHECK_TITLES["h"], False, "no baseline recorded",
+                           ["the manifest records no bootstrap_latency_ms to beat"])
+    if reported is None:
+        return CheckResult("h", CHECK_TITLES["h"], False, "no latency reported",
+                           [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
+    baseline = float(baseline)
+    if reported >= baseline:
+        speedup = baseline / reported if reported else 0.0
+        return CheckResult(
+            "h", CHECK_TITLES["h"], False, f"{reported:g} ms vs {baseline:g} ms",
+            [f"{reported:g} ms is not faster than the bootstrapped module's {baseline:g} ms "
+             f"({speedup:.2f}x). Four ranks that do not beat one core have spent their "
+             f"parallelism on overhead"],
+        )
+    return CheckResult("h", CHECK_TITLES["h"], True,
+                       f"{reported:g} ms vs {baseline:g} ms ({baseline / reported:.2f}x)")
+
+
+def check_overhead(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
+    """(i) No slower than 1.1x the submodule it is made of.
+
+    The bound that makes a lazy cut fail. A submodule that was fast because it quietly did a
+    quarter of the work leaves the assembly with three-quarters still to do, and no collective is
+    cheap enough to hide that inside 10%.
+    """
+    submodule = (manifest.get("baselines") or {}).get("submodule_latency_ms")
+    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    if submodule is None:
+        return CheckResult("i", CHECK_TITLES["i"], False, "no submodule latency recorded",
+                           ["the manifest records no submodule_latency_ms"])
+    if reported is None:
+        return CheckResult("i", CHECK_TITLES["i"], False, "no latency reported",
+                           [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
+    submodule = float(submodule)
+    ceiling = submodule * OVERHEAD_ALLOWANCE
+    if reported > ceiling:
+        excess = (reported / submodule - 1.0) * 100 if submodule else float("inf")
+        return CheckResult(
+            "i", CHECK_TITLES["i"], False, f"{reported:g} ms vs {ceiling:g} ms allowed",
+            [f"{reported:g} ms is {excess:.1f}% over the submodule's {submodule:g} ms, past the "
+             f"{(OVERHEAD_ALLOWANCE - 1) * 100:.0f}% the collective is allowed"],
+        )
+    overhead = (reported / submodule - 1.0) * 100 if submodule else 0.0
+    return CheckResult("i", CHECK_TITLES["i"], True,
+                       f"{overhead:+.1f}% over the submodule's {submodule:g} ms")
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------------------
+# driving
+# --------------------------------------------------------------------------------------
+
+
+def evaluate(repo: Path, manifest: dict[str, Any],
+             timeout: int) -> tuple[list[CheckResult], RunOutcome]:
+    """One `torchrun` of the frozen validator, then all nine checks off that execution."""
+    bar = expected_tolerance(manifest)
+    run = gate.run_candidate(
+        repo, LAUNCH, timeout=timeout,
+        env_overrides={"NEURON_RT_NUM_CORES": str(RANKS)},
+    )
+    return [
+        check_frozen_validator(repo, manifest),
+        check_self_contained(repo),
+        check_nki_collectives(repo),
+        check_four_ranks(run),
+        check_matches(run, bar, repo),
+        check_measurement(run),
+        check_provenance(repo, manifest),
+        check_faster(run, manifest),
+        check_overhead(run, manifest),
+    ], run
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=".", help="the candidate repository")
+    parser.add_argument("--json", default=None, help="where to write the machine-readable verdict")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
+    args = parser.parse_args(argv)
+
+    repo = Path(args.repo).resolve()
+    try:
+        manifest = load_manifest(find_manifest(repo))
+        results, run = evaluate(repo, manifest, args.timeout)
+    except CheckerError as exc:
+        report = f"\nwhole-module gate\n\n  [FAIL] the repo is unusable — {exc}\n"
+        print(report)
+        if args.json:
+            gate.write_verdict([], None, "whole-module gate", Path(args.json),
+                               extra={"passed": False, "error": str(exc), "report": report})
+        return 2
+
+    extra: dict[str, Any] = {}
+    latency = gate.marker_value(run.output, LATENCY_MARKER)
+    if latency is not None:
+        extra["latency_ms"] = latency
+        extra["rank_latency_ms"] = {
+            str(r): gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
+            for r in range(RANKS)
+        }
+    verdict = gate.write_verdict(
+        results, run, "whole-module gate", Path(args.json) if args.json else None, extra=extra,
+    )
+    print(verdict.report)
+    return 0 if verdict.passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

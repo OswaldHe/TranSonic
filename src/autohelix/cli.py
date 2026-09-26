@@ -797,9 +797,41 @@ class _FloorplanGroup(click.Group):
         return self._delegate().get_command(ctx, name)
 
 
+class _OptimizeGroup(click.Group):
+    """Lazy proxy for the `optimize` CLI.
+
+    Same reasoning as the other three proxies: the optimization pipeline reads a bootstrapped
+    module repo, a partition artifact and a floorplan scheme, and drives the NKI toolchain — and no
+    other `autohelix` invocation should pay to import them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="optimize",
+            help="Make one bootstrapped module fast on a single Trainium device.",
+        )
+
+    def _delegate(self) -> click.Group:
+        try:
+            from optimization.cli import optimize
+        except ImportError as exc:
+            raise click.ClickException(
+                f"The optimize subsystem is unavailable ({exc}). It needs the extras "
+                'in partition/: pip install -e ".[partition]"'
+            ) from exc
+        return optimize
+
+    def list_commands(self, ctx):
+        return self._delegate().list_commands(ctx)
+
+    def get_command(self, ctx, name):
+        return self._delegate().get_command(ctx, name)
+
+
 main.add_command(_PartitionGroup())
 main.add_command(_BootstrapGroup())
 main.add_command(_FloorplanGroup())
+main.add_command(_OptimizeGroup())
 
 
 if __name__ == "__main__":

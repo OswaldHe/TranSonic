@@ -40,6 +40,11 @@ uv pip install -e ".[dev]"
   `probe` (measure primitives on real silicon), `build` (an agent writes the simulator's
   per-module cost models, then they are frozen by hash), `run` (five iterations editing only
   `floorplan.yaml`), `rank` (a blind agent ranks the top three). See `floorplan/README.md`
+- `optimization/` - the optimization pipeline (`autohelix optimize`): makes one bootstrapped
+  module fast on a single device. Five stages — `init` (project the floorplan's placement onto
+  one device), `submodule` (an agent cuts the module to one rank), `run` (N iterations under a
+  per-iteration constraint schedule), `assemble` (an agent rejoins the ranks with
+  `nki.collectives`), `run-full`. See `optimization/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -60,6 +65,7 @@ autohelix report       # Agent-written analysis of the run
 autohelix partition    # Model partitioning / tracing / verification (see partition/)
 autohelix bootstrap    # Bootstrap a Trainium NKI kernel for one module (see bootstrap/)
 autohelix floorplan    # Decide what runs where on a Trainium instance (see floorplan/)
+autohelix optimize     # Make one bootstrapped module fast on one device (see optimization/)
 ```
 
 ## Testing
@@ -69,6 +75,7 @@ pytest                    # run all fast tests
 pytest -k partition       # just the model-partitioning suite (no network, no GPU)
 pytest -m bootstrap       # just the NKI bootstrap suite (no network, no device)
 pytest -m floorplan       # just the floorplan suite (no network, no device)
+pytest -m optimization    # just the optimization suite (no network, no device)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers
