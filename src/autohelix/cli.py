@@ -766,8 +766,40 @@ class _BootstrapGroup(click.Group):
         return self._delegate().get_command(ctx, name)
 
 
+class _FloorplanGroup(click.Group):
+    """Lazy proxy for the `floorplan` CLI.
+
+    Same reasoning as the other two proxies: floorplanning reads a partition artifact and,
+    for `probe`, the NKI toolchain, and no other `autohelix` invocation should pay to import
+    them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="floorplan",
+            help="Decide how to distribute a model across a Trainium instance's hierarchy.",
+        )
+
+    def _delegate(self) -> click.Group:
+        try:
+            from floorplan.cli import floorplan
+        except ImportError as exc:
+            raise click.ClickException(
+                f"The floorplan subsystem is unavailable ({exc}). It needs the extras "
+                'in partition/: pip install -e ".[partition]"'
+            ) from exc
+        return floorplan
+
+    def list_commands(self, ctx):
+        return self._delegate().list_commands(ctx)
+
+    def get_command(self, ctx, name):
+        return self._delegate().get_command(ctx, name)
+
+
 main.add_command(_PartitionGroup())
 main.add_command(_BootstrapGroup())
+main.add_command(_FloorplanGroup())
 
 
 if __name__ == "__main__":
