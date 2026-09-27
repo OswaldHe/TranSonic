@@ -888,3 +888,55 @@ def test_seeding_says_so_when_there_is_no_verdict_to_seed(tmp_path):
     pipeline.console = Console(quiet=True)
     pipeline._seed_baseline_verdict(repo, "submodule")
     assert not (repo / ".autohelix" / "optimization" / "gate.json").exists()
+
+
+def test_an_unconstrained_slot_is_not_reported_as_drift(tmp_path):
+    """The manifest records every slot; only the enforceable ones are compiled.
+
+    Comparing the recorded schedule against `enforceable()` reported each unconstrained slot as
+    removed, which recompiled every checker on each `run_loop` invocation — two wasted agent runs on
+    the first real pass. The shipped schedule has exactly this shape: 7-8 is deliberately empty.
+    """
+    from optimization import constraints as cons
+
+    schedule = cons.Schedule.from_config([
+        {"from": 1, "to": 3, "text": "NKI only."},
+        {"from": 4, "to": 6, "text": "Both allowed."},
+        {"from": 7, "to": 8, "text": ""},
+        {"from": 9, "to": 10, "text": "Both allowed."},
+    ], max_iterations=10)
+
+    compiled = []
+    for slot in schedule.enforceable():
+        path = cons.checker_path(tmp_path, slot)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# --repo --json 'passed' 'findings'\n")
+        compiled.append(
+            cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))
+        )
+    cons.write_manifest(tmp_path, compiled, schedule)
+
+    assert [c.label for c in compiled] == ["1-3", "4-6", "9-10"]
+    assert cons.schedule_drift(tmp_path, schedule) == []
+
+
+def test_a_slot_that_stopped_being_enforceable_is_reported(tmp_path):
+    """The real version of that finding: it was compiled, and now it would not be."""
+    from optimization import constraints as cons
+
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    slot = schedule.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        schedule,
+    )
+    narrowed = cons.Schedule.from_config([
+        {"from": 1, "to": 3, "text": "NKI only.", "enforce": False},
+        {"from": 4, "to": 5, "text": "Both allowed."},
+    ])
+    findings = cons.schedule_drift(tmp_path, narrowed)
+    assert any("no longer enforceable" in f for f in findings)

@@ -423,8 +423,18 @@ def schedule_drift(project_path: Path, schedule: Schedule) -> list[str]:
             findings.append(f"slot {slot.label}'s constraint text has changed since it was compiled")
         if bool(entry.get("enforce", True)) != slot.enforce:
             findings.append(f"slot {slot.label}'s enforcement has been toggled")
-    for label in sorted(set(by_label) - {s.label for s in enforceable}):
-        findings.append(f"slot {label} was compiled but is no longer in the schedule")
+    # The reverse direction compares against what was *compiled*, not against the recorded schedule.
+    # The manifest records every slot, enforceable or not, so comparing the recorded schedule with
+    # `enforceable()` reported each unconstrained slot as "compiled but no longer in the schedule" —
+    # a finding that is never true of a slot that was never compiled, and which recompiled all the
+    # checkers on every `run_loop` invocation. That cost two needless agent runs on the first real
+    # pass before it was noticed.
+    compiled = {
+        str(entry.get("label")) for entry in (manifest.get("slots") or [])
+        if isinstance(entry, dict)
+    }
+    for label in sorted(compiled - {s.label for s in enforceable}):
+        findings.append(f"slot {label} was compiled but is no longer enforceable")
     return findings
 
 
