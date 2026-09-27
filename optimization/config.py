@@ -35,6 +35,12 @@ class ConfigError(ValueError):
 #: fifty lines deeper.
 PLACEHOLDER = "<FILL IN>"
 
+#: How long a reviewer gets. Reviewing a kernel here is not the skim upstream's default assumes —
+#: it means reading a few hundred lines of NKI against a reference and forming an adversarial view
+#: of whether the iteration is real — and a reviewer killed mid-read leaves the iteration with no
+#: verdict, which is the one thing the loop cannot recover later.
+REVIEWER_TIMEOUT_SECONDS = 2000
+
 
 @dataclass
 class StageConfig:
@@ -48,6 +54,7 @@ class StageConfig:
     schedule: Schedule = field(default_factory=Schedule)
     reviewer_prompt: str = ""
     reviewer_model: str | None = None
+    reviewer_timeout_seconds: int = REVIEWER_TIMEOUT_SECONDS
 
     @property
     def has_reviewer(self) -> bool:
@@ -271,7 +278,11 @@ class PipelineConfig:
                 for slot in spec.schedule.slots
             ]
         if spec.has_reviewer:
-            payload["reviewer"] = {"prompt": spec.reviewer_prompt, "auto_memory": False}
+            payload["reviewer"] = {
+                "prompt": spec.reviewer_prompt,
+                "auto_memory": False,
+                "timeout_seconds": spec.reviewer_timeout_seconds,
+            }
             if spec.reviewer_model:
                 payload["reviewer"]["model"] = spec.reviewer_model
         return payload
@@ -348,4 +359,7 @@ def _stage(data: dict[str, Any], name: str) -> StageConfig:
         schedule=schedule,
         reviewer_prompt=str(reviewer.get("prompt") or ""),
         reviewer_model=reviewer.get("model"),
+        reviewer_timeout_seconds=int(
+            reviewer.get("timeout_seconds", REVIEWER_TIMEOUT_SECONDS)
+        ),
     )

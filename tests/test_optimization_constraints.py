@@ -231,3 +231,48 @@ def test_checkers_live_outside_what_the_worktree_is_seeded_with():
     parts = cons.CONSTRAINTS_REL.parts
     assert parts[0] == ".autohelix"
     assert parts[1] not in seeded
+
+
+# -- the end-of-interval escape --------------------------------------------------------
+
+
+def test_the_last_iteration_of_an_interval_is_identified():
+    schedule = cons.Schedule.from_config([
+        {"from": 1, "to": 3, "text": "a"},
+        {"iterations": [5, 7, 9], "text": "b"},
+    ])
+    assert schedule.slots[0].last_iteration == 3
+    assert schedule.slots[1].last_iteration == 9
+
+
+def test_a_single_iteration_slot_is_its_own_last():
+    schedule = cons.Schedule.from_config([{"iterations": [4], "text": "a"}])
+    assert schedule.slots[0].last_iteration == 4
+
+
+def test_the_prompt_threatens_rejection_inside_an_interval():
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    for iteration in (1, 2):
+        text = schedule.describe_for_prompt(iteration)
+        assert "rejected and its work discarded" in text
+        assert "strictly faster" not in text
+
+
+def test_the_prompt_offers_the_escape_on_the_last_iteration():
+    """The agent has to know the terms, or it will follow the constraint into a dead end."""
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    text = schedule.describe_for_prompt(3)
+    assert "no longer fatal" in text
+    assert "strictly faster" in text
+    assert "5%" in text
+    assert "rejected and its work discarded" not in text
+
+
+def test_the_checker_command_carries_the_advisory_flag():
+    enforcing = cons.CHECKER_COMMAND.format(checker="/c.py", report="/r.json", advisory="")
+    advisory = cons.CHECKER_COMMAND.format(
+        checker="/c.py", report="/r.json", advisory=" --advisory",
+    )
+    assert "optimization.slotcheck" in enforcing
+    assert "--advisory" not in enforcing
+    assert advisory.endswith("--advisory")

@@ -69,6 +69,9 @@ class OptimizationLoop(Harness):
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.schedule = self._load_schedule()
         self._slot_verdicts: dict[int, cons.SlotVerdict] = {}
+        #: Which iteration `_check_metric_gates` is judging. Upstream does not pass it, and the
+        #: end-of-interval rule needs to know whose slot verdict to consult.
+        self._current_iteration: int | None = None
 
     # -- configuration -------------------------------------------------------------
 
@@ -129,27 +132,31 @@ class OptimizationLoop(Harness):
     def run_iteration(self, iteration: int) -> IterationResult:
         """One iteration: agent, slot check, then upstream's constraints/metric/review path.
 
-        The slot check is spliced in between scope enforcement and the constraints. Everything
-        after it is `Harness.run_iteration`, reached by letting the base class run when the slot
-        passes — rather than copied, so the acceptance logic, the metric gates and the reviewer
-        stay in one place.
+        The slot check is spliced in as constraint zero. Everything after it is
+        `Harness.run_iteration` rather than a copy of it, so the acceptance logic, the metric gates
+        and the reviewer stay in one place.
         """
+        # `_check_metric_gates` needs to know which iteration it is judging, and upstream does not
+        # pass it. Set before the branch so it is right for ungoverned iterations too.
+        self._current_iteration = iteration
+
         slot = self.schedule.slot_for(iteration)
         if slot is None or not (slot.has_text and slot.enforce):
             return super().run_iteration(iteration)
-
-        # A governed iteration needs the agent's work in hand before the slot can be judged, so the
-        # cheapest correct structure is to let the base class do everything and check the slot
-        # inside the constraint phase. `run_constraints` is where that hook goes.
         return self._run_governed_iteration(iteration)
 
     def _run_governed_iteration(self, iteration: int) -> IterationResult:
         """`Harness.run_iteration` with the slot checker prepended to the constraint list.
 
-        Implemented by temporarily prefixing `config.constraints` with the checker command. That
-        keeps one copy of the iteration body: the slot becomes constraint zero, so a violation is
-        rejected by exactly the path a failing constraint already takes, with the same reporting,
-        the same discard and the same failure output carried into the next prompt.
+        Implemented by temporarily prefixing `config.constraints` with the checker command, so a
+        violation is rejected by exactly the path a failing constraint already takes — same
+        reporting, same discard, same failure output carried into the next prompt.
+
+        On the **last** iteration of the slot's interval the checker runs `--advisory`: it writes the
+        same verdict but exits 0, so the real constraints and the measurement still run, and the
+        accept/reject decision moves to `_check_metric_gates`, which requires a strict improvement
+        instead of allowing the usual 5%. By then the agent has had every iteration the slot allows,
+        and discarding something correct and faster buys nothing.
         """
         from autohelix.config import ConstraintCommand
 
@@ -167,35 +174,99 @@ class OptimizationLoop(Harness):
         report.parent.mkdir(parents=True, exist_ok=True)
         if report.exists():
             report.unlink()  # a stale verdict from a re-run would be read as this iteration's
-        command = cons.CHECKER_COMMAND.format(checker=checker, report=report)
+
+        advisory = iteration >= slot.last_iteration
+        command = cons.CHECKER_COMMAND.format(
+            checker=checker, report=report, advisory=" --advisory" if advisory else "",
+        )
+        if advisory:
+            self.console.print(
+                f"  [dim]slot {slot.label}: last iteration of the interval, so the constraint is "
+                f"checked but not fatal — acceptance needs a strict improvement instead[/dim]"
+            )
 
         original = list(self.config.constraints)
-        self.config.constraints = [ConstraintCommand(command=command, timeout=120), *original]
+        self.config.constraints = [ConstraintCommand(command=command, timeout=180), *original]
         try:
             result = super().run_iteration(iteration)
         finally:
             self.config.constraints = original
 
-        # The checker's own JSON report is the authority on whether the slot was followed, not the
-        # iteration's outcome: a rejection from the real constraints or the metric gate is an
-        # ordinary failure that happened to run after a passing slot check, and recording it as a
-        # violation would blame the schedule for it.
-        verdict = cons.read_slot_verdict(
-            iteration, slot.label, report, result.failure_output or "",
-            return_code=0 if report.is_file() else 1,
-        )
-        self._slot_verdicts[iteration] = verdict
+        verdict = self._slot_verdict(iteration, slot, report, result.failure_output or "")
         if not verdict.passed:
-            result.reason = f"constraint slot {slot.label} violated"
             self.console.print(f"  [red]{verdict.summary()}[/red]")
             if verdict.findings:
                 self.console.print(Panel(
                     Text("\n".join(verdict.findings)),
                     title=f"constraint slot {slot.label}", border_style="red",
                 ))
+            if not advisory:
+                result.reason = f"constraint slot {slot.label} violated"
         elif verdict.checked:
             self.console.print(f"  [green]{verdict.summary()}[/green]")
         return result
+
+    def _slot_verdict(
+        self, iteration: int, slot: cons.Slot, report: Path, output: str,
+    ) -> cons.SlotVerdict:
+        """Read (and cache) whether one iteration followed its slot.
+
+        The checker's own JSON report is the authority, not the iteration's outcome: a rejection
+        from the real constraints or the metric gate is an ordinary failure that happened to run
+        after a passing slot check, and recording it as a violation would blame the schedule.
+        """
+        cached = self._slot_verdicts.get(iteration)
+        if cached is not None:
+            return cached
+        verdict = cons.read_slot_verdict(
+            iteration, slot.label, report, output,
+            return_code=0 if report.is_file() else 1,
+        )
+        self._slot_verdicts[iteration] = verdict
+        return verdict
+
+    # -- acceptance ----------------------------------------------------------------
+
+    def _check_metric_gates(self, metrics: dict[str, float]) -> str | None:
+        """Upstream's gate, plus the stricter rule for an end-of-interval violation.
+
+        A candidate that violated its slot on the interval's last iteration reached this point only
+        because the checker ran advisory. It does not get the 5% of slack every compliant iteration
+        gets: it has to be **strictly faster** than the best accepted so far. Correct-and-faster is
+        worth keeping; correct-and-merely-not-much-worse is not, when it also ignored the constraint.
+        """
+        iteration = getattr(self, "_current_iteration", None)
+        verdict = self._slot_verdicts.get(iteration) if iteration is not None else None
+        slot = self.schedule.slot_for(iteration) if iteration is not None else None
+
+        if verdict is None and iteration is not None and slot is not None:
+            # The gate runs inside `Harness.run_iteration`, before `_run_governed_iteration` gets
+            # to read the report, so on the first pass the verdict has to be read here.
+            report = cons.report_path(self.project_path, iteration)
+            if report.is_file():
+                verdict = self._slot_verdict(iteration, slot, report, "")
+
+        if verdict is None or verdict.passed or not verdict.checked:
+            return super()._check_metric_gates(metrics)
+
+        value = metrics.get(METRIC)
+        if value is None:
+            return f"metric gate: {METRIC} not produced by benchmark"
+        best = self.history.get_best_metrics(self.config.metric_directions()).get(METRIC)
+        if best is None:
+            return super()._check_metric_gates(metrics)
+        best_value, best_iteration = best
+        if value < best_value:
+            self.console.print(
+                f"  [yellow]kept anyway:[/yellow] slot {verdict.label} was not followed, but "
+                f"{METRIC} improved {best_value:g} -> {value:g} ms and the correctness gate passed"
+            )
+            return None
+        return (
+            f"constraint slot {verdict.label} violated on its last iteration and {METRIC} did not "
+            f"improve ({value:g} ms against the best {best_value:g} ms from iter {best_iteration}). "
+            f"An iteration that ignores its constraint has to earn it with a strict improvement"
+        )
 
     # -- candidate archive ---------------------------------------------------------
 

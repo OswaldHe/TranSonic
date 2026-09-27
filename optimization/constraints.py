@@ -49,8 +49,13 @@ CONSTRAINTS_REL = Path(".autohelix") / "optimization" / "constraints"
 #: The record of what the compiler produced, hashed so a later edit to a checker is detectable.
 MANIFEST_REL = CONSTRAINTS_REL / "manifest.json"
 
-#: What a checker is invoked as. `--repo .` is the candidate; the JSON is where findings go.
-CHECKER_COMMAND = "python {checker} --repo . --json {report}"
+#: What a checker is invoked as. Driven through `optimization.slotcheck` rather than directly, so
+#: that the last iteration of an interval can run it `--advisory` — writing the same verdict but
+#: exiting 0, which lets the measurement proceed and hands the accept/reject decision to the loop's
+#: stricter end-of-interval rule. See `optimization/slotcheck.py`.
+CHECKER_COMMAND = (
+    "python -m optimization.slotcheck --checker {checker} --repo . --json {report}{advisory}"
+)
 
 
 class ScheduleError(ValueError):
@@ -71,6 +76,17 @@ class Slot:
     enforce_explicit: bool = False
     #: Filled in by `compile_schedule`: the checker written for this slot.
     checker: str | None = None
+
+    @property
+    def last_iteration(self) -> int:
+        """The final iteration this slot governs.
+
+        The one where a violation stops being fatal: by then the agent has had every iteration the
+        slot allows, so a correct-and-faster candidate that still misses the constraint is worth
+        keeping. See `optimization/slotcheck.py` for the reasoning and the stricter rule that
+        replaces the rejection.
+        """
+        return max(self.iterations)
 
     @property
     def label(self) -> str:
@@ -228,13 +244,22 @@ class Schedule:
             "",
             slot.text.strip(),
         ]
-        if slot.enforce:
+        if slot.enforce and iteration < slot.last_iteration:
             lines += [
                 "",
                 "This is checked by a script you cannot see, before anything is measured. An "
                 "iteration that does not follow it is rejected and its work discarded, however "
                 "fast it is — so if you believe the constraint is wrong for this module, say so "
                 "in your notes and follow it anyway.",
+            ]
+        elif slot.enforce:
+            lines += [
+                "",
+                f"This is the last iteration this constraint governs, so it is checked but no "
+                f"longer fatal. If you cannot satisfy it and you have something correct and "
+                f"**strictly faster than the best so far**, it will still be kept — the usual 5% "
+                f"of slack is what you give up, not the work. Follow the constraint if you can; "
+                f"say in your notes why you could not if you did not.",
             ]
         return "\n".join(lines)
 

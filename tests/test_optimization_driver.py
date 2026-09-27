@@ -472,3 +472,139 @@ def test_the_template_documents_the_two_editable_regions():
     template = presets.config_template()
     assert template.count("### EDIT ME") >= 4
     assert template.count("<FILL IN>") >= 5
+
+
+# ======================================================================================
+# the reviewer timeout, and the end-of-interval acceptance rule
+# ======================================================================================
+
+
+def test_both_reviewers_get_the_long_timeout(tmp_path):
+    """Reviewing a kernel is not a skim, and a reviewer killed mid-read leaves no verdict."""
+    from optimization.config import REVIEWER_TIMEOUT_SECONDS
+
+    config = PipelineConfig.load(_filled(tmp_path))
+    for stage in ("submodule", "full"):
+        reviewer = config.derive_loop_config(stage)["reviewer"]
+        assert reviewer["timeout_seconds"] == REVIEWER_TIMEOUT_SECONDS == 2000
+
+
+def test_the_reviewer_timeout_can_be_overridden(tmp_path):
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["submodule"]["reviewer"]["timeout_seconds"] = 600
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    config = PipelineConfig.load(path)
+    assert config.derive_loop_config("submodule")["reviewer"]["timeout_seconds"] == 600
+    assert config.derive_loop_config("full")["reviewer"]["timeout_seconds"] == 2000
+
+
+def test_the_template_sets_the_reviewer_timeout_for_both_stages():
+    data = yaml.safe_load(presets.config_template())
+    assert data["submodule"]["reviewer"]["timeout_seconds"] == 2000
+    assert data["full"]["reviewer"]["timeout_seconds"] == 2000
+
+
+def test_autohelix_applies_the_reviewer_timeout(tmp_path):
+    """It has to reach `AgentConfig`, not merely sit in the YAML."""
+    from autohelix.config import Config
+
+    config = PipelineConfig.load(_filled(tmp_path))
+    parsed = Config.from_dict(config.derive_loop_config("submodule"))
+    assert parsed.reviewer is not None
+    assert parsed.reviewer.timeout_seconds == 2000
+
+
+class _FakeHistory:
+    def __init__(self, best):
+        self._best = best
+
+    def get_best_metrics(self, directions=None):
+        return {"latency_ms": self._best} if self._best is not None else {}
+
+
+class _FakeConfig:
+    """Only what `_check_metric_gates` reads off the config."""
+
+    def metric_directions(self):
+        return {"latency_ms": "lower"}
+
+
+def _loop_stub(schedule, verdicts, best, tmp_path):
+    """An OptimizationLoop with only the attributes `_check_metric_gates` reaches for.
+
+    Built by `__new__` rather than by constructing a real loop: the real one needs a git repo, a
+    config file and a worktree, none of which this rule touches.
+    """
+    from rich.console import Console
+
+    from optimization.loop import OptimizationLoop
+
+    loop = OptimizationLoop.__new__(OptimizationLoop)
+    loop.schedule = schedule
+    loop._slot_verdicts = verdicts
+    loop._current_iteration = None
+    loop.history = _FakeHistory(best)
+    loop.config = _FakeConfig()
+    loop.console = Console(quiet=True)
+    loop.project_path = tmp_path
+    return loop
+
+
+def _violation(iteration, label):
+    from optimization.constraints import SlotVerdict
+
+    return SlotVerdict(iteration, label, checked=True, passed=False,
+                       findings=["source.py:4 imports torch"])
+
+
+def test_an_end_of_interval_violation_is_kept_when_it_improves(tmp_path):
+    """Correct and strictly faster: the constraint shaped the search, and the search is over."""
+    from optimization.constraints import Schedule
+
+    schedule = Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    loop = _loop_stub(schedule, {3: _violation(3, "1-3")}, (100.0, 2), tmp_path)
+    loop._current_iteration = 3
+    assert loop._check_metric_gates({"latency_ms": 90.0}) is None
+
+
+def test_an_end_of_interval_violation_is_rejected_when_it_does_not_improve(tmp_path):
+    """It does not get the 5% of slack a compliant iteration gets — it has to earn the escape."""
+    from optimization.constraints import Schedule
+
+    schedule = Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    loop = _loop_stub(schedule, {3: _violation(3, "1-3")}, (100.0, 2), tmp_path)
+    loop._current_iteration = 3
+
+    # Inside the 5% slack a compliant iteration would be allowed, and still rejected here.
+    reason = loop._check_metric_gates({"latency_ms": 103.0})
+    assert reason is not None
+    assert "did not improve" in reason and "strict improvement" in reason
+    # Equal is not an improvement either.
+    assert loop._check_metric_gates({"latency_ms": 100.0}) is not None
+
+
+def test_a_compliant_iteration_keeps_the_ordinary_slack(tmp_path):
+    """The escape must not become the rule: a followed constraint still gets its 5%."""
+    from optimization.constraints import Schedule, SlotVerdict
+
+    schedule = Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    followed = SlotVerdict(3, "1-3", checked=True, passed=True)
+    loop = _loop_stub(schedule, {3: followed}, (100.0, 2), tmp_path)
+    loop._current_iteration = 3
+
+    from unittest.mock import patch
+
+    with patch("autohelix.harness.Harness._check_metric_gates", return_value=None) as upstream:
+        assert loop._check_metric_gates({"latency_ms": 103.0}) is None
+        assert upstream.called
+
+
+def test_a_violation_with_no_metric_is_rejected(tmp_path):
+    from optimization.constraints import Schedule
+
+    schedule = Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    loop = _loop_stub(schedule, {3: _violation(3, "1-3")}, (100.0, 2), tmp_path)
+    loop._current_iteration = 3
+    reason = loop._check_metric_gates({"something_else": 1.0})
+    assert reason is not None and "not produced" in reason

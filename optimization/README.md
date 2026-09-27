@@ -79,6 +79,26 @@ reproduces the golden perfectly. That cut fails at stage 4, on the +10% bound, b
 ranks cannot make the whole module fast. The two checks divide the work on purpose — conflating them
 would make the arithmetic one reject legitimate asymmetric cuts.
 
+## What the agents are not told
+
+`source.py` and `inference.py` are carried into an optimization repo with their **comments and
+docstrings removed** (`strip.py`). Those were written by an earlier agent, and they are its claims
+about the hardware and the compiler — some hard-won and right, some wrong, and indistinguishable at a
+glance. A claim in a comment reads as established fact to the agent that reads it next, which will
+design around it without testing it.
+
+This repository has already produced the worked example. `floorplan/README.md` states that NKI 0.6.0
+exposes no collective primitive, and the floorplan's intra-device bandwidth is *derived* rather than
+measured on the strength of it. The claim is false, and it went unchallenged because it was written
+down confidently. A comment inside a kernel is the same hazard with less visibility.
+
+`reference_torch.py`, `reference_numerics.py`, `reference_inference.py`, `vendor/` and `compat/` keep
+theirs — that is the vendor's and the harness's own code, carried in verbatim as the specification,
+and its comments are authoritative rather than inferred. The rule is by filename, so a directory
+added to a repo later cannot accidentally be exposed to it. Formatting is preserved exactly
+(position-based removal, not a `tokenize` round-trip), and the result is re-parsed before it is
+written: a file that cannot be stripped safely is left alone and reported.
+
 ## The per-iteration constraint schedule
 
 The novel part. Ten iterations of "do whatever you like" converge on whatever the first iteration
@@ -105,6 +125,13 @@ Four properties, each a choice:
   iteration 4 still gets slot 4. The budget, the schedule and the transcript stay aligned.
 - **The checker runs before the device run.** It is a static read of one file costing milliseconds;
   the run it saves is four minutes of hardware. A violating iteration is rejected without spending it.
+- **On the last iteration of a range the constraint is checked but not fatal.** By then the agent has
+  had every iteration the range allows, and the constraint's job — shaping the search — is done. A
+  candidate that still misses it while passing the correctness gate and being **strictly faster** than
+  the best so far is kept. What it gives up is the 5% of regression slack every compliant iteration
+  gets, so the escape has to be earned rather than taken. `slotcheck.py` runs the checker
+  `--advisory` there (same verdict, exit 0) and `loop.py`'s `_check_metric_gates` applies the
+  stricter rule.
 - **A permissive slot still gets a checker.** "Both NKI and torch are allowed" has nothing to reject,
   so the compiler writes one that passes and says in a comment why. Otherwise "there was nothing to
   check" is indistinguishable from "the compiler failed to write a script".
@@ -243,6 +270,8 @@ optimization/
   projection.py            a floorplan placement -> what one device holds, and what that cost
   materialize.py           the two repos: what the preparation agents read
   recipe.py                the declared reassembly, checked arithmetically
+  strip.py                 removing an earlier agent's comments from the code the next one reads
+  slotcheck.py             running a compiled checker, enforcing or advisory
   loop.py                  Harness + the per-iteration constraint, candidate archive, best commit
   constraints.py           the schedule, the compiled checkers, their manifest
   gate.py                  what the two gates share (reuses bootstrap/nki_checker's analysis)
@@ -273,6 +302,9 @@ optimization/
   not a worse starting point than the last attempt, it is not a starting point. Read the last report
   before raising `preparation.retries`, because a repeated failure is the prompt or the module rather
   than luck.
+- **Stripping never touches the originals.** The bootstrapped repo keeps its comments; only the
+  copies inside an optimization repo lose them. If you want to read the bootstrap agent's reasoning,
+  it is still in `bootstrap-runs/<module>/`.
 - **The checkers are hidden, not sandboxed.** They live under `.autohelix/optimization/constraints/`,
   which `Sandbox.prepare_worktree` does not seed into a worktree — but a worktree sits *inside* the
   project, so a determined agent can walk up to them. As in `floorplan`, treat it as a speed bump

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from optimization.projection import Projection
+from optimization.strip import StripResult, strip_tree
 
 #: What a materialized repo carries, by role. `module/` and `reference/` are read-only inputs;
 #: `tensors/` is the agent's to fill from them.
@@ -251,6 +252,12 @@ def materialize_submodule(
     records = read_tensor_table(readme)
     golden = golden_record(records)
 
+    # The bootstrapped kernel and validator arrive stripped of their commentary. See
+    # `optimization/strip.py`: those comments are the bootstrap agent's claims about the hardware
+    # and the compiler, some of them wrong, and a wrong claim in a comment reads as established
+    # fact to the agent that reads it next. `reference/` is untouched — it is the specification.
+    stripped = strip_tree(module_dst)
+
     (repo / "FLOORPLAN.md").write_text(projection.describe())
     (repo / "README.md").write_text(_submodule_readme(
         module_id, projection, entry_point, bar, golden, tensors_note,
@@ -262,6 +269,7 @@ def materialize_submodule(
     manifest = {
         "module": module_id,
         "entry_point": entry_point,
+        "stripped": [s.describe() for s in stripped],
         "projection": projection.to_dict(),
         "module_output": {
             "file": f"{MODULE_DIR}/{golden.file}",
@@ -426,6 +434,12 @@ def materialize_full(
     records = read_tensor_table(readme)
     golden = golden_record(records)
 
+    # Both carried-in kernels lose their commentary, for the reason in `optimization/strip.py`.
+    # `submodule/` matters as much as `module/` here: its comments are stage 2's and stage 3's
+    # claims, written by agents that were themselves reading a stripped copy, and the assembly
+    # agent has no way to tell a measured one from a guess.
+    stripped = strip_tree(module_dst) + strip_tree(submodule_dst)
+
     tensors: dict[str, Any] = {}
     for record in records:
         path = repo / "tensors" / Path(record.file).name
@@ -451,6 +465,7 @@ def materialize_full(
         "module": module_id,
         "entry_point": entry_point,
         "ranks": projection.projected_units,
+        "stripped": [s.describe() for s in stripped],
         "projection": projection.to_dict(),
         "tolerance": bar,
         "tensors": tensors,

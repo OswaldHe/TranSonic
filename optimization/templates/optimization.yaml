@@ -35,6 +35,11 @@ module:
   # e.g. /home/ubuntu/workspace/bootstrap-runs/01-MoE
   bootstrap_repo: <FILL IN>
 
+  # The bootstrapped repo's source.py and inference.py are carried in with their comments and
+  # docstrings removed. Those are the bootstrap agent's claims about the hardware and the
+  # compiler, and a wrong one reads as established fact to the agent that reads it next. The
+  # frozen references under reference/ keep theirs — they are the specification, not inference.
+  #
   # The partition artifact the module came from. Supplies the frozen references
   # (reference_torch.py, reference_numerics.py, vendor/, compat/) the stage-2 agent reads to
   # work out what one rank computes.
@@ -111,6 +116,12 @@ submodule:
   #  Ranges may not overlap. A range with no text leaves those iterations unconstrained. Set
   #  `enforce: false` to have text appear in the prompt as guidance without being checked.
   #
+  #  On the **last iteration of each range** the constraint is checked but is no longer fatal: if
+  #  the candidate still misses it while passing the correctness gate and being *strictly faster*
+  #  than the best so far, it is kept anyway. By then the agent has had every iteration the range
+  #  allows, and throwing away something correct and faster buys nothing. What it gives up is the
+  #  5% of regression slack every compliant iteration gets — so the escape has to be earned.
+  #
   #  Add module-specific guidance to any `text:` below — that is what the space is for.
   #
   iteration_constraints:
@@ -179,6 +190,10 @@ submodule:
   #
   reviewer:
     model: claude-sonnet-5
+    # Reviewing a kernel is not a skim: a few hundred lines of NKI read against a reference,
+    # with an adversarial view of whether the iteration is real. A reviewer killed mid-read
+    # leaves the iteration with no verdict, which is the one thing the loop cannot recover.
+    timeout_seconds: 2000
     prompt: |
       <FILL IN>
 
@@ -222,6 +237,7 @@ full:
   #
   reviewer:
     model: claude-sonnet-5
+    timeout_seconds: 2000
     prompt: |
       <FILL IN>
 

@@ -250,11 +250,13 @@ class Pipeline:
             self.console.print(f"\n[bold]submodule, attempt {attempt}[/bold] → {repo}")
             if repo.exists():
                 shutil.rmtree(repo)
-            materialize.materialize_submodule(
+            prepared = materialize.materialize_submodule(
                 repo=repo, bootstrap_repo=self.config.bootstrap_repo,
                 artifact=self.config.artifact, projection=projection,
                 module_id=self.config.module_id,
             )
+            for line in prepared.get("stripped") or []:
+                self.console.print(f"  [dim]stripped {line}[/dim]")
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id,
                 "entry_point": "kernel",
@@ -440,13 +442,15 @@ class Pipeline:
             self.console.print(f"\n[bold]assemble, attempt {attempt}[/bold] → {repo}")
             if repo.exists():
                 shutil.rmtree(repo)
-            materialize.materialize_full(
+            prepared = materialize.materialize_full(
                 repo=repo, bootstrap_repo=self.config.bootstrap_repo,
                 artifact=self.config.artifact, submodule_repo=submodule_repo,
                 projection=projection, module_id=self.config.module_id,
                 bootstrap_latency_ms=bootstrap_ms, submodule_latency_ms=submodule_ms,
                 best_commit=best_commit,
             )
+            for line in prepared.get("stripped") or []:
+                self.console.print(f"  [dim]stripped {line}[/dim]")
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id, "entry_point": "kernel",
                 "ranks": ranks, "last_rank": ranks - 1,

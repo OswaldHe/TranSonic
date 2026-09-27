@@ -32,6 +32,20 @@
   `.ffn`, all 43 `.attention` and `lm_head` span two, and both Engram tables span four. The
   projection is reported as a divergence from the ranked plan, with the per-core weight
   residency it costs.
+- `source.py` and `inference.py` are carried into an optimization repo with their comments and
+  docstrings removed. They were written by an earlier agent and are its claims about the hardware
+  and the compiler, indistinguishable at a glance from established fact, and the next agent will
+  design around a wrong one without testing it — this repository's own `floorplan/README.md` claim
+  that NKI 0.6.0 has no collective primitive is the worked example. The frozen references,
+  `vendor/` and `compat/` keep theirs: that code is the specification, not inference.
+- On the last iteration of a constraint range the constraint is checked but no longer fatal. A
+  candidate that still misses it, passes the correctness gate and is *strictly faster* than the best
+  so far is kept — by then the agent has had every iteration the range allows, and discarding
+  something correct and faster buys nothing. It forfeits the 5% of regression slack a compliant
+  iteration gets, so the escape is earned rather than taken.
+- Reviewers get 2000 seconds. Reviewing a kernel here means reading a few hundred lines of NKI
+  against a reference and forming an adversarial view of whether the iteration is real, and a
+  reviewer killed mid-read leaves the iteration with no verdict at all.
 - In both loop stages the agent may edit `source.py` alone; `inference.py` is written once
   by the preparation agent, gated, then frozen, so one iteration's latency is comparable to
   another's. The metric is read back from the gate's verdict rather than measured again, so
