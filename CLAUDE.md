@@ -104,3 +104,19 @@ User-facing docs are plain markdown in `docs/` (see `docs/README.md` for the ind
 - **Editable install:** the package is installed with `pip install -e .`, so edits under `src/autohelix/` are live immediately — no reinstall needed. Only re-run `pip install -e .` if `pyproject.toml` dependencies or console-script entry points change.
 - **Agent edits the main repo instead of the worktree:** iterations run in a git worktree, but if an editable install (`.pth`) or a hardcoded absolute path resolves imports/writes back to the *main* repo, the iteration is rejected with "Main repo has uncommitted changes." Keep per-iteration writable paths inside the worktree, and put long-lived outputs (models, large artifacts) at a fixed absolute path *outside* the repo entirely.
 - **Resetting a run is not just `autohelix clear`:** `clear` only archives `.autohelix/` run state — it does NOT touch code or external outputs. A full reset = `clear` + `git reset --hard <initial-commit>` (roll back the agent's per-iteration commits) + delete any outputs written outside the repo (e.g. model checkpoints). Then the tree must be committed-clean or `run` refuses to start. See "Resetting a run" in README.md.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues on `OswaldHe/TranSonic`, via the `gh` CLI. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
