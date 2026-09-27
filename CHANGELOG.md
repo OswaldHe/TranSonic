@@ -43,6 +43,28 @@
   so far is kept — by then the agent has had every iteration the range allows, and discarding
   something correct and faster buys nothing. It forfeits the 5% of regression slack a compliant
   iteration gets, so the escape is earned rather than taken.
+- The gate's own first contact with reality. A real run of stage 2 reached 5 of 7 checks and failed
+  on two checker bugs rather than on the candidate: a literal `"/"` used as a `str.join` separator
+  was read as an absolute path, and 586 provenance findings came from a manifest shape the prompt
+  had never specified. Both are fixed — the tensor record is now read keyed by path, keyed by name
+  or as a list, and the prompt states the shape — and both now have tests, because a gate that
+  enforces what its prompt does not state is a trap rather than a requirement.
+- Also from that run: a rank's partial legitimately has the reference's flattened `(tokens, dim)`
+  shape where the module's golden is `(batch, tokens, dim)`, so the reassembly check reshapes when
+  the element count matches; and `NEURON_RT_VISIBLE_CORES` is how a single-core run pins itself to a
+  core, so only a widened `NEURON_RT_NUM_CORES` is refused now.
+- Hardened the places where the gates could be satisfied without the work. Collective calls are
+  resolved through the file's import table, so `import torch.distributed as ncc; ncc.all_reduce(...)`
+  no longer reads as the NKI collective. The reassembly check requires one distinct golden per rank
+  and refuses the module's own recorded output as a shard, closing the path where a declaration
+  reproduces the target without involving any rank. Non-finite marker values are dropped rather than
+  parsed, since `nan` defeats every comparison that guards the pipeline. The preparation agents no
+  longer own the manifest fields the gates read back. And the assembly's rank count comes from the
+  recorded projection instead of a hardcoded four, which a one- or two-unit placement could never
+  have satisfied.
+- Fixed the candidate archive, which retained nothing: it read each iteration back out of its branch
+  after the loop, and `Sandbox.remove_worktree` deletes that branch inside the iteration. Candidates
+  are now captured in the last moment the worktree exists.
 - Reviewers get 2000 seconds. Reviewing a kernel here means reading a few hundred lines of NKI
   against a reference and forming an adversarial view of whether the iteration is real, and a
   reviewer killed mid-read leaves the iteration with no verdict at all.

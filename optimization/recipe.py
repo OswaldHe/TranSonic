@@ -106,6 +106,44 @@ def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     return mapping[key]
 
 
+def validate_shards(
+    recipe: dict[str, Any], factor: int | None, module_golden: str | None,
+) -> list[str]:
+    """Findings if the declared shard list is not one golden per rank.
+
+    The check that keeps this verifier honest. Without it a declaration can name the module's own
+    recorded output as its single shard and reproduce the target exactly — the arithmetic passes
+    while no rank output was involved at all, which is the one way a bad cut could get through the
+    only early check standing against it.
+
+    Three requirements, each closing a distinct way to satisfy the sum without doing the work:
+    as many shards as there are ranks, all of them distinct, and none of them the module golden.
+    """
+    findings: list[str] = []
+    shards = [str(s) for s in (recipe.get("shards") or [])]
+
+    if factor is not None and len(shards) != factor:
+        findings.append(
+            f"reassembly.shards names {len(shards)} golden(s) but the cut is {factor}-way. "
+            f"There has to be one per rank, or the sum is not over the whole module"
+        )
+    duplicated = sorted({s for s in shards if shards.count(s) > 1})
+    if duplicated:
+        findings.append(
+            f"reassembly.shards repeats {', '.join(duplicated)}. Each rank's golden is a different "
+            f"tensor; naming one twice counts its contribution twice and omits another rank's"
+        )
+    if module_golden:
+        wanted = Path(module_golden).name
+        for shard in shards:
+            if Path(shard).name == wanted:
+                findings.append(
+                    f"reassembly.shards names '{shard}', which is the module's own recorded output. "
+                    f"Reassembling the answer from the answer proves nothing about the cut"
+                )
+    return findings
+
+
 def apply_recipe(repo: Path, recipe: dict[str, Any]) -> np.ndarray:
     """Combine the per-rank goldens the recipe names into one array.
 
@@ -159,7 +197,17 @@ def compare(
     imported one can be changed somewhere else.
     """
     if got.shape != want.shape:
-        return False, {}, f"shape {got.shape} against the recorded {want.shape}"
+        # A leading batch axis is allowed to differ, because the reference itself flattens: the
+        # module's golden is `(1, 128, 5120)` while a rank's partial is the `(128, 5120)` that
+        # `x.view(-1, dim)` produces and `y.view(shape)` restores. Same elements in the same order,
+        # so comparing them is comparing the same tensor — the first real run failed here for
+        # exactly that, with a cut that was otherwise correct.
+        if got.size != want.size:
+            return False, {}, (
+                f"shape {got.shape} holds {got.size} element(s) against the recorded "
+                f"{want.shape}'s {want.size}"
+            )
+        got = got.reshape(want.shape)
 
     a, b = got.ravel(), want.ravel()
     abs_err = np.abs(a - b)
@@ -189,6 +237,15 @@ def compare(
             f"worst element off by {max_abs_err:g}, over the ceiling of {bar['MAX_ABS_ERR']:g}"
         )
     return not reasons, metrics, "; ".join(reasons)
+
+
+def _factor(declaration: dict[str, Any]) -> int | None:
+    """The declared cut width, when it is stated as a positive integer."""
+    try:
+        factor = int(declaration.get("factor"))
+    except (TypeError, ValueError):
+        return None
+    return factor if factor > 0 else None
 
 
 def verify_recipe(
@@ -223,6 +280,12 @@ def verify_recipe(
         )
     bar = {k: float(bar_source[k]) for k in bar_source if k in {
         "RTOL", "ATOL", "MIN_COSINE", "MIN_PASS_FRACTION", "MAX_ABS_ERR"}}
+
+    problems = validate_shards(
+        recipe, _factor(declaration), str(module_golden.get("file") or ""),
+    )
+    if problems:
+        return RecipeOutcome(reproduces=False, detail="; ".join(problems))
 
     got = apply_recipe(repo, recipe)
     ok, metrics, detail = compare(got, want, bar)

@@ -163,7 +163,11 @@ def test_the_derived_config_pins_what_is_not_the_operators(tmp_path):
     config = PipelineConfig.load(_filled(tmp_path))
     derived = config.derive_loop_config("submodule")
     assert derived["scope"]["editable"] == ["source.py"]
-    assert derived["metrics"][0]["values"] == {"latency_ms": "lower"}
+    values = derived["metrics"][0]["values"]
+    assert values["latency_ms"] == "lower"
+    # Recorded, never gated: the spread is what keeps the fastest-rank metric's optimism visible.
+    assert set(values) == {"latency_ms", "slowest_rank_ms", "rank_spread_ms"}
+    assert [g["metric"] for g in derived["acceptance"]["metric_gates"]] == ["latency_ms"]
     assert "optimization.submodule_checker" in derived["constraints"][0]["command"]
     assert derived["acceptance"]["metric_gates"][0]["max_regression_pct"] == 5
 
@@ -262,7 +266,12 @@ def _bootstrap_repo(tmp_path: Path) -> Path:
     (repo / "inference.py").write_text("import source\n")
     (repo / "README.md").write_text(_readme())
     for name in ("input.bin", "reference.bin", "w1.bin"):
-        (repo / "tensors" / name).write_bytes(b"\x00\x01" * 8)
+        path = repo / "tensors" / name
+        if path.exists():
+            # Materialization makes the recorded tensors read-only on the shared inode, so a
+            # fixture reused within one test has to restore write permission first.
+            path.chmod(0o644)
+        path.write_bytes(b"\x00\x01" * 8)
     (repo / "reference_torch.py").write_text("# what it computes\n")
     (repo / "reference_numerics.py").write_text("# what counts as matching\n")
     return repo
@@ -608,3 +617,160 @@ def test_a_violation_with_no_metric_is_rejected(tmp_path):
     loop._current_iteration = 3
     reason = loop._check_metric_gates({"something_else": 1.0})
     assert reason is not None and "not produced" in reason
+
+
+# ======================================================================================
+# PR review: custody, schedule drift, quoting, the gate command
+# ======================================================================================
+
+
+def test_pipeline_owned_manifest_fields_are_restored(tmp_path):
+    """The preparation agent writes the file the gate then trusts for the bar and the bounds."""
+    from optimization import custody
+
+    manifest_path = tmp_path / "module.json"
+    original = {
+        "module": "layers.1.ffn",
+        "tolerance": {"MAX_ABS_ERR": 0.280469},
+        "baselines": {"bootstrap_latency_ms": 2793.29, "submodule_latency_ms": 700.0},
+        "ranks": 4,
+        "frozen": {},
+    }
+    manifest_path.write_text(json.dumps(original))
+    held = custody.take_custody(original, custody.MODULE_OWNED, tmp_path / "held.json")
+
+    # The agent loosens the bar, raises a baseline, and adds a field of its own.
+    manifest_path.write_text(json.dumps({
+        "module": "layers.1.ffn",
+        "tolerance": {"MAX_ABS_ERR": 99.0},
+        "baselines": {"bootstrap_latency_ms": 99999.0, "submodule_latency_ms": 700.0},
+        "ranks": 1,
+        "frozen": {"inference.py": "abc"},
+    }))
+    changed = custody.restore(manifest_path, held)
+    restored = json.loads(manifest_path.read_text())
+
+    assert restored["tolerance"]["MAX_ABS_ERR"] == 0.280469
+    assert restored["baselines"]["bootstrap_latency_ms"] == 2793.29
+    assert restored["ranks"] == 4
+    # And the agent's own field survives.
+    assert restored["frozen"] == {"inference.py": "abc"}
+    assert any("tolerance" in c for c in changed)
+    assert any("baselines" in c for c in changed)
+
+
+def test_a_dropped_pipeline_field_is_restored_and_reported(tmp_path):
+    """A manifest rewritten from scratch loses what the agent did not think to copy."""
+    from optimization import custody
+
+    manifest_path = tmp_path / "submodule.json"
+    original = {"module": "m", "module_tolerance": {"RTOL": 0.1}, "tensors": {}}
+    manifest_path.write_text(json.dumps(original))
+    held = custody.take_custody(original, custody.SUBMODULE_OWNED, tmp_path / "held.json")
+
+    manifest_path.write_text(json.dumps({"tensors": {"a.bin": {}}}))
+    changed = custody.restore(manifest_path, held)
+    restored = json.loads(manifest_path.read_text())
+    assert restored["module_tolerance"] == {"RTOL": 0.1}
+    assert any("was dropped" in c for c in changed)
+
+
+def test_an_untouched_manifest_reports_nothing(tmp_path):
+    from optimization import custody
+
+    manifest_path = tmp_path / "m.json"
+    original = {"module": "m", "ranks": 4}
+    manifest_path.write_text(json.dumps(original))
+    held = custody.take_custody(original, custody.MODULE_OWNED, tmp_path / "held.json")
+    assert custody.restore(manifest_path, held) == []
+
+
+def test_edited_constraint_prose_forces_a_recompile(tmp_path):
+    """Same range, different text: the old checker would judge a prompt that says something else."""
+    from optimization import constraints as cons
+
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    slot = schedule.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        schedule,
+    )
+    assert cons.schedule_drift(tmp_path, schedule) == []
+
+    edited = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only, and no numpy."}])
+    assert any("text has changed" in f for f in cons.schedule_drift(tmp_path, edited))
+
+
+def test_a_changed_range_forces_a_recompile(tmp_path):
+    from optimization import constraints as cons
+
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    slot = schedule.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        schedule,
+    )
+    widened = cons.Schedule.from_config([{"from": 1, "to": 4, "text": "NKI only."}])
+    findings = cons.schedule_drift(tmp_path, widened)
+    assert findings, "a new range leaves the manifest non-empty and its checker absent"
+
+
+def test_a_toggled_enforcement_forces_a_recompile(tmp_path):
+    from optimization import constraints as cons
+
+    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    slot = schedule.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        schedule,
+    )
+    off = cons.Schedule.from_config(
+        [{"from": 1, "to": 3, "text": "NKI only.", "enforce": False}],
+    )
+    # With enforcement off there is nothing to compile, so drift is moot rather than reported.
+    assert cons.schedule_drift(tmp_path, off) == []
+
+
+def test_an_empty_schedule_never_reports_drift(tmp_path):
+    from optimization import constraints as cons
+
+    assert cons.schedule_drift(tmp_path, cons.Schedule()) == []
+
+
+def test_the_checker_command_quotes_both_paths():
+    """The command runs under `shell=True`, and the workspace root is the operator's to choose."""
+    from optimization import constraints as cons
+
+    command = cons.checker_command(
+        Path("/work space/slot-1-3.py"), Path("/work space/iter-1.json"),
+    )
+    assert "'/work space/slot-1-3.py'" in command
+    assert "'/work space/iter-1.json'" in command
+    assert cons.checker_command(Path("/a/b.py"), Path("/a/r.json"), advisory=True).endswith(
+        "--advisory"
+    )
+
+
+def test_tensors_are_carried_in_read_only(tmp_path):
+    """A hard link shares the inode, and `open(path, "wb")` truncates it — the bootstrap repo's
+    recorded golden is irreplaceable, and this filesystem has no reflink to fall back on."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.bin").write_bytes(b"x" * 64)
+    dst = tmp_path / "dst"
+    note = materialize._link_or_copy_tensors(src, dst)
+    assert "read-only" in note
+    with pytest.raises(PermissionError):
+        (dst / "a.bin").open("wb")

@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ from rich.text import Text
 
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
 from optimization import constraints as cons
-from optimization import materialize, presets
+from optimization import custody, materialize, presets
 from optimization.config import PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
 from optimization.projection import Projection, ProjectionError, project_module
@@ -85,6 +86,23 @@ class Pipeline:
         path.write_text(json.dumps(payload, indent=2))
         return path
 
+    def _set_aside(self, repo: Path, stage: str, attempt: int) -> None:
+        """Move a failed attempt's repo aside rather than deleting it.
+
+        The first real run reached 5 of 7 checks on attempt 1, failed on two gate bugs, and the work
+        was gone before it could be read — attempt 2 had already overwritten it. A failed attempt is
+        the most informative artifact a preparation stage produces, and it costs nothing to keep:
+        the tensors inside are hard links, so the whole tree is a megabyte and change.
+        """
+        if not repo.exists():
+            return
+        attic = self.state_dir / "attempts" / f"{stage}-{attempt - 1}"
+        attic.parent.mkdir(parents=True, exist_ok=True)
+        if attic.exists():
+            shutil.rmtree(attic)
+        repo.rename(attic)
+        self.console.print(f"  [dim]previous attempt kept at {attic}[/dim]")
+
     def _read_record(self, name: str) -> dict[str, Any]:
         path = self.state_dir / f"{name}.json"
         if not path.is_file():
@@ -102,12 +120,30 @@ class Pipeline:
         """
         if self._projection is not None:
             return self._projection
+
+        # `init` records the projection and the later stages are documented as using that frozen
+        # result. A separate `optimize submodule` or `assemble` invocation builds a fresh Pipeline,
+        # so without this the placement is recomputed from whatever the scheme says *now* — and a
+        # scheme edited between stages would give the assembly a different cut from the one the
+        # submodule was built for, with nothing reporting the change.
+        recorded = (self._read_record("projection") or {}).get("projection") or {}
         try:
             projection = project_module(
                 self.config.scheme, self.config.module_id, self.config.target_units,
             )
         except ProjectionError as exc:
             raise StageError(str(exc)) from exc
+
+        if recorded:
+            was = recorded.get("projected", {}).get("units")
+            now = projection.projected_units
+            if was is not None and int(was) != now:
+                raise StageError(
+                    f"{self.config.scheme.name} now projects {self.config.module_id} onto {now} "
+                    f"unit(s), but this workspace was initialized against {was}. The repos already "
+                    f"built assume {was}.\n"
+                    f"Either restore the scheme, or start a fresh workspace.root for the new one."
+                )
 
         if projection.diverges and self.config.on_oversized == "error":
             raise StageError(
@@ -248,8 +284,7 @@ class Pipeline:
 
         for attempt in range(1, self.config.preparation_retries + 1):
             self.console.print(f"\n[bold]submodule, attempt {attempt}[/bold] → {repo}")
-            if repo.exists():
-                shutil.rmtree(repo)
+            self._set_aside(repo, "submodule", attempt)
             prepared = materialize.materialize_submodule(
                 repo=repo, bootstrap_repo=self.config.bootstrap_repo,
                 artifact=self.config.artifact, projection=projection,
@@ -263,9 +298,18 @@ class Pipeline:
                 "dim": (projection.projected[0].dim if projection.projected else "none"),
                 "factor": projection.projected_units,
             })
-            if not self._run_one_shot(repo, prompt, "submodule",
+            held = custody.take_custody(
+                prepared, custody.SUBMODULE_OWNED,
+                self.state_dir / "custody" / f"submodule-{attempt}.json",
+            )
+            if not self._run_one_shot(repo, prompt, f"submodule-{attempt}",
                                       self.config.preparation_timeout):
                 continue
+
+            for line in custody.restore(
+                repo / ".autohelix" / "optimization" / "submodule.json", held,
+            ):
+                self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.submodule_checker", "submodule")
             self._record(f"submodule-attempt-{attempt}", {"passed": ok, "report": report})
@@ -363,12 +407,15 @@ class Pipeline:
                 f"{repo} does not exist — run `autohelix optimize "
                 f"{'submodule' if stage == 'submodule' else 'assemble'}` first"
             )
-        manifest = cons.read_manifest(repo)
         spec = self.config.submodule if stage == "submodule" else self.config.full
-        if spec.schedule.enforceable() and not manifest.get("slots"):
-            self.console.print(
-                "  [yellow]![/yellow] no compiled checkers found; compiling them now"
-            )
+        stale = cons.schedule_drift(repo, spec.schedule)
+        if stale:
+            for line in stale:
+                self.console.print(f"  [yellow]![/yellow] {line}")
+            # Recompiling rather than reusing. A checker compiled from different prose than the
+            # prompt now carries is the worst of both: the agent is told one rule and judged by
+            # another, and a range whose checker is simply absent runs unenforced while the prompt
+            # still claims it is checked.
             self.compile_constraints(stage)
         for finding in cons.verify_manifest(repo):
             raise StageError(f"a compiled checker has changed since it was written: {finding}")
@@ -396,9 +443,15 @@ class Pipeline:
         bootstrap_ms = self._measure(
             self.config.bootstrap_repo, "the bootstrapped module (1 core)", cores="1",
         )
-        submodule_ms = self._measure(
-            self.config.submodule_repo, "the optimized submodule (1 core)", cores="1",
-        )
+        # The submodule is measured at the *commit the assembly is built from*, not at `HEAD`. With
+        # 5% of regression slack those differ, and measuring one while assembling the other would
+        # make the 1.1x ceiling describe code that is not in the assembly.
+        best_commit, _ = _best_from_summary(self.config.submodule_repo)
+        with self._at_commit(self.config.submodule_repo, best_commit) as repo:
+            submodule_ms = self._measure(
+                repo, f"the optimized submodule at {(best_commit or 'HEAD')[:12]} (1 core)",
+                cores="1",
+            )
         self._record("baselines", {
             "bootstrap_latency_ms": bootstrap_ms,
             "submodule_latency_ms": submodule_ms,
@@ -406,6 +459,40 @@ class Pipeline:
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
         return bootstrap_ms, submodule_ms
+
+    @contextmanager
+    def _at_commit(self, repo: Path, commit: str | None):
+        """Yield the repo with one file — `source.py` — at ``commit``, then put it back.
+
+        Only `source.py`, because that is the only file an iteration may change; everything else at
+        `HEAD` is identical to everything else at `commit` by construction. Swapping one file rather
+        than checking out a commit keeps the profile artifacts, the tensors and `.autohelix/` exactly
+        where the validator expects them, and leaves nothing to clean up if the measurement fails.
+        """
+        target = repo / "source.py"
+        if not commit or not target.is_file():
+            yield repo
+            return
+        shown = subprocess.run(
+            ["git", "show", f"{commit}:source.py"],
+            cwd=repo, capture_output=True, text=True, check=False,
+        )
+        if shown.returncode != 0:
+            self.console.print(
+                f"  [yellow]![/yellow] could not read source.py at {commit[:12]}; "
+                f"measuring HEAD instead"
+            )
+            yield repo
+            return
+        original = target.read_text()
+        if shown.stdout == original:
+            yield repo
+            return
+        target.write_text(shown.stdout)
+        try:
+            yield repo
+        finally:
+            target.write_text(original)
 
     def _measure(self, repo: Path, label: str, cores: str) -> float:
         from optimization import gate
@@ -440,8 +527,7 @@ class Pipeline:
 
         for attempt in range(1, self.config.preparation_retries + 1):
             self.console.print(f"\n[bold]assemble, attempt {attempt}[/bold] → {repo}")
-            if repo.exists():
-                shutil.rmtree(repo)
+            self._set_aside(repo, "assemble", attempt)
             prepared = materialize.materialize_full(
                 repo=repo, bootstrap_repo=self.config.bootstrap_repo,
                 artifact=self.config.artifact, submodule_repo=submodule_repo,
@@ -458,8 +544,18 @@ class Pipeline:
                 "submodule_latency": f"{submodule_ms:g}",
                 "overhead_ceiling": f"{submodule_ms * 1.10:g}",
             })
-            if not self._run_one_shot(repo, prompt, "assemble", self.config.preparation_timeout):
+            held = custody.take_custody(
+                prepared, custody.MODULE_OWNED,
+                self.state_dir / "custody" / f"assemble-{attempt}.json",
+            )
+            if not self._run_one_shot(repo, prompt, f"assemble-{attempt}",
+                                      self.config.preparation_timeout):
                 continue
+
+            for line in custody.restore(
+                repo / ".autohelix" / "optimization" / "module.json", held,
+            ):
+                self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.module_checker", "module")
             self._record(f"assemble-attempt-{attempt}", {"passed": ok, "report": report})

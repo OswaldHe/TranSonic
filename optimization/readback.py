@@ -56,17 +56,40 @@ def read_latency(path: Path) -> tuple[float | None, str]:
     return None, f"no {METRIC} in {path}"
 
 
+def read_spread(path: Path) -> tuple[float, float] | None:
+    """(slowest, fastest) rank latency from a whole-module verdict, when it recorded them."""
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = payload.get("rank_latency_ms")
+    if not isinstance(raw, dict):
+        return None
+    values = [float(v) for v in raw.values() if isinstance(v, (int, float))]
+    return (max(values), min(values)) if values else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", required=True, help="the gate's verdict file")
     args = parser.parse_args(argv)
 
-    latency, note = read_latency(Path(args.json))
+    path = Path(args.json)
+    latency, note = read_latency(path)
     if latency is None:
         print(f"could not read {METRIC}: {note}", file=sys.stderr)
         return 1
     print(f"{note}")
     print(f"##autohelix[{METRIC}={latency}]")
+
+    # The per-rank numbers travel with the metric, so the run's history carries them and the
+    # report's load-imbalance warning has something behind it. The gate wrote them into its verdict
+    # and the verdict lives in a worktree that is deleted when the iteration ends.
+    spread = read_spread(path)
+    if spread is not None:
+        slowest, fastest = spread
+        print(f"##autohelix[slowest_rank_ms={slowest}]")
+        print(f"##autohelix[rank_spread_ms={round(slowest - fastest, 6)}]")
     return 0
 
 

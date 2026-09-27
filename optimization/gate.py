@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import re
 import subprocess
@@ -217,13 +218,23 @@ _MARKER = r"##autohelix\[{name}=([^\]]+)\]"
 
 
 def marker_values(output: str, name: str) -> list[float]:
-    """Every `##autohelix[name=value]` in the output, in order, as floats."""
+    """Every finite `##autohelix[name=value]` in the output, in order, as floats.
+
+    Non-finite values are dropped rather than returned. `float("nan")` parses happily and then
+    defeats every comparison that guards this pipeline: `nan <= 0` is False so a nan latency looks
+    like a measurement, and `nan > ceiling` is False so a nan error clears the numerical bar. A
+    validator reporting `latency_ms=nan` would pass the gate and carry a non-finite metric into
+    acceptance, the 5% comparison and the report. Dropping them means the marker reads as absent,
+    which is the failure the checks already handle.
+    """
     out: list[float] = []
     for raw in re.findall(_MARKER.format(name=re.escape(name)), output):
         try:
-            out.append(float(raw.strip()))
+            value = float(raw.strip())
         except ValueError:
             continue
+        if math.isfinite(value):
+            out.append(value)
     return out
 
 
@@ -324,6 +335,38 @@ def called_attributes(tree: ast.Module) -> dict[str, int]:
     return found
 
 
+def import_aliases(tree: ast.Module) -> dict[str, str]:
+    """Local name -> the dotted module it actually refers to.
+
+    `import torch.distributed as foo` maps `foo` to `torch.distributed`; `from nki import
+    collectives as ncc` maps `ncc` to `nki.collectives`. Needed because a check that matches call
+    names textually is defeated by one rename: `import torch.distributed as ncc; ncc.all_reduce(x)`
+    reads as the NKI collective to anything that does not resolve the alias.
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # `import a.b` binds `a`; `import a.b as c` binds `c` to `a.b`.
+                aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                continue
+            module = node.module or ""
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{module}.{alias.name}".strip(".")
+    return aliases
+
+
+def resolve_call(dotted: str, aliases: dict[str, str]) -> str:
+    """A call's dotted name with its leading alias replaced by what it was imported as."""
+    head, _, tail = dotted.partition(".")
+    target = aliases.get(head)
+    if target is None:
+        return dotted
+    return f"{target}.{tail}" if tail else target
+
+
 def referenced_names(tree: ast.Module) -> dict[str, int]:
     """Every bare name and attribute root referenced, mapped to its first line."""
     found: dict[str, int] = {}
@@ -364,12 +407,22 @@ def _is_stdlib(root: str) -> bool:
     return root in getattr(sys, "stdlib_module_names", frozenset()) or root == "__future__"
 
 
+#: Literals that are made only of separators and dots. `"/"` is the argument to `str.join`, `"."`
+#: is `Path(".")`, `".."` is a relative step — none of them names a file, and all of them satisfy
+#: "contains a separator". Flagging `"/"` as an absolute path rejected a validator that built its
+#: tensor names with `"/".join(...)`, which is the ordinary way to do it.
+_SEPARATOR_ONLY = frozenset({"/", ".", "..", "./", "../", "//", ""})
+
+
 def path_findings(tree: ast.Module, filename: str,
                   markers: tuple[str, ...] = FORBIDDEN_PATH_MARKERS) -> list[str]:
     """Path-shaped literals that reach outside the repository."""
     findings: list[str] = []
     for text, line in _string_literals(tree):
         if not _path_like(text):
+            continue
+        # A literal with no alphanumeric character in it is punctuation, not a path.
+        if text.strip() in _SEPARATOR_ONLY or not any(c.isalnum() for c in text):
             continue
         if text.startswith("/") or ".." in Path(text).parts:
             findings.append(f"{filename}:{line} names '{text}', which is outside this repository")
@@ -398,6 +451,89 @@ def fabrication_findings(tree: ast.Module, filename: str) -> list[str]:
         elif tail in SYNTHETIC_INPLACE:
             findings.append(f"{filename}:{line} calls '{dotted}', which overwrites a tensor's data")
     return findings
+
+
+def recorded_tensors(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The manifest's tensor record, normalized to ``{relative path: entry}``.
+
+    Accepts both shapes an agent naturally writes for "every file with its sha256 and bytes":
+
+        {"input": {"file": "tensors/input.bin", "sha256": ..., "bytes": ...}}   # keyed by name
+        {"tensors/input.bin": {"sha256": ..., "bytes": ...}}                    # keyed by path
+        [{"file": "tensors/input.bin", "sha256": ...}, ...]                     # a list
+
+    Liberal on purpose. The first real run failed 586 provenance checks because the agent keyed by
+    path and the checker read a `file` field the prompt had never asked for — a trap rather than a
+    requirement, and the exact failure mode the drift tests exist to prevent. This is bookkeeping
+    format, not a semantic property: whichever shape it arrives in, the bytes are still hashed.
+    """
+    raw = manifest.get("tensors") or {}
+    out: dict[str, dict[str, Any]] = {}
+
+    def add(rel: Any, entry: Any) -> None:
+        if not isinstance(entry, dict):
+            return
+        path = str(entry.get("file") or rel or "").strip()
+        if path:
+            out[path] = entry
+
+    if isinstance(raw, dict):
+        for key, entry in raw.items():
+            add(key, entry)
+    elif isinstance(raw, list):
+        for entry in raw:
+            add(None, entry)
+    return out
+
+
+def provenance_findings(repo: Path, manifest: dict[str, Any]) -> tuple[list[str], int]:
+    """Findings for the recorded tensors, and how many were hash-checked.
+
+    A missing `sha256` is not a finding: it is how the record reads when the agent listed a tensor
+    without hashing it, and the file being present is already most of what provenance means. What is
+    a finding is a file that is absent, or one whose bytes no longer match a hash that *was*
+    recorded — a golden edited into agreement with a wrong kernel is the one thing no numerical
+    check can catch.
+    """
+    findings: list[str] = []
+    recorded = recorded_tensors(manifest)
+    if not recorded:
+        return ["the manifest lists no tensors, so provenance cannot be established"], 0
+
+    checked = 0
+    for rel, entry in sorted(recorded.items()):
+        path = repo / rel
+        if not path.is_file():
+            findings.append(f"{rel} is missing from the repo")
+            continue
+        want = entry.get("sha256")
+        if want:
+            checked += 1
+            if _sha256(path) != str(want):
+                findings.append(
+                    f"{rel} has been edited since the repo was built — a golden changed to agree "
+                    f"with a wrong kernel is the one failure no numerical check can catch"
+                )
+        size = entry.get("bytes")
+        if size is not None:
+            try:
+                if path.stat().st_size != int(size):
+                    findings.append(
+                        f"{rel} is {path.stat().st_size} bytes, recorded as {int(size)}"
+                    )
+            except (TypeError, ValueError):
+                pass
+    return findings, checked
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def pinned_constants(tree: ast.Module, expected: dict[str, float],

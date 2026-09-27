@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,20 @@ MANIFEST_REL = CONSTRAINTS_REL / "manifest.json"
 CHECKER_COMMAND = (
     "python -m optimization.slotcheck --checker {checker} --repo . --json {report}{advisory}"
 )
+
+
+def checker_command(checker: Path, report: Path, advisory: bool = False) -> str:
+    """The command line for one slot's checker, with both paths shell-quoted.
+
+    `autohelix.checks.run_constraint` executes with `shell=True`, and these are absolute paths under
+    a workspace root the operator chose. One space in it and the command splits — every governed
+    iteration would then fail before its work was even looked at.
+    """
+    return CHECKER_COMMAND.format(
+        checker=shlex.quote(str(checker)),
+        report=shlex.quote(str(report)),
+        advisory=" --advisory" if advisory else "",
+    )
 
 
 class ScheduleError(ValueError):
@@ -372,6 +387,45 @@ def read_manifest(project_path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
     except json.JSONDecodeError:
         return {}
+
+
+def schedule_drift(project_path: Path, schedule: Schedule) -> list[str]:
+    """Why the compiled checkers no longer match the schedule in the config, if they do not.
+
+    "Are there any compiled slots" is not the question. An operator who edits a slot's prose while
+    keeping its iteration range leaves the manifest non-empty and every hash intact, and the old
+    checker is then applied to a prompt that says something else — the agent told one rule and
+    judged by another. Changing the *ranges* is worse: the manifest stays non-empty, the new slot's
+    checker is simply absent, and the loop falls back to running that iteration unenforced while its
+    prompt still claims a script is watching.
+    """
+    manifest = read_manifest(project_path)
+    recorded = manifest.get("schedule")
+    enforceable = schedule.enforceable()
+
+    if not enforceable:
+        return []
+    if not manifest.get("slots"):
+        return ["no compiled checkers found for the current schedule"]
+    if recorded is None:
+        return ["the checker manifest records no schedule, so it cannot be matched to this config"]
+
+    by_label = {str(entry.get("label")): entry for entry in recorded if isinstance(entry, dict)}
+    findings: list[str] = []
+    for slot in enforceable:
+        entry = by_label.get(slot.label)
+        if entry is None:
+            findings.append(f"slot {slot.label} has no compiled checker")
+            continue
+        if list(entry.get("iterations") or []) != list(slot.iterations):
+            findings.append(f"slot {slot.label} now covers different iterations")
+        if str(entry.get("text") or "").strip() != slot.text.strip():
+            findings.append(f"slot {slot.label}'s constraint text has changed since it was compiled")
+        if bool(entry.get("enforce", True)) != slot.enforce:
+            findings.append(f"slot {slot.label}'s enforcement has been toggled")
+    for label in sorted(set(by_label) - {s.label for s in enforceable}):
+        findings.append(f"slot {label} was compiled but is no longer in the schedule")
+    return findings
 
 
 def verify_manifest(project_path: Path) -> list[str]:

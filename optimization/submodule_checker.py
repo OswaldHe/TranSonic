@@ -240,39 +240,12 @@ def check_provenance(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     inference = gate._parse(repo / INFERENCE_FILE)
     findings += gate.fabrication_findings(inference, INFERENCE_FILE)
 
-    recorded = manifest.get("tensors") or {}
-    if not recorded:
-        findings.append("the manifest lists no tensors, so provenance cannot be established")
-    for name, entry in sorted(recorded.items()):
-        rel = str(entry.get("file") or "")
-        path = repo / rel
-        if not path.is_file():
-            findings.append(f"{rel} is missing from the repo")
-            continue
-        want = entry.get("sha256")
-        if want and gate_sha256(path) != want:
-            findings.append(
-                f"{rel} has been edited since the repo was built — a golden changed to agree "
-                f"with a wrong kernel is the one failure no numerical check can catch"
-            )
-        size = entry.get("bytes")
-        if size is not None and path.stat().st_size != int(size):
-            findings.append(
-                f"{rel} is {path.stat().st_size} bytes, recorded as {size}"
-            )
+    recorded, hashed = gate.provenance_findings(repo, manifest)
+    findings += recorded
+    total = len(gate.recorded_tensors(manifest))
     return CheckResult("e", CHECK_TITLES["e"], not findings,
-                       f"{len(recorded)} tensor(s) match the record" if not findings
+                       f"{total} tensor(s) present, {hashed} hash-checked" if not findings
                        else f"{len(findings)} problem(s)", findings)
-
-
-def gate_sha256(path: Path) -> str:
-    import hashlib
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def check_declaration(repo: Path, manifest: dict[str, Any]) -> CheckResult:
@@ -340,14 +313,20 @@ def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
     """
     findings: list[str] = []
     inference = gate._parse(repo / INFERENCE_FILE)
-    for text, line in gate._string_literals(inference):
-        if text.strip() in {"NEURON_RT_NUM_CORES", "NEURON_RT_VISIBLE_CORES"}:
-            assigned = _environ_assignments(inference)
-            if text.strip() in assigned:
-                findings.append(
-                    f"{INFERENCE_FILE}:{line} sets {text.strip()} itself. How much of the device "
-                    f"a submodule may use is not the validator's to choose — it is one core"
-                )
+    # Only the *count* is out of bounds. `NEURON_RT_VISIBLE_CORES` is how a single-core run pins
+    # itself to a particular core, which is ordinary and does not widen anything — the first real
+    # run failed this check for doing exactly that.
+    assigned = _environ_assignments(inference)
+    if "NEURON_RT_NUM_CORES" in assigned:
+        values = _environ_values(inference, "NEURON_RT_NUM_CORES")
+        widened = [v for v in values if v.strip() not in {SUBMODULE_CORES, ""}]
+        if widened or not values:
+            findings.append(
+                f"{INFERENCE_FILE} sets NEURON_RT_NUM_CORES"
+                + (f" to {', '.join(widened)}" if widened else " itself")
+                + f". How much of the device a submodule may use is not the validator's to "
+                f"choose — it is {SUBMODULE_CORES}"
+            )
     if "torchrun" in (repo / INFERENCE_FILE).read_text():
         findings.append(
             f"{INFERENCE_FILE} mentions torchrun: a submodule is a single-rank kernel, and a "
@@ -356,6 +335,29 @@ def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
     return CheckResult("g", CHECK_TITLES["g"], not findings,
                        f"ran with NEURON_RT_NUM_CORES={SUBMODULE_CORES}" if not findings
                        else f"{len(findings)} problem(s)", findings)
+
+
+def _environ_values(tree: ast.Module, name: str) -> list[str]:
+    """String values assigned to one environment variable, where they are plain literals.
+
+    Lets the check distinguish `NEURON_RT_NUM_CORES = "1"` — restating what the gate already set,
+    which is harmless — from a validator quietly widening itself to the whole device.
+    """
+    values: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == name):
+                continue
+            if isinstance(node.value, ast.Constant):
+                values.append(str(node.value.value))
+            else:
+                # Computed: unreadable here, so it counts as unknown rather than as compliant.
+                values.append("<computed>")
+    return values
 
 
 def _environ_assignments(tree: ast.Module) -> set[str]:

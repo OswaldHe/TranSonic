@@ -82,21 +82,19 @@ the above.
 Not regenerated and not re-sliced: this stage's whole purpose is to be judged against the recorded
 module, so its inputs are the recorded inputs.
 
-**`.autohelix/optimization/module.json`** — the manifest, written last:
+**`.autohelix/optimization/module.json`** — the manifest. **Edit the file that is already there**;
+do not rewrite it. It arrives carrying `module`, `entry_point`, `ranks`, `projection`, `tolerance`,
+`module_output` and `baselines` — the pipeline owns all of those and restores them after you finish,
+so an edit there is put back rather than honoured. One field is yours:
 
 ```json
 {
-  "module": "{{ module }}",
-  "entry_point": "{{ entry_point }}",
-  "ranks": {{ ranks }},
-  "tolerance": { "RTOL": ..., "ATOL": ..., "MIN_COSINE": ..., "MIN_PASS_FRACTION": ...,
-                 "MAX_ABS_ERR": ... },
-  "tensors": { "<name>": {"file": "tensors/....bin", "sha256": "...", "bytes": 123} },
-  "frozen":  { "inference.py": "<sha256 of the validator you just froze>" },
-  "baselines": { "bootstrap_latency_ms": {{ bootstrap_latency }},
-                 "submodule_latency_ms": {{ submodule_latency }} }
+  "frozen": { "inference.py": "<sha256 of the validator you just froze>" }
 }
 ```
+
+`tensors` is already filled in from the module's recorded bytes; leave it alone. The hash in `frozen`
+is what lets the gate tell that the validator judging iteration 5 is the one that was gated here.
 
 **`ASSEMBLY.md`** — for a human: how the ranks divide the work, which collective rejoins them and
 where in the graph it sits, what is replicated, and what the first measurement showed — total, per

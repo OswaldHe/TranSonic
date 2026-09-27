@@ -72,6 +72,9 @@ class OptimizationLoop(Harness):
         #: Which iteration `_check_metric_gates` is judging. Upstream does not pass it, and the
         #: end-of-interval rule needs to know whose slot verdict to consult.
         self._current_iteration: int | None = None
+        #: Each iteration's `source.py`, read in the last moment before its worktree is torn down.
+        self._captured_source: dict[int, str] = {}
+        self._install_candidate_capture()
 
     # -- configuration -------------------------------------------------------------
 
@@ -142,8 +145,13 @@ class OptimizationLoop(Harness):
 
         slot = self.schedule.slot_for(iteration)
         if slot is None or not (slot.has_text and slot.enforce):
-            return super().run_iteration(iteration)
-        return self._run_governed_iteration(iteration)
+            result = super().run_iteration(iteration)
+        else:
+            result = self._run_governed_iteration(iteration)
+        archived = self.archive_candidate(iteration, result)
+        if archived is not None and not result.accepted:
+            self.console.print(f"  [dim]candidate kept at {archived}[/dim]")
+        return result
 
     def _run_governed_iteration(self, iteration: int) -> IterationResult:
         """`Harness.run_iteration` with the slot checker prepended to the constraint list.
@@ -271,24 +279,24 @@ class OptimizationLoop(Harness):
     # -- candidate archive ---------------------------------------------------------
 
     def archive_candidate(self, iteration: int, result: IterationResult) -> Path | None:
-        """Keep a constraint-passing candidate's `source.py` and metrics, accepted or not.
+        """Keep a candidate's `source.py` and metrics, accepted or not.
 
         The metric gate decides what the next iteration builds on. It should not decide what the
         run *retains*: iterations 7-8 exist to try something the disciplined iterations cannot, and
         an experiment 6% slower is rejected while still being the most informative thing in the run.
-        Recovered from the iteration's branch, since the worktree is gone by now.
+
+        Called from inside `run_iteration`, **before** the worktree is discarded. The obvious place
+        is after the run, reading each candidate back out of its branch — and that silently archives
+        nothing, because `Sandbox.remove_worktree` runs `git branch -D` in `Harness.run_iteration`'s
+        `finally` block, so by the time the loop ends every iteration branch it would read is gone.
         """
-        branch = f"{self.sandbox.branch_prefix}-iter-{iteration}"
         target = self.project_path / CANDIDATES_DIR / f"iter-{iteration}"
+        source = self._candidate_source(iteration)
+        if source is None:
+            return None
         try:
-            show = subprocess.run(
-                ["git", "show", f"{branch}:source.py"],
-                cwd=self.project_path, capture_output=True, text=True, check=False,
-            )
-            if show.returncode != 0:
-                return None
             target.mkdir(parents=True, exist_ok=True)
-            (target / "source.py").write_text(show.stdout)
+            (target / "source.py").write_text(source)
             (target / "metrics.json").write_text(json.dumps({
                 "iteration": iteration,
                 "accepted": result.accepted,
@@ -296,10 +304,50 @@ class OptimizationLoop(Harness):
                 "reason": result.reason,
                 "slot": (self.schedule.slot_for(iteration).label
                          if self.schedule.slot_for(iteration) else None),
+                "slot_followed": (self._slot_verdicts[iteration].passed
+                                  if iteration in self._slot_verdicts else None),
             }, indent=2))
             return target
         except OSError:
             return None
+
+    def _candidate_source(self, iteration: int) -> str | None:
+        """This iteration's `source.py`, captured just before its worktree was torn down."""
+        captured = self._captured_source.pop(iteration, None)
+        if captured is not None:
+            return captured
+        # A merged iteration's code is also on the main branch, which outlives the worktree.
+        shown = subprocess.run(
+            ["git", "show", "HEAD:source.py"],
+            cwd=self.project_path, capture_output=True, text=True, check=False,
+        )
+        return shown.stdout if shown.returncode == 0 else None
+
+    def _install_candidate_capture(self) -> None:
+        """Read each candidate's `source.py` in the last moment it exists.
+
+        `Harness.run_iteration` tears the worktree down in a `finally` block, and
+        `Sandbox.remove_worktree` deletes the iteration branch as well as the directory — so after
+        the iteration returns there is nothing left to archive from, for a rejected iteration in
+        particular. Wrapping the teardown is the one seam where the candidate is still on disk and
+        the outcome is already decided.
+        """
+        original = self.sandbox.remove_worktree
+
+        def remove(worktree_path: Path) -> None:
+            try:
+                path = Path(worktree_path)
+                if self.sandbox.repo_prefix:
+                    path = path / self.sandbox.repo_prefix
+                source = path / "source.py"
+                iteration = self._current_iteration
+                if iteration is not None and source.is_file():
+                    self._captured_source[iteration] = source.read_text()
+            except OSError:
+                pass
+            original(worktree_path)
+
+        self.sandbox.remove_worktree = remove  # type: ignore[method-assign]
 
     # -- the deliverable -----------------------------------------------------------
 
@@ -339,6 +387,8 @@ class OptimizationLoop(Harness):
                     "iteration": r.iteration,
                     "accepted": r.accepted,
                     METRIC: r.metrics.get(METRIC),
+                    "slowest_rank_ms": r.metrics.get("slowest_rank_ms"),
+                    "rank_spread_ms": r.metrics.get("rank_spread_ms"),
                     "reason": r.reason,
                     "slot": (self.schedule.slot_for(r.iteration).label
                              if self.schedule.slot_for(r.iteration) else None),
@@ -358,9 +408,6 @@ class OptimizationLoop(Harness):
     def run(self, max_iterations: int | None = None) -> None:
         """Upstream's run, with candidates archived and a stage summary written at the end."""
         super().run(max_iterations)
-        for record in self.history.load():
-            if record.iteration > 0:
-                self.archive_candidate(record.iteration, record)
         path = self.write_stage_summary()
         best_commit, best_value = self.best_commit()
         if best_value is not None:

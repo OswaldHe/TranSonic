@@ -293,11 +293,26 @@ optimization/
 - **The pipeline config is not an AutoHelix config.** `optimization.yaml` describes the whole run;
   `config.derive_loop_config()` produces the AutoHelix config each loop stage takes, and writes it
   *beside* the repos because it names the hidden gate.
-- **Tensors are hard-linked, not copied.** The MoE module's `tensors/` is 6.8 GiB and three copies is
-  not a design. Same inode, so `sha256` still sees the recorded bytes and a write must unlink first.
+- **Tensors are hard-linked and made read-only.** The MoE module's `tensors/` is 6.8 GiB and three
+  copies is not a design. The read-only part is load-bearing and an earlier version of this note had
+  it wrong: a hard link shares the inode, and `open(path, "wb")` truncates it *without* unlinking, so
+  a validator that opened a recorded tensor for writing by mistake would destroy the bootstrap repo's
+  golden — irreplaceable, and the assembly's provenance hashes would then bless the corruption. This
+  filesystem is ext4 with no reflink support, so copy-on-write is unavailable and the mode bits are
+  the guard. Clearing write permission covers the shared original too, which is the right outcome.
 - **`iteration_constraints` is read from the raw config, not from `Config`.** It is listed in
   `KNOWN_TOP_LEVEL_KEYS` so it does not warn as a typo, but there is no field for it on the shared
   dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config.
+- **Preparation agents do not own the fields the gate reads.** They finish the manifest, and the
+  tensor record and the declaration are genuinely theirs — but the bar, the golden, the rank count
+  and both latency bounds are written by materialization to a copy outside the repo and restored
+  afterwards (`custody.py`). Otherwise the agent writes its own examination paper. A field that
+  changed is reported rather than rejected: the usual cause is a manifest rewritten instead of
+  edited, which is careless rather than dishonest, and the pipeline can simply put it back.
+- **A failed preparation attempt is kept, not deleted.** Moved to
+  `.optimization/attempts/<stage>-<n>/`. The first real run reached 5 of 7 checks on its first
+  attempt and the work was overwritten before it could be read; the tensors inside are hard links, so
+  keeping a tree costs about a megabyte.
 - **A preparation stage that fails three times stops.** It is not a loop: a half-materialized repo is
   not a worse starting point than the last attempt, it is not a starting point. Read the last report
   before raising `preparation.retries`, because a repeated failure is the prompt or the module rather

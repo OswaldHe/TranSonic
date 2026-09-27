@@ -272,7 +272,7 @@ def test_a_consistent_fastest_rank_passes_and_reports_the_spread(tmp_path):
 
 def test_missing_per_rank_markers_are_refused():
     output = _rank_markers([40.0, 32.0]) + "##autohelix[latency_ms=32.0]\n"
-    result = module_checker.check_four_ranks(_run(output))
+    result = module_checker.check_all_ranks(_run(output))
     assert not result.passed
     assert any("rank(s) [2, 3]" in f for f in result.findings)
 
@@ -576,3 +576,226 @@ def test_compare_rejects_a_shape_mismatch():
         "MAX_ABS_ERR": 1.0,
     })
     assert not ok and "shape" in detail
+
+
+# ======================================================================================
+# regressions from the first real run and the PR review
+# ======================================================================================
+
+
+def test_a_separator_literal_is_not_an_absolute_path():
+    """The first real run failed self-containment for building names with `"/".join(...)`."""
+    findings = gate.path_findings(
+        _tree('paths = ["/".join(["tensors", n]) for n in NAMES]\nHERE = "."\nUP = ".."\n'),
+        "inference.py",
+    )
+    assert findings == []
+
+
+def test_a_real_absolute_path_is_still_caught():
+    findings = gate.path_findings(_tree('P = "/home/ubuntu/checkpoint/model.bin"\n'), "inference.py")
+    assert len(findings) == 1
+
+
+def test_non_finite_markers_are_ignored():
+    """`nan` defeats every comparison that guards this pipeline, so it must read as absent."""
+    for bad in ("nan", "-nan", "inf", "-inf", "Infinity"):
+        assert gate.marker_value(f"##autohelix[latency_ms={bad}]", "latency_ms") is None
+    assert gate.marker_value("##autohelix[latency_ms=12.5]", "latency_ms") == 12.5
+
+
+def test_a_nan_latency_fails_the_measurement_check():
+    result = module_checker.check_measurement(
+        _run(_rank_markers([1.0, 1.0, 1.0, 1.0]) + "##autohelix[latency_ms=nan]\n"), 4,
+    )
+    assert not result.passed
+    assert any("no ##autohelix[latency_ms" in f for f in result.findings)
+
+
+def test_a_nan_max_abs_err_does_not_clear_the_ceiling(tmp_path):
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999,
+           "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.28}
+    repo = _module_repo(tmp_path, NKI_SOURCE, inference="\n".join(
+        f"{name} = {value!r}" for name, value in bar.items()
+    ) + "\nimport source\n")
+    result = module_checker.check_matches(
+        _run("##autohelix[passed=1]\n##autohelix[max_abs_err=nan]\n"), bar, repo,
+    )
+    assert not result.passed
+    assert any("max_abs_err" in f for f in result.findings)
+
+
+def test_the_manifest_tensor_record_is_read_in_either_shape(tmp_path):
+    """586 provenance failures in the first real run, for a shape the prompt never specified."""
+    (tmp_path / "tensors").mkdir()
+    (tmp_path / "tensors" / "input.bin").write_bytes(b"abc")
+    digest = gate._sha256(tmp_path / "tensors" / "input.bin")
+
+    by_path = {"tensors": {"tensors/input.bin": {"sha256": digest, "bytes": 3}}}
+    by_name = {"tensors": {"input": {"file": "tensors/input.bin", "sha256": digest, "bytes": 3}}}
+    as_list = {"tensors": [{"file": "tensors/input.bin", "sha256": digest, "bytes": 3}]}
+    for manifest in (by_path, by_name, as_list):
+        findings, checked = gate.provenance_findings(tmp_path, manifest)
+        assert findings == [], manifest
+        assert checked == 1
+
+
+def test_an_edited_tensor_is_still_caught_in_either_shape(tmp_path):
+    (tmp_path / "tensors").mkdir()
+    (tmp_path / "tensors" / "input.bin").write_bytes(b"abc")
+    manifest = {"tensors": {"tensors/input.bin": {"sha256": "0" * 64}}}
+    findings, _ = gate.provenance_findings(tmp_path, manifest)
+    assert any("has been edited" in f for f in findings)
+
+
+def test_an_absent_tensor_names_itself(tmp_path):
+    """The first run reported 586 findings that all read ' is missing from the repo'."""
+    findings, _ = gate.provenance_findings(tmp_path, {"tensors": {"tensors/gone.bin": {}}})
+    assert findings == ["tensors/gone.bin is missing from the repo"]
+
+
+def test_import_aliases_are_resolved():
+    aliases = gate.import_aliases(_tree(
+        "import torch.distributed as foo\n"
+        "import nki.collectives as ncc\n"
+        "from nki import collectives as c2\n"
+        "import nki\n"
+    ))
+    assert gate.resolve_call("foo.all_reduce", aliases) == "torch.distributed.all_reduce"
+    assert gate.resolve_call("ncc.all_reduce", aliases) == "nki.collectives.all_reduce"
+    assert gate.resolve_call("c2.all_reduce", aliases) == "nki.collectives.all_reduce"
+
+
+def test_an_aliased_torch_collective_is_refused(tmp_path):
+    """`import torch.distributed as ncc` used to read as the NKI collective."""
+    repo = _module_repo(tmp_path, """
+        import torch.distributed as ncc
+        import nki
+
+        def kernel(x):
+            ncc.all_reduce(x)
+            return x
+    """)
+    result = module_checker.check_nki_collectives(repo, 4)
+    assert not result.passed
+    assert any("torch.distributed.all_reduce" in f for f in result.findings)
+
+
+def test_the_nki_collective_passes_under_any_alias(tmp_path):
+    repo = _module_repo(tmp_path, """
+        import nki
+        import nki.collectives as whatever
+        import nki.isa as nisa
+        import nki.language as nl
+
+        def kernel(x, replica_group):
+            src = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm, name="src")
+            dst = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm, name="dst")
+            out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=src, src=x)
+            whatever.all_reduce(srcs=[src], dsts=[dst], replica_group=replica_group, op=nl.add)
+            nisa.dma_copy(dst=out, src=dst)
+            return out
+    """)
+    result = module_checker.check_nki_collectives(repo, 4)
+    assert result.passed, result.findings
+
+
+def test_the_rank_count_comes_from_the_manifest():
+    """A 2-unit placement is valid, and the gate used to launch 4 processes regardless."""
+    assert module_checker.rank_count({"ranks": 2}) == 2
+    assert module_checker.rank_count({"projection": {"projected": {"units": 1}}}) == 1
+    assert module_checker.rank_count({}) == module_checker.DEFAULT_RANKS
+    assert module_checker.launch(2)[:3] == ["torchrun", "--nproc_per_node", "2"]
+
+
+def test_a_two_rank_assembly_is_judged_against_two_ranks():
+    output = _rank_markers([40.0, 32.0]) + "##autohelix[latency_ms=32.0]\n"
+    assert module_checker.check_all_ranks(_run(output), 2).passed
+    assert not module_checker.check_all_ranks(_run(output), 4).passed
+
+
+def test_a_flattened_shard_shape_is_compared_after_reshaping():
+    """The reference flattens `(1, 128, 5120)` to `(128, 5120)`; the first run failed on that."""
+    want = np.arange(12.0).reshape(1, 3, 4)
+    got = np.arange(12.0).reshape(3, 4)
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999,
+           "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.28}
+    ok, _, detail = compare(got, want, bar)
+    assert ok, detail
+
+
+def test_a_genuine_size_mismatch_is_still_refused():
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9, "MIN_PASS_FRACTION": 0.9,
+           "MAX_ABS_ERR": 1.0}
+    ok, _, detail = compare(np.zeros(6), np.zeros(12), bar)
+    assert not ok and "element(s)" in detail
+
+
+def test_the_module_golden_cannot_be_its_own_shard(tmp_path):
+    """Reassembling the answer from the answer reproduces the target and proves nothing."""
+    from optimization.recipe import validate_shards
+
+    findings = validate_shards(
+        {"shards": ["tensors/reference.bin"]}, 4, "tensors/reference.bin",
+    )
+    assert any("own recorded output" in f for f in findings)
+
+
+def test_the_shard_count_must_equal_the_cut_width():
+    from optimization.recipe import validate_shards
+
+    assert validate_shards({"shards": ["a", "b"]}, 4, None)
+    assert validate_shards({"shards": ["a", "b", "c", "d"]}, 4, None) == []
+
+
+def test_repeated_shards_are_refused():
+    from optimization.recipe import validate_shards
+
+    findings = validate_shards({"shards": ["a", "a", "b", "c"]}, 4, None)
+    assert any("repeats" in f for f in findings)
+
+
+def test_a_verified_recipe_still_needs_a_legal_shard_list(tmp_path):
+    """The arithmetic and the shard rules are both required, not either."""
+    rng = np.random.default_rng(9)
+    shape = (4, 8)
+    whole = rng.standard_normal(shape).astype(np.float32)
+    (tmp_path / "golden.bin").write_bytes(
+        (whole.astype("<f4").view("<u4") >> 16).astype("<u2").tobytes()
+    )
+    (tmp_path / "r0.bin").write_bytes(whole.astype("<f4").tobytes())
+    declaration = {
+        "module": "m", "dim": "expert", "factor": 4, "shard": 0, "inputs": [], "outputs": [],
+        "reassembly": {"op": "sum", "shards": ["r0.bin"], "dtype": "float32",
+                       "shape": list(shape)},
+    }
+    outcome = verify_recipe(tmp_path, declaration, _manifest(shape))
+    assert not outcome.reproduces
+    assert "1 golden(s) but the cut is 4-way" in outcome.detail
+
+
+def test_the_submodule_may_pin_itself_to_a_core(tmp_path):
+    """`NEURON_RT_VISIBLE_CORES` pins to one core; it does not widen anything."""
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    (repo / "inference.py").write_text(
+        "import os\nos.environ['NEURON_RT_VISIBLE_CORES'] = '0'\n"
+    )
+    assert submodule_checker.check_single_core(_run(""), repo).passed
+
+
+def test_restating_one_core_is_allowed(tmp_path):
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '1'\n")
+    assert submodule_checker.check_single_core(_run(""), repo).passed
+
+
+def test_widening_the_core_count_is_refused(tmp_path):
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
+    result = submodule_checker.check_single_core(_run(""), repo)
+    assert not result.passed
+    assert any("to 4" in f for f in result.findings)

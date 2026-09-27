@@ -39,21 +39,27 @@ def _stage_table(summary: dict[str, Any]) -> str:
     rows = summary.get("iterations") or []
     if not rows:
         return "_no iterations recorded_"
-    lines = [
-        f"| iteration | {METRIC} | accepted | slot | followed | note |",
-        "|---|---|---|---|---|---|",
-    ]
+    has_ranks = any(row.get("rank_spread_ms") is not None for row in rows)
+    header = f"| iteration | {METRIC} (fastest rank) | accepted | slot | followed |"
+    rule = "|---|---|---|---|---|"
+    if has_ranks:
+        header = (f"| iteration | {METRIC} (fastest) | slowest rank | spread | accepted | slot "
+                  f"| followed |")
+        rule = "|---|---|---|---|---|---|---|"
+    lines = [f"{header} note |", f"{rule}---|"]
     for row in rows:
         value = row.get(METRIC)
         followed = row.get("slot_followed")
-        lines.append(
-            f"| {row.get('iteration')} "
-            f"| {f'{value:g}' if isinstance(value, (int, float)) else '—'} "
-            f"| {'yes' if row.get('accepted') else 'no'} "
-            f"| {row.get('slot') or '—'} "
-            f"| {'—' if followed is None else ('yes' if followed else '**no**')} "
-            f"| {row.get('reason') or ''} |"
-        )
+        cells = [str(row.get("iteration")), _fmt(value)]
+        if has_ranks:
+            cells += [_fmt(row.get("slowest_rank_ms")), _fmt(row.get("rank_spread_ms"))]
+        cells += [
+            "yes" if row.get("accepted") else "no",
+            str(row.get("slot") or "—"),
+            "—" if followed is None else ("yes" if followed else "**no**"),
+            str(row.get("reason") or ""),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 

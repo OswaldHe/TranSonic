@@ -73,13 +73,36 @@ CHECK_TITLES: dict[str, str] = {
 
 MANIFEST_REL = ".autohelix/optimization/module.json"
 
-#: The number of ranks the assembly runs, and the value of `NEURON_RT_NUM_CORES`. Four: the logical
-#: NeuronCores of one trn2 device, which is what `PROJECTION_TARGET_UNITS` projected onto.
-RANKS = 4
+#: The rank count when the manifest does not say. The logical NeuronCores of one trn2 device, which
+#: is what `PROJECTION_TARGET_UNITS` projects onto — but only a default: the projection deliberately
+#: keeps a placement already narrower than the target, and `floorplan.target_units` is configurable,
+#: so a valid assembly can be 1 or 2 ranks wide. Fixing this at four made the gate launch four
+#: processes and demand four rank markers for a two-rank assembly the stage-4 prompt had asked for,
+#: which no candidate could ever satisfy.
+DEFAULT_RANKS = 4
 
-#: How the validator is launched. `torchrun` for the correctness run — `torch.distributed` only
-#: bootstraps the process group, and every reduction happens in `nki.collectives` on device.
-LAUNCH = ["torchrun", "--nproc_per_node", str(RANKS), INFERENCE_FILE]
+
+def rank_count(manifest: dict[str, Any]) -> int:
+    """How many ranks this assembly runs, from what materialization recorded."""
+    for key in ("ranks",):
+        try:
+            value = int(manifest.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value >= 1:
+            return value
+    projected = (manifest.get("projection") or {}).get("projected") or {}
+    try:
+        value = int(projected.get("units"))
+    except (TypeError, ValueError):
+        return DEFAULT_RANKS
+    return value if value >= 1 else DEFAULT_RANKS
+
+
+def launch(ranks: int) -> list[str]:
+    """How the validator is launched. `torchrun` for the correctness run — `torch.distributed` only
+    bootstraps the process group, and every reduction happens in `nki.collectives` on device."""
+    return ["torchrun", "--nproc_per_node", str(ranks), INFERENCE_FILE]
 
 #: Per-rank latency markers the validator must print, on top of the fastest-rank `latency_ms`.
 #: Required rather than optional: without them "the fastest rank" is the candidate's unverifiable
@@ -214,54 +237,58 @@ def check_self_contained(repo: Path) -> CheckResult:
                        else f"{len(findings)} problem(s)", findings)
 
 
-def check_nki_collectives(repo: Path) -> CheckResult:
-    """(c) The reduction is `nki.collectives`, and no host-side collective stands in for it."""
+def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult:
+    """(c) The reduction is `nki.collectives`, and no host-side collective stands in for it.
+
+    Every call is resolved through the file's import table before it is judged. A textual match is
+    defeated by a single rename — `import torch.distributed as ncc; ncc.all_reduce(x)` looks like
+    the NKI collective and is the host-side one — and this check is the whole reason the measured
+    number describes the machine the floorplan is about.
+    """
     findings: list[str] = []
     source = gate._parse(repo / SOURCE_FILE)
-    calls = gate.called_attributes(source)
-    inference_calls = gate.called_attributes(gate._parse(repo / INFERENCE_FILE))
+    inference = gate._parse(repo / INFERENCE_FILE)
 
-    used = [d for d in calls if any(d.endswith(f".{op}") or d == op for op in COLLECTIVE_OPS)]
-    from_nki = [
-        d for d in used
-        if d.startswith(COLLECTIVE_MODULE) or d.startswith("ncc.") or d.startswith("collectives.")
-    ]
-    imports = gate._import_roots(source)
-    has_import = "nki" in imports
-    if not used:
+    resolved_from_nki: list[str] = []
+    for where, tree in ((SOURCE_FILE, source), (INFERENCE_FILE, inference)):
+        aliases = gate.import_aliases(tree)
+        for dotted, line in sorted(gate.called_attributes(tree).items(), key=lambda kv: kv[1]):
+            tail = dotted.rsplit(".", 1)[-1]
+            resolved = gate.resolve_call(dotted, aliases)
+
+            if tail in COLLECTIVE_OPS:
+                if resolved.startswith(COLLECTIVE_MODULE):
+                    resolved_from_nki.append(f"{resolved} ({where})")
+                else:
+                    findings.append(
+                        f"{where}:{line} calls '{dotted}'"
+                        + (f", which resolves to '{resolved}'" if resolved != dotted else "")
+                        + f". The reduction has to come from {COLLECTIVE_MODULE} and happen inside "
+                        f"the traced graph — a host-side or XLA collective works and measures a "
+                        f"different machine"
+                    )
+                continue
+
+            if resolved.startswith("torch.distributed.") and tail not in ALLOWED_DIST_CALLS:
+                findings.append(
+                    f"{where}:{line} calls '{dotted}'"
+                    + (f" ('{resolved}')" if resolved != dotted else "")
+                    + f". torch.distributed may organize the {ranks} processes "
+                    f"({', '.join(sorted(ALLOWED_DIST_CALLS))}) but may not move tensor data"
+                )
+
+    if not resolved_from_nki and not findings:
         findings.append(
-            f"{SOURCE_FILE} calls no collective at all. Four ranks each holding part of the "
+            f"{SOURCE_FILE} calls no collective at all. {ranks} ranks each holding part of the "
             f"module cannot produce the whole module's output without one"
         )
-    elif not from_nki and not has_import:
-        findings.append(
-            f"{SOURCE_FILE} calls {', '.join(sorted(used))} but does not take it from "
-            f"{COLLECTIVE_MODULE}"
-        )
-
-    for where, found in ((SOURCE_FILE, calls), (INFERENCE_FILE, inference_calls)):
-        for dotted, line in sorted(found.items(), key=lambda kv: kv[1]):
-            if dotted in BANNED_COLLECTIVES:
-                findings.append(
-                    f"{where}:{line} calls '{dotted}'. The reduction has to happen inside the "
-                    f"traced graph via {COLLECTIVE_MODULE} — a host-side or XLA collective works "
-                    f"and measures a different machine"
-                )
-            elif dotted.startswith(("dist.", "torch.distributed.")):
-                tail = dotted.rsplit(".", 1)[-1]
-                if tail not in ALLOWED_DIST_CALLS:
-                    findings.append(
-                        f"{where}:{line} calls '{dotted}'. torch.distributed may organize the "
-                        f"four processes ({', '.join(sorted(ALLOWED_DIST_CALLS))}) but may not "
-                        f"move tensor data"
-                    )
     return CheckResult("c", CHECK_TITLES["c"], not findings,
-                       f"reduction via {', '.join(sorted(from_nki or used))}" if not findings
+                       f"reduction via {', '.join(sorted(resolved_from_nki))}" if not findings
                        else f"{len(findings)} problem(s)", findings)
 
 
-def check_four_ranks(run: RunOutcome) -> CheckResult:
-    """(d) All four ranks ran and all four exited 0."""
+def check_all_ranks(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResult:
+    """(d) Every rank ran and every rank exited 0."""
     findings: list[str] = []
     if not run.ran:
         findings.append(f"the validator did not start: {run.detail}")
@@ -271,19 +298,19 @@ def check_four_ranks(run: RunOutcome) -> CheckResult:
         if run.return_code != 0:
             tail = "\n".join(run.output.strip().splitlines()[-15:])
             findings.append(
-                f"torchrun exited {run.return_code}. With four ranks this is usually one rank "
+                f"torchrun exited {run.return_code}. With {ranks} ranks this is usually one rank "
                 f"failing and taking the others down\nlast output:\n{tail}"
             )
-    seen = [r for r in range(RANKS)
+    seen = [r for r in range(ranks)
             if gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r)) is not None]
-    if len(seen) != RANKS:
-        absent = sorted(set(range(RANKS)) - set(seen))
+    if len(seen) != ranks:
+        absent = sorted(set(range(ranks)) - set(seen))
         findings.append(
             f"no ##autohelix[{RANK_LATENCY_MARKER.format(rank='N')}=...] for rank(s) {absent}. "
             f"Every rank has to report, or 'the fastest rank' is an unverifiable claim"
         )
     return CheckResult("d", CHECK_TITLES["d"], not findings,
-                       f"{RANKS} ranks, all exit 0" if not findings
+                       f"{ranks} ranks, all exit 0" if not findings
                        else f"{len(findings)} problem(s)", findings)
 
 
@@ -317,17 +344,17 @@ def check_matches(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckRe
                        findings)
 
 
-def check_measurement(run: RunOutcome) -> CheckResult:
+def check_measurement(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResult:
     """(f) A fresh 4-rank collective profile, and the reported latency is the fastest rank of it."""
     findings: list[str] = []
     if not run.artifacts.get("neff"):
         findings.append("the run left no fresh .neff behind")
     ntffs = run.artifacts.get("ntff") or []
     per_rank = [n for n in ntffs if "_rank_" in Path(n).name]
-    if len(per_rank) < RANKS:
+    if len(per_rank) < ranks:
         findings.append(
-            f"the run left {len(per_rank)} fresh per-rank .ntff file(s), expected {RANKS} from "
-            f"`neuron-explorer capture --collectives-worker-count {RANKS} "
+            f"the run left {len(per_rank)} fresh per-rank .ntff file(s), expected {ranks} from "
+            f"`neuron-explorer capture --collectives-worker-count {ranks} "
             f"--collectives-profile-id all`"
         )
 
@@ -340,7 +367,7 @@ def check_measurement(run: RunOutcome) -> CheckResult:
 
     rank_latencies = {
         r: gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
-        for r in range(RANKS)
+        for r in range(ranks)
     }
     known = {r: v for r, v in rank_latencies.items() if v is not None}
     if known:
@@ -352,7 +379,7 @@ def check_measurement(run: RunOutcome) -> CheckResult:
                 f"fastest rank, and it has to be one of the numbers the ranks actually printed"
             )
     summary = f"{reported:g} ms (fastest of {len(known)} ranks)"
-    if len(known) == RANKS:
+    if len(known) == ranks:
         spread = max(known.values()) - min(known.values())
         summary += f", spread {spread:g} ms"
     return CheckResult("f", CHECK_TITLES["f"], not findings,
@@ -456,17 +483,18 @@ def evaluate(repo: Path, manifest: dict[str, Any],
              timeout: int) -> tuple[list[CheckResult], RunOutcome]:
     """One `torchrun` of the frozen validator, then all nine checks off that execution."""
     bar = expected_tolerance(manifest)
+    ranks = rank_count(manifest)
     run = gate.run_candidate(
-        repo, LAUNCH, timeout=timeout,
-        env_overrides={"NEURON_RT_NUM_CORES": str(RANKS)},
+        repo, launch(ranks), timeout=timeout,
+        env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
     return [
         check_frozen_validator(repo, manifest),
         check_self_contained(repo),
-        check_nki_collectives(repo),
-        check_four_ranks(run),
+        check_nki_collectives(repo, ranks),
+        check_all_ranks(run, ranks),
         check_matches(run, bar, repo),
-        check_measurement(run),
+        check_measurement(run, ranks),
         check_provenance(repo, manifest),
         check_faster(run, manifest),
         check_overhead(run, manifest),
@@ -498,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
         extra["latency_ms"] = latency
         extra["rank_latency_ms"] = {
             str(r): gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
-            for r in range(RANKS)
+            for r in range(rank_count(manifest))
         }
     verdict = gate.write_verdict(
         results, run, "whole-module gate", Path(args.json) if args.json else None, extra=extra,

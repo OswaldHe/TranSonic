@@ -258,7 +258,14 @@ class PipelineConfig:
                 "command": (
                     "python -m optimization.readback --json .autohelix/optimization/gate.json"
                 ),
-                "values": {"latency_ms": "lower"},
+                # `slowest_rank_ms` and `rank_spread_ms` are recorded, never gated: the metric is
+                # the fastest rank, and the spread is what makes that number's optimism visible in
+                # the report rather than a claim it cannot substantiate.
+                "values": {
+                    "latency_ms": "lower",
+                    "slowest_rank_ms": "lower",
+                    "rank_spread_ms": "lower",
+                },
                 "timeout": 120,
             }],
             "scope": {"editable": ["source.py"]},

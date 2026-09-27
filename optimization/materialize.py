@@ -148,27 +148,40 @@ def _copy(src: Path, dst: Path) -> None:
 
 
 def _link_or_copy_tensors(src: Path, dst: Path) -> str:
-    """Make the bootstrapped module's tensors readable from the new repo.
+    """Make the bootstrapped module's tensors readable from the new repo, and not writable.
 
-    Hard-linked when the filesystem allows it. The MoE module's `tensors/` is 6.8 GiB and both repos
-    plus the agent's own slices would otherwise be 20 GiB of identical bytes; a hard link is the same
-    inode, so `sha256` still sees the recorded content and a write would need to unlink first.
-    Falls back to copying across filesystems.
+    Hard-linked, because the MoE module's `tensors/` is 6.8 GiB and both repos plus the agent's own
+    slices would otherwise be 20 GiB of identical bytes.
+
+    The links are then made **read-only**, and that part is not cosmetic. A hard link is the same
+    inode, and an earlier comment here claimed a write would have to unlink first — it does not:
+    `open(path, "wb")` truncates the shared inode, so a validator that opened a tensor for writing
+    by mistake would destroy the recorded golden in the bootstrap repo, which is irreplaceable and
+    which the assembly's provenance hashes would then happily bless. This filesystem is ext4 with no
+    reflink support, so copy-on-write is unavailable and the mode bits are the guard. Clearing write
+    permission on the inode covers the original too, which is the right outcome: recorded tensors are
+    ground truth and nothing in this pipeline should be writing to them.
     """
     dst.mkdir(parents=True, exist_ok=True)
-    linked = 0
+    linked = copied = 0
     for path in sorted(src.iterdir()):
         if not path.is_file():
             continue
         target = dst / path.name
-        if target.exists():
-            continue
+        if not target.exists():
+            try:
+                target.hardlink_to(path)
+                linked += 1
+            except (OSError, AttributeError):
+                shutil.copy2(path, target)
+                copied += 1
         try:
-            target.hardlink_to(path)
-            linked += 1
-        except (OSError, AttributeError):
-            shutil.copy2(path, target)
-    return f"{linked} hard-linked" if linked else "copied"
+            # 0o444 on the inode, so the shared original becomes read-only as well.
+            target.chmod(0o444)
+        except OSError:
+            pass
+    parts = [f"{linked} hard-linked" if linked else "", f"{copied} copied" if copied else ""]
+    return ", ".join(p for p in parts if p) + ", read-only"
 
 
 def git_init(repo: Path, message: str) -> None:

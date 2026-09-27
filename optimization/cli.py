@@ -185,15 +185,27 @@ def gate(config: str | None, stage: str | None) -> None:
     pipeline = _pipeline(config, verbose=False)
     stages = [stage] if stage else ["submodule", "full"]
     failed = False
+    ran = 0
     for name in stages:
         repo = (pipeline.config.submodule_repo if name == "submodule"
                 else pipeline.config.full_repo)
         if not repo.is_dir():
-            console.print(f"  [dim]{name}: {repo} does not exist yet[/dim]")
+            # A missing repo is a failure when it was asked for by name, and only a note when the
+            # command is the sweep over both. Exiting 0 for "nothing existed to check" would let a
+            # CI step treat an absent artifact as a validated one.
+            if stage:
+                console.print(f"  [red]FAIL[/red] {name}: {repo} does not exist")
+                failed = True
+            else:
+                console.print(f"  [dim]{name}: {repo} does not exist yet[/dim]")
             continue
         module = (f"optimization.{'submodule_checker' if name == 'submodule' else 'module_checker'}")
         ok, _ = pipeline._run_gate(repo, module, name)
         failed = failed or not ok
+        ran += 1
+    if not ran and not stage:
+        console.print("  [red]FAIL[/red] neither repo exists, so no gate ran")
+        failed = True
     raise SystemExit(1 if failed else 0)
 
 

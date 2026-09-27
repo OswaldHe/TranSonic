@@ -95,6 +95,15 @@ So dump all {{ factor }} ranks' goldens into `goldens/`, not just rank 0's. `op`
 that rejoin by reduction) or `concat` with a `dim` (shards that rejoin by gathering); `then_add`
 names terms that belong *after* the ranks rejoin rather than inside any rank's partial.
 
+Three things the shard list has to satisfy, because the check is only worth running if they hold:
+**exactly {{ factor }} shards**, one per rank; **all distinct**; and **none of them the module's own
+recorded output**. Reassembling the answer from the answer would reproduce the target perfectly and
+prove nothing about the cut.
+
+A shard's shape may be the flattened `(tokens, dim)` rather than the module's `(batch, tokens, dim)`
+if that is what one rank actually produces — the comparison reshapes when the element count matches,
+because the reference itself flattens and restores.
+
 If that check fails, your cut does not close, and finding out here costs you minutes instead of
 costing the pipeline two stages.
 
@@ -104,10 +113,25 @@ derivation that produced them. Derive them from *this* rank's own recorded outpu
 `reference/reference_numerics.py` — the submodule's output is often a different dtype from the
 module's, so inheriting the module's bar would be the wrong bar.
 
-**`.autohelix/optimization/submodule.json`** — the manifest, written last. Same shape as the
-declaration plus: `tolerance` (the five constants), `tensors` (every file with its `sha256` and
-`bytes`), `module_output` (the module's golden: file, dtype, shape), `module_tolerance` (the
-module's five constants, from `module/README.md`), `projection`, and `entry_point`.
+**`.autohelix/optimization/submodule.json`** — the manifest. **Edit the file that is already
+there**; do not rewrite it from scratch. It arrives carrying `module`, `entry_point`, `projection`,
+`module_output`, `module_tolerance` and `module_tensors`, all of which the pipeline owns and restores
+after you finish — anything you change there is put back. Two fields are yours to fill:
+
+```json
+{
+  "tolerance": {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999,
+                "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.0},
+  "tensors": {
+    "tensors/input.bin":  {"sha256": "...", "bytes": 1310720},
+    "tensors/golden.bin": {"sha256": "...", "bytes": 1310720}
+  }
+}
+```
+
+`tensors` may be keyed by relative path as above, or keyed by tensor name with a `"file"` field in
+each entry — either is read. List every `.bin` your validator loads. `sha256` is optional but is what
+makes a golden edited later detectable, so record it.
 
 ## When you are done
 
