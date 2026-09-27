@@ -91,9 +91,16 @@ class Pipeline:
 
         The first real run reached 5 of 7 checks on attempt 1, failed on two gate bugs, and the work
         was gone before it could be read — attempt 2 had already overwritten it. A failed attempt is
-        the most informative artifact a preparation stage produces, and it costs nothing to keep:
-        the tensors inside are hard links, so the whole tree is a megabyte and change.
+        the most informative artifact a preparation stage produces.
+
+        What it costs: the carried-in `module/tensors/` are hard links to the bootstrapped repo, so
+        they add no disk, but the slices the agent cut for itself are its own bytes and those do —
+        on the order of the submodule's share of the weights per attempt, 1.8 GB for a quarter of
+        this MoE. `du` on the attic reports the hard links too, so it reads far larger than the space
+        actually held. Only the most recent `preparation.retries` attempts are kept, so the ceiling
+        is bounded rather than growing with the run.
         """
+        self._prune_attempts(stage, keep=self.config.preparation_retries)
         if not repo.exists():
             return
         attic = self.state_dir / "attempts" / f"{stage}-{attempt - 1}"
@@ -102,6 +109,23 @@ class Pipeline:
             shutil.rmtree(attic)
         repo.rename(attic)
         self.console.print(f"  [dim]previous attempt kept at {attic}[/dim]")
+
+    def _prune_attempts(self, stage: str, keep: int) -> None:
+        """Drop all but the newest ``keep`` set-aside attempts for one stage.
+
+        Each one holds the tensor slices its agent cut, so without a ceiling a run that retries
+        repeatedly across several invocations accumulates gigabytes of superseded work.
+        """
+        attic = self.state_dir / "attempts"
+        if not attic.is_dir() or keep < 0:
+            return
+        existing = sorted(
+            (p for p in attic.iterdir() if p.is_dir() and p.name.startswith(f"{stage}-")),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for path in existing[: max(len(existing) - keep, 0)]:
+            shutil.rmtree(path, ignore_errors=True)
+            self.console.print(f"  [dim]pruned superseded attempt {path.name}[/dim]")
 
     def _read_record(self, name: str) -> dict[str, Any]:
         path = self.state_dir / f"{name}.json"

@@ -774,3 +774,27 @@ def test_tensors_are_carried_in_read_only(tmp_path):
     assert "read-only" in note
     with pytest.raises(PermissionError):
         (dst / "a.bin").open("wb")
+
+
+def test_superseded_attempts_are_pruned(tmp_path):
+    """Each set-aside attempt holds the tensor slices its agent cut, so the attic needs a ceiling."""
+    import time as _time
+
+    from rich.console import Console
+
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.state_dir = tmp_path / ".optimization"
+    pipeline.console = Console(quiet=True)
+
+    attic = pipeline.state_dir / "attempts"
+    attic.mkdir(parents=True)
+    for index in range(5):
+        (attic / f"submodule-{index}").mkdir()
+        _time.sleep(0.01)
+    (attic / "assemble-0").mkdir()
+
+    pipeline._prune_attempts("submodule", keep=2)
+    kept = sorted(p.name for p in attic.iterdir())
+    assert kept == ["assemble-0", "submodule-3", "submodule-4"], kept
