@@ -258,14 +258,19 @@ class PipelineConfig:
                 "command": (
                     "python -m optimization.readback --json .autohelix/optimization/gate.json"
                 ),
-                # `slowest_rank_ms` and `rank_spread_ms` are recorded, never gated: the metric is
-                # the fastest rank, and the spread is what makes that number's optimism visible in
-                # the report rather than a claim it cannot substantiate.
-                "values": {
-                    "latency_ms": "lower",
-                    "slowest_rank_ms": "lower",
-                    "rank_spread_ms": "lower",
-                },
+                # Only what this stage can actually produce. `Harness._capture_baseline` requires
+                # *every* declared metric at iteration 0 and fails the run when one is missing, so
+                # declaring the per-rank numbers for the single-rank stage — which has no ranks —
+                # aborted the loop the moment it started.
+                "values": (
+                    {"latency_ms": "lower"} if stage == "submodule" else {
+                        "latency_ms": "lower",
+                        # Recorded, never gated: the metric is the fastest rank, and the spread is
+                        # what keeps that number's optimism visible in the report.
+                        "slowest_rank_ms": "lower",
+                        "rank_spread_ms": "lower",
+                    }
+                ),
                 "timeout": 120,
             }],
             "scope": {"editable": ["source.py"]},

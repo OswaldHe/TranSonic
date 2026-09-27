@@ -444,6 +444,7 @@ class Pipeline:
         for finding in cons.verify_manifest(repo):
             raise StageError(f"a compiled checker has changed since it was written: {finding}")
 
+        self._seed_baseline_verdict(repo, stage)
         config_path = self.config.write_loop_config(stage)
         loop = OptimizationLoop(repo, config_file=config_path, stage=stage, verbose=self.verbose)
         loop.run()
@@ -453,6 +454,32 @@ class Pipeline:
             detail=f"best {best_value} ms" if best_value else "no accepted iteration",
             payload={"best_commit": best_commit, "best_ms": best_value},
         )
+
+    def _seed_baseline_verdict(self, repo: Path, stage: str) -> None:
+        """Put the acceptance gate's verdict where iteration 0's metric command will look.
+
+        `Harness._capture_baseline` runs the *metric* commands and not the constraints, in the
+        project root rather than a worktree. Here the metric is read back out of the gate's verdict
+        — deliberately, so the gate is the only thing that ever runs the candidate — and at iteration
+        0 no constraint has run, so there is no verdict and the loop aborts before its first
+        iteration. That is what happened on the first attempt at stage 3.
+
+        The verdict is not synthesized. The stage's acceptance gate ran the validator on exactly this
+        code minutes earlier and wrote its measurement, including the freshness checks that prove the
+        profile came from that run; this copies it to the filename the loop reads. Iteration 1
+        overwrites it with its own.
+        """
+        name = "submodule-gate.json" if stage == "submodule" else "module-gate.json"
+        source = repo / ".autohelix" / "optimization" / name
+        target = repo / ".autohelix" / "optimization" / "gate.json"
+        if not source.is_file():
+            self.console.print(
+                f"  [yellow]![/yellow] no {name} to seed the baseline from; iteration 0 will have "
+                f"no measurement and the loop will refuse to start"
+            )
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
     # -- stage: assemble -----------------------------------------------------------
 

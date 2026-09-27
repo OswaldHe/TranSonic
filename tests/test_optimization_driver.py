@@ -165,8 +165,8 @@ def test_the_derived_config_pins_what_is_not_the_operators(tmp_path):
     assert derived["scope"]["editable"] == ["source.py"]
     values = derived["metrics"][0]["values"]
     assert values["latency_ms"] == "lower"
-    # Recorded, never gated: the spread is what keeps the fastest-rank metric's optimism visible.
-    assert set(values) == {"latency_ms", "slowest_rank_ms", "rank_spread_ms"}
+    # The single-rank stage declares only what it can produce; see the iteration-0 tests below.
+    assert set(values) == {"latency_ms"}
     assert [g["metric"] for g in derived["acceptance"]["metric_gates"]] == ["latency_ms"]
     assert "optimization.submodule_checker" in derived["constraints"][0]["command"]
     assert derived["acceptance"]["metric_gates"][0]["max_regression_pct"] == 5
@@ -798,3 +798,93 @@ def test_superseded_attempts_are_pruned(tmp_path):
     pipeline._prune_attempts("submodule", keep=2)
     kept = sorted(p.name for p in attic.iterdir())
     assert kept == ["assemble-0", "submodule-3", "submodule-4"], kept
+
+
+# ======================================================================================
+# iteration 0: the baseline has to produce every metric the stage declares
+# ======================================================================================
+
+
+def test_each_stage_declares_only_metrics_it_can_produce(tmp_path):
+    """`Harness._capture_baseline` aborts the run when any declared metric is missing at iter 0.
+
+    Declaring the per-rank numbers for the single-rank stage killed the first real attempt at
+    stage 3 before its first iteration: a submodule has no ranks, so nothing emits them.
+    """
+    config = PipelineConfig.load(_filled(tmp_path))
+    assert set(config.derive_loop_config("submodule")["metrics"][0]["values"]) == {"latency_ms"}
+    assert set(config.derive_loop_config("full")["metrics"][0]["values"]) == {
+        "latency_ms", "slowest_rank_ms", "rank_spread_ms",
+    }
+
+
+def _seeded(repo: Path, stage: str, verdict: dict) -> Path:
+    from optimization.driver import Pipeline
+    from rich.console import Console
+
+    name = "submodule-gate.json" if stage == "submodule" else "module-gate.json"
+    d = repo / ".autohelix" / "optimization"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(json.dumps(verdict))
+
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.console = Console(quiet=True)
+    pipeline._seed_baseline_verdict(repo, stage)
+    return d / "gate.json"
+
+
+def test_the_baseline_reads_the_acceptance_gates_measurement(tmp_path):
+    """Iteration 0 runs the metric commands without the constraints, so there is no fresh verdict.
+
+    The gate ran the validator on exactly this code minutes earlier; seeding its verdict is what
+    gives iteration 0 a real measurement without a second device run.
+    """
+    from autohelix.checks import run_observables
+    from autohelix.config import Config
+
+    repo = tmp_path / "rank0"
+    repo.mkdir()
+    seeded = _seeded(repo, "submodule", {"passed": True, "latency_ms": 1363.48})
+    assert seeded.is_file()
+
+    config = PipelineConfig.load(_filled(tmp_path))
+    parsed = Config.from_dict(config.derive_loop_config("submodule"))
+    metrics: dict[str, float] = {}
+    for result in run_observables(parsed, repo):
+        metrics.update(result.values)
+    assert metrics == {"latency_ms": 1363.48}
+    assert not set(parsed.metric_directions()) - set(metrics)
+
+
+def test_the_assembly_baseline_carries_the_per_rank_spread(tmp_path):
+    from autohelix.checks import run_observables
+    from autohelix.config import Config
+
+    repo = tmp_path / "full"
+    repo.mkdir()
+    _seeded(repo, "full", {
+        "passed": True, "latency_ms": 700.0,
+        "rank_latency_ms": {"0": 740.0, "1": 700.0, "2": 715.0, "3": 760.0},
+    })
+    config = PipelineConfig.load(_filled(tmp_path))
+    parsed = Config.from_dict(config.derive_loop_config("full"))
+    metrics: dict[str, float] = {}
+    for result in run_observables(parsed, repo):
+        metrics.update(result.values)
+    assert metrics["latency_ms"] == 700.0
+    assert metrics["slowest_rank_ms"] == 760.0
+    assert metrics["rank_spread_ms"] == 60.0
+    assert not set(parsed.metric_directions()) - set(metrics)
+
+
+def test_seeding_says_so_when_there_is_no_verdict_to_seed(tmp_path):
+    """Silently seeding nothing would surface as an abort inside the loop instead."""
+    from optimization.driver import Pipeline
+    from rich.console import Console
+
+    repo = tmp_path / "rank0"
+    repo.mkdir()
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.console = Console(quiet=True)
+    pipeline._seed_baseline_verdict(repo, "submodule")
+    assert not (repo / ".autohelix" / "optimization" / "gate.json").exists()
