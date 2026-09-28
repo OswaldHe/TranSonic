@@ -374,11 +374,16 @@ class Schedule:
         """The whole schedule, for the operator's report and the project README."""
         if not self.slots:
             return "(no per-iteration constraints)"
-        rows = ["| iterations | enforced | constraint |", "|---|---|---|"]
+        rows = ["| iterations | enforcement | constraint |", "|---|---|---|"]
         for slot in self.slots:
             first = slot.text.strip().splitlines()[0] if slot.has_text else "—"
-            enforced = "yes" if (slot.enforce and slot.has_text) else "no"
-            rows.append(f"| {slot.label} | {enforced} | {first} |")
+            # Per iteration, not per slot: a hard slot's last iteration is soft, and printing one
+            # word for the whole slot hid the difference the operator had just configured.
+            modes = [slot.enforcement_for(i) for i in sorted(slot.iterations)]
+            shown = modes[0] if len(set(modes)) == 1 else (
+                f"{modes[0]}, {modes[-1]} on {slot.last_iteration}"
+            )
+            rows.append(f"| {slot.label} | {shown} | {first} |")
         return "\n".join(rows)
 
 

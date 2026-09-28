@@ -449,3 +449,18 @@ def test_bare_off_survives_yamls_boolean_coercion():
         [{"at": 1, "enforcement": False, "text": "x"}]).slots[0].enforcement == "off"
     assert cons.Schedule.from_config(
         [{"at": 1, "enforcement": True, "text": "x"}]).slots[0].enforcement == "hard"
+
+
+def test_the_schedule_table_shows_each_slots_enforcement():
+    """Printing one word per slot hid the hard/soft split the operator had just configured."""
+    table = cons.Schedule.from_config([
+        {"at": 1, "enforcement": "hard", "text": "A."},
+        {"at": 2, "enforcement": "soft", "text": "B."},
+        {"at": 3, "enforcement": "off", "text": "C."},
+        {"from": 4, "to": 6, "enforcement": "hard", "text": "D."},
+    ]).summary_table()
+    assert "| 1 | hard |" in table
+    assert "| 2 | soft |" in table
+    assert "| 3 | off |" in table
+    # A hard range softens its last iteration, and the table says which.
+    assert "| 4-6 | hard, soft on 6 |" in table
