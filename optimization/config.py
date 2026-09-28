@@ -85,6 +85,10 @@ class PipelineConfig:
     preparation_timeout: str = "4h"
     compiler_model: str | None = None
     compiler_timeout: str = "1h"
+    #: The feedback stage reads ~100k words of notes and reviews, checks claims against the device,
+    #: and searches for documentation links, so it gets longer than the constraint compiler.
+    feedback_model: str | None = None
+    feedback_timeout: str = "3h"
     source: Path | None = None
 
     # -- derived paths -------------------------------------------------------------
@@ -130,12 +134,14 @@ class PipelineConfig:
             raise ConfigError("the config did not parse as a mapping")
         unknown = set(data) - {
             "module", "floorplan", "workspace", "submodule", "full", "agent", "preparation",
+            "feedback",
             "constraint_compiler",
         }
         if unknown:
             raise ConfigError(
                 f"unknown top-level key(s): {', '.join(sorted(unknown))}. Known: module, "
-                f"floorplan, workspace, submodule, full, agent, preparation, constraint_compiler"
+                f"floorplan, workspace, submodule, full, agent, preparation, "
+                f"constraint_compiler, feedback"
             )
 
         module = _section(data, "module")
@@ -163,6 +169,7 @@ class PipelineConfig:
         agent = data.get("agent") or {}
         preparation = data.get("preparation") or {}
         compiler = data.get("constraint_compiler") or {}
+        feedback_section = data.get("feedback") or {}
 
         return cls(
             module_id=module_id,
@@ -180,6 +187,8 @@ class PipelineConfig:
             preparation_timeout=str(preparation.get("timeout", "4h")),
             compiler_model=compiler.get("model"),
             compiler_timeout=str(compiler.get("timeout", "1h")),
+            feedback_model=feedback_section.get("model"),
+            feedback_timeout=str(feedback_section.get("timeout", "3h")),
         )
 
     # -- validation ----------------------------------------------------------------

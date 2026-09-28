@@ -41,10 +41,11 @@ uv pip install -e ".[dev]"
   per-module cost models, then they are frozen by hash), `run` (five iterations editing only
   `floorplan.yaml`), `rank` (a blind agent ranks the top three). See `floorplan/README.md`
 - `optimization/` - the optimization pipeline (`autohelix optimize`): makes one bootstrapped
-  module fast on a single device. Five stages — `init` (project the floorplan's placement onto
+  module fast on a single device. Six stages — `init` (project the floorplan's placement onto
   one device), `submodule` (an agent cuts the module to one rank), `run` (N iterations under a
   per-iteration constraint schedule), `assemble` (an agent rejoins the ranks with
-  `nki.collectives`), `run-full`. See `optimization/README.md`
+  `nki.collectives`), `run-full`, `feedback` (an agent reconciles both loops' notes into a report
+  of what blocked further optimization). See `optimization/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,

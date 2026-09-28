@@ -16,20 +16,20 @@ The words this pipeline coins — *projection*, *slot*, *checker*, *advisory*, *
 ambiguous, or before coining another. Three decisions are recorded with their rejected alternatives
 in [`docs/adr/`](../docs/adr/), and named below at the point where each one bites.
 
-## Five stages, and why they are five
+## Six stages, and why they are six
 
 ```
-    init            submodule            run              assemble          run-full
- ┌──────────┐    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
- │ project  │    │ agent cuts  │   │ N iters on  │   │ agent joins │   │ 5 iters on  │
- │ the      │───►│ the module  │──►│ one rank,   │──►│ N ranks with│──►│ the whole   │
- │ placement│    │ to one rank │   │ under the   │   │ nki.collect-│   │ module      │
- │ onto one │    │             │   │ constraint  │   │ ives        │   │             │
- │ device   │    │             │   │ schedule    │   │             │   │             │
- └──────────┘    └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
-      │                 │                 │                 │                 │
-  projection.py   submodule_checker  loop.py +        module_checker     loop.py
-                                     constraints.py                     (no schedule)
+    init            submodule            run              assemble          run-full        feedback
+ ┌──────────┐    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌───────────┐   ┌───────────┐
+ │ project  │    │ agent cuts  │   │ N iters on  │   │ agent joins │   │ 5 iters on│   │ agent reads
+ │ the      │───►│ the module  │──►│ one rank,   │──►│ N ranks with│──►│ the whole │──►│ every note
+ │ placement│    │ to one rank │   │ under the   │   │ nki.collect-│   │ module    │   │ and reports
+ │ onto one │    │             │   │ constraint  │   │ ives        │   │           │   │ what blocked
+ │ device   │    │             │   │ schedule    │   │             │   │           │   │ it
+ └──────────┘    └─────────────┘   └─────────────┘   └─────────────┘   └───────────┘   └───────────┘
+      │                 │                 │                 │               │               │
+  projection.py   submodule_checker  loop.py +        module_checker     loop.py       feedback.py
+                                     constraints.py                   (no schedule)  (no gate)
 ```
 
 **`init` is a rule, not a search.** The ranked floorplan is written for a 16-device trn2.48xlarge and
@@ -55,6 +55,14 @@ agent chose. Here the target is the bootstrapped module's own recorded output, a
 module's own bar, faster than the bootstrapped module, and within 10% of the submodule. A wrong cut
 cannot pass. A submodule that was fast because it did a quarter of the work cannot pass. That is what
 makes the looseness upstream safe.
+
+**`feedback` reads what the run wrote and nobody else will.** Fifteen iterations leave ~83,000 words
+of notes and reviews, written one iteration at a time by agents that did not know how the run would
+end — so the corpus contradicts itself, and a reader who trusts any one file learns something false.
+One agent reads all of it, reconciles the disagreements (a measurement beats an inference; recency
+alone settles nothing), and writes `FEEDBACK.md`: what stopped the kernel, split by **who would have
+to fix it**. It measures nothing and edits no repository, so it has no gate — `feedback.py` checks
+the report's *shape*, and nothing checks whether a finding is true, because nothing could.
 
 ## What a script checks, and what an agent is trusted with
 
@@ -289,6 +297,8 @@ optimization/
   module_checker.py        the module gate: 9 checks, the only semantic ones in the pipeline
   readback.py              the metric command: the latency the gate already measured
   report.py                REPORT.md, with the two caveats at the top
+  feedback.py              FEEDBACK.md: the last stage's corpus, and the report's shape
+                           (`--check` so the agent can check its own work)
   presets.py               reading the packaged templates
   templates/
     optimization.yaml      the config template the operator fills in
@@ -296,6 +306,7 @@ optimization/
     submodule_prompt.md    the `submodule` stage: cut the module down
     assemble_prompt.md     the `assemble` stage: put the ranks back together
     compiler_prompt.md     the constraint compiler
+    feedback_prompt.md     the `feedback` stage: reconcile the notes into toolchain feedback
 ```
 
 ## Gotchas

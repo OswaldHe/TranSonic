@@ -168,3 +168,14 @@ _Avoid_: archive, backup, trash
 Where every iteration's kernel is kept with its metrics, accepted or not, so a rejected experiment is
 still readable afterwards.
 _Avoid_: history, attic
+
+**Corpus**:
+Every note and review both loops wrote, read as one body of evidence. Self-contradictory by
+construction, because each file was written before the run ended.
+_Avoid_: logs, history, transcript
+
+**Blocker**:
+Something that stopped a kernel getting faster and that this project cannot fix for itself, named by
+who would have to: a toolchain **bug** (L0), a missing **software feature** (L1), or missing
+**hardware** (L2).
+_Avoid_: issue, limitation, problem, bottleneck (which names where the time goes, not who owns it)

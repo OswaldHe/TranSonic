@@ -67,15 +67,16 @@ _verbose_option = click.option("--verbose", "-v", is_flag=True, help="stream age
 def optimize() -> None:
     """Optimize one bootstrapped module: cut it to one rank, speed that up, reassemble it.
 
-    Five stages. Run them one at a time while finding your footing, or `all` once you trust the
+    Six stages. Run them one at a time while finding your footing, or `all` once you trust the
     config:
 
     \b
       init       validate the config and project the floorplan placement onto one device
       submodule  an agent cuts the module down to the part one NeuronCore runs
       run        the optimization loop on that rank, under the per-iteration constraint schedule
-      assemble   an agent rebuilds all four ranks, rejoined with nki.collectives
+      assemble   an agent rebuilds all the ranks, rejoined with nki.collectives
       run-full   the optimization loop on the whole module
+      feedback   an agent reads both loops' notes and reports what stopped them getting faster
 
     See `optimization/README.md` for what each stage checks and why the seams are where they are.
     """
@@ -173,11 +174,20 @@ def run_full(config: str | None, verbose: bool) -> None:
     raise SystemExit(_run("run-full", lambda: pipeline.run_loop("full")))
 
 
+@optimize.command()
+@_config_option
+@_verbose_option
+def feedback(config: str | None, verbose: bool) -> None:
+    """Have an agent read both loops' notes and reviews and report what blocked them."""
+    pipeline = _pipeline(config, verbose)
+    raise SystemExit(_run("feedback", pipeline.feedback))
+
+
 @optimize.command(name="all")
 @_config_option
 @_verbose_option
 def run_all(config: str | None, verbose: bool) -> None:
-    """Run all five stages in order."""
+    """Run all six stages in order."""
     pipeline = _pipeline(config, verbose)
     raise SystemExit(_run("the pipeline", pipeline.all))
 

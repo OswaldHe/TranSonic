@@ -264,3 +264,15 @@ preparation:
 constraint_compiler:
   model: claude-sonnet-5
   timeout: 1h
+
+# The last stage. One agent reads every note and review both loops wrote -- for MoE that was about
+# 83,000 words -- reconciles the places where they contradict each other, and writes FEEDBACK.md:
+# what stopped the kernel getting faster, split by who would have to fix it (a toolchain bug, a
+# missing software feature, or missing silicon). It reads rather than measures, so it changes no
+# repository and has no gate; a structural check on the report is all that is enforced.
+#
+# Not a cheap model. Reconciling 83,000 words of contradictory notes and deciding which claim a
+# profile actually supports is the hardest reading task in the pipeline.
+feedback:
+  model: null          # null = the same model as the optimizing agent
+  timeout: 3h

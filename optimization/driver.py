@@ -40,6 +40,7 @@ from rich.text import Text
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
+from optimization import feedback as fb
 from optimization.config import GATE_PYTHON, PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
 from optimization.projection import Projection, ProjectionError, project_module
@@ -673,6 +674,82 @@ class Pipeline:
             f"assembly."
         )
 
+    # -- stage: feedback -----------------------------------------------------------
+
+    def feedback(self) -> StageOutcome:
+        """One agent reads everything both loops wrote and reports what stopped them.
+
+        Last, because it needs the whole run: a blocker is only a blocker once the iterations that
+        might have worked around it have been spent. It reads rather than measures, so unlike every
+        other stage it changes no repository and has no gate — `fb.validate_report` checks the
+        deliverable's shape, and nothing checks whether a finding is true, because nothing could.
+        """
+        sub, full = self.config.submodule_repo, self.config.full_repo
+        files = fb.corpus(sub, full)
+        if not files:
+            raise StageError(
+                f"neither {sub.name} nor {full.name} has any notes or reviews to read, so there is "
+                f"nothing to reconcile. Run the loops first."
+            )
+
+        listing = "\n".join(
+            f"- `{repo}/.autohelix/` — {len(paths)} file(s): "
+            + ", ".join(sorted({p.parent.name for p in paths}))
+            for repo, paths in files.items()
+        )
+        words = fb.word_count(files)
+        baselines = self._read_record("baselines")
+        sub_summary = _read_summary(sub, "submodule")
+        full_summary = _read_summary(full, "full")
+
+        fb.repro_dir(self.config.workspace_root).mkdir(parents=True, exist_ok=True)
+        prompt = _render(presets.feedback_prompt(), {
+            "module": self.config.module_id,
+            "corpus": listing,
+            "words": f"{words:,}",
+            "submodule_repo": str(sub),
+            "full_repo": str(full),
+            "workspace_root": str(self.config.workspace_root),
+            "report_path": str(fb.report_path(self.config.workspace_root)),
+            "repro_dir": fb.REPRO_DIR,
+            "context_md": str(_context_md()),
+            "levels": "\n".join(f"- **{key}** — {text}" for key, text in fb.LEVELS.items()),
+            "ranks": self.projection().projected_units,
+            "bootstrap_latency": _ms(baselines.get("bootstrap_latency_ms")),
+            "submodule_latency": _ms(sub_summary.get("best_ms")),
+            "full_latency": _ms(full_summary.get("best_ms")),
+        })
+
+        self.console.print(
+            f"  reading {sum(len(p) for p in files.values())} note(s) and review(s), "
+            f"~{words:,} words"
+        )
+        for attempt in range(1, self.config.preparation_retries + 1):
+            ok = self._run_one_shot(
+                self.config.workspace_root, prompt, f"feedback-{attempt}",
+                self.config.feedback_timeout, model=self.config.feedback_model,
+            )
+            problems = fb.validate_report(self.config.workspace_root)
+            self._record(f"feedback-attempt-{attempt}",
+                         {"agent_ok": ok, "problems": problems})
+            if ok and not problems:
+                counts = fb.summarize(self.config.workspace_root)
+                levels = ", ".join(f"{k} {v}" for k, v in counts["by_level"].items())
+                self.console.print(
+                    f"  [green]feedback written[/green] — {counts['findings']} finding(s) "
+                    f"({levels}) in {fb.REPORT_NAME}"
+                )
+                return StageOutcome("feedback", True,
+                                    f"{counts['findings']} finding(s)", counts)
+            for problem in problems:
+                self.console.print(f"  [yellow]![/yellow] {problem}")
+
+        raise StageError(
+            f"the feedback report did not pass its structural check in "
+            f"{self.config.preparation_retries} attempt(s). The last problems are listed above; "
+            f"{fb.report_path(self.config.workspace_root)} is on disk to read either way."
+        )
+
     # -- the whole thing -----------------------------------------------------------
 
     def all(self) -> list[StageOutcome]:
@@ -684,6 +761,7 @@ class Pipeline:
         if self.config.full.schedule.enforceable():
             outcomes.append(self.compile_constraints("full"))
         outcomes.append(self.run_loop("full"))
+        outcomes.append(self.feedback())
         return outcomes
 
 
@@ -697,6 +775,29 @@ def _render(template: str, variables: dict[str, Any]) -> str:
     from autohelix.prompt_template import render_template
 
     return render_template(template, variables)
+
+
+def _read_summary(repo: Path, stage: str) -> dict[str, Any]:
+    path = repo / ".autohelix" / "optimization" / f"{stage}-summary.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _ms(value: Any) -> str:
+    return f"{float(value):g} ms" if isinstance(value, (int, float)) else "not recorded"
+
+
+def _context_md() -> Path:
+    """This project's glossary, which the feedback agent is told to write against.
+
+    Found from this file rather than from the workspace: the agent runs in `optimization-runs`,
+    which is not the repository the glossary lives in.
+    """
+    return Path(__file__).resolve().parent.parent / "CONTEXT.md"
 
 
 def _latency_from_gate(path: Path) -> float | None:

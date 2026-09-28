@@ -12,6 +12,23 @@
   rejoin the ranks with `nki.collectives`, accepted by a nine-check gate that compares the
   reassembled output against the bootstrapped module's own recorded golden and holds it to
   two latency bounds; `run-full` loops on the whole module. See `optimization/README.md`.
+- `autohelix optimize feedback`, a sixth and final stage. One agent reads every note and review
+  both loops wrote — about 83,000 words for the MoE run — reconciles the places where they
+  contradict each other, and writes `FEEDBACK.md`: what stopped the kernel getting faster, as a
+  table of blockers each classified by who would have to fix it (**L0** a toolchain bug, where the
+  documentation or API claims the device supports something it does not; **L1** a missing software
+  feature in the compiler or programming interface; **L2** missing silicon). Every row carries the
+  profiling scenario in detail, a runnable reproduction under `feedback-repro/`, the mechanism in
+  plain words, links into the Neuron documentation and issue tracker, and a specific suggestion.
+  The corpus is self-contradictory by construction — each note was written before the run ended, so
+  iteration 2's theory is disproved by iteration 7 — and the prompt makes the reconciliation rules
+  explicit: a measurement beats an inference, recency alone settles nothing, an unsettled conflict
+  is filed as unsettled with the measurement that would settle it. The agent is asked to run the
+  `domain-modeling` skill and write against `CONTEXT.md`, because "core", "rank", "unit" and
+  "block" each mean at least two things in this toolchain and the report is read by people who were
+  not on the run. It measures nothing and edits no repository, so it has no gate:
+  `feedback.validate_report` checks the report's shape (a level in range, a reproduction file that
+  exists, a link per row) and nothing checks whether a finding is true, because nothing could.
 - Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` slots
   of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
   unconstrained for aggressive exploration, and the last ones returned to the disciplined

@@ -46,6 +46,11 @@ def compiler_prompt() -> str:
     return read("compiler_prompt.md")
 
 
+def feedback_prompt() -> str:
+    """The last stage's prompt: reconcile the run's notes into toolchain feedback."""
+    return read("feedback_prompt.md")
+
+
 def config_template() -> str:
     return read(CONFIG_TEMPLATE)
 
