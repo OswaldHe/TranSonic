@@ -158,9 +158,16 @@ def _module_repo(tmp_path: Path, source: str, inference: str = "") -> Path:
     repo = tmp_path / "full"
     repo.mkdir(parents=True, exist_ok=True)
     (repo / "source.py").write_text(textwrap.dedent(source))
+    # The default validator launches the kernel the way the real one does — `kernel[2](...)`, the
+    # LNC=2 grid launch — because check (a) now requires the frozen validator to actually drive
+    # the entry point, not merely import the module that defines it.
     (repo / "inference.py").write_text(textwrap.dedent(inference or """
         import source
+        from source import kernel
         RTOL = 0.1
+
+        def run(x, group):
+            return kernel[2](x, group)
         """))
     return repo
 
@@ -799,3 +806,56 @@ def test_widening_the_core_count_is_refused(tmp_path):
     result = submodule_checker.check_single_core(_run(""), repo)
     assert not result.passed
     assert any("to 4" in f for f in result.findings)
+
+
+# ======================================================================================
+# the review of #6, second pass: what the two gates read out of a manifest, and whether
+# the frozen validator is connected to the kernel at all
+# ======================================================================================
+
+
+def test_the_projected_rank_count_is_read_from_where_materialization_writes_it():
+    """`projection.projected.units` is the real shape; a flat `projected_units` never existed, so
+    the submodule gate's factor-mismatch check read 0 and disabled itself for a whole run."""
+    manifest = {"projection": {"projected": {"units": 4, "devices": 1,
+                                            "splits": [{"dim": "expert", "factor": 4}]}}}
+    assert candidate.projected_units(manifest) == 4
+
+
+def test_an_older_flat_projected_units_is_still_read():
+    assert candidate.projected_units({"projection": {"projected_units": 2}}) == 2
+
+
+def test_an_explicit_rank_count_is_read():
+    assert candidate.projected_units({"ranks": 8}) == 8
+
+
+def test_a_manifest_that_says_nothing_reports_zero_rather_than_guessing():
+    assert candidate.projected_units({}) == 0
+    assert candidate.projected_units({"projection": {"projected": {}}}) == 0
+
+
+def test_the_grid_launch_counts_as_driving_the_kernel():
+    """`kernel[2](...)` is the LNC=2 launch idiom, so the callee is a Subscript and an analyzer
+    that only understands `f()` reports the real validator as never calling the kernel."""
+    tree = ast.parse("from source import kernel\nout = kernel[2](x, group)\n")
+    assert candidate.invokes_entry_point(tree, "kernel")
+
+
+def test_a_plain_call_counts():
+    assert candidate.invokes_entry_point(ast.parse("import source\nsource.kernel(x)\n"), "kernel")
+
+
+def test_handing_the_kernel_to_a_tracer_counts():
+    assert candidate.invokes_entry_point(ast.parse("import nki\nf = nki.trace(kernel)\n"), "kernel")
+
+
+def test_importing_source_without_running_it_does_not_count():
+    """The defect: once frozen by hash, such a validator lets every later source.py pass."""
+    tree = ast.parse("import source\nprint(source.INTER_PAD)\nout = my_helper(x)\n")
+    assert not candidate.invokes_entry_point(tree, "kernel")
+
+
+def test_tracing_some_other_function_does_not_count():
+    tree = ast.parse("import nki\nf = nki.trace(helper)\nout = f(x)\n")
+    assert not candidate.invokes_entry_point(tree, "kernel")

@@ -19,6 +19,8 @@ import pytest
 from optimization import PROJECTION_TARGET_UNITS
 from optimization.projection import (
     WEIGHT_PARTITION_DIMS,
+    Factor,
+    Projection,
     ProjectionError,
     project,
     project_module,
@@ -210,3 +212,58 @@ def test_the_real_scheme_projects_every_module_it_places():
     for module in modules:
         result = project_module(scheme, module)
         assert 1 <= result.projected_units <= PROJECTION_TARGET_UNITS, module
+
+
+# ======================================================================================
+# the review of #6: reading a recorded projection back instead of recomputing it
+# ======================================================================================
+
+
+def test_a_recorded_projection_round_trips_exactly():
+    """Later stages and the report read this back rather than re-planning from the scheme."""
+    original = Projection(
+        module="layers.1.ffn",
+        planned=[Factor("expert", 8, "all_to_all")], planned_units=8, planned_devices=2,
+        projected=[Factor("expert", 4, "all_to_all")], projected_units=4,
+        scaled=[(Factor("expert", 8, "all_to_all"), Factor("expert", 4, "all_to_all"))],
+        target="trn2-16device",
+    )
+    assert Projection.from_dict(original.to_dict()).to_dict() == original.to_dict()
+
+
+def test_a_dropped_factor_survives_the_round_trip():
+    original = Projection(
+        module="m", planned=[Factor("head", 4), Factor("batch", 2)], planned_units=8,
+        planned_devices=2, projected=[Factor("head", 4)], projected_units=4,
+        dropped=[Factor("batch", 2)],
+    )
+    assert Projection.from_dict(original.to_dict()).dropped == [Factor("batch", 2)]
+
+
+def test_a_same_width_different_dimension_is_a_difference():
+    """The old drift guard compared only the unit count, so `expert x4` -> `head x4` passed it —
+    four ranks either way, and an entirely different kernel."""
+    was = Projection(module="m", planned=[], planned_units=4, planned_devices=1,
+                     projected=[Factor("expert", 4)], projected_units=4)
+    now = Projection(module="m", planned=[], planned_units=4, planned_devices=1,
+                     projected=[Factor("head", 4)], projected_units=4)
+    assert was.differences(now)
+
+
+def test_a_changed_collective_is_a_difference():
+    was = Projection(module="m", planned=[], planned_units=4, planned_devices=1,
+                     projected=[Factor("expert", 4, "all_to_all")], projected_units=4)
+    now = Projection(module="m", planned=[], planned_units=4, planned_devices=1,
+                     projected=[Factor("expert", 4, "allreduce")], projected_units=4)
+    assert was.differences(now)
+
+
+def test_an_identical_projection_reports_no_difference():
+    one = Projection(module="m", planned=[Factor("expert", 8)], planned_units=8, planned_devices=2,
+                     projected=[Factor("expert", 4)], projected_units=4)
+    assert one.differences(Projection.from_dict(one.to_dict())) == []
+
+
+def test_an_unreadable_factor_label_is_refused():
+    with pytest.raises(ProjectionError):
+        Factor.parse("not a factor")

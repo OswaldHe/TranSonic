@@ -36,6 +36,7 @@ which is why `describe()` puts it in the repo the agent reads.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,9 @@ from typing import Any
 import yaml
 
 from optimization import PROJECTION_TARGET_UNITS
+
+#: `Factor.label()`'s shape, for reading a recorded projection back: `expertx8(all_to_all)`.
+_LABEL = re.compile(r"(?P<dim>\w+)x(?P<factor>\d+)\((?P<collective>[\w.]+)\)")
 
 #: Dimensions whose split divides the *weight* bytes each unit holds. Mirrors
 #: `floorplan.schema.WEIGHT_PARTITION_DIMS`, duplicated rather than imported so a projection can
@@ -68,6 +72,19 @@ class Factor:
 
     def label(self) -> str:
         return f"{self.dim}x{self.factor}({self.collective})"
+
+    @classmethod
+    def parse(cls, label: str) -> Factor:
+        """The inverse of `label()`, so a recorded projection can be read back.
+
+        `dropped` and `scaled` are serialized as labels rather than as objects, which is right for
+        a human reading `projection.json` and means rehydrating one has to parse them.
+        """
+        match = _LABEL.fullmatch(label.strip())
+        if not match:
+            raise ProjectionError(f"cannot read '{label}' as a split factor")
+        return cls(dim=match.group("dim"), factor=int(match.group("factor")),
+                   collective=match.group("collective"))
 
 
 @dataclass
@@ -133,6 +150,54 @@ class Projection:
             "scaled": [f"{was.label()} -> {now.label()}" for was, now in self.scaled],
             "weight_residency_ratio": round(self.weight_residency_ratio(), 4),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Projection:
+        """Rehydrate a projection recorded by `init`, so later stages read it rather than redo it.
+
+        Recomputing is what the pipeline used to do, and it means a scheme edited mid-run silently
+        re-plans the module: `assemble` would build against a cut the submodule repo was never
+        made for, and `report` would label finished measurements with a split that never ran.
+        """
+        def splits(side: str) -> list[Factor]:
+            return [Factor(dim=str(s.get("dim")), factor=int(s.get("factor") or 1),
+                           collective=str(s.get("collective") or "allreduce"))
+                    for s in ((data.get(side) or {}).get("splits") or [])]
+
+        planned, projected = data.get("planned") or {}, data.get("projected") or {}
+        scaled: list[tuple[Factor, Factor]] = []
+        for entry in data.get("scaled") or []:
+            was, _, now = str(entry).partition("->")
+            scaled.append((Factor.parse(was), Factor.parse(now)))
+        return cls(
+            module=str(data.get("module") or ""),
+            planned=splits("planned"),
+            planned_units=int(planned.get("units") or 0),
+            planned_devices=int(planned.get("devices") or 0),
+            projected=splits("projected"),
+            projected_units=int(projected.get("units") or 0),
+            dropped=[Factor.parse(d) for d in (data.get("dropped") or [])],
+            scaled=scaled,
+            target=str(data.get("target") or ""),
+        )
+
+    def differences(self, other: Projection) -> list[str]:
+        """How this projection and another disagree, in the terms a reader would check.
+
+        Only the fields a later stage builds on. The unit count alone is not enough: a scheme
+        edited from `expert x4` to `head x4` keeps the width and changes the cut entirely, and a
+        changed collective changes what rejoining the ranks costs.
+        """
+        found: list[str] = []
+        if self.projected_units != other.projected_units:
+            found.append(f"{self.projected_units} unit(s) -> {other.projected_units}")
+        mine = " * ".join(f.label() for f in self.projected) or "no split"
+        theirs = " * ".join(f.label() for f in other.projected) or "no split"
+        if mine != theirs:
+            found.append(f"{mine} -> {theirs}")
+        if self.planned_units != other.planned_units:
+            found.append(f"planned {self.planned_units} unit(s) -> {other.planned_units}")
+        return found
 
     def describe(self) -> str:
         """The prose the submodule repo carries as `FLOORPLAN.md`.

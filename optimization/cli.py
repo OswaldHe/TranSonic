@@ -40,7 +40,13 @@ def _pipeline(config: str | None, verbose: bool) -> Pipeline:
 
 def _run(stage_name: str, fn) -> int:
     try:
-        fn()
+        outcome = fn()
+        # A stage that returned `ok=False` reported a failure without raising, and this used to
+        # discard it: the command exited 0 and `optimize all` carried on to the next stage.
+        if getattr(outcome, "ok", True) is False:
+            console.print(f"\n[red]{stage_name} did not succeed:[/red] "
+                          f"{getattr(outcome, 'detail', 'no detail')}")
+            return 1
     except StageError as exc:
         console.print(f"\n[red]{stage_name} stopped:[/red] {exc}")
         return 1

@@ -973,3 +973,43 @@ def test_a_slot_that_stopped_being_enforceable_is_reported(tmp_path):
     ])
     findings = cons.schedule_drift(tmp_path, narrowed)
     assert any("no longer enforceable" in f for f in findings)
+
+
+# ======================================================================================
+# the review of #6, second pass
+# ======================================================================================
+
+
+def test_a_resumed_summary_reads_verdicts_off_disk(tmp_path):
+    """`_slot_verdicts` only holds what this instance judged, so before the fix every governed
+    iteration from before a resume showed `—` while its `iter-N.json` sat on disk."""
+    from optimization import constraints as cons
+
+    project = tmp_path / "repo"
+    (project / cons.CONSTRAINTS_REL).mkdir(parents=True)
+    cons.report_path(project, 3).write_text(json.dumps({"passed": False, "findings": ["torch"]}))
+
+    verdict = cons.persisted_verdict(project, 3, "1-3")
+    assert verdict is not None and verdict.passed is False and verdict.checked
+
+
+def test_a_missing_persisted_verdict_reads_as_unknown(tmp_path):
+    from optimization import constraints as cons
+
+    (tmp_path / cons.CONSTRAINTS_REL).mkdir(parents=True)
+    assert cons.persisted_verdict(tmp_path, 9, "9-10") is None
+
+
+def test_the_derived_commands_and_the_preflight_name_one_interpreter(tmp_path):
+    """The preflight probed `sys.executable` while every command ran bare `python` from PATH, so it
+    proved something about an interpreter no iteration ever used."""
+    from optimization.config import GATE_PYTHON
+
+    config = PipelineConfig.load(_filled(tmp_path))
+    for stage in ("submodule", "full"):
+        derived = config.derive_loop_config(stage)
+        commands = [c["command"] for c in derived["constraints"]]
+        commands += [m["command"] for m in derived["metrics"]]
+        assert commands, stage
+        for command in commands:
+            assert command.startswith(f"{GATE_PYTHON} -m "), command

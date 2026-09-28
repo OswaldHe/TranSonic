@@ -240,6 +240,21 @@ class OptimizationLoop(Harness):
         self._slot_verdicts[iteration] = verdict
         return verdict
 
+    def _slot_followed(self, iteration: int) -> bool | None:
+        """Whether this iteration followed its slot: from memory, then from disk, then unknown.
+
+        The disk fallback is what makes a resumed run's summary honest. `_slot_verdicts` only holds
+        what *this* instance judged, so after a resume every earlier governed iteration reported as
+        un-checked even though its verdict was still on disk.
+        """
+        cached = self._slot_verdicts.get(iteration)
+        if cached is not None:
+            return cached.passed
+        slot = self.schedule.slot_for(iteration)
+        stored = cons.persisted_verdict(self.project_path, iteration,
+                                        slot.label if slot else None)
+        return stored.passed if stored is not None else None
+
     # -- acceptance ----------------------------------------------------------------
 
     def _check_metric_gates(self, metrics: dict[str, float]) -> str | None:
@@ -311,8 +326,7 @@ class OptimizationLoop(Harness):
                 "reason": result.reason,
                 "slot": (self.schedule.slot_for(iteration).label
                          if self.schedule.slot_for(iteration) else None),
-                "slot_followed": (self._slot_verdicts[iteration].passed
-                                  if iteration in self._slot_verdicts else None),
+                "slot_followed": self._slot_followed(iteration),
             }, indent=2))
             return target
         except OSError:
@@ -399,8 +413,7 @@ class OptimizationLoop(Harness):
                     "reason": r.reason,
                     "slot": (self.schedule.slot_for(r.iteration).label
                              if self.schedule.slot_for(r.iteration) else None),
-                    "slot_followed": (self._slot_verdicts[r.iteration].passed
-                                      if r.iteration in self._slot_verdicts else None),
+                    "slot_followed": self._slot_followed(r.iteration),
                 }
                 for r in self.history.load()
             ],

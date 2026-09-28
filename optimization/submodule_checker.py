@@ -147,9 +147,7 @@ def check_shape(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     imported = candidate._import_roots(inference)
     if "source" not in imported:
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
-    calls = candidate.called_attributes(inference)
-    traced = [d for d in calls if d.endswith("trace") or d.endswith("nki_jit")]
-    if not traced and entry not in calls and f"source.{entry}" not in calls:
+    if not candidate.invokes_entry_point(inference, entry):
         findings.append(
             f"{INFERENCE_FILE} neither traces nor calls '{entry}' — nothing connects the "
             f"validator to the kernel it is supposed to measure"
@@ -280,7 +278,7 @@ def check_declaration(repo: Path, manifest: dict[str, Any]) -> CheckResult:
                            f"{len(findings)} field(s) missing", findings)
 
     factor = int(declaration.get("factor") or 0)
-    projected = int((manifest.get("projection") or {}).get("projected_units") or 0)
+    projected = candidate.projected_units(manifest)
     if projected and factor != projected:
         findings.append(
             f"{DECLARATION_FILE} declares a {factor}-way cut, but the floorplan projection for "

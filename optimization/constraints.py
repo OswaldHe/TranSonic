@@ -32,6 +32,7 @@ Three properties worth stating because each was a choice:
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -375,6 +376,29 @@ def report_path(project_path: Path, iteration: int) -> Path:
     return project_path / CONSTRAINTS_REL / f"iter-{iteration}.json"
 
 
+def persisted_verdict(project_path: Path, iteration: int, label: str | None) -> SlotVerdict | None:
+    """The verdict an earlier run of this iteration left on disk, or None if there is none.
+
+    A resumed loop has an empty in-memory cache, so a summary written after a resume reported every
+    iteration from before it as un-checked — the report showed `—` for iterations whose `iter-N.json`
+    was sitting right there. Read as pass/fail only: the exit code that produced it is long gone, so
+    a verdict is trusted here exactly as the checker wrote it.
+    """
+    path = report_path(project_path, iteration)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if "passed" not in payload:
+        return None
+    return SlotVerdict(
+        iteration=iteration, label=label, checked=True, passed=bool(payload.get("passed")),
+        findings=[str(f) for f in (payload.get("findings") or [])],
+    )
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -554,13 +578,18 @@ def validate_checker_source(path: Path) -> list[str]:
     Not a proof that the checker implements its prose — nothing here can be. It catches the
     failures that would otherwise surface as a mid-run infrastructure error: a script that does
     not parse, does not take the arguments the loop passes, or never writes a verdict.
+
+    It also holds the checker to the read-only half of `CHECKER_CONTRACT`, which used to be stated
+    and unchecked. A checker runs *after* `revert_out_of_scope`, so a script that writes
+    `source.py` writes the code that is then measured and merged as the candidate — the agent's
+    constraint would be enforced by a program able to edit the thing it is judging.
     """
     findings: list[str] = []
     if not path.is_file():
         return [f"{path.name} was not written"]
     source = path.read_text()
     try:
-        compile(source, str(path), "exec")
+        tree = ast.parse(source, str(path))
     except SyntaxError as exc:
         return [f"{path.name} does not parse: {exc}"]
     for flag in ("--repo", "--json"):
@@ -570,4 +599,59 @@ def validate_checker_source(path: Path) -> list[str]:
         findings.append(
             f"{path.name} does not write both 'passed' and 'findings' into its JSON report"
         )
+    findings += _side_effect_findings(tree, path.name)
     return findings
+
+
+#: Imports a checker may have. It reads one file and writes one JSON report, so the standard
+#: library's text, parsing and path tools are the whole job. `subprocess` is absent deliberately:
+#: a checker that can spawn a process can do anything this list is trying to prevent.
+CHECKER_ALLOWED_IMPORTS = frozenset({
+    "argparse", "ast", "json", "os", "pathlib", "re", "sys", "collections", "dataclasses",
+    "itertools", "functools", "typing", "textwrap", "difflib", "tokenize", "io", "math",
+    "string", "enum", "keyword", "symtable", "hashlib", "warnings",
+})
+
+#: Calls that delete, replace or execute. Writing is *not* here: a checker's whole output is the
+#: JSON report, so it legitimately writes one file, and banning writes would reject every checker
+#: the compiler can produce. What the candidate needs protecting from is a checker that removes or
+#: overwrites existing files or runs something else — and the runtime guard in `slotcheck` catches
+#: the mutation itself, whatever shape the code takes. This list is the cheap early warning.
+CHECKER_BANNED_CALLS = frozenset({
+    "remove", "unlink", "rmdir", "rmtree", "rename", "copy", "copy2", "copyfile", "copytree",
+    "move", "chmod", "system", "popen", "spawnl", "spawnv", "execv", "execve",
+    "check_call", "check_output", "Popen", "eval", "exec", "__import__", "import_module",
+    "truncate", "symlink", "link",
+})
+
+
+def _side_effect_findings(tree: ast.Module, name: str) -> list[str]:
+    """Static reasons this checker is not the read-only reader its contract promises."""
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            roots = ([a.name.split(".")[0] for a in node.names]
+                     if isinstance(node, ast.Import)
+                     else [(node.module or "").split(".")[0]])
+            for root in roots:
+                if root and root not in CHECKER_ALLOWED_IMPORTS:
+                    findings.append(
+                        f"{name}:{node.lineno} imports '{root}', which is outside the checker's "
+                        f"allowed imports — it reads one file and writes one JSON report"
+                    )
+        elif isinstance(node, ast.Call):
+            tail = _call_tail(node.func)
+            if tail in CHECKER_BANNED_CALLS:
+                findings.append(
+                    f"{name}:{node.lineno} calls '{tail}', which can delete, overwrite or execute. "
+                    f"A checker runs after out-of-scope changes are reverted, so anything it "
+                    f"changes in the repository is measured as the candidate"
+                )
+    return findings
+
+
+def _call_tail(func: ast.expr) -> str:
+    """The last name in a call's callee: `a.b.rmtree` -> `rmtree`."""
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return func.id if isinstance(func, ast.Name) else ""

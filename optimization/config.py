@@ -35,6 +35,11 @@ class ConfigError(ValueError):
 #: fifty lines deeper.
 PLACEHOLDER = "<FILL IN>"
 
+#: The interpreter the derived constraint and metric commands invoke. Bare, so the config file is
+#: not tied to one absolute path, which means it resolves from the iteration's PATH — and so the
+#: preflight has to probe *this*, not `sys.executable`. `driver._preflight` does.
+GATE_PYTHON = "python"
+
 #: How long a reviewer gets. Reviewing a kernel here is not the skim upstream's default assumes —
 #: it means reading a few hundred lines of NKI against a reference and forming an adversarial view
 #: of whether the iteration is real — and a reviewer killed mid-read leaves the iteration with no
@@ -246,7 +251,7 @@ class PipelineConfig:
                 # `python` from PATH, as bootstrap's preset does, so the file is not specific to an
                 # interpreter. The preflight proves it can import what the gate needs.
                 "command": (
-                    f"python -m {checker} --repo . "
+                    f"{GATE_PYTHON} -m {checker} --repo . "
                     f"--json .autohelix/optimization/gate.json --timeout {timeout}"
                 ),
                 "timeout": timeout + 300,
@@ -256,7 +261,8 @@ class PipelineConfig:
                 # re-running it would double every iteration's device time and could disagree with
                 # the number the gate judged. This reads the verdict back instead.
                 "command": (
-                    "python -m optimization.readback --json .autohelix/optimization/gate.json"
+                    f"{GATE_PYTHON} -m optimization.readback "
+                    f"--json .autohelix/optimization/gate.json"
                 ),
                 # Only what this stage can actually produce. `Harness._capture_baseline` requires
                 # *every* declared metric at iteration 0 and fails the run when one is missing, so

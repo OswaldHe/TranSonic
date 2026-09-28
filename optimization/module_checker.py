@@ -84,19 +84,11 @@ DEFAULT_RANKS = 4
 
 def rank_count(manifest: dict[str, Any]) -> int:
     """How many ranks this assembly runs, from what materialization recorded."""
-    for key in ("ranks",):
-        try:
-            value = int(manifest.get(key))
-        except (TypeError, ValueError):
-            continue
-        if value >= 1:
-            return value
-    projected = (manifest.get("projection") or {}).get("projected") or {}
     try:
-        value = int(projected.get("units"))
+        explicit = int(manifest.get("ranks"))
     except (TypeError, ValueError):
-        return DEFAULT_RANKS
-    return value if value >= 1 else DEFAULT_RANKS
+        explicit = 0
+    return explicit if explicit >= 1 else (candidate.projected_units(manifest) or DEFAULT_RANKS)
 
 
 def launch(ranks: int) -> list[str]:
@@ -212,6 +204,14 @@ def check_frozen_validator(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     inference = candidate._parse(path)
     if "source" not in candidate._import_roots(inference):
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
+    elif not candidate.invokes_entry_point(inference, entry):
+        # Importing `source` is not the same as running it. Once this file is frozen by hash, a
+        # validator that profiles a helper of its own or compares the golden against itself would
+        # let every later `source.py` pass without its output ever being checked.
+        findings.append(
+            f"{INFERENCE_FILE} imports {SOURCE_FILE} but never traces or calls '{entry}' — "
+            f"nothing connects the frozen validator to the kernel it is supposed to measure"
+        )
     return CheckResult("a", CHECK_TITLES["a"], not findings,
                        f"frozen, drives '{entry}'" if not findings
                        else f"{len(findings)} problem(s)", findings)

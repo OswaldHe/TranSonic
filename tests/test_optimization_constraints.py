@@ -302,3 +302,53 @@ def test_the_checker_command_carries_the_advisory_flag():
     assert "optimization.slotcheck" in enforcing
     assert "--advisory" not in enforcing
     assert advisory.endswith("--advisory")
+
+
+# -- the review of #6: the checker's read-only contract, checked statically -------------
+
+
+def _write(tmp_path, body: str):
+    """A checker that already satisfies the structural checks, so only `body` is under test."""
+    path = tmp_path / "slot-1-3.py"
+    path.write_text(
+        "import argparse, json\n"
+        "FLAGS = ('--repo', '--json')\n"
+        "VERDICT = {'passed': True, 'findings': []}\n"
+        + body
+    )
+    return path
+
+
+def test_a_checker_that_shells_out_is_refused(tmp_path):
+    findings = cons.validate_checker_source(_write(tmp_path, "import subprocess\n"))
+    assert any("subprocess" in f for f in findings)
+
+
+def test_a_checker_that_imports_shutil_is_refused(tmp_path):
+    findings = cons.validate_checker_source(_write(tmp_path, "import shutil\n"))
+    assert any("shutil" in f for f in findings)
+
+
+def test_a_checker_that_deletes_is_refused(tmp_path):
+    findings = cons.validate_checker_source(_write(tmp_path, "import os\nos.remove('x')\n"))
+    assert any("remove" in f for f in findings)
+
+
+def test_a_checker_that_execs_is_refused(tmp_path):
+    findings = cons.validate_checker_source(_write(tmp_path, "exec('x = 1')\n"))
+    assert any("exec" in f for f in findings)
+
+
+def test_writing_the_json_report_is_not_refused(tmp_path):
+    """A checker's whole output is that report, so banning writes would reject every checker."""
+    findings = cons.validate_checker_source(_write(
+        tmp_path, "import pathlib\npathlib.Path('r.json').write_text('{}')\n",
+    ))
+    assert findings == []
+
+
+def test_an_ordinary_static_checker_is_accepted(tmp_path):
+    findings = cons.validate_checker_source(_write(
+        tmp_path, "import ast, re, sys\nt = ast.parse(open('source.py').read())\n",
+    ))
+    assert findings == []

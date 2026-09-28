@@ -40,7 +40,7 @@ from rich.text import Text
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
-from optimization.config import PipelineConfig
+from optimization.config import GATE_PYTHON, PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
 from optimization.projection import Projection, ProjectionError, project_module
 
@@ -146,28 +146,36 @@ class Pipeline:
             return self._projection
 
         # `init` records the projection and the later stages are documented as using that frozen
-        # result. A separate `optimize submodule` or `assemble` invocation builds a fresh Pipeline,
-        # so without this the placement is recomputed from whatever the scheme says *now* — and a
-        # scheme edited between stages would give the assembly a different cut from the one the
-        # submodule was built for, with nothing reporting the change.
+        # result, so the recorded one is *the* projection whenever it exists. A separate
+        # `optimize submodule` or `assemble` invocation builds a fresh Pipeline, and recomputing
+        # from whatever the scheme says now would let a scheme edited mid-run re-plan the module:
+        # the assembly would be built against a cut the submodule repo was never made for.
         recorded = (self._read_record("projection") or {}).get("projection") or {}
         try:
             projection = project_module(
                 self.config.scheme, self.config.module_id, self.config.target_units,
             )
         except ProjectionError as exc:
-            raise StageError(str(exc)) from exc
+            if not recorded:
+                raise StageError(str(exc)) from exc
+            # The scheme no longer projects at all. The workspace is still coherent, so the
+            # recorded projection stands and the run continues from it.
+            projection = Projection.from_dict(recorded)
 
         if recorded:
-            was = recorded.get("projected", {}).get("units")
-            now = projection.projected_units
-            if was is not None and int(was) != now:
+            frozen = Projection.from_dict(recorded)
+            # Every field a later stage builds on, not just the width: `expert x4` and `head x4`
+            # are the same number of ranks and entirely different kernels.
+            drift = frozen.differences(projection)
+            if drift:
                 raise StageError(
-                    f"{self.config.scheme.name} now projects {self.config.module_id} onto {now} "
-                    f"unit(s), but this workspace was initialized against {was}. The repos already "
-                    f"built assume {was}.\n"
+                    f"{self.config.scheme.name} no longer projects {self.config.module_id} the way "
+                    f"this workspace was initialized:\n  "
+                    + "\n  ".join(drift)
+                    + f"\nThe repos already built assume the recorded projection.\n"
                     f"Either restore the scheme, or start a fresh workspace.root for the new one."
                 )
+            projection = frozen
 
         if projection.diverges and self.config.on_oversized == "error":
             raise StageError(
@@ -189,18 +197,33 @@ class Pipeline:
         fault rather than the environment's.
         """
         problems = self.config.validate()
-        probe = subprocess.run(
-            [sys.executable, "-c",
-             "import optimization.submodule_checker, optimization.module_checker, "
-             "torch, torch_neuronx; print('ok')"],
-            capture_output=True, text=True,
-        )
-        if probe.returncode != 0:
-            tail = (probe.stderr.strip().splitlines() or ["unknown import error"])[-1]
+        # Probe the interpreter the *derived commands* invoke, which is bare `python` from PATH, not
+        # `sys.executable`. Launched through an absolute venv console script, pipx, or any wrapper
+        # that does not put its own bin first, the two are different interpreters — and this
+        # preflight claimed to prove something about an interpreter no iteration ever runs.
+        resolved = shutil.which(GATE_PYTHON)
+        if resolved is None:
             problems.append(
-                f"the gate runs `python -m optimization.*_checker`, but this interpreter cannot "
-                f"import what it needs: {tail}. Activate {self.config.venv or 'the venv'}"
+                f"the gate and metric commands run `{GATE_PYTHON} -m optimization.*`, but "
+                f"'{GATE_PYTHON}' is not on PATH. Activate {self.config.venv or 'the venv'}"
             )
+        else:
+            probe = subprocess.run(
+                [resolved, "-c",
+                 "import optimization.submodule_checker, optimization.module_checker, "
+                 "torch, torch_neuronx; print('ok')"],
+                capture_output=True, text=True,
+            )
+            if probe.returncode != 0:
+                tail = (probe.stderr.strip().splitlines() or ["unknown import error"])[-1]
+                note = ("" if Path(resolved).resolve() == Path(sys.executable).resolve() else
+                        f" Note that this is not the interpreter running autohelix "
+                        f"({sys.executable}); the commands use `{GATE_PYTHON}` from PATH.")
+                problems.append(
+                    f"the gate runs `{GATE_PYTHON} -m optimization.*_checker`, and {resolved} "
+                    f"cannot import what it needs: {tail}. "
+                    f"Activate {self.config.venv or 'the venv'}.{note}"
+                )
         for tool in ("torchrun", "neuron-explorer"):
             if shutil.which(tool) is None:
                 problems.append(f"'{tool}' is not on PATH; stage 4 and 5 cannot run without it")
@@ -447,7 +470,22 @@ class Pipeline:
         self._seed_baseline_verdict(repo, stage)
         config_path = self.config.write_loop_config(stage)
         loop = OptimizationLoop(repo, config_file=config_path, stage=stage, verbose=self.verbose)
+        # `Harness.run()` reports a dirty repository, a missing editable file or rejected config
+        # drift by printing and returning normally, so "it ran" cannot be read off the call. Count
+        # the iterations it recorded instead: an aborted loop leaves the history where it was, and
+        # `optimize all` would otherwise walk straight into assembling a submodule never optimized.
+        before = len(loop.history.load())
         loop.run()
+        after = len(loop.history.load())
+        budgeted = (self.config.submodule if stage == "submodule" else self.config.full).iterations
+        if after == before and budgeted > 0:
+            raise StageError(
+                f"the {stage} loop recorded no iteration, so it did not start. The usual causes "
+                f"print above: the repository has uncommitted changes, a file named in "
+                f"scope.editable is missing, or the derived config no longer matches the saved "
+                f"run state."
+            )
+
         best_commit, best_value = loop.best_commit()
         return StageOutcome(
             stage=f"run-{stage}", ok=best_value is not None,

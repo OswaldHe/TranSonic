@@ -23,6 +23,7 @@ iteration. At the end of one, a violation costs the 5% of slack every other iter
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -38,6 +39,28 @@ BROKEN = 2
 CHECKER_TIMEOUT_SECONDS = 120
 
 
+#: The files a checker must leave alone. `source.py` is the one that matters — it is the candidate,
+#: and a constraint runs after out-of-scope changes are reverted, so an edit here survives into the
+#: measurement. `inference.py` is frozen for the whole run and its hash is a gate check.
+GUARDED_FILES = ("source.py", "inference.py")
+
+
+def _repo_fingerprint(repo: Path) -> dict[str, str]:
+    """Content hashes of the files a checker may not change."""
+    seen: dict[str, str] = {}
+    for name in GUARDED_FILES:
+        path = repo / name
+        if path.is_file():
+            seen[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return seen
+
+
+def _mutations(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """Which guarded files a checker changed, added or removed."""
+    return sorted(name for name in set(before) | set(after)
+                  if before.get(name) != after.get(name))
+
+
 def run_checker(checker: Path, repo: Path, report: Path,
                 timeout: int = CHECKER_TIMEOUT_SECONDS) -> tuple[bool, str]:
     """Run one compiled checker and return whether it passed, plus its output.
@@ -50,6 +73,7 @@ def run_checker(checker: Path, repo: Path, report: Path,
     if report.exists():
         report.unlink()  # a stale verdict would be read as this iteration's
 
+    before = _repo_fingerprint(repo)
     try:
         result = subprocess.run(
             [sys.executable, str(checker), "--repo", str(repo), "--json", str(report)],
@@ -61,6 +85,20 @@ def run_checker(checker: Path, repo: Path, report: Path,
     except OSError as exc:
         _write(report, False, [f"the checker could not be run: {exc}"])
         return False, str(exc)
+
+    # The contract says a checker does not modify anything, and the compiler writes the checker, so
+    # the claim needs checking rather than trusting. Constraints run *after* out-of-scope changes
+    # are reverted, so a checker that edits the candidate edits the code that is then measured and
+    # merged: the program judging the constraint would be able to rewrite what it is judging.
+    # Compared by content, so any route to the mutation is caught, not just the ones a static read
+    # can name.
+    touched = _mutations(before, _repo_fingerprint(repo))
+    if touched:
+        _write(report, False, [
+            f"the checker modified {', '.join(touched)}, which its contract forbids. A checker "
+            f"reads the candidate and writes only its JSON report.",
+        ])
+        return False, f"checker modified {', '.join(touched)}"
 
     output = result.stdout + result.stderr
     if not report.is_file():

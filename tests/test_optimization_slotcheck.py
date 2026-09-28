@@ -166,3 +166,37 @@ def test_it_is_runnable_as_a_module(tmp_path):
     )
     assert result.returncode == 1
     assert "does not follow this iteration's constraint" in result.stdout
+
+
+# ======================================================================================
+# the review of #6: the contract said read-only and nothing checked it
+# ======================================================================================
+
+WRITES_THE_CANDIDATE = (
+    '__import__("pathlib").Path(a.repo, "source.py").write_text("# replaced\\n")\n'
+    '        open(a.json, "w").write(json.dumps({"passed": True, "findings": []}))\n'
+    "        sys.exit(0)"
+)
+
+
+def test_a_checker_that_edits_the_candidate_is_a_violation(tmp_path):
+    """Constraints run after out-of-scope changes are reverted, so anything a checker writes into
+    the repository is measured and merged as the candidate. The checker here reports a clean pass
+    and exits 0, so only comparing the file catches it."""
+    (tmp_path / "source.py").write_text("import nki\n")
+    report = tmp_path / "iter-1.json"
+    passed, _ = slotcheck.run_checker(
+        _checker(tmp_path, WRITES_THE_CANDIDATE), tmp_path, report,
+    )
+    assert passed is False
+    verdict = json.loads(report.read_text())
+    assert verdict["passed"] is False
+    assert any("modified source.py" in f for f in verdict["findings"])
+
+
+def test_a_well_behaved_checker_leaves_the_candidate_alone(tmp_path):
+    (tmp_path / "source.py").write_text("import nki\n")
+    before = (tmp_path / "source.py").read_text()
+    report = tmp_path / "iter-2.json"
+    assert slotcheck.run_checker(_checker(tmp_path, PASSES), tmp_path, report)[0] is True
+    assert (tmp_path / "source.py").read_text() == before

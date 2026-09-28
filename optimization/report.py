@@ -132,11 +132,22 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
         config.full_repo / ".autohelix" / "optimization" / "full-summary.json"
     )
 
+    # The recorded projection is the one the run was built against. Recomputing from the scheme
+    # would let a scheme edited after the run label finished measurements with a split and a rank
+    # count that were never executed — the one thing this report's own caveats exist to prevent.
+    # Recomputation is the fallback for a workspace with no record, not the default.
     projection: Projection | None = None
-    try:
-        projection = project_module(config.scheme, config.module_id, config.target_units)
-    except Exception:
-        projection = None
+    recorded = (projection_record or {}).get("projection") or {}
+    if recorded:
+        try:
+            projection = Projection.from_dict(recorded)
+        except Exception:
+            projection = None
+    if projection is None:
+        try:
+            projection = project_module(config.scheme, config.module_id, config.target_units)
+        except Exception:
+            projection = None
 
     bootstrap_ms = baselines.get("bootstrap_latency_ms")
     submodule_best = submodule_summary.get("best_ms")

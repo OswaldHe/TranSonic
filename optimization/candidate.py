@@ -453,6 +453,77 @@ def fabrication_findings(tree: ast.Module, filename: str) -> list[str]:
     return findings
 
 
+#: Things that take a kernel and run it, so naming the entry point as their argument counts as
+#: driving it. `kernel[2]` is a launch, not one of these — see `_callee_name`.
+TRACER_NAMES = frozenset({
+    "trace", "jit", "nki_jit", "baremetal", "benchmark", "simulate_kernel",
+})
+
+
+def _callee_name(node: ast.expr) -> str:
+    """The dotted name an expression resolves to, with any subscript unwrapped.
+
+    `kernel[2](...)` is the LNC=2 launch idiom on this host, so a callee is not always a plain
+    name or attribute: the grid subscript sits between the name and the call, and an analyzer that
+    only understands `f()` and `a.f()` reports that the validator never calls the kernel at all.
+    """
+    while isinstance(node, ast.Subscript):
+        node = node.value
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def invokes_entry_point(tree: ast.Module, entry: str) -> bool:
+    """Whether this file runs the kernel, or hands it to something that will.
+
+    Four shapes, all of which a real validator in this pipeline has used: `entry(...)`,
+    `source.entry(...)`, `entry[grid](...)`, and `nki.trace(entry)` — where the kernel is the
+    argument rather than the callee.
+
+    Checking that the validator names the entry point at all is what stops a frozen validator
+    from profiling an unrelated helper or comparing the golden against itself: once it is frozen
+    by hash, every later iteration of `source.py` would pass without its output being looked at.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _callee_name(node.func)
+        if name == entry or name.endswith(f".{entry}"):
+            return True
+        if name.rsplit(".", 1)[-1] in TRACER_NAMES:
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                handed = _callee_name(arg)
+                if handed == entry or handed.endswith(f".{entry}"):
+                    return True
+    return False
+
+
+def projected_units(manifest: dict[str, Any]) -> int:
+    """How many ranks the recorded projection calls for, or 0 when the manifest does not say.
+
+    One accessor for both gates. Materialization writes this nested, as
+    ``projection.projected.units``, and the submodule gate used to read a flat ``projected_units``
+    that has never existed — so its factor-mismatch check read 0 and disabled itself for a whole
+    run while reporting nothing. The flat key is still accepted in case an older manifest has it.
+    """
+    projection = manifest.get("projection") or {}
+    for value in ((projection.get("projected") or {}).get("units"),
+                  projection.get("projected_units"),
+                  manifest.get("ranks")):
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count >= 1:
+            return count
+    return 0
+
+
 def recorded_tensors(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """The manifest's tensor record, normalized to ``{relative path: entry}``.
 
