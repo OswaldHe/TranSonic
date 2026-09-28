@@ -253,6 +253,10 @@ def write_gitignore(repo: Path) -> None:
             "*.neff",
             "*.ntff",
             "profile*.json",
+            "# A validator's scratch directory: compile caches, per-rank logs, the device output it",
+            "# compares. Regenerated every run, and tracking it means every gate run leaves the",
+            "# tree dirty — which the loop refuses to start on.",
+            "build/",
             "",
         ])
     )

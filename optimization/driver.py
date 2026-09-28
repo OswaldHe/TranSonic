@@ -765,7 +765,7 @@ class Pipeline:
                 f"Run `optimize assemble` first."
             )
 
-        previous = _read_summary(repo, "full")
+        previous = self._previous_round(repo)
         target = from_commit or previous.get("best_commit")
         previous_best = previous.get("best_ms")
         if not target:
@@ -798,6 +798,12 @@ class Pipeline:
         latency = _latency_from_gate(repo / ".autohelix" / "optimization" / "module-gate.json")
         self.console.print(f"  round {round_number} baseline: {latency or float('nan'):g} ms")
 
+        # The gate just ran the validator, which rewrites its outputs under `build/`, and those are
+        # tracked — so the tree is dirty and `Harness.run` refuses to start. In the first-time flow
+        # `assemble` happens to absorb this, because `git_init` on a fresh repo commits everything
+        # the gate left; on an existing repo it returns early and nothing does.
+        self._commit_tree(repo, f"round {round_number} baseline: {latency or float('nan'):g} ms")
+
         outcome = self.run_loop("full")
         self._record(f"round-{round_number}", {
             "stage": "full", "from_commit": target, "note": note,
@@ -806,6 +812,44 @@ class Pipeline:
             "best_commit": outcome.payload.get("best_commit"),
         })
         return outcome
+
+    def _previous_round(self, repo: Path) -> dict[str, Any]:
+        """The last round's summary, from the live file or from the newest archived round.
+
+        The archive matters because this command can fail *after* rolling the state — a startup
+        refusal from the loop, say — and re-running it then found no live summary and reported "no
+        previous round to continue from" about a round it had itself just filed away.
+        """
+        live = _read_summary(repo, "full")
+        if live.get("best_commit"):
+            return live
+        rounds = repo / ".autohelix" / "rounds"
+        if not rounds.is_dir():
+            return live
+        for directory in sorted(rounds.iterdir(), reverse=True):
+            summary = directory / "full-summary.json"
+            if not summary.is_file():
+                continue
+            try:
+                archived = json.loads(summary.read_text())
+            except json.JSONDecodeError:
+                continue
+            if archived.get("best_commit"):
+                self.console.print(f"  reading the last round's result from {directory.name}")
+                return archived
+        return live
+
+    def _commit_tree(self, repo: Path, message: str) -> None:
+        """Commit whatever is in the tree, so the loop starts on a clean one. A no-op when clean."""
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        if not subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip():
+            return
+        subprocess.run(
+            ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
+             "commit", "-q", "-m", message],
+            cwd=repo, check=True,
+        )
 
     def _roll_round(self, repo: Path, note: str, previous: dict[str, Any]) -> int:
         """Move the finished round's run state aside and return *its* number, not the next one.
@@ -818,7 +862,15 @@ class Pipeline:
         state = repo / ".autohelix"
         rounds = state / "rounds"
         rounds.mkdir(parents=True, exist_ok=True)
-        number = 1 + sum(1 for p in rounds.iterdir() if p.is_dir() and p.name.startswith("round-"))
+        existing = sum(1 for p in rounds.iterdir() if p.is_dir() and p.name.startswith("round-"))
+
+        # Nothing to archive means this is a re-run after a start that did not reach iteration 1.
+        # Rolling again would file an empty round and shift every later number by one.
+        if not (state / "history.jsonl").exists():
+            self.console.print(f"  the previous round is already archived ({existing} on record)")
+            return existing
+
+        number = existing + 1
         destination = rounds / f"round-{number}"
         destination.mkdir(parents=True, exist_ok=True)
 

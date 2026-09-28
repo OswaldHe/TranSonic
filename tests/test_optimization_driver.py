@@ -1170,3 +1170,49 @@ def test_the_new_round_is_numbered_after_the_one_it_archives(tmp_path):
     pipeline, repo = _round_one(tmp_path)
     assert pipeline._roll_round(repo, note="", previous={}) == 1
     assert (repo / ".autohelix" / "rounds" / "round-1").is_dir()
+
+
+def test_rerunning_after_a_failed_start_does_not_file_an_empty_round(tmp_path):
+    """The command can fail after rolling — a startup refusal from the loop — and re-running it then
+    must not archive a second, empty round and shift every later number."""
+    pipeline, repo = _round_one(tmp_path)
+    assert pipeline._roll_round(repo, note="", previous={}) == 1
+    assert pipeline._roll_round(repo, note="", previous={}) == 1
+    rounds = repo / ".autohelix" / "rounds"
+    assert [p.name for p in sorted(rounds.iterdir())] == ["round-1"]
+
+
+def test_the_last_rounds_result_is_found_in_the_archive(tmp_path):
+    """After a roll there is no live summary, and `rerun-full` has to find the commit it filed."""
+    pipeline, repo = _round_one(tmp_path)
+    expected = json.loads(
+        (repo / ".autohelix" / "optimization" / "full-summary.json").read_text()
+    )["best_commit"]
+    pipeline._roll_round(repo, note="", previous={})
+    assert not (repo / ".autohelix" / "optimization" / "full-summary.json").exists()
+    assert pipeline._previous_round(repo).get("best_commit") == expected
+
+
+def test_committing_the_tree_is_a_no_op_when_it_is_clean(tmp_path):
+    import subprocess
+
+    pipeline, repo = _round_one(tmp_path)
+    pipeline._commit_tree(repo, "absorb what the fixture left")
+    before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                            capture_output=True, text=True).stdout
+    pipeline._commit_tree(repo, "nothing to do")
+    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                           capture_output=True, text=True).stdout
+    assert before == after
+
+
+def test_committing_the_tree_absorbs_what_the_gates_run_left(tmp_path):
+    """The gate runs the validator, which rewrites its tracked outputs under `build/`."""
+    import subprocess
+
+    pipeline, repo = _round_one(tmp_path)
+    (repo / "build").mkdir(exist_ok=True)
+    (repo / "build" / "rank0_output.pt").write_text("new output\n")
+    pipeline._commit_tree(repo, "round 2 baseline")
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip() == ""
