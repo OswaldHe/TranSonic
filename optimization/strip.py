@@ -159,8 +159,11 @@ def strip_source(text: str) -> tuple[str, int, int]:
             continue
         head = line[: starts[number]].rstrip()
         if head:
-            rebuilt.append(head)  # a trailing comment on a line of code
-        # otherwise the line was only a comment, and it goes entirely
+            rebuilt.append(head)
+            continue
+        # The line held nothing but a comment, so it is dropped rather than blanked. Blanking would
+        # leave the file the shape its commentary gave it — a gap of blank lines wherever a block
+        # used to be — and that shape is itself a claim about which code was worth explaining.
 
     # A removed comment block leaves a hole. Collapse runs of three or more blank lines to two,
     # which is what the code looked like before the block was written.

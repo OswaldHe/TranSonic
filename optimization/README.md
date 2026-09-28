@@ -277,8 +277,8 @@ optimization/
   loop.py                  Harness + the per-iteration constraint, candidate archive, best commit
   constraints.py           the schedule, the compiled checkers, their manifest
   custody.py               holding the fields a gate reads back outside the agent's repo
-  gate.py                  the analysis the two gates share — not itself a gate
-                           (reuses bootstrap/nki_checker's)
+  candidate.py             running a candidate repo and reading facts out of it: what both
+                           gates share (reuses bootstrap/nki_checker's analysis)
   submodule_checker.py     the submodule gate: 7 module-agnostic checks
   module_checker.py        the module gate: 9 checks, the only semantic ones in the pipeline
   readback.py              the metric command: the latency the gate already measured

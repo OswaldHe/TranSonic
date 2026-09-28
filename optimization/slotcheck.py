@@ -8,15 +8,15 @@ rejected, its work is discarded, and — because upstream skips the metric comma
 fails — nothing is measured. That is right for most of a slot's iterations. It is wrong for the last
 one.
 
-By the last iteration of an interval the agent has had every iteration the slot allows. If it still
-cannot satisfy the constraint but has produced something correct and *faster*, throwing that away
-buys nothing: the constraint exists to shape the search, and at the end of the interval the search
-is over. So on the last iteration the checker runs **advisory** — it writes the same verdict and
+By a slot's last iteration the agent has had every iteration that slot allows. If it still cannot
+satisfy the constraint but has produced something correct and *faster*, throwing that away buys
+nothing: the constraint exists to shape the search, and at the end of the slot the search is over.
+So on that last iteration the checker runs **advisory** — it writes the same verdict and
 always exits 0, letting the real constraints and the measurement proceed — and the loop applies a
 stricter acceptance rule instead of the usual 5% slack: correct, and strictly faster than the best
 so far, or it is rejected anyway.
 
-Which makes the escape hatch narrow in the right way. Inside an interval, a violation costs the
+Which makes the escape hatch narrow in the right way. Inside a slot, a violation costs the
 iteration. At the end of one, a violation costs the 5% of slack every other iteration gets.
 """
 
@@ -84,8 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument(
         "--advisory", action="store_true",
-        help="always exit 0, so the measurement still runs. Used on the last iteration of an "
-             "interval, where the loop applies a stricter acceptance rule instead of rejecting.",
+        help="always exit 0, so the measurement still runs. Used on the last iteration of a "
+             "slot, where the loop applies a stricter acceptance rule instead of rejecting.",
     )
     args = parser.parse_args(argv)
 

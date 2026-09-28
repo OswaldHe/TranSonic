@@ -227,11 +227,11 @@ class PipelineConfig:
         and the editable scope is one file because a movable validator makes the measurements
         incomparable.
         """
-        from optimization import gate, module_checker
+        from optimization import candidate, module_checker
 
         if stage == "submodule":
             spec, checker, timeout = (
-                self.submodule, "optimization.submodule_checker", gate.DEFAULT_RUN_TIMEOUT,
+                self.submodule, "optimization.submodule_checker", candidate.DEFAULT_RUN_TIMEOUT,
             )
         elif stage == "full":
             spec, checker, timeout = (

@@ -9,9 +9,11 @@ one-device trn2.3xlarge, and the interesting modules do not fit: in `schemes/ran
 and both Engram tables over sixteen spanning four. Only the hyper-connection plumbing, the
 norms, `embed` and the small MTP heads are single-device placements.
 
-So a literal "this module must fit in one device" check fails on 85 of the 89 placements worth
-optimizing, and the projection here is what makes the pipeline usable: reduce the split product
-to exactly the four logical cores one device has, and record what was given up.
+Of the scheme's 271 placements, 182 fit one device and 89 do not — and those 89 are exactly the
+ones worth optimizing: all 43 `.ffn`, all 43 `.attention`, `lm_head`, and both Engram tables. So a
+literal "this module must fit in one device" check refuses every module anyone would bring here,
+which is what the projection exists to avoid: reduce the split product to exactly the four logical
+cores one device has, and record what was given up.
 
 The rule, and why it is this rule:
 

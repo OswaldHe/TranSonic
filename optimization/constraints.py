@@ -51,9 +51,9 @@ CONSTRAINTS_REL = Path(".autohelix") / "optimization" / "constraints"
 MANIFEST_REL = CONSTRAINTS_REL / "manifest.json"
 
 #: What a checker is invoked as. Driven through `optimization.slotcheck` rather than directly, so
-#: that the last iteration of an interval can run it `--advisory` — writing the same verdict but
+#: that a slot's last iteration can run it `--advisory` — writing the same verdict but
 #: exiting 0, which lets the measurement proceed and hands the accept/reject decision to the loop's
-#: stricter end-of-interval rule. See `optimization/slotcheck.py`.
+#: stricter end-of-slot rule. See `optimization/slotcheck.py`.
 CHECKER_COMMAND = (
     "python -m optimization.slotcheck --checker {checker} --repo . --json {report}{advisory}"
 )
@@ -197,7 +197,7 @@ class Schedule:
                 if beyond:
                     raise ScheduleError(
                         f"{where}: names iteration(s) {beyond} but budget.iterations is "
-                        f"{max_iterations}. Raise the budget or narrow the range — a slot that "
+                        f"{max_iterations}. Raise the budget or narrow the slot — a slot that "
                         f"never runs is a constraint you will believe was applied"
                     )
             for i in iterations:

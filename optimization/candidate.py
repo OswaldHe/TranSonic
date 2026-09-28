@@ -11,7 +11,7 @@ show up as a gate that passes something its sibling rejects.
 
 The private names are imported deliberately. They are private to callers *outside* this
 distribution; inside it, `optimization/` is a consumer of `bootstrap/` by construction — it starts
-from a bootstrapped repo — and `tests/test_optimization_gate.py` fails if any of them disappears,
+from a bootstrapped repo — and `tests/test_optimization_candidate.py` fails if any disappears,
 which turns a refactor over there into a failing test here rather than a silent behaviour change.
 """
 

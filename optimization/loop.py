@@ -70,7 +70,7 @@ class OptimizationLoop(Harness):
         self.schedule = self._load_schedule()
         self._slot_verdicts: dict[int, cons.SlotVerdict] = {}
         #: Which iteration `_check_metric_gates` is judging. Upstream does not pass it, and the
-        #: end-of-interval rule needs to know whose slot verdict to consult.
+        #: end-of-slot rule needs to know whose slot verdict to consult.
         self._current_iteration: int | None = None
         #: Each iteration's `source.py`, read in the last moment before its worktree is torn down.
         self._captured_source: dict[int, str] = {}
@@ -160,7 +160,7 @@ class OptimizationLoop(Harness):
         violation is rejected by exactly the path a failing constraint already takes — same
         reporting, same discard, same failure output carried into the next prompt.
 
-        On the **last** iteration of the slot's interval the checker runs `--advisory`: it writes the
+        On the slot's **last** iteration the checker runs `--advisory`: it writes the
         same verdict but exits 0, so the real constraints and the measurement still run, and the
         accept/reject decision moves to `_check_metric_gates`, which requires a strict improvement
         instead of allowing the usual 5%. By then the agent has had every iteration the slot allows,
@@ -189,7 +189,7 @@ class OptimizationLoop(Harness):
         )
         if advisory:
             self.console.print(
-                f"  [dim]slot {slot.label}: last iteration of the interval, so the constraint is "
+                f"  [dim]slot {slot.label}: last iteration of the slot, so the constraint is "
                 f"checked but not fatal — acceptance needs a strict improvement instead[/dim]"
             )
 
@@ -236,9 +236,9 @@ class OptimizationLoop(Harness):
     # -- acceptance ----------------------------------------------------------------
 
     def _check_metric_gates(self, metrics: dict[str, float]) -> str | None:
-        """Upstream's gate, plus the stricter rule for an end-of-interval violation.
+        """Upstream's gate, plus the stricter rule for an end-of-slot violation.
 
-        A candidate that violated its slot on the interval's last iteration reached this point only
+        A candidate that violated its slot on that slot's last iteration reached this point only
         because the checker ran advisory. It does not get the 5% of slack every compliant iteration
         gets: it has to be **strictly faster** than the best accepted so far. Correct-and-faster is
         worth keeping; correct-and-merely-not-much-worse is not, when it also ignored the constraint.

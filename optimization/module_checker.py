@@ -6,7 +6,7 @@
 Everything upstream is advisory by design. The agent chooses how to cut the module; the submodule
 gate asks only module-agnostic questions; ten iterations of optimization are measured against a
 golden the agent itself derived. That is deliberate — a script that knew how to shard an MoE would
-work for MoE and nothing else — and it is safe only because of what happens here: the four ranks
+work for MoE and nothing else — and it is safe only because of what happens here: the ranks
 are reassembled, and the result has to be the bootstrapped module's recorded output, at the
 bootstrapped module's own bar, faster than the bootstrapped module, and within 10% of the
 submodule it was built from.
@@ -18,9 +18,9 @@ looseness upstream is bounded by this gate, which is why it can be loose.
     a  frozen validator  `inference.py` is the one stage 4 wrote, and it drives `source.py`
     b  self-contained    neither file reaches outside its allowlist or this repository
     c  nki collectives   the reduction is `nki.collectives`, not `torch.distributed` or XLA
-    d  four ranks        `torchrun --nproc_per_node=4`, every rank exits 0
+    d  every rank        `torchrun --nproc_per_node=<the manifest's count>`, every rank exits 0
     e  matches           the post-collective output equals the module's recorded output
-    f  measured          a fresh 4-rank collective profile, and the latency is read from it
+    f  measured          a fresh collective profile covering every rank, and the latency comes from it
     g  provenance        the input, weights and golden are the recorded bytes
     h  faster            quicker than the bootstrapped single-core module
     i  overhead bounded  no slower than 1.1x the submodule it is made of
@@ -46,8 +46,8 @@ from pathlib import Path
 from typing import Any
 
 from bootstrap.nki_checker import CheckResult
-from optimization import gate
-from optimization.gate import (
+from optimization import candidate
+from optimization.candidate import (
     CEILING_NAME,
     INFERENCE_FILE,
     LATENCY_MARKER,
@@ -63,7 +63,7 @@ CHECK_TITLES: dict[str, str] = {
     "a": "frozen validator",
     "b": "self-containment",
     "c": "nki collectives",
-    "d": "four ranks",
+    "d": "every rank",
     "e": "matches the module",
     "f": "measurement",
     "g": "data provenance",
@@ -132,8 +132,8 @@ SOURCE_ALLOWED_IMPORTS = frozenset({
 })
 INFERENCE_ALLOWED_IMPORTS = SOURCE_ALLOWED_IMPORTS | {"source"}
 
-#: Longer than the submodule's: four ranks, each compiling its own graph on a cold cache, then a
-#: separate `neuron-explorer capture` pass over the result.
+#: Longer than the submodule's: every rank compiles its own graph on a cold cache, and then a
+#: separate `neuron-explorer capture` pass runs over the result.
 DEFAULT_RUN_TIMEOUT = 4800
 
 #: How much of the submodule's latency the collective may add. The bound that makes a lazy cut fail.
@@ -206,11 +206,11 @@ def check_frozen_validator(repo: Path, manifest: dict[str, Any]) -> CheckResult:
         findings.append("the manifest records no hash for the frozen validator")
 
     entry = str(manifest.get("entry_point") or "kernel")
-    source = gate._parse(repo / SOURCE_FILE)
-    if entry not in gate.top_level_functions(source):
+    source = candidate._parse(repo / SOURCE_FILE)
+    if entry not in candidate.top_level_functions(source):
         findings.append(f"{SOURCE_FILE} defines no top-level '{entry}'")
-    inference = gate._parse(path)
-    if "source" not in gate._import_roots(inference):
+    inference = candidate._parse(path)
+    if "source" not in candidate._import_roots(inference):
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
     return CheckResult("a", CHECK_TITLES["a"], not findings,
                        f"frozen, drives '{entry}'" if not findings
@@ -222,12 +222,12 @@ def check_self_contained(repo: Path) -> CheckResult:
     findings: list[str] = []
     for filename, allowed in ((SOURCE_FILE, SOURCE_ALLOWED_IMPORTS),
                               (INFERENCE_FILE, INFERENCE_ALLOWED_IMPORTS)):
-        tree = gate._parse(repo / filename)
-        findings += gate.import_findings(tree, allowed, filename)
-        findings += gate.path_findings(tree, filename)
-    source = gate._parse(repo / SOURCE_FILE)
-    for dotted, line in sorted(gate.called_attributes(source).items(), key=lambda kv: kv[1]):
-        if dotted.rsplit(".", 1)[-1] in gate.FILE_IO_NAMES:
+        tree = candidate._parse(repo / filename)
+        findings += candidate.import_findings(tree, allowed, filename)
+        findings += candidate.path_findings(tree, filename)
+    source = candidate._parse(repo / SOURCE_FILE)
+    for dotted, line in sorted(candidate.called_attributes(source).items(), key=lambda kv: kv[1]):
+        if dotted.rsplit(".", 1)[-1] in candidate.FILE_IO_NAMES:
             findings.append(
                 f"{SOURCE_FILE}:{line} calls '{dotted}' — the kernel receives its tensors as "
                 f"arguments and may not read files"
@@ -246,15 +246,15 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
     number describes the machine the floorplan is about.
     """
     findings: list[str] = []
-    source = gate._parse(repo / SOURCE_FILE)
-    inference = gate._parse(repo / INFERENCE_FILE)
+    source = candidate._parse(repo / SOURCE_FILE)
+    inference = candidate._parse(repo / INFERENCE_FILE)
 
     resolved_from_nki: list[str] = []
     for where, tree in ((SOURCE_FILE, source), (INFERENCE_FILE, inference)):
-        aliases = gate.import_aliases(tree)
-        for dotted, line in sorted(gate.called_attributes(tree).items(), key=lambda kv: kv[1]):
+        aliases = candidate.import_aliases(tree)
+        for dotted, line in sorted(candidate.called_attributes(tree).items(), key=lambda kv: kv[1]):
             tail = dotted.rsplit(".", 1)[-1]
-            resolved = gate.resolve_call(dotted, aliases)
+            resolved = candidate.resolve_call(dotted, aliases)
 
             if tail in COLLECTIVE_OPS:
                 if resolved.startswith(COLLECTIVE_MODULE):
@@ -302,7 +302,7 @@ def check_all_ranks(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResult:
                 f"failing and taking the others down\nlast output:\n{tail}"
             )
     seen = [r for r in range(ranks)
-            if gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r)) is not None]
+            if candidate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r)) is not None]
     if len(seen) != ranks:
         absent = sorted(set(range(ranks)) - set(seen))
         findings.append(
@@ -317,9 +317,9 @@ def check_all_ranks(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResult:
 def check_matches(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckResult:
     """(e) The reassembled output matches the module's recorded output at the pinned bar."""
     findings: list[str] = []
-    findings += gate.pinned_constants(gate._parse(repo / INFERENCE_FILE), bar, INFERENCE_FILE)
+    findings += candidate.pinned_constants(candidate._parse(repo / INFERENCE_FILE), bar, INFERENCE_FILE)
 
-    passed = gate.marker_value(run.output, PASSED_MARKER)
+    passed = candidate.marker_value(run.output, PASSED_MARKER)
     if passed is None:
         findings.append(f"the run printed no ##autohelix[{PASSED_MARKER}=...] line")
     elif passed != 1:
@@ -327,7 +327,7 @@ def check_matches(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckRe
             f"the run reported {PASSED_MARKER}={passed:g}: the reassembled output does not match "
             f"the module's recorded output"
         )
-    worst = gate.marker_value(run.output, MAX_ABS_ERR_MARKER)
+    worst = candidate.marker_value(run.output, MAX_ABS_ERR_MARKER)
     ceiling = bar[CEILING_NAME]
     if worst is None:
         findings.append(
@@ -358,7 +358,7 @@ def check_measurement(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResul
             f"--collectives-profile-id all`"
         )
 
-    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    reported = candidate.marker_value(run.output, LATENCY_MARKER)
     if reported is None:
         findings.append(f"the run printed no ##autohelix[{LATENCY_MARKER}=...] line")
         return CheckResult("f", CHECK_TITLES["f"], False, f"{len(findings)} problem(s)", findings)
@@ -366,7 +366,7 @@ def check_measurement(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResul
         findings.append(f"the reported latency is {reported:g} ms, which is not a measurement")
 
     rank_latencies = {
-        r: gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
+        r: candidate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
         for r in range(ranks)
     }
     known = {r: v for r, v in rank_latencies.items() if v is not None}
@@ -389,8 +389,8 @@ def check_measurement(run: RunOutcome, ranks: int = DEFAULT_RANKS) -> CheckResul
 def check_provenance(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     """(g) The input, weights and golden are the bootstrapped module's recorded bytes."""
     findings: list[str] = []
-    inference = gate._parse(repo / INFERENCE_FILE)
-    findings += gate.fabrication_findings(inference, INFERENCE_FILE)
+    inference = candidate._parse(repo / INFERENCE_FILE)
+    findings += candidate.fabrication_findings(inference, INFERENCE_FILE)
 
     recorded = manifest.get("tensors") or {}
     if not recorded:
@@ -415,7 +415,7 @@ def check_provenance(repo: Path, manifest: dict[str, Any]) -> CheckResult:
 def check_faster(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
     """(h) Faster than the bootstrapped single-core module."""
     baseline = (manifest.get("baselines") or {}).get("bootstrap_latency_ms")
-    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    reported = candidate.marker_value(run.output, LATENCY_MARKER)
     if baseline is None:
         return CheckResult("h", CHECK_TITLES["h"], False, "no baseline recorded",
                            ["the manifest records no bootstrap_latency_ms to beat"])
@@ -443,7 +443,7 @@ def check_overhead(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
     cheap enough to hide that inside 10%.
     """
     submodule = (manifest.get("baselines") or {}).get("submodule_latency_ms")
-    reported = gate.marker_value(run.output, LATENCY_MARKER)
+    reported = candidate.marker_value(run.output, LATENCY_MARKER)
     if submodule is None:
         return CheckResult("i", CHECK_TITLES["i"], False, "no submodule latency recorded",
                            ["the manifest records no submodule_latency_ms"])
@@ -484,7 +484,7 @@ def evaluate(repo: Path, manifest: dict[str, Any],
     """One `torchrun` of the frozen validator, then all nine checks off that execution."""
     bar = expected_tolerance(manifest)
     ranks = rank_count(manifest)
-    run = gate.run_candidate(
+    run = candidate.run_candidate(
         repo, launch(ranks), timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
@@ -516,19 +516,19 @@ def main(argv: list[str] | None = None) -> int:
         report = f"\nwhole-module gate\n\n  [FAIL] the repo is unusable — {exc}\n"
         print(report)
         if args.json:
-            gate.write_verdict([], None, "whole-module gate", Path(args.json),
+            candidate.write_verdict([], None, "whole-module gate", Path(args.json),
                                extra={"passed": False, "error": str(exc), "report": report})
         return 2
 
     extra: dict[str, Any] = {}
-    latency = gate.marker_value(run.output, LATENCY_MARKER)
+    latency = candidate.marker_value(run.output, LATENCY_MARKER)
     if latency is not None:
         extra["latency_ms"] = latency
         extra["rank_latency_ms"] = {
-            str(r): gate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
+            str(r): candidate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
             for r in range(rank_count(manifest))
         }
-    verdict = gate.write_verdict(
+    verdict = candidate.write_verdict(
         results, run, "whole-module gate", Path(args.json) if args.json else None, extra=extra,
     )
     print(verdict.report)

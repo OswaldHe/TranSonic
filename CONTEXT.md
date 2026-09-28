@@ -120,9 +120,9 @@ pipeline checks arithmetically, which is what lets the cut itself go unchecked.
 _Avoid_: merge rule, combine step, join
 
 **Slot**:
-A range of iterations governed by one constraint written in prose. Slots do not overlap, and an
-iteration belongs to at most one.
-_Avoid_: phase, stage, window, bucket, band
+A run of consecutive iterations governed by one constraint written in prose. Slots do not overlap,
+and an iteration belongs to at most one.
+_Avoid_: interval, range, phase, stage, window, bucket, band
 
 **Constraint schedule**:
 The ordered set of slots for one loop stage.

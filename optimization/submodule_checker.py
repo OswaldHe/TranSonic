@@ -39,8 +39,8 @@ from pathlib import Path
 from typing import Any
 
 from bootstrap.nki_checker import CheckResult
-from optimization import gate
-from optimization.gate import (
+from optimization import candidate
+from optimization.candidate import (
     CEILING_NAME,
     DECLARATION_FILE,
     INFERENCE_FILE,
@@ -135,26 +135,26 @@ def check_shape(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     entry = str(manifest.get("entry_point") or "kernel")
     findings: list[str] = []
 
-    source = gate._parse(repo / SOURCE_FILE)
-    functions = gate.top_level_functions(source)
+    source = candidate._parse(repo / SOURCE_FILE)
+    functions = candidate.top_level_functions(source)
     if entry not in functions:
         findings.append(
             f"{SOURCE_FILE} defines no top-level '{entry}'. "
             f"Found: {', '.join(sorted(functions)) or 'nothing'}"
         )
 
-    inference = gate._parse(repo / INFERENCE_FILE)
-    imported = gate._import_roots(inference)
+    inference = candidate._parse(repo / INFERENCE_FILE)
+    imported = candidate._import_roots(inference)
     if "source" not in imported:
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
-    calls = gate.called_attributes(inference)
+    calls = candidate.called_attributes(inference)
     traced = [d for d in calls if d.endswith("trace") or d.endswith("nki_jit")]
     if not traced and entry not in calls and f"source.{entry}" not in calls:
         findings.append(
             f"{INFERENCE_FILE} neither traces nor calls '{entry}' — nothing connects the "
             f"validator to the kernel it is supposed to measure"
         )
-    kinds = gate.traced_entry_points(source)
+    kinds = candidate.traced_entry_points(source)
     detail = f"'{entry}' present" + (f", @nki.jit on {', '.join(kinds)}" if kinds else "")
     return CheckResult("a", CHECK_TITLES["a"], not findings,
                        detail if not findings else f"{len(findings)} problem(s)", findings)
@@ -165,14 +165,14 @@ def check_self_contained(repo: Path) -> CheckResult:
     findings: list[str] = []
     for filename, allowed in ((SOURCE_FILE, SOURCE_ALLOWED_IMPORTS),
                               (INFERENCE_FILE, INFERENCE_ALLOWED_IMPORTS)):
-        tree = gate._parse(repo / filename)
-        findings += gate.import_findings(tree, allowed, filename)
-        findings += gate.path_findings(tree, filename)
+        tree = candidate._parse(repo / filename)
+        findings += candidate.import_findings(tree, allowed, filename)
+        findings += candidate.path_findings(tree, filename)
     # The kernel may not open files at all: one that can read `tensors/` can read the golden and
     # hand it back, and the .bin allowlist on the validator's side cannot distinguish the two.
-    source = gate._parse(repo / SOURCE_FILE)
-    for dotted, line in sorted(gate.called_attributes(source).items(), key=lambda kv: kv[1]):
-        if dotted.rsplit(".", 1)[-1] in gate.FILE_IO_NAMES:
+    source = candidate._parse(repo / SOURCE_FILE)
+    for dotted, line in sorted(candidate.called_attributes(source).items(), key=lambda kv: kv[1]):
+        if dotted.rsplit(".", 1)[-1] in candidate.FILE_IO_NAMES:
             findings.append(
                 f"{SOURCE_FILE}:{line} calls '{dotted}' — the kernel receives its tensors as "
                 f"arguments and may not read files"
@@ -188,7 +188,7 @@ def check_measurement(run: RunOutcome) -> CheckResult:
     for kind in ("neff", "ntff"):
         if not run.artifacts.get(kind):
             findings.append(f"the run left no fresh .{kind} behind")
-    latency = gate.marker_value(run.output, LATENCY_MARKER)
+    latency = candidate.marker_value(run.output, LATENCY_MARKER)
     if latency is None:
         findings.append(f"the run printed no ##autohelix[{LATENCY_MARKER}=...] line")
     elif latency <= 0:
@@ -210,15 +210,15 @@ def check_baseline(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckR
             tail = "\n".join(run.output.strip().splitlines()[-12:])
             findings.append(f"{INFERENCE_FILE} exited {run.return_code}\nlast output:\n{tail}")
 
-    findings += gate.pinned_constants(gate._parse(repo / INFERENCE_FILE), bar, INFERENCE_FILE)
+    findings += candidate.pinned_constants(candidate._parse(repo / INFERENCE_FILE), bar, INFERENCE_FILE)
 
-    passed = gate.marker_value(run.output, PASSED_MARKER)
+    passed = candidate.marker_value(run.output, PASSED_MARKER)
     if passed is None:
         findings.append(f"the run printed no ##autohelix[{PASSED_MARKER}=...] line")
     elif passed != 1:
         findings.append(f"the run reported {PASSED_MARKER}={passed:g}: the output does not match")
 
-    worst = gate.marker_value(run.output, MAX_ABS_ERR_MARKER)
+    worst = candidate.marker_value(run.output, MAX_ABS_ERR_MARKER)
     ceiling = bar[CEILING_NAME]
     if worst is None:
         findings.append(
@@ -237,12 +237,12 @@ def check_baseline(run: RunOutcome, bar: dict[str, float], repo: Path) -> CheckR
 def check_provenance(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     """(e) The tensors fed in are the recorded bytes, unedited and unfabricated."""
     findings: list[str] = []
-    inference = gate._parse(repo / INFERENCE_FILE)
-    findings += gate.fabrication_findings(inference, INFERENCE_FILE)
+    inference = candidate._parse(repo / INFERENCE_FILE)
+    findings += candidate.fabrication_findings(inference, INFERENCE_FILE)
 
-    recorded, hashed = gate.provenance_findings(repo, manifest)
+    recorded, hashed = candidate.provenance_findings(repo, manifest)
     findings += recorded
-    total = len(gate.recorded_tensors(manifest))
+    total = len(candidate.recorded_tensors(manifest))
     return CheckResult("e", CHECK_TITLES["e"], not findings,
                        f"{total} tensor(s) present, {hashed} hash-checked" if not findings
                        else f"{len(findings)} problem(s)", findings)
@@ -312,7 +312,7 @@ def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
     intent is what the check is about.
     """
     findings: list[str] = []
-    inference = gate._parse(repo / INFERENCE_FILE)
+    inference = candidate._parse(repo / INFERENCE_FILE)
     # Only the *count* is out of bounds. `NEURON_RT_VISIBLE_CORES` is how a single-core run pins
     # itself to a particular core, which is ordinary and does not widen anything — the first real
     # run failed this check for doing exactly that.
@@ -355,7 +355,10 @@ def _environ_values(tree: ast.Module, name: str) -> list[str]:
             if isinstance(node.value, ast.Constant):
                 values.append(str(node.value.value))
             else:
-                # Computed: unreadable here, so it counts as unknown rather than as compliant.
+                # An expression rather than a literal — `str(n)`, an f-string, a name bound
+                # elsewhere. Its value is not knowable from the source, so it is recorded under a
+                # placeholder that matches no permitted count and therefore fails the check. An
+                # unreadable assignment is treated as a possible violation, not waved through.
                 values.append("<computed>")
     return values
 
@@ -368,7 +371,7 @@ def _environ_assignments(tree: ast.Module) -> set[str]:
         if isinstance(node, ast.Assign):
             targets = list(node.targets)
         elif isinstance(node, ast.Call):
-            dotted = gate.called_attributes(ast.Module(body=[ast.Expr(node)], type_ignores=[]))
+            dotted = candidate.called_attributes(ast.Module(body=[ast.Expr(node)], type_ignores=[]))
             if any(d.endswith("setdefault") or d.endswith("putenv") for d in dotted):
                 for arg in node.args[:1]:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -389,7 +392,7 @@ def evaluate(repo: Path, manifest: dict[str, Any],
              timeout: int) -> tuple[list[CheckResult], RunOutcome]:
     """Run the candidate once, then answer all seven checks from that one execution."""
     bar = expected_tolerance(manifest)
-    run = gate.run_candidate(
+    run = candidate.run_candidate(
         repo, [sys.executable, INFERENCE_FILE], timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": SUBMODULE_CORES},
     )
@@ -409,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=".", help="the candidate repository")
     parser.add_argument("--json", default=None, help="where to write the machine-readable verdict")
-    parser.add_argument("--timeout", type=int, default=gate.DEFAULT_RUN_TIMEOUT)
+    parser.add_argument("--timeout", type=int, default=candidate.DEFAULT_RUN_TIMEOUT)
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -420,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         report = f"\nsubmodule gate\n\n  [FAIL] the repo is unusable — {exc}\n"
         print(report)
         if args.json:
-            gate.write_verdict([], None, "submodule gate", Path(args.json),
+            candidate.write_verdict([], None, "submodule gate", Path(args.json),
                                extra={"passed": False, "error": str(exc), "report": report})
         return 2
 
@@ -428,11 +431,11 @@ def main(argv: list[str] | None = None) -> int:
     # AutoHelix's metric command and reads it from here, so the gate stays the only thing that
     # executes the candidate. Two runs could disagree about which code was measured.
     extra: dict[str, Any] = {}
-    latency = gate.marker_value(run.output, LATENCY_MARKER)
+    latency = candidate.marker_value(run.output, LATENCY_MARKER)
     if latency is not None:
         extra[LATENCY_MARKER] = latency
 
-    verdict = gate.write_verdict(
+    verdict = candidate.write_verdict(
         results, run, "submodule gate", Path(args.json) if args.json else None, extra=extra,
     )
     print(verdict.report)

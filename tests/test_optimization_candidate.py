@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from optimization import gate, module_checker, submodule_checker
+from optimization import candidate, module_checker, submodule_checker
 from optimization.recipe import RecipeError, apply_recipe, compare, verify_recipe
 
 pytestmark = pytest.mark.optimization
@@ -39,7 +39,7 @@ def _tree(source: str) -> ast.Module:
 
 
 def test_the_bootstrap_helpers_this_package_reuses_still_exist():
-    """`optimization/gate.py` imports private names from `bootstrap.nki_checker`.
+    """`optimization/candidate.py` imports private names from `bootstrap.nki_checker`.
 
     Deliberate — one definition of "path-like literal" is worth more than two — and the risk is
     that a refactor over there renames one and this package silently stops checking something. This
@@ -55,7 +55,7 @@ def test_the_bootstrap_helpers_this_package_reuses_still_exist():
 
 
 def test_imports_outside_the_allowlist_are_found():
-    findings = gate.import_findings(
+    findings = candidate.import_findings(
         _tree("import json\nimport nki\nimport tensorflow\n"),
         frozenset({"nki"}), "source.py",
     )
@@ -64,7 +64,7 @@ def test_imports_outside_the_allowlist_are_found():
 
 
 def test_dynamic_imports_make_the_allowlist_unenforceable():
-    findings = gate.import_findings(
+    findings = candidate.import_findings(
         _tree("import importlib\nm = importlib.import_module('torch')\n"),
         frozenset({"importlib"}), "source.py",
     )
@@ -72,7 +72,7 @@ def test_dynamic_imports_make_the_allowlist_unenforceable():
 
 
 def test_a_path_escaping_the_repo_is_found():
-    findings = gate.path_findings(
+    findings = candidate.path_findings(
         _tree("A = '/home/ubuntu/workspace/bootstrap-runs/01-MoE/tensors/reference.bin'\n"
               "B = '../../checkpoint/model.safetensors'\n"
               "C = 'tensors/input.bin'\n"),
@@ -84,13 +84,13 @@ def test_a_path_escaping_the_repo_is_found():
 
 def test_prose_mentioning_a_filename_is_not_a_path():
     """Without this the rules fire on error messages, which would reject correct work."""
-    assert gate.path_findings(
+    assert candidate.path_findings(
         _tree("MSG = 'load the tensors from tensors/*.bin before running'\n"), "inference.py",
     ) == []
 
 
 def test_fabricated_tensors_are_found():
-    findings = gate.fabrication_findings(
+    findings = candidate.fabrication_findings(
         _tree("import torch\nx = torch.randn(4, 4)\ny = torch.zeros(4, 4)\n"), "inference.py",
     )
     assert len(findings) == 1
@@ -99,15 +99,15 @@ def test_fabricated_tensors_are_found():
 
 def test_allocating_an_output_buffer_is_not_fabrication():
     """`zeros`/`empty` are how an output buffer is made, and a zeroed weight cannot pass anyway."""
-    assert gate.fabrication_findings(
+    assert candidate.fabrication_findings(
         _tree("import torch\nout = torch.zeros(8)\nbuf = torch.empty(8)\n"), "inference.py",
     ) == []
 
 
 def test_a_moved_tolerance_constant_is_found_in_either_direction():
     bar = {"RTOL": 0.1, "MIN_COSINE": 0.9999}
-    loosened = gate.pinned_constants(_tree("RTOL = 0.2\nMIN_COSINE = 0.9999\n"), bar, "inference.py")
-    tightened = gate.pinned_constants(_tree("RTOL = 0.1\nMIN_COSINE = 0.99999\n"), bar,
+    loosened = candidate.pinned_constants(_tree("RTOL = 0.2\nMIN_COSINE = 0.9999\n"), bar, "inference.py")
+    tightened = candidate.pinned_constants(_tree("RTOL = 0.1\nMIN_COSINE = 0.99999\n"), bar,
                                       "inference.py")
     assert any("0.2" in f for f in loosened)
     # A tightened bar looks virtuous and is still a different experiment from the recorded one.
@@ -116,19 +116,19 @@ def test_a_moved_tolerance_constant_is_found_in_either_direction():
 
 def test_a_computed_tolerance_reads_as_a_missing_one():
     """The bar has to be legible at a glance, so only bare literals count."""
-    findings = gate.pinned_constants(_tree("RTOL = 2e-2 * 5\n"), {"RTOL": 0.1}, "inference.py")
+    findings = candidate.pinned_constants(_tree("RTOL = 2e-2 * 5\n"), {"RTOL": 0.1}, "inference.py")
     assert any("number literal" in f for f in findings)
 
 
 def test_marker_values_take_the_last_occurrence():
     """A warm-up print must not shadow the real result."""
     output = "##autohelix[latency_ms=99.0]\n...\n##autohelix[latency_ms=12.5]\n"
-    assert gate.marker_value(output, "latency_ms") == 12.5
-    assert gate.marker_values(output, "latency_ms") == [99.0, 12.5]
+    assert candidate.marker_value(output, "latency_ms") == 12.5
+    assert candidate.marker_values(output, "latency_ms") == [99.0, 12.5]
 
 
 def test_a_missing_marker_is_none_not_zero():
-    assert gate.marker_value("nothing here", "latency_ms") is None
+    assert candidate.marker_value("nothing here", "latency_ms") is None
 
 
 def test_stale_profile_artifacts_are_not_counted_as_fresh(tmp_path):
@@ -139,12 +139,12 @@ def test_stale_profile_artifacts_are_not_counted_as_fresh(tmp_path):
     old = tmp_path / "old.neff"
     old.write_bytes(b"x")
     os.utime(old, (time.time() - 10_000, time.time() - 10_000))
-    before = gate._artifact_mtimes(tmp_path)
+    before = candidate._artifact_mtimes(tmp_path)
 
     started = time.time()
     fresh = tmp_path / "new.ntff"
     fresh.write_bytes(b"y")
-    found = gate._fresh_artifacts(tmp_path, before, started)
+    found = candidate._fresh_artifacts(tmp_path, before, started)
     assert found["ntff"] == ["new.ntff"]
     assert found["neff"] == []
 
@@ -243,12 +243,12 @@ def test_no_collective_at_all_is_refused(tmp_path):
     assert any("no collective at all" in f for f in result.findings)
 
 
-def _run(output: str, **kwargs) -> gate.RunOutcome:
+def _run(output: str, **kwargs) -> candidate.RunOutcome:
     defaults = dict(ran=True, return_code=0, output=output,
                     artifacts={"neff": ["model.neff"],
                                "ntff": [f"profile_rank_{r}.ntff" for r in range(4)]})
     defaults.update(kwargs)
-    return gate.RunOutcome(**defaults)
+    return candidate.RunOutcome(**defaults)
 
 
 def _rank_markers(values: list[float]) -> str:
@@ -336,7 +336,7 @@ def test_an_unedited_validator_passes(tmp_path):
 
 def test_the_module_bar_is_not_re_derived(tmp_path):
     """Stage 5 inherits the bootstrapped module's five constants; there is no default."""
-    with pytest.raises(gate.CheckerError, match="MIN_COSINE"):
+    with pytest.raises(candidate.CheckerError, match="MIN_COSINE"):
         module_checker.expected_tolerance({"tolerance": {"RTOL": 0.1, "ATOL": 0.1}})
 
 
@@ -585,7 +585,7 @@ def test_compare_rejects_a_shape_mismatch():
 
 def test_a_separator_literal_is_not_an_absolute_path():
     """The first real run failed self-containment for building names with `"/".join(...)`."""
-    findings = gate.path_findings(
+    findings = candidate.path_findings(
         _tree('paths = ["/".join(["tensors", n]) for n in NAMES]\nHERE = "."\nUP = ".."\n'),
         "inference.py",
     )
@@ -593,15 +593,15 @@ def test_a_separator_literal_is_not_an_absolute_path():
 
 
 def test_a_real_absolute_path_is_still_caught():
-    findings = gate.path_findings(_tree('P = "/home/ubuntu/checkpoint/model.bin"\n'), "inference.py")
+    findings = candidate.path_findings(_tree('P = "/home/ubuntu/checkpoint/model.bin"\n'), "inference.py")
     assert len(findings) == 1
 
 
 def test_non_finite_markers_are_ignored():
     """`nan` defeats every comparison that guards this pipeline, so it must read as absent."""
     for bad in ("nan", "-nan", "inf", "-inf", "Infinity"):
-        assert gate.marker_value(f"##autohelix[latency_ms={bad}]", "latency_ms") is None
-    assert gate.marker_value("##autohelix[latency_ms=12.5]", "latency_ms") == 12.5
+        assert candidate.marker_value(f"##autohelix[latency_ms={bad}]", "latency_ms") is None
+    assert candidate.marker_value("##autohelix[latency_ms=12.5]", "latency_ms") == 12.5
 
 
 def test_a_nan_latency_fails_the_measurement_check():
@@ -629,13 +629,13 @@ def test_the_manifest_tensor_record_is_read_in_either_shape(tmp_path):
     """586 provenance failures in the first real run, for a shape the prompt never specified."""
     (tmp_path / "tensors").mkdir()
     (tmp_path / "tensors" / "input.bin").write_bytes(b"abc")
-    digest = gate._sha256(tmp_path / "tensors" / "input.bin")
+    digest = candidate._sha256(tmp_path / "tensors" / "input.bin")
 
     by_path = {"tensors": {"tensors/input.bin": {"sha256": digest, "bytes": 3}}}
     by_name = {"tensors": {"input": {"file": "tensors/input.bin", "sha256": digest, "bytes": 3}}}
     as_list = {"tensors": [{"file": "tensors/input.bin", "sha256": digest, "bytes": 3}]}
     for manifest in (by_path, by_name, as_list):
-        findings, checked = gate.provenance_findings(tmp_path, manifest)
+        findings, checked = candidate.provenance_findings(tmp_path, manifest)
         assert findings == [], manifest
         assert checked == 1
 
@@ -644,26 +644,26 @@ def test_an_edited_tensor_is_still_caught_in_either_shape(tmp_path):
     (tmp_path / "tensors").mkdir()
     (tmp_path / "tensors" / "input.bin").write_bytes(b"abc")
     manifest = {"tensors": {"tensors/input.bin": {"sha256": "0" * 64}}}
-    findings, _ = gate.provenance_findings(tmp_path, manifest)
+    findings, _ = candidate.provenance_findings(tmp_path, manifest)
     assert any("has been edited" in f for f in findings)
 
 
 def test_an_absent_tensor_names_itself(tmp_path):
     """The first run reported 586 findings that all read ' is missing from the repo'."""
-    findings, _ = gate.provenance_findings(tmp_path, {"tensors": {"tensors/gone.bin": {}}})
+    findings, _ = candidate.provenance_findings(tmp_path, {"tensors": {"tensors/gone.bin": {}}})
     assert findings == ["tensors/gone.bin is missing from the repo"]
 
 
 def test_import_aliases_are_resolved():
-    aliases = gate.import_aliases(_tree(
+    aliases = candidate.import_aliases(_tree(
         "import torch.distributed as foo\n"
         "import nki.collectives as ncc\n"
         "from nki import collectives as c2\n"
         "import nki\n"
     ))
-    assert gate.resolve_call("foo.all_reduce", aliases) == "torch.distributed.all_reduce"
-    assert gate.resolve_call("ncc.all_reduce", aliases) == "nki.collectives.all_reduce"
-    assert gate.resolve_call("c2.all_reduce", aliases) == "nki.collectives.all_reduce"
+    assert candidate.resolve_call("foo.all_reduce", aliases) == "torch.distributed.all_reduce"
+    assert candidate.resolve_call("ncc.all_reduce", aliases) == "nki.collectives.all_reduce"
+    assert candidate.resolve_call("c2.all_reduce", aliases) == "nki.collectives.all_reduce"
 
 
 def test_an_aliased_torch_collective_is_refused(tmp_path):

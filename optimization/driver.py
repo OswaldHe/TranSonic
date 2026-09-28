@@ -438,7 +438,7 @@ class Pipeline:
                 self.console.print(f"  [yellow]![/yellow] {line}")
             # Recompiling rather than reusing. A checker compiled from different prose than the
             # prompt now carries is the worst of both: the agent is told one rule and judged by
-            # another, and a range whose checker is simply absent runs unenforced while the prompt
+            # another, and a slot whose checker is simply absent runs unenforced while the prompt
             # still claims it is checked.
             self.compile_constraints(stage)
         for finding in cons.verify_manifest(repo):
@@ -546,14 +546,14 @@ class Pipeline:
             target.write_text(original)
 
     def _measure(self, repo: Path, label: str, cores: str) -> float:
-        from optimization import gate
+        from optimization import candidate
 
         self.console.print(f"  measuring {label} in {repo}")
-        outcome = gate.run_candidate(
+        outcome = candidate.run_candidate(
             repo, [sys.executable, "inference.py"],
             env_overrides={"NEURON_RT_NUM_CORES": cores},
         )
-        latency = gate.marker_value(outcome.output, METRIC)
+        latency = candidate.marker_value(outcome.output, METRIC)
         if outcome.return_code != 0 or latency is None:
             tail = "\n".join(outcome.output.strip().splitlines()[-15:])
             raise StageError(
