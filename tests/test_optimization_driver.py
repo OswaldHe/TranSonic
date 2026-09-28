@@ -1162,3 +1162,11 @@ def test_rerunning_without_an_assembly_says_so(tmp_path):
     (repo / "source.py").unlink()
     with pytest.raises(StageError, match="no source.py"):
         pipeline.rerun_full()
+
+
+def test_the_new_round_is_numbered_after_the_one_it_archives(tmp_path):
+    """The archive keeps the finished round's number, so the new round is the next one — printing
+    the archive's number called round 2 "round 1" in the log."""
+    pipeline, repo = _round_one(tmp_path)
+    assert pipeline._roll_round(repo, note="", previous={}) == 1
+    assert (repo / ".autohelix" / "rounds" / "round-1").is_dir()

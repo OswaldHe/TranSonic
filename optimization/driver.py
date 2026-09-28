@@ -774,7 +774,9 @@ class Pipeline:
                 f"Use `optimize run-full` for the first round, or pass --from-commit to name one."
             )
 
-        round_number = self._roll_round(repo, note=note, previous=previous)
+        # `_roll_round` returns the number it gave the round it just archived, so this one is the
+        # next: printing the archive's number called the new round by the old round's name.
+        round_number = 1 + self._roll_round(repo, note=note, previous=previous)
         self.console.print(
             f"  round {round_number}: starting from {str(target)[:12]}"
             + (f", the best of the last round at {previous_best:g} ms" if previous_best else "")
@@ -806,7 +808,7 @@ class Pipeline:
         return outcome
 
     def _roll_round(self, repo: Path, note: str, previous: dict[str, Any]) -> int:
-        """Move the finished round's run state aside and return the new round's number.
+        """Move the finished round's run state aside and return *its* number, not the next one.
 
         `history.jsonl` has to go, because the loop numbers iterations from what it finds there and a
         second round would otherwise continue at iteration 6 with a budget of 5. The candidate archive
