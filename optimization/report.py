@@ -14,6 +14,7 @@ a way the numbers themselves cannot reveal.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,55 @@ def _speedup(before: Any, after: Any) -> str:
     if not isinstance(before, (int, float)) or not isinstance(after, (int, float)) or not after:
         return "—"
     return f"{before / after:.2f}x"
+
+
+#: How much of a slot's prose fits in a table cell before it has to be cut. Wide enough to clear the
+#: bolded lead and reach the sentence after it, which is what tells two slots with the same lead
+#: apart: 4-6 and 9-10 both open "NKI and torch-xla are both allowed" and differ only in what
+#: follows.
+_GIST_WIDTH = 120
+
+
+def _embed(markdown: str, demote: int = 2) -> str:
+    """Demote a standalone document's headings so it reads as a section of this one.
+
+    `Projection.describe()` writes `FLOORPLAN.md`, which has its own `#` title because it is a
+    document in its own right. Splicing it in verbatim put an H1 in the middle of the report and
+    made its subsections siblings of the report's own, so "What the projection gave up" appeared in
+    an outline view as a top-level finding of the run rather than as part of the projection.
+
+    Only a heading at column 0 is demoted, which is where `describe()` puts them. That leaves an
+    indented code block containing a `#` comment alone.
+    """
+    out = []
+    for line in markdown.splitlines():
+        match = re.match(r"(#{1,6}) ", line)
+        out.append(f"{'#' * min(len(match.group(1)) + demote, 6)}{line[match.end(1):]}"
+                   if match else line)
+    return "\n".join(out)
+
+
+def _slot_gist(text: str) -> str:
+    """One table cell's worth of a slot's prose, cut where a reader can see the cut.
+
+    The full constraint runs to paragraphs. Taking its first physical line ended the cell
+    mid-sentence with no ellipsis — "may import and reference `nki` and the Python" — which reads as
+    a rendering fault rather than as a summary. So: collapse to one line, cut on a word boundary,
+    and mark the cut.
+
+    Two details the obvious version gets wrong. A cut landing inside a slot's bolded lead leaves an
+    unpaired `**` that bleeds emphasis across the rest of the table, so an odd count is closed. And
+    a constraint that mentions a pipe would split the row, so pipes are escaped.
+    """
+    flat = " ".join(text.split()).replace("|", "\\|")
+    if not flat:
+        return "—"
+    if len(flat) <= _GIST_WIDTH:
+        return flat
+    cut = flat[:_GIST_WIDTH].rsplit(" ", 1)[0]
+    if cut.count("**") % 2:
+        cut += "**"
+    return f"{cut}…"
 
 
 def write_report(config: PipelineConfig, console: Console | None = None) -> Path:
@@ -136,18 +186,30 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
         "",
     ]
 
-    if isinstance(submodule_best, (int, float)) and isinstance(full_best, (int, float)):
-        overhead = (full_best / submodule_best - 1.0) * 100
-        parts += [
-            f"Collective overhead at the best assembled iteration: **{overhead:+.1f}%** over the "
-            f"submodule's {submodule_best:g} ms, against the 10% the gate allows.",
-            "",
-        ]
+    # Reported as two separate numbers on purpose. Calling the best iteration's figure the
+    # "collective overhead against the 10% bound" printed `-55.7% ... against the 10% the gate
+    # allows`, which invites a reader to hunt for a blown bound. Nothing was blown: the bound is
+    # tight at assembly and slack afterwards, because the submodule is frozen there while the whole
+    # module goes on being optimized past it.
+    if isinstance(submodule_best, (int, float)) and submodule_best:
+        note = [f"Both latency bounds are measured against the submodule's {submodule_best:g} ms on "
+                f"one rank, and the module gate re-checks them every iteration."]
+        if isinstance(full_baseline, (int, float)):
+            note.append(f" Rejoining the ranks cost "
+                        f"**{(full_baseline / submodule_best - 1.0) * 100:+.1f}%** against the 10% "
+                        f"allowance — that is where the bound is tight.")
+        if isinstance(full_best, (int, float)):
+            delta = (full_best / submodule_best - 1.0) * 100
+            note.append(f" Stage 5 then finished at **{delta:+.1f}%** of it"
+                        + (": faster than the single rank it was cut from, because the submodule "
+                           "was frozen at assembly while the whole module kept being optimized."
+                           if delta < 0 else "."))
+        parts += ["".join(note), ""]
 
     parts += [
         "## The projection",
         "",
-        (projection.describe() if projection else "_could not be recomputed_"),
+        (_embed(projection.describe()) if projection else "_could not be recomputed_"),
         "",
         "## Stage 3 — one rank",
         "",
@@ -160,10 +222,9 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
     if schedule:
         parts += ["| iterations | enforced | constraint |", "|---|---|---|"]
         for slot in schedule:
-            text = (slot.get("text") or "").strip().splitlines()
-            first = text[0] if text else "—"
+            text = (slot.get("text") or "").strip()
             enforced = "yes" if (slot.get("enforce") and text) else "no"
-            parts.append(f"| {slot.get('label')} | {enforced} | {first} |")
+            parts.append(f"| {slot.get('label')} | {enforced} | {_slot_gist(text)} |")
     else:
         parts.append("_no per-iteration constraints_")
 
