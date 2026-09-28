@@ -119,4 +119,6 @@ The five canonical triage roles, each label string equal to its name. See
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+`CONTEXT.md` (the glossary) and `docs/adr/` (decisions, each with the alternative it rejected) at the
+repo root. Read them when naming a new concept, when a term in the code reads as ambiguous, or before
+a decision that is hard to reverse. Layout and consumer rules: `docs/agents/domain.md`.

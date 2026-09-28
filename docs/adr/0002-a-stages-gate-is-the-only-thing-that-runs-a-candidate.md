@@ -1,4 +1,4 @@
-# The gate is the only thing that runs a candidate; the metric is read back from its verdict
+# A stage's gate is the only thing that runs a candidate; the metric is read back from its verdict
 
 The loop runs constraints and then, if they pass, runs the metric commands. The obvious metric command
 here is the validator, and it is wrong twice over: it doubles every iteration's device time — four

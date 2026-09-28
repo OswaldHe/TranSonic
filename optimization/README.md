@@ -11,6 +11,11 @@ autohelix optimize check                          # validate the config, show th
 autohelix optimize all                            # all five stages
 ```
 
+The words this pipeline coins — *projection*, *slot*, *checker*, *advisory*, *custody*, *attic*,
+*drift* — are defined in [`CONTEXT.md`](../CONTEXT.md); reach for it when a term here reads as
+ambiguous, or before coining another. Three decisions are recorded with their rejected alternatives
+in [`docs/adr/`](../docs/adr/), and named below at the point where each one bites.
+
 ## Five stages, and why they are five
 
 ```
@@ -24,26 +29,23 @@ autohelix optimize all                            # all five stages
  └──────────┘    └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
       │                 │                 │                 │                 │
   projection.py   submodule_checker  loop.py +        module_checker     loop.py
-  (a rule, not    (7 generic         constraints.py   (9 checks:        (same gate,
-   a search)       checks)           (per-iteration    the semantic      no schedule)
-                                      slots)           gate)
+                                     constraints.py                     (no schedule)
 ```
-
-The seams are the design.
 
 **`init` is a rule, not a search.** The ranked floorplan is written for a 16-device trn2.48xlarge and
 development happens on a one-device trn2.3xlarge, so almost nothing fits. In `schemes/rank1.yaml`,
 of 271 placements: 182 fit one device (every hyper-connection module, the norms, `embed`, the small
 MTP heads), **87 span two devices** (all 43 `.ffn` at `expert x8`, all 43 `.attention`, `lm_head`),
 and 2 span four (both Engram tables). So every module worth optimizing is oversized, and `init`
-narrows the split to what one device holds — `expert x8` becomes `expert x4` — and records what that
-cost.
+narrows the split to what one device holds — `expert x8` becomes `expert x4`. That narrowing is a
+divergence from the ranked plan and is priced as one, not waved through:
+[ADR 0003](../docs/adr/0003-projecting-onto-one-device-diverges-from-the-plan.md).
 
 **`submodule` is an agent, not a script.** How to divide a module into per-rank work is a judgement
-about what the module computes: which tensors are replicated, what a partial result is, whether a
-term belongs inside a rank's share or is added after the ranks rejoin. A script that knew how to
-shard an MoE would work for MoE and nothing else. So the agent decides, and the loose end is tied
-off at the far end of the pipeline rather than here.
+about what the module computes, and a script that knew how to shard an MoE would work for MoE and
+nothing else. So the agent decides and nothing here checks its semantics — deliberately, and the
+loose end is tied off at `assemble` instead:
+[ADR 0001](../docs/adr/0001-the-agent-chooses-the-cut.md).
 
 **`run` and `run-full` are the same loop.** Ordinary `autohelix run` semantics — green baseline, a
 metric, a rejected iteration discarded — plus one thing: a per-iteration constraint.
@@ -54,32 +56,28 @@ module's own bar, faster than the bootstrapped module, and within 10% of the sub
 cannot pass. A submodule that was fast because it did a quarter of the work cannot pass. That is what
 makes the looseness upstream safe.
 
-## Where the gate is, and where it is not
+## What a script checks, and what an agent is trusted with
 
 | | checked by a script | left to an agent |
 |---|---|---|
 | the projection | **yes** — `projection.py`, deterministic | — |
-| how the module is cut | no | **the stage-2 agent** |
+| how the module is cut | no | **the `submodule` agent** |
 | that the cut *closes* | **yes** — `recipe.py`, arithmetic | — |
-| whether the cut is *good* | **yes** — the +10% bound, at stage 4 | — |
-| the submodule repo's integrity | **yes** — 7 module-agnostic checks | — |
-| the per-iteration constraint | **yes** — a compiled checker per slot | the constraint compiler writes it |
-| the whole module's correctness | **yes** — 9 checks, the semantic gate | — |
+| whether the cut is *good* | **yes** — the +10% bound, at `assemble` | — |
+| the submodule repo's integrity | **yes** — the submodule gate, 7 checks | — |
+| the per-iteration constraint | **yes** — one compiled checker per slot | the constraint compiler writes it |
+| the whole module's correctness | **yes** — the module gate, 9 checks | — |
 
 The row worth dwelling on is the third. A wrong cut cannot be caught by reading `source.py`, but it
-*can* be caught arithmetically. The stage-2 agent has to declare how its ranks recombine — stage 4
-needs that anyway — and a declaration of that form is checkable: take the N per-rank goldens it
-dumped, apply the declared recipe, and see whether the result is the module's recorded output. A cut
-that drops an expert, double-counts a shared path, shards along the wrong axis or dumps a golden from
-the wrong rank fails, because none of those sum back to the recorded output. Host-side numpy over
-bytes already on disk, a second to run, and entirely ignorant of what the module computes.
+*can* be caught arithmetically. The `submodule` agent has to declare its **reassembly recipe** — how
+its ranks recombine, which `assemble` needs anyway — and a declaration of that form is checkable:
+take the N per-rank goldens it dumped, apply the declared recipe, and see whether the result is the
+module's recorded output. A cut that drops an expert, double-counts a shared path, shards along the
+wrong axis or dumps a golden from the wrong rank fails, because none of those sum back. Host-side
+numpy over bytes already on disk, a second to run, and entirely ignorant of what the module computes.
+What it cannot prove, and why that job belongs to the +10% bound instead, is in ADR 0001.
 
-What it does *not* prove: a recipe declaring one rank does everything and three return zeros
-reproduces the golden perfectly. That cut fails at stage 4, on the +10% bound, because three idle
-ranks cannot make the whole module fast. The two checks divide the work on purpose — conflating them
-would make the arithmetic one reject legitimate asymmetric cuts.
-
-## What the agents are not told
+## Stripping: the code arrives without an earlier agent's claims
 
 `source.py` and `inference.py` are carried into an optimization repo with their **comments and
 docstrings removed** (`strip.py`). Those were written by an earlier agent, and they are its claims
@@ -88,9 +86,9 @@ glance. A claim in a comment reads as established fact to the agent that reads i
 design around it without testing it.
 
 This repository has already produced the worked example. `floorplan/README.md` states that NKI 0.6.0
-exposes no collective primitive, and the floorplan's intra-device bandwidth is *derived* rather than
-measured on the strength of it. The claim is false, and it went unchallenged because it was written
-down confidently. A comment inside a kernel is the same hazard with less visibility.
+exposes no collective primitive, and derives the floorplan's intra-device bandwidth rather than
+measuring it on the strength of that. The claim is false (see below), and it went unchallenged because
+it was written down confidently. A comment inside a kernel is the same hazard with less visibility.
 
 `reference_torch.py`, `reference_numerics.py`, `reference_inference.py`, `vendor/` and `compat/` keep
 theirs — that is the vendor's and the harness's own code, carried in verbatim as the specification,
@@ -101,8 +99,8 @@ written: a file that cannot be stripped safely is left alone and reported.
 
 ## The per-iteration constraint schedule
 
-The novel part. Ten iterations of "do whatever you like" converge on whatever the first iteration
-happened to try, so the iterations are given different constraints:
+Ten iterations of "do whatever you like" converge on whatever the first iteration happened to try, so
+the iterations are divided into **slots**, each with its own constraint:
 
 | iterations | constraint |
 |---|---|
@@ -113,11 +111,11 @@ happened to try, so the iterations are given different constraints:
 
 The constraints are prose, because the useful ones are prose. Turning prose into a predicate is a job,
 and it goes to a **constraint compiler**: an agent that runs once, before iteration 1, and writes one
-checker script per slot. The optimizing agent gets the prose in its prompt and never sees the script —
+**checker** per slot. The optimizing agent gets the prose in its prompt and never sees the checker —
 the same asymmetry `bootstrap` and `floorplan` use, for the same reason. A constraint whose
 implementation is readable gets read for loopholes instead of followed.
 
-Four properties, each a choice:
+Five properties, each a choice:
 
 - **The compiler runs once, up front.** A checker written at the top of iteration 7 could be written
   around what iteration 6 already did.
@@ -125,19 +123,21 @@ Four properties, each a choice:
   iteration 4 still gets slot 4. The budget, the schedule and the transcript stay aligned.
 - **The checker runs before the device run.** It is a static read of one file costing milliseconds;
   the run it saves is four minutes of hardware. A violating iteration is rejected without spending it.
-- **On the last iteration of a range the constraint is checked but not fatal.** By then the agent has
-  had every iteration the range allows, and the constraint's job — shaping the search — is done. A
-  candidate that still misses it while passing the correctness gate and being **strictly faster** than
-  the best so far is kept. What it gives up is the 5% of regression slack every compliant iteration
-  gets, so the escape has to be earned rather than taken. `slotcheck.py` runs the checker
-  `--advisory` there (same verdict, exit 0) and `loop.py`'s `_check_metric_gates` applies the
-  stricter rule.
+- **On a slot's last iteration the constraint is checked but not fatal** — it runs **advisory**. By
+  then the agent has had every iteration the slot allows, and the constraint's job, shaping the
+  search, is done. A candidate that still misses it while passing the correctness gate and being
+  **strictly faster** than the best so far is kept. What it gives up is the regression allowance every
+  compliant iteration gets (`acceptance.max_regression_pct`, 5% by default), so the escape has to be
+  earned rather than taken. `slotcheck.py` runs the checker `--advisory` there (same verdict, exit 0)
+  and `loop.py`'s `_check_metric_gates` applies the stricter rule.
 - **A permissive slot still gets a checker.** "Both NKI and torch are allowed" has nothing to reject,
   so the compiler writes one that passes and says in a comment why. Otherwise "there was nothing to
-  check" is indistinguishable from "the compiler failed to write a script".
+  check" is indistinguishable from "the compiler failed to write a checker".
 
-Ranges live in `optimization.yaml` and are where module-specific guidance goes. A slot with no text
+Slots live in `optimization.yaml` and are where module-specific guidance goes. A slot with no text
 leaves those iterations unconstrained; `enforce: false` puts text in the prompt without checking it.
+Editing a slot's prose after its checker was compiled is **drift**, and the pipeline refuses to run
+until the checker is recompiled.
 
 ## The frozen validator
 
@@ -155,41 +155,47 @@ edit the validator, and the reviewer carries it to the operator. Write that sect
 prompt — it is the only way the feedback gets out.
 
 And the **metric is read back from the gate's verdict** rather than measured again
-(`optimization.readback`). The gate is the only thing that runs the candidate. Running the validator a
-second time as AutoHelix's metric command would double every iteration's device time and let the two
-runs disagree about which code was measured.
+(`optimization.readback`), because the stage's gate is the only thing that runs the candidate. Why
+that is worth the one wrinkle it introduces at iteration 0:
+[ADR 0002](../docs/adr/0002-a-stages-gate-is-the-only-thing-that-runs-a-candidate.md).
 
 ## The two gates
 
-**`submodule_checker.py`, 7 checks**, all module-agnostic: the declared entry point exists and the
-validator reaches it; both files are self-contained; a fresh profile and a real latency; the baseline
-passes at a pinned bar; the tensors are recorded bytes; the cut is declared and its reassembly
-verified; the run used one core.
+A bare "gate" is ambiguous between these two, so they are always named apart. Neither is
+`acceptance.metric_gates`, which is a regression allowance and not a gate in this sense.
+
+**The submodule gate** (`submodule_checker.py`), 7 checks, all module-agnostic: the declared entry
+point exists and the validator reaches it; both files are self-contained; a fresh profile and a real
+latency; the baseline passes at a pinned bar; the tensors are recorded bytes; the cut is declared and
+its reassembly verified; the run used one core.
 
 Note what is *not* there. The bar has no default — unlike bootstrap's, which can fall back to the
 bfloat16 row from a known dtype, a submodule's golden is an intermediate the agent chose, so its bar
 was derived when the repo was built or it does not exist. And **torch is allowed in `source.py`**,
 because from iteration 4 the schedule permits it and a gate contradicting the schedule is a trap.
 
-**`module_checker.py`, 9 checks**, and this one is semantic:
+**The module gate** (`module_checker.py`), 9 checks, and this one is semantic:
 
 | | check |
 |---|---|
-| a | `inference.py` is byte-identical to what stage 4 froze, and drives `source.py` |
+| a | `inference.py` is byte-identical to what `assemble` froze, and drives `source.py` |
 | b | self-containment |
 | c | **the reduction is `nki.collectives`** — not `torch.distributed`, not `xm.*` |
-| d | four ranks under `torchrun`, every rank exits 0, every rank reports its latency |
+| d | every rank ran under `torchrun`, exited 0, and reported its latency |
 | e | rank 0's post-collective output matches the module's recorded output at the module's bar |
-| f | a fresh 4-rank collective profile, and `latency_ms` is one of the numbers the ranks printed |
+| f | a fresh collective profile covering every rank, and `latency_ms` is one of the numbers they printed |
 | g | data provenance, byte-for-byte |
 | h | **faster than the bootstrapped single-core module** |
 | i | **no slower than 1.1x the submodule** |
 
 (c) matters because `torch.distributed.all_reduce` would work and would measure a different machine:
-the point is a collective inside the traced graph, where the compiler can overlap it. (h) and (i) are
-constraints rather than metric gates because they compare against numbers measured *outside* this run
-— a metric gate can only compare an iteration against the best iteration of the same loop. Both are
-**re-measured at assembly time** on this host rather than copied from a log.
+the point is a collective inside the traced graph, where the compiler can overlap it. It is checked
+through import aliases, so `import torch.distributed as ncc` does not slip past. (d) and (f) take the
+rank count from the manifest (`rank_count`, 4 on this host) rather than assuming four, so a two-rank
+assembly is not failed for missing markers nobody asked for. (h) and (i) are constraints rather than
+metric gates because they compare against numbers measured *outside* this run — a metric gate can
+only compare an iteration against the best iteration of the same loop. Both are **re-measured at
+assembly time** on this host rather than copied from a log.
 
 ## `nki.collectives` on this toolchain
 
@@ -223,13 +229,12 @@ neuron-explorer view -n model.neff -s profile_rank_0.ntff --output-format=summar
 
 One `profile_rank_N.ntff` per rank. `total_exec_time` is in **seconds**; the summary also carries
 `cc_op_count`, `cc_op_time` and `cc_op_active_time_percent`, which isolate the collective from the
-compute — the number stage 5 is trying to shrink.
+compute — the number `run-full` is trying to shrink.
 
-**This contradicts `floorplan/README.md`**, which states that NKI 0.6.0 exposes no collective
-primitive and derives the intra-device link bandwidth from probed DMA efficiency instead of measuring
-it. That claim is wrong: the collectives are in `nki.collectives`, absent from `nl`/`nisa`, which is
-why they looked missing. The floorplan's intra-device bandwidth — and every conclusion it draws about
-whether tensor parallelism belongs inside a device or across them — could now rest on a measurement.
+This is what **contradicts `floorplan/README.md`**: the collectives are in `nki.collectives`, absent
+from `nl`/`nisa`, which is why they looked missing. So the floorplan's intra-device link bandwidth —
+and every conclusion it draws about whether tensor parallelism belongs inside a device or across
+them — could now rest on a measurement instead of a derivation.
 
 ## Why the metric is the fastest rank
 
@@ -237,25 +242,22 @@ It isolates compute from load imbalance, which is what makes iteration-to-iterat
 meaningful. It also **understates** what the module costs in a pipeline, where the slowest rank gates
 the next stage. Both facts are stated at the top of the report rather than in a footnote, along with
 the other uncalibrated thing: the projection diverges from the ranked plan, so a fast kernel here is a
-fast *single-device* kernel and not evidence about the 16-device deployment.
-
-For `.ffn` that divergence is precise and worth knowing. The floorplan's report chose `expert x8`
-*because* it halves per-bank weight residency and decode is bank-bandwidth bound. Projecting to
-`expert x4` doubles per-core residency — so this pipeline optimizes the plan the search ranked second.
-That is the right thing to want when the goal is the fastest single-device kernel, and the wrong thing
-to forget when reading the number.
+fast *single-device* kernel and not evidence about the 16-device deployment. For `.ffn` that
+divergence is precise and quantified in ADR 0003 — worth reading before quoting a number from this
+pipeline at anyone.
 
 ## What is kept
 
 Every constraint-passing candidate is archived to `.autohelix/optimization/candidates/iter-N/` with
-its metrics, accepted or not. The 5% metric gate governs what the next iteration *builds on*; it
+its metrics, accepted or not. The regression allowance governs what the next iteration *builds on*; it
 should not govern what the run *retains* — iterations 7-8 exist to try what the disciplined ones
 cannot, and an experiment 6% slower is rejected while still being the most informative thing in the
-run.
+run. The capture happens before the worktree is torn down, because teardown does `git branch -D` and
+takes the commit with it.
 
 And the deliverable is the **best accepted commit**, not `HEAD`. With 5% of slack, `HEAD` after ten
-iterations can be slower than the best iteration; handing it to stage 4 would quietly give away part
-of what the loop achieved.
+iterations can be slower than the best iteration; handing it to `assemble` would quietly give away
+part of what the loop achieved.
 
 ## Layout
 
@@ -266,7 +268,7 @@ optimization/
                                                run,assemble,run-full,all,gate,report}
   driver.py                the five stages, the preparation agents, the manifests
   config.py                optimization.yaml -> the pipeline config, and the derived per-stage
-                           AutoHelix configs (written outside the repos: they name the gate)
+                           AutoHelix configs (written outside the repos: they name the gates)
   projection.py            a floorplan placement -> what one device holds, and what that cost
   materialize.py           the two repos: what the preparation agents read
   recipe.py                the declared reassembly, checked arithmetically
@@ -274,17 +276,19 @@ optimization/
   slotcheck.py             running a compiled checker, enforcing or advisory
   loop.py                  Harness + the per-iteration constraint, candidate archive, best commit
   constraints.py           the schedule, the compiled checkers, their manifest
-  gate.py                  what the two gates share (reuses bootstrap/nki_checker's analysis)
-  submodule_checker.py     the stage-2 gate: 7 module-agnostic checks
-  module_checker.py        the stage-4/5 gate: 9 checks, the only semantic one in the pipeline
+  custody.py               holding the fields a gate reads back outside the agent's repo
+  gate.py                  the analysis the two gates share — not itself a gate
+                           (reuses bootstrap/nki_checker's)
+  submodule_checker.py     the submodule gate: 7 module-agnostic checks
+  module_checker.py        the module gate: 9 checks, the only semantic ones in the pipeline
   readback.py              the metric command: the latency the gate already measured
   report.py                REPORT.md, with the two caveats at the top
   presets.py               reading the packaged templates
   templates/
     optimization.yaml      the config template the operator fills in
     loop_prompt.md         the per-iteration prompt
-    submodule_prompt.md    stage 2: cut the module down
-    assemble_prompt.md     stage 4: put the ranks back together
+    submodule_prompt.md    the `submodule` stage: cut the module down
+    assemble_prompt.md     the `assemble` stage: put the ranks back together
     compiler_prompt.md     the constraint compiler
 ```
 
@@ -303,16 +307,18 @@ optimization/
 - **`iteration_constraints` is read from the raw config, not from `Config`.** It is listed in
   `KNOWN_TOP_LEVEL_KEYS` so it does not warn as a typo, but there is no field for it on the shared
   dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config.
-- **Preparation agents do not own the fields the gate reads.** They finish the manifest, and the
+- **Preparation agents do not own the fields a gate reads.** They finish the manifest, and the
   tensor record and the declaration are genuinely theirs — but the bar, the golden, the rank count
   and both latency bounds are written by materialization to a copy outside the repo and restored
   afterwards (`custody.py`). Otherwise the agent writes its own examination paper. A field that
   changed is reported rather than rejected: the usual cause is a manifest rewritten instead of
   edited, which is careless rather than dishonest, and the pipeline can simply put it back.
-- **A failed preparation attempt is kept, not deleted.** Moved to
+- **A failed preparation attempt is kept in the attic, not deleted.** Moved to
   `.optimization/attempts/<stage>-<n>/`. The first real run reached 5 of 7 checks on its first
-  attempt and the work was overwritten before it could be read; the tensors inside are hard links, so
-  keeping a tree costs about a megabyte.
+  attempt and the work was overwritten before it could be read. The carried-in tensors are hard links
+  and cost nothing, but the slices the agent cut for itself are its own bytes — around 1.8 GB per
+  attempt for a quarter of this MoE, and `du` over-reports because it counts the hard links too. Only
+  the last `preparation.retries` attempts are kept, so the ceiling is bounded.
 - **A preparation stage that fails three times stops.** It is not a loop: a half-materialized repo is
   not a worse starting point than the last attempt, it is not a starting point. Read the last report
   before raising `preparation.retries`, because a repeated failure is the prompt or the module rather
@@ -324,3 +330,5 @@ optimization/
   which `Sandbox.prepare_worktree` does not seed into a worktree — but a worktree sits *inside* the
   project, so a determined agent can walk up to them. As in `floorplan`, treat it as a speed bump
   backed by the reviewer.
+</content>
+</invoke>
