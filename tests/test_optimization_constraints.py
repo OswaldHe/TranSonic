@@ -434,3 +434,18 @@ def test_the_recorded_slot_carries_its_per_iteration_modes():
     """The report and the manifest read this, so what was hard and what was soft stays on record."""
     slot = cons.Schedule.from_config([{"from": 4, "to": 6, "text": "x"}]).slots[0]
     assert slot.to_dict()["per_iteration"] == {"4": "hard", "5": "hard", "6": "soft"}
+
+
+def test_a_one_iteration_hard_slot_stays_hard():
+    """`soften_last` would otherwise make `at: 3, enforcement: hard` mean nothing, since the only
+    iteration is also the last one. The escape exists for the iterations that came before it."""
+    slot = cons.Schedule.from_config([{"at": 3, "enforcement": "hard", "text": "x"}]).slots[0]
+    assert slot.enforcement_for(3) == "hard"
+
+
+def test_bare_off_survives_yamls_boolean_coercion():
+    """YAML 1.1 reads an unquoted `off` as False, and `enforcement: off` is the documented spelling."""
+    assert cons.Schedule.from_config(
+        [{"at": 1, "enforcement": False, "text": "x"}]).slots[0].enforcement == "off"
+    assert cons.Schedule.from_config(
+        [{"at": 1, "enforcement": True, "text": "x"}]).slots[0].enforcement == "hard"

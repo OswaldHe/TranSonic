@@ -111,9 +111,16 @@ class Slot:
     text: str = ""
     #: One of `ENFORCEMENT`. See that constant for what each does.
     enforcement: str = "hard"
-    #: Whether the last iteration of a `hard` slot drops to `soft`. On by default: by then the agent
-    #: has had every iteration the slot allows, so discarding something correct and faster buys
-    #: nothing. Set false for a constraint that must hold on every iteration without exception.
+    #: Whether the last iteration of a `hard` slot spanning **more than one** iteration drops to
+    #: `soft`. On by default: by then the agent has had every other iteration the slot allows, so
+    #: discarding something correct and faster buys nothing. Set false for a constraint that must
+    #: hold on every iteration of the slot without exception.
+    #:
+    #: It does not apply to a one-iteration slot, where the only iteration is also the last one:
+    #: softening it would make `enforcement: hard` mean nothing, which is never what `at: 3` with
+    #: `enforcement: hard` was asking for. The escape exists because earlier iterations under the
+    #: same constraint came first; with no earlier iterations there is nothing it can be an escape
+    #: from.
     soften_last: bool = True
     #: Whether enforcement was written in the config. Tracked so "enforced with no text" can be
     #: warned about while a deliberately empty slot — the free-exploration ones — stays silent.
@@ -136,7 +143,7 @@ class Slot:
             return "off"
         if self.enforcement == "soft":
             return "soft"
-        if self.soften_last and iteration >= self.last_iteration:
+        if self.soften_last and len(self.iterations) > 1 and iteration >= self.last_iteration:
             return "soft"
         return "hard"
 
@@ -244,6 +251,11 @@ class Schedule:
             enforcement = entry.get("enforcement")
             if enforcement is None:
                 enforcement = _ENFORCE_ALIAS.get(bool(entry.get("enforce", True)), "hard")
+            elif isinstance(enforcement, bool):
+                # YAML 1.1 reads bare `off` as False and `on` as True, so `enforcement: off` — the
+                # spelling this file documents — arrives here as a boolean. Requiring quotes around
+                # one of three documented values would be a trap, so both spellings are accepted.
+                enforcement = _ENFORCE_ALIAS[enforcement]
             enforcement = str(enforcement).strip().lower()
             if enforcement not in ENFORCEMENT:
                 raise ScheduleError(
