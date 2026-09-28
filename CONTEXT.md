@@ -139,10 +139,21 @@ Distinct from a gate: a checker reads one file statically and judges compliance,
 candidate and judges acceptability.
 _Avoid_: gate, validator, linter
 
+**Enforcement**:
+What a violation of a slot's constraint costs on one iteration: `hard` rejects it, `soft` records it
+and falls back to requiring a strict improvement, `off` does not check at all. A property of an
+iteration, not of a slot: a hard slot's last iteration is soft by default.
+_Avoid_: strictness, severity, level (which names a blocker's L0-L2 instead)
+
 **Advisory**:
-A checker run that records its verdict without rejecting the iteration. What the last iteration of a
-slot gets, so a candidate that misses its constraint but is correct and faster can still be kept.
-_Avoid_: soft, warning, non-blocking, lenient
+The `soft` enforcement of a checker run: it records its verdict and never rejects the iteration on
+its own. Named this way at the invocation (`slotcheck --advisory`); `soft` is the word in the config.
+_Avoid_: warning, non-blocking, lenient
+
+**Round**:
+One pass of a loop stage over its whole iteration budget. A second round starts from the first
+round's best kernel with new constraints, and keeps its notes.
+_Avoid_: run, pass, attempt, retry
 
 **Custody**:
 Holding the manifest fields a gate reads back — the bar, the golden, the bounds — outside the

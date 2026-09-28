@@ -85,30 +85,64 @@ class ScheduleError(ValueError):
     """The iteration-constraint schedule is not well formed."""
 
 
+#: How a slot's constraint is enforced, per iteration.
+#:
+#: - ``hard``  a violation rejects the iteration and its work is discarded.
+#: - ``soft``  a violation is checked and recorded but never rejects on its own. Acceptance falls to
+#:             the stricter metric rule: correct, and *strictly* faster than the best so far, or the
+#:             iteration is rejected anyway. So a soft constraint still costs something to miss.
+#: - ``off``   the text goes into the prompt as guidance and no checker is written.
+ENFORCEMENT = ("hard", "soft", "off")
+
+#: What the old boolean `enforce:` meant, kept working because configs in the wild use it.
+_ENFORCE_ALIAS = {True: "hard", False: "off"}
+
+
 @dataclass
 class Slot:
-    """One run of consecutive iterations and the constraint text that governs them."""
+    """The iterations one constraint governs, and how strictly it is enforced on each of them.
+
+    A slot may be a single iteration, which is how per-iteration control is written: one slot per
+    iteration, each with its own text and its own `enforcement`. The range form is shorthand for
+    several iterations that happen to share a constraint.
+    """
 
     iterations: list[int]
     text: str = ""
-    #: Set false to force a no-op checker regardless of what the text says. The escape hatch for
-    #: text that is guidance for the agent rather than a rule to enforce.
-    enforce: bool = True
-    #: Whether `enforce` was written in the config. Tracked so "enforce: true with no text" can be
+    #: One of `ENFORCEMENT`. See that constant for what each does.
+    enforcement: str = "hard"
+    #: Whether the last iteration of a `hard` slot drops to `soft`. On by default: by then the agent
+    #: has had every iteration the slot allows, so discarding something correct and faster buys
+    #: nothing. Set false for a constraint that must hold on every iteration without exception.
+    soften_last: bool = True
+    #: Whether enforcement was written in the config. Tracked so "enforced with no text" can be
     #: warned about while a deliberately empty slot — the free-exploration ones — stays silent.
     enforce_explicit: bool = False
     #: Filled in by `compile_schedule`: the checker written for this slot.
     checker: str | None = None
 
     @property
-    def last_iteration(self) -> int:
-        """The final iteration this slot governs.
+    def enforce(self) -> bool:
+        """Whether this slot needs a checker at all. Retained for the old boolean's readers."""
+        return self.enforcement != "off"
 
-        The one where a violation stops being fatal: by then the agent has had every iteration the
-        slot allows, so a correct-and-faster candidate that still misses the constraint is worth
-        keeping. See `optimization/slotcheck.py` for the reasoning and the stricter rule that
-        replaces the rejection.
+    def enforcement_for(self, iteration: int) -> str:
+        """How this iteration is judged: one of `ENFORCEMENT`.
+
+        The only place the three-way decision is made, so the prompt, the checker invocation and the
+        acceptance rule cannot disagree about which iteration was hard and which was soft.
         """
+        if not self.has_text or self.enforcement == "off":
+            return "off"
+        if self.enforcement == "soft":
+            return "soft"
+        if self.soften_last and iteration >= self.last_iteration:
+            return "soft"
+        return "hard"
+
+    @property
+    def last_iteration(self) -> int:
+        """The final iteration this slot governs."""
         return max(self.iterations)
 
     @property
@@ -132,7 +166,9 @@ class Slot:
             "iterations": list(self.iterations),
             "label": self.label,
             "text": self.text,
-            "enforce": self.enforce,
+            "enforcement": self.enforcement,
+            "soften_last": self.soften_last,
+            "per_iteration": {str(i): self.enforcement_for(i) for i in sorted(self.iterations)},
             "checker": self.checker,
         }
 
@@ -192,11 +228,27 @@ class Schedule:
             where = f"iteration_constraints[{index}]"
             if not isinstance(entry, dict):
                 raise ScheduleError(f"{where}: must be a mapping")
-            unknown = set(entry) - {"iterations", "from", "to", "text", "enforce"}
+            known = {"iterations", "at", "from", "to", "text", "enforce", "enforcement",
+                     "soften_last"}
+            unknown = set(entry) - known
             if unknown:
                 raise ScheduleError(
                     f"{where}: unknown key(s) {', '.join(sorted(unknown))}. "
-                    f"Known: iterations, from, to, text, enforce"
+                    f"Known: {', '.join(sorted(known))}"
+                )
+            if "enforce" in entry and "enforcement" in entry:
+                raise ScheduleError(
+                    f"{where}: has both 'enforce' and 'enforcement'. Use 'enforcement' "
+                    f"({'/'.join(ENFORCEMENT)}); 'enforce' is the older boolean form of it"
+                )
+            enforcement = entry.get("enforcement")
+            if enforcement is None:
+                enforcement = _ENFORCE_ALIAS.get(bool(entry.get("enforce", True)), "hard")
+            enforcement = str(enforcement).strip().lower()
+            if enforcement not in ENFORCEMENT:
+                raise ScheduleError(
+                    f"{where}: enforcement must be one of {', '.join(ENFORCEMENT)}, "
+                    f"not '{enforcement}'"
                 )
 
             iterations = _parse_iterations(entry, where)
@@ -218,8 +270,9 @@ class Schedule:
             slot = Slot(
                 iterations=iterations,
                 text=str(entry.get("text") or ""),
-                enforce=bool(entry.get("enforce", True)),
-                enforce_explicit="enforce" in entry,
+                enforcement=enforcement,
+                soften_last=bool(entry.get("soften_last", True)),
+                enforce_explicit=("enforce" in entry or "enforcement" in entry),
             )
             for i in iterations:
                 seen[i] = slot.label
@@ -275,22 +328,33 @@ class Schedule:
             "",
             slot.text.strip(),
         ]
-        if slot.enforce and iteration < slot.last_iteration:
+        mode = slot.enforcement_for(iteration)
+        if mode == "hard":
             lines += [
                 "",
-                "This is checked by a script you cannot see, before anything is measured. An "
-                "iteration that does not follow it is rejected and its work discarded, however "
-                "fast it is — so if you believe the constraint is wrong for this module, say so "
-                "in your notes and follow it anyway.",
+                "**This is a hard constraint on this iteration.** It is checked by a script you "
+                "cannot see, before anything is measured. An iteration that does not follow it is "
+                "rejected and its work discarded, however fast it is — so if you believe the "
+                "constraint is wrong for this module, say so in your notes and follow it anyway.",
             ]
-        elif slot.enforce:
+        elif mode == "soft":
+            last = iteration >= slot.last_iteration and slot.enforcement == "hard"
             lines += [
                 "",
-                f"This is the last iteration this constraint governs, so it is checked but no "
-                f"longer fatal. If you cannot satisfy it and you have something correct and "
-                f"**strictly faster than the best so far**, it will still be kept — the usual 5% "
-                f"of slack is what you give up, not the work. Follow the constraint if you can; "
-                f"say in your notes why you could not if you did not.",
+                "**This is a soft constraint on this iteration.** It is still checked by a script "
+                "you cannot see, and the verdict is recorded and reported"
+                + (", but this is the last iteration it governs, so a violation is no longer fatal"
+                   if last else ", but a violation does not reject the iteration on its own")
+                + ". What a violation costs is the regression slack: a candidate that misses the "
+                  "constraint has to be correct and **strictly faster than the best so far** to be "
+                  "kept, where a compliant one only has to stay within the allowance. Follow the "
+                  "constraint if you can, and say in your notes why you could not if you did not.",
+            ]
+        else:
+            lines += [
+                "",
+                "This is guidance rather than a rule: nothing checks it, and nothing rejects an "
+                "iteration for missing it.",
             ]
         return "\n".join(lines)
 
@@ -307,6 +371,19 @@ class Schedule:
 
 
 def _parse_iterations(entry: dict[str, Any], where: str) -> list[int]:
+    """Which iterations a slot governs, from `at:`, `iterations:` or `from:`/`to:`.
+
+    `at: 7` is the single-iteration form, and it is the one to reach for when the point is to give
+    one iteration its own constraint and its own enforcement rather than to describe a phase.
+    """
+    if "at" in entry:
+        for other in ("iterations", "from", "to"):
+            if other in entry:
+                raise ScheduleError(f"{where}: 'at' names one iteration, so drop '{other}'")
+        try:
+            return [int(entry["at"])] if int(entry["at"]) >= 1 else _refuse_zero(where)
+        except (TypeError, ValueError) as exc:
+            raise ScheduleError(f"{where}: 'at' must be an integer ({exc})") from exc
     raw = entry.get("iterations")
     if raw is not None:
         if isinstance(raw, int):
@@ -330,11 +407,15 @@ def _parse_iterations(entry: dict[str, Any], where: str) -> list[int]:
             raise ScheduleError(f"{where}: 'to' ({end}) is before 'from' ({start})")
         iterations = list(range(start, end + 1))
     if any(i < 1 for i in iterations):
-        raise ScheduleError(
-            f"{where}: iterations are 1-based and iteration 0 is the baseline, which has no "
-            f"agent and so cannot be constrained"
-        )
+        _refuse_zero(where)
     return iterations
+
+
+def _refuse_zero(where: str) -> list[int]:
+    raise ScheduleError(
+        f"{where}: iterations are 1-based and iteration 0 is the baseline, which has no agent and "
+        f"so cannot be constrained"
+    )
 
 
 def _contiguous_runs(values: list[int]) -> list[tuple[int, int]]:

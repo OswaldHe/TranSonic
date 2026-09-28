@@ -78,6 +78,10 @@ def optimize() -> None:
       run-full   the optimization loop on the whole module
       feedback   an agent reads both loops' notes and reports what stopped them getting faster
 
+    \b
+    And then, once you have read the notes and written what they taught you into the config:
+      rerun-full  another round of run-full, starting from the kernel the last round produced
+
     See `optimization/README.md` for what each stage checks and why the seams are where they are.
     """
 
@@ -174,6 +178,28 @@ def run_full(config: str | None, verbose: bool) -> None:
     """Run the optimization loop on the whole distributed module."""
     pipeline = _pipeline(config, verbose)
     raise SystemExit(_run("run-full", lambda: pipeline.run_loop("full")))
+
+
+@optimize.command(name="rerun-full")
+@_config_option
+@_verbose_option
+@click.option("--from-commit", default=None,
+              help="start from this commit instead of the last round's best")
+@click.option("--note", default="",
+              help="why this round exists, recorded with the previous round's state")
+def rerun_full_stage(config: str | None, verbose: bool,
+                     from_commit: str | None, note: str) -> None:
+    """Run another round of the whole-module loop, starting from the kernel you already have.
+
+    For the case the first round creates: you read its notes, you learn what blocked it, you write
+    that into `full.iteration_constraints`, and you want the loop to carry on from its own best
+    kernel rather than from the assembly baseline. The previous round's history moves to
+    `.autohelix/rounds/round-N/`; its notes and reviews stay where the next agent will read them.
+    """
+    pipeline = _pipeline(config, verbose)
+    raise SystemExit(_run(
+        "rerun-full", lambda: pipeline.rerun_full(from_commit=from_commit, note=note),
+    ))
 
 
 @optimize.command()

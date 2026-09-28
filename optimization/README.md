@@ -56,6 +56,15 @@ module's own bar, faster than the bootstrapped module, and within 10% of the sub
 cannot pass. A submodule that was fast because it did a quarter of the work cannot pass. That is what
 makes the looseness upstream safe.
 
+**`rerun-full` is how a second round happens.** The first round's notes are where the ideas for the
+second one come from: you read them, you learn that the expert skip was blocked by a loop bound or
+that the scale multiply is the binding pass, and you want the loop to carry on *from the kernel you
+already have* with that written in as a constraint. So `optimize rerun-full` starts from the previous
+round's **best accepted commit** — not `HEAD`, which regression slack can leave slower — re-measures
+its baseline with the gate, and recompiles the checkers from whatever the prose now says. The old
+round's history moves to `.autohelix/rounds/round-N/`, and its `notes/` and `reviews/` stay exactly
+where they are, because the next agent reading them is the point.
+
 **`feedback` reads what the run wrote and nobody else will.** Fifteen iterations leave ~83,000 words
 of notes and reviews, written one iteration at a time by agents that did not know how the run would
 end — so the corpus contradicts itself, and a reader who trusts any one file learns something false.
@@ -110,12 +119,30 @@ written: a file that cannot be stripped safely is left alone and reported.
 Ten iterations of "do whatever you like" converge on whatever the first iteration happened to try, so
 the iterations are divided into **slots**, each with its own constraint:
 
-| iterations | constraint |
-|---|---|
-| 1-3 | NKI only, no torch — prove the fast path is reachable in NKI at all |
-| 4-6 | NKI and torch-xla both allowed |
-| 7-8 | nothing; explore aggressively |
-| 9-10 | NKI and torch-xla — consolidate what 7-8 learned |
+| iterations | constraint | enforcement |
+|---|---|---|
+| 1-3 | NKI only, no torch — prove the fast path is reachable in NKI at all | hard |
+| 4-6 | NKI and torch-xla both allowed | hard |
+| 7-8 | nothing; explore aggressively | off |
+| 9-10 | NKI and torch-xla — consolidate what 7-8 learned | hard |
+
+A slot can be one iteration (`at: 5`), a range (`from`/`to`) or a set (`iterations: [1, 3, 5]`), and
+each carries its own **enforcement**, which is what a violation costs:
+
+- **`hard`** — the iteration is rejected and its work discarded.
+- **`soft`** — checked and recorded, but it does not reject on its own. What it costs is the
+  regression slack: a candidate that missed its constraint has to be correct and *strictly faster*
+  than the best so far, where a compliant one only has to stay inside
+  `acceptance.max_regression_pct`. That is what stops a soft constraint being no constraint.
+- **`off`** — the text is guidance in the prompt and nothing checks it.
+
+`soften_last` (default true) drops a **hard** slot's last iteration to `soft`. One slot per iteration
+plus these two fields is per-iteration control of hard versus soft; `soften_last: false` on a
+single-iteration slot is a constraint with no escape at all. The older `enforce: true|false` still
+works and means `hard`|`off`.
+
+Both loop stages read a schedule. Stage 5's is empty by default, because the first round has nothing
+to go on — see `rerun-full` below for where it earns its place.
 
 The constraints are prose, because the useful ones are prose. Turning prose into a predicate is a job,
 and it goes to a **constraint compiler**: an agent that runs once, before iteration 1, and writes one

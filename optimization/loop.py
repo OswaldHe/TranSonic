@@ -190,15 +190,20 @@ class OptimizationLoop(Harness):
         if report.exists():
             report.unlink()  # a stale verdict from a re-run would be read as this iteration's
 
-        advisory = iteration >= slot.last_iteration
+        # `enforcement_for` is the single place the hard/soft decision is made, so what the prompt
+        # told the agent and what acceptance applies cannot come apart.
+        mode = slot.enforcement_for(iteration)
+        advisory = mode == "soft"
         # Through the helper, which quotes both paths. Formatting `CHECKER_COMMAND` here instead —
         # which this did — bypasses the quoting on the one call site that actually runs, so a
         # workspace path with a space in it split the command and failed every governed iteration.
         command = cons.checker_command(checker, report, advisory=advisory)
         if advisory:
+            because = ("the last iteration of the slot" if slot.enforcement == "hard"
+                       else "a soft slot")
             self.console.print(
-                f"  [dim]slot {slot.label}: last iteration of the slot, so the constraint is "
-                f"checked but not fatal — acceptance needs a strict improvement instead[/dim]"
+                f"  [dim]slot {slot.label}: {because}, so the constraint is checked but not fatal "
+                f"— acceptance needs a strict improvement instead[/dim]"
             )
 
         original = list(self.config.constraints)
@@ -259,12 +264,14 @@ class OptimizationLoop(Harness):
     # -- acceptance ----------------------------------------------------------------
 
     def _check_metric_gates(self, metrics: dict[str, float]) -> str | None:
-        """Upstream's gate, plus the stricter rule for an end-of-slot violation.
+        """Upstream's gate, plus the stricter rule for a violation the checker did not reject.
 
-        A candidate that violated its slot on that slot's last iteration reached this point only
-        because the checker ran advisory. It does not get the 5% of slack every compliant iteration
-        gets: it has to be **strictly faster** than the best accepted so far. Correct-and-faster is
-        worth keeping; correct-and-merely-not-much-worse is not, when it also ignored the constraint.
+        A candidate reaches here having violated its constraint only when that iteration was soft —
+        either a slot declared `enforcement: soft`, or the last iteration of a hard one. It does not
+        get the regression slack a compliant iteration gets: it has to be **strictly faster** than
+        the best accepted so far. Correct-and-faster is worth keeping; correct-and-merely-not-much-
+        worse is not, when it also ignored the constraint. That is what keeps a soft constraint from
+        being the same thing as no constraint.
         """
         iteration = getattr(self, "_current_iteration", None)
         verdict = self._slot_verdicts.get(iteration) if iteration is not None else None

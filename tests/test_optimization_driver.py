@@ -1060,3 +1060,105 @@ def test_the_glossary_the_feedback_prompt_points_at_exists():
     from optimization.driver import _context_md
 
     assert _context_md().is_file()
+
+
+# ======================================================================================
+# another round of stage 5
+# ======================================================================================
+
+
+def _full_repo_with_a_round(repo: Path, best: str = "", best_ms: float = 14.84) -> Path:
+    """A whole-module repo that has finished one round, as `rerun_full` expects to find it."""
+    import subprocess
+
+    (repo / ".autohelix" / "optimization").mkdir(parents=True, exist_ok=True)
+    (repo / ".autohelix" / "notes").mkdir()
+    (repo / ".autohelix" / "reviews").mkdir()
+    (repo / "source.py").write_text("# round one kernel\n")
+    (repo / ".autohelix" / "notes" / "iter-1.md").write_text("what round one learned\n")
+    (repo / ".autohelix" / "reviews" / "iter-1.md").write_text("what the reviewer thought\n")
+    (repo / ".autohelix" / "history.jsonl").write_text('{"iteration": 1}\n')
+    for name in ("candidates", "constraints"):
+        (repo / ".autohelix" / "optimization" / name).mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "-m", "round one"], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    (repo / ".autohelix" / "optimization" / "full-summary.json").write_text(json.dumps({
+        "best_commit": best or head, "best_ms": best_ms,
+    }))
+    return repo
+
+
+def _round_one(tmp_path, **kwargs):
+    """A pipeline whose `full_repo` exists and has one finished round in it."""
+    from optimization.driver import Pipeline
+
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["workspace"]["root"] = str(tmp_path / "runs")
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    pipeline = Pipeline(PipelineConfig.load(path))
+    repo = _full_repo_with_a_round(pipeline.config.full_repo, **kwargs)
+    return pipeline, repo
+
+
+def test_rolling_a_round_keeps_the_notes_and_moves_the_history(tmp_path):
+    """Round 2's agent should read what round 1 learned — that is why the round exists."""
+    pipeline, repo = _round_one(tmp_path)
+
+    number = pipeline._roll_round(repo, note="trying the expert skip", previous={"best_ms": 14.84})
+    assert number == 1
+    state = repo / ".autohelix"
+    assert (state / "notes" / "iter-1.md").is_file()
+    assert (state / "reviews" / "iter-1.md").is_file()
+    assert not (state / "history.jsonl").exists()
+    archived = state / "rounds" / "round-1"
+    assert (archived / "history.jsonl").is_file()
+    assert (archived / "full-summary.json").is_file()
+    assert json.loads((archived / "round.json").read_text())["note"] == "trying the expert skip"
+
+
+def test_a_second_roll_gets_the_next_number(tmp_path):
+    pipeline, repo = _round_one(tmp_path)
+    assert pipeline._roll_round(repo, note="", previous={}) == 1
+    (repo / ".autohelix" / "history.jsonl").write_text('{"iteration": 1}\n')
+    assert pipeline._roll_round(repo, note="", previous={}) == 2
+
+
+def test_the_round_starts_from_the_named_kernel_on_a_clean_tree(tmp_path):
+    """`Harness.run` refuses a dirty tree, and the restored kernel has to be committed."""
+    import subprocess
+
+    pipeline, repo = _round_one(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    (repo / "source.py").write_text("# a later, slower iteration\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "-m", "later"], cwd=repo, check=True)
+
+    pipeline._restore_commit(repo, head, round_number=2)
+    assert (repo / "source.py").read_text() == "# round one kernel\n"
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip() == ""
+
+
+def test_rerunning_without_a_previous_round_says_so(tmp_path):
+    from optimization.driver import StageError
+
+    pipeline, repo = _round_one(tmp_path)
+    (repo / ".autohelix" / "optimization" / "full-summary.json").write_text("{}")
+    with pytest.raises(StageError, match="no previous round"):
+        pipeline.rerun_full()
+
+
+def test_rerunning_without_an_assembly_says_so(tmp_path):
+    from optimization.driver import StageError
+
+    pipeline, repo = _round_one(tmp_path)
+    (repo / "source.py").unlink()
+    with pytest.raises(StageError, match="no source.py"):
+        pipeline.rerun_full()

@@ -290,7 +290,8 @@ def test_the_prompt_offers_the_escape_on_the_last_iteration():
     text = schedule.describe_for_prompt(3)
     assert "no longer fatal" in text
     assert "strictly faster" in text
-    assert "5%" in text
+    # Named rather than quoted as a number: the allowance is `acceptance.max_regression_pct`.
+    assert "allowance" in text
     assert "rejected and its work discarded" not in text
 
 
@@ -352,3 +353,84 @@ def test_an_ordinary_static_checker_is_accepted(tmp_path):
         tmp_path, "import ast, re, sys\nt = ast.parse(open('source.py').read())\n",
     ))
     assert findings == []
+
+
+# -- per-iteration enforcement ----------------------------------------------------------
+
+
+def test_at_names_a_single_iteration():
+    """One slot per iteration is how each one gets its own constraint and its own strictness."""
+    schedule = cons.Schedule.from_config([{"at": 7, "text": "NKI only."}])
+    assert schedule.slots[0].iterations == [7]
+    assert schedule.slots[0].label == "7"
+
+
+def test_at_refuses_to_be_mixed_with_a_range():
+    with pytest.raises(cons.ScheduleError, match="drop 'to'"):
+        cons.Schedule.from_config([{"at": 7, "to": 9, "text": "x"}])
+
+
+def test_a_hard_slot_rejects_every_iteration_but_its_last():
+    slot = cons.Schedule.from_config([{"from": 4, "to": 6, "enforcement": "hard",
+                                       "text": "x"}]).slots[0]
+    assert [slot.enforcement_for(i) for i in (4, 5, 6)] == ["hard", "hard", "soft"]
+
+
+def test_soften_last_false_makes_every_iteration_hard():
+    slot = cons.Schedule.from_config([{"from": 4, "to": 6, "enforcement": "hard",
+                                       "soften_last": False, "text": "x"}]).slots[0]
+    assert [slot.enforcement_for(i) for i in (4, 5, 6)] == ["hard", "hard", "hard"]
+
+
+def test_a_soft_slot_is_soft_throughout():
+    slot = cons.Schedule.from_config([{"from": 1, "to": 3, "enforcement": "soft",
+                                       "text": "x"}]).slots[0]
+    assert [slot.enforcement_for(i) for i in (1, 2, 3)] == ["soft", "soft", "soft"]
+
+
+def test_an_off_slot_is_never_checked():
+    slot = cons.Schedule.from_config([{"at": 2, "enforcement": "off", "text": "x"}]).slots[0]
+    assert slot.enforcement_for(2) == "off"
+    assert cons.Schedule.from_config([{"at": 2, "enforcement": "off",
+                                       "text": "x"}]).enforceable() == []
+
+
+def test_a_slot_with_no_text_is_off_whatever_it_declares():
+    slot = cons.Schedule.from_config([{"at": 2, "enforcement": "hard", "text": ""}]).slots[0]
+    assert slot.enforcement_for(2) == "off"
+
+
+def test_the_old_boolean_still_works():
+    """Configs in the wild use `enforce:`, and it has to keep meaning what it meant."""
+    hard = cons.Schedule.from_config([{"at": 1, "enforce": True, "text": "x"}]).slots[0]
+    off = cons.Schedule.from_config([{"at": 2, "enforce": False, "text": "x"}]).slots[0]
+    assert hard.enforcement == "hard" and off.enforcement == "off"
+
+
+def test_declaring_both_forms_is_refused():
+    with pytest.raises(cons.ScheduleError, match="both 'enforce' and 'enforcement'"):
+        cons.Schedule.from_config([{"at": 1, "enforce": True, "enforcement": "soft", "text": "x"}])
+
+
+def test_an_unknown_enforcement_is_refused():
+    with pytest.raises(cons.ScheduleError, match="enforcement must be one of"):
+        cons.Schedule.from_config([{"at": 1, "enforcement": "maybe", "text": "x"}])
+
+
+def test_the_prompt_says_which_mode_this_iteration_is_in():
+    schedule = cons.Schedule.from_config([
+        {"at": 1, "enforcement": "hard", "soften_last": False, "text": "NKI only."},
+        {"at": 2, "enforcement": "soft", "text": "Prefer fp8."},
+        {"at": 3, "enforcement": "off", "text": "Ideas."},
+    ])
+    assert "hard constraint" in schedule.describe_for_prompt(1)
+    assert "rejected and its work discarded" in schedule.describe_for_prompt(1)
+    assert "soft constraint" in schedule.describe_for_prompt(2)
+    assert "strictly faster" in schedule.describe_for_prompt(2)
+    assert "guidance rather than a rule" in schedule.describe_for_prompt(3)
+
+
+def test_the_recorded_slot_carries_its_per_iteration_modes():
+    """The report and the manifest read this, so what was hard and what was soft stays on record."""
+    slot = cons.Schedule.from_config([{"from": 4, "to": 6, "text": "x"}]).slots[0]
+    assert slot.to_dict()["per_iteration"] == {"4": "hard", "5": "hard", "6": "soft"}

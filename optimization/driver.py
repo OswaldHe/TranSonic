@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -732,6 +733,141 @@ class Pipeline:
             f"golden but missing a bound, the submodule's cut is the thing to revisit, not the "
             f"assembly."
         )
+
+    # -- another round of stage 5 --------------------------------------------------
+
+    def rerun_full(self, from_commit: str | None = None, note: str = "") -> StageOutcome:
+        """Start a fresh round of the whole-module loop from the kernel the last round produced.
+
+        The reason this exists: the first round's own notes are where the ideas for the second round
+        come from. You read them, you learn that the routed-expert skip was blocked by a loop bound
+        or that the scale multiply is the binding pass, you write that into a constraint slot — and
+        then you need the loop to start again *from the kernel you already have*, not from the
+        assembly baseline it started from the first time.
+
+        So this rolls the run state into `.autohelix/rounds/round-N/` and starts over, keeping three
+        things deliberately:
+
+        - **`notes/` and `reviews/` stay where they are.** Round 2's agent should read what round 1
+          learned; that is the whole point. Archiving them, which `autohelix clear` does, would throw
+          away the material that motivated the round.
+        - **The kernel is the previous round's best accepted commit**, not `HEAD`. With regression
+          slack those differ, and starting from a kernel slower than the one you have would spend the
+          first iterations getting back to where you were.
+        - **The baseline is re-measured by the gate** on that kernel. A recorded verdict from the old
+          round describes different code, and every bound in the new round is stated against this
+          number.
+        """
+        repo = self.config.full_repo
+        if not (repo / "source.py").is_file():
+            raise StageError(
+                f"{repo} has no source.py, so there is no assembled module to re-run. "
+                f"Run `optimize assemble` first."
+            )
+
+        previous = _read_summary(repo, "full")
+        target = from_commit or previous.get("best_commit")
+        previous_best = previous.get("best_ms")
+        if not target:
+            raise StageError(
+                f"no previous round to continue from: {repo} has no recorded best commit.\n"
+                f"Use `optimize run-full` for the first round, or pass --from-commit to name one."
+            )
+
+        round_number = self._roll_round(repo, note=note, previous=previous)
+        self.console.print(
+            f"  round {round_number}: starting from {str(target)[:12]}"
+            + (f", the best of the last round at {previous_best:g} ms" if previous_best else "")
+        )
+        self._restore_commit(repo, target, round_number)
+
+        # Recompiled, not reused: the point of a new round is new prose, and a checker written from
+        # the old prose would judge the agent by a rule it was never told.
+        if self.config.full.schedule.enforceable():
+            self.compile_constraints("full")
+
+        ok, report = self._run_gate(repo, "optimization.module_checker", "module")
+        if not ok:
+            raise StageError(
+                f"the kernel this round starts from does not pass the module gate, so there is no "
+                f"baseline to improve on. That kernel passed when it was accepted, so look for what "
+                f"changed around it — the tensors, the manifest, the toolchain.\n{report[-800:]}"
+            )
+        latency = _latency_from_gate(repo / ".autohelix" / "optimization" / "module-gate.json")
+        self.console.print(f"  round {round_number} baseline: {latency or float('nan'):g} ms")
+
+        outcome = self.run_loop("full")
+        self._record(f"round-{round_number}", {
+            "stage": "full", "from_commit": target, "note": note,
+            "baseline_ms": latency, "previous_best_ms": previous_best,
+            "best_ms": outcome.payload.get("best_ms"),
+            "best_commit": outcome.payload.get("best_commit"),
+        })
+        return outcome
+
+    def _roll_round(self, repo: Path, note: str, previous: dict[str, Any]) -> int:
+        """Move the finished round's run state aside and return the new round's number.
+
+        `history.jsonl` has to go, because the loop numbers iterations from what it finds there and a
+        second round would otherwise continue at iteration 6 with a budget of 5. The candidate archive
+        and the slot verdicts go with it so the new round's records are its own. Notes and reviews
+        stay.
+        """
+        state = repo / ".autohelix"
+        rounds = state / "rounds"
+        rounds.mkdir(parents=True, exist_ok=True)
+        number = 1 + sum(1 for p in rounds.iterdir() if p.is_dir() and p.name.startswith("round-"))
+        destination = rounds / f"round-{number}"
+        destination.mkdir(parents=True, exist_ok=True)
+
+        for relative in ("history.jsonl",
+                         "optimization/full-summary.json",
+                         "optimization/candidates",
+                         "optimization/constraints"):
+            source = state / relative
+            if not source.exists():
+                continue
+            moved = destination / Path(relative).name
+            if moved.exists():
+                shutil.rmtree(moved) if moved.is_dir() else moved.unlink()
+            shutil.move(str(source), str(moved))
+
+        (destination / "round.json").write_text(json.dumps({
+            "round": number,
+            "note": note,
+            "closed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "best_ms": previous.get("best_ms"),
+            "best_commit": previous.get("best_commit"),
+        }, indent=2))
+        self.console.print(f"  previous round's state kept at {destination}")
+        return number
+
+    def _restore_commit(self, repo: Path, commit: str, round_number: int) -> None:
+        """Put `source.py` at `commit` and commit it, so the loop starts on a clean tree.
+
+        Committing rather than leaving the working tree dirty because `Harness.run` refuses to start
+        otherwise — and the commit is a real record of what this round began from.
+        """
+        shown = subprocess.run(["git", "show", f"{commit}:source.py"],
+                               cwd=repo, capture_output=True, text=True)
+        if shown.returncode != 0:
+            raise StageError(
+                f"cannot read source.py at {commit[:12]} in {repo}: {shown.stderr.strip()}"
+            )
+        target = repo / "source.py"
+        if target.read_text() == shown.stdout:
+            self.console.print("  the working tree is already that kernel")
+        else:
+            target.write_text(shown.stdout)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        status = subprocess.run(["git", "status", "--porcelain"],
+                                cwd=repo, capture_output=True, text=True)
+        if status.stdout.strip():
+            subprocess.run(
+                ["git", "commit", "-q", "-m",
+                 f"round {round_number}: start from {commit[:12]}"],
+                cwd=repo, check=True,
+            )
 
     # -- stage: feedback -----------------------------------------------------------
 

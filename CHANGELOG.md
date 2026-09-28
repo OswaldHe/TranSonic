@@ -29,6 +29,22 @@
   not on the run. It measures nothing and edits no repository, so it has no gate:
   `feedback.validate_report` checks the report's shape (a level in range, a reproduction file that
   exists, a link per row) and nothing checks whether a finding is true, because nothing could.
+- Per-iteration constraint enforcement. A slot names its iterations with `at: 5` (one),
+  `from`/`to` (a range) or `iterations: [1, 3, 5]` (a set), and carries `enforcement: hard|soft|off`.
+  `hard` rejects the iteration; `soft` checks and records without rejecting, but costs the
+  regression slack — a candidate that missed its constraint has to be correct and *strictly faster*
+  than the best so far, which is what stops a soft constraint being no constraint; `off` is prompt
+  guidance nothing checks. `soften_last` (default true) drops a hard slot's last iteration to soft,
+  so one slot per iteration with `soften_last: false` is a constraint with no escape at all. The
+  older `enforce: true|false` still works and means `hard|off`. Both loop stages read a schedule;
+  stage 5's is empty by default because the first round has nothing to go on.
+- `autohelix optimize rerun-full`, another round of the whole-module loop starting from the kernel
+  the last round produced. The first round's notes are where the second round's ideas come from, so
+  this starts from the previous round's *best accepted commit* rather than `HEAD` (regression slack
+  can leave `HEAD` slower), re-measures that kernel's baseline with the gate rather than trusting a
+  verdict describing different code, and recompiles the checkers from whatever the prose now says.
+  The old round's history, candidate archive and slot verdicts move to `.autohelix/rounds/round-N/`;
+  its `notes/` and `reviews/` stay where they are, because the next agent reading them is the point.
 - Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` slots
   of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
   unconstrained for aggressive exploration, and the last ones returned to the disciplined
