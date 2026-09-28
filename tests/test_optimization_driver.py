@@ -1105,8 +1105,18 @@ def _round_one(tmp_path, **kwargs):
     return pipeline, repo
 
 
-def test_rolling_a_round_keeps_the_notes_and_moves_the_history(tmp_path):
-    """Round 2's agent should read what round 1 learned — that is why the round exists."""
+def _archive_of(repo: Path) -> Path:
+    """The round archive `_roll_round` wrote, under the same `.autohelix/archive/<timestamp>/` that
+    `autohelix clear` uses."""
+    archives = [d for d in (repo / ".autohelix" / "archive").iterdir()
+                if (d / "round.json").is_file()]
+    assert len(archives) == 1, archives
+    return archives[0]
+
+
+def test_rolling_a_round_archives_it_and_carries_the_notes_forward(tmp_path):
+    """Round 2's agent should read what round 1 learned — that is why the round exists. The archive
+    keeps its own copy, so it stays a complete record."""
     pipeline, repo = _round_one(tmp_path)
 
     number = pipeline._roll_round(repo, note="trying the expert skip", previous={"best_ms": 14.84})
@@ -1115,16 +1125,37 @@ def test_rolling_a_round_keeps_the_notes_and_moves_the_history(tmp_path):
     assert (state / "notes" / "iter-1.md").is_file()
     assert (state / "reviews" / "iter-1.md").is_file()
     assert not (state / "history.jsonl").exists()
-    archived = state / "rounds" / "round-1"
+    archived = _archive_of(repo)
     assert (archived / "history.jsonl").is_file()
+    assert (archived / "notes" / "iter-1.md").is_file()
     assert (archived / "full-summary.json").is_file()
     assert json.loads((archived / "round.json").read_text())["note"] == "trying the expert skip"
 
 
+def test_rolling_a_round_does_not_carry_observations_or_logs_forward(tmp_path):
+    """Those belong to the round that produced them; leaving them mixes two rounds' measurements."""
+    pipeline, repo = _round_one(tmp_path)
+    for name in ("observations", "logs"):
+        (repo / ".autohelix" / name).mkdir(exist_ok=True)
+        (repo / ".autohelix" / name / "iter-1").mkdir(exist_ok=True)
+
+    pipeline._roll_round(repo, note="", previous={})
+    archived = _archive_of(repo)
+    for name in ("observations", "logs"):
+        assert (archived / name / "iter-1").exists(), name
+        assert not (repo / ".autohelix" / name / "iter-1").exists(), name
+
+
 def test_a_second_roll_gets_the_next_number(tmp_path):
     pipeline, repo = _round_one(tmp_path)
-    assert pipeline._roll_round(repo, note="", previous={}) == 1
-    (repo / ".autohelix" / "history.jsonl").write_text('{"iteration": 1}\n')
+    # A round already on record, filed under an earlier timestamp as it would be in practice. The
+    # count comes from the `round.json` markers, not from the number of archive directories, so an
+    # `autohelix clear` archive alongside these does not shift the numbering.
+    old = repo / ".autohelix" / "archive" / "20260101-000000"
+    old.mkdir(parents=True)
+    (old / "round.json").write_text(json.dumps({"round": 1}))
+    (repo / ".autohelix" / "archive" / "20260102-000000").mkdir()  # a plain `clear`, not a round
+
     assert pipeline._roll_round(repo, note="", previous={}) == 2
 
 
@@ -1169,7 +1200,7 @@ def test_the_new_round_is_numbered_after_the_one_it_archives(tmp_path):
     the archive's number called round 2 "round 1" in the log."""
     pipeline, repo = _round_one(tmp_path)
     assert pipeline._roll_round(repo, note="", previous={}) == 1
-    assert (repo / ".autohelix" / "rounds" / "round-1").is_dir()
+    assert (_archive_of(repo) / "round.json").is_file()
 
 
 def test_rerunning_after_a_failed_start_does_not_file_an_empty_round(tmp_path):
@@ -1178,8 +1209,9 @@ def test_rerunning_after_a_failed_start_does_not_file_an_empty_round(tmp_path):
     pipeline, repo = _round_one(tmp_path)
     assert pipeline._roll_round(repo, note="", previous={}) == 1
     assert pipeline._roll_round(repo, note="", previous={}) == 1
-    rounds = repo / ".autohelix" / "rounds"
-    assert [p.name for p in sorted(rounds.iterdir())] == ["round-1"]
+    archives = [d for d in (repo / ".autohelix" / "archive").iterdir()
+                if (d / "round.json").is_file()]
+    assert len(archives) == 1
 
 
 def test_the_last_rounds_result_is_found_in_the_archive(tmp_path):

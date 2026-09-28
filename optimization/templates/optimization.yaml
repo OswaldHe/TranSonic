@@ -256,9 +256,9 @@ full:
   #  written from a profile you have read is worth more than any schedule guessed in advance.
   #
   #  `rerun-full` starts from the previous round's best accepted kernel, re-measures its baseline,
-  #  and recompiles these checkers from whatever the prose now says. The previous round's history
-  #  moves to `.autohelix/rounds/round-N/`; its notes and reviews stay where the next agent reads
-  #  them, which is what makes a second round cheaper than the first.
+  #  and recompiles these checkers from whatever the prose now says. The previous round's run state
+  #  is archived to `.autohelix/archive/<timestamp>/`, the same way `autohelix clear` archives a run;
+  #  its notes and reviews are carried forward, which is what makes a second round cheaper.
   #
   iteration_constraints: []      ### EDIT ME (optional)
   #  For example:

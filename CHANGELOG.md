@@ -43,8 +43,12 @@
   this starts from the previous round's *best accepted commit* rather than `HEAD` (regression slack
   can leave `HEAD` slower), re-measures that kernel's baseline with the gate rather than trusting a
   verdict describing different code, and recompiles the checkers from whatever the prose now says.
-  The old round's history, candidate archive and slot verdicts move to `.autohelix/rounds/round-N/`;
-  its `notes/` and `reviews/` stay where they are, because the next agent reading them is the point.
+  The old round's run state is archived to `.autohelix/archive/<timestamp>/` through the same
+  `archive_state` that `autohelix clear` uses, so there is one convention rather than two, and the
+  pipeline's own per-round records — the stage summary, the candidate archive, the compiled checkers —
+  go into the same directory. `notes/` and `reviews/` are copied back afterwards, because the next
+  agent reading them is the point; `observations/`, `logs/` and `output/` are not, because they
+  belong to the round that produced them.
 - Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` slots
   of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
   unconstrained for aggressive exploration, and the last ones returned to the disciplined

@@ -193,8 +193,9 @@ def rerun_full_stage(config: str | None, verbose: bool,
 
     For the case the first round creates: you read its notes, you learn what blocked it, you write
     that into `full.iteration_constraints`, and you want the loop to carry on from its own best
-    kernel rather than from the assembly baseline. The previous round's history moves to
-    `.autohelix/rounds/round-N/`; its notes and reviews stay where the next agent will read them.
+    kernel rather than from the assembly baseline. The previous round's run state is archived to
+    `.autohelix/archive/<timestamp>/`, as `autohelix clear` would; its notes and reviews are carried
+    forward so the next agent reads what the last one learned.
     """
     pipeline = _pipeline(config, verbose)
     raise SystemExit(_run(

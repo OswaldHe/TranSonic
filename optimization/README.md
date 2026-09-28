@@ -62,8 +62,10 @@ that the scale multiply is the binding pass, and you want the loop to carry on *
 already have* with that written in as a constraint. So `optimize rerun-full` starts from the previous
 round's **best accepted commit** — not `HEAD`, which regression slack can leave slower — re-measures
 its baseline with the gate, and recompiles the checkers from whatever the prose now says. The old
-round's history moves to `.autohelix/rounds/round-N/`, and its `notes/` and `reviews/` stay exactly
-where they are, because the next agent reading them is the point.
+round's run state is archived to `.autohelix/archive/<timestamp>/` — the same place and the same way
+`autohelix clear` archives a run, so there is one convention rather than two. Its `notes/` and
+`reviews/` are copied back afterwards, because the next agent reading them is the point;
+`observations/`, `logs/` and `output/` are not, because they belong to the round that produced them.
 
 **`feedback` reads what the run wrote and nobody else will.** Fifteen iterations leave ~83,000 words
 of notes and reviews, written one iteration at a time by agents that did not know how the run would

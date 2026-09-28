@@ -745,12 +745,12 @@ class Pipeline:
         then you need the loop to start again *from the kernel you already have*, not from the
         assembly baseline it started from the first time.
 
-        So this rolls the run state into `.autohelix/rounds/round-N/` and starts over, keeping three
+        So this archives the run state the way `autohelix clear` does and starts over, keeping three
         things deliberately:
 
-        - **`notes/` and `reviews/` stay where they are.** Round 2's agent should read what round 1
-          learned; that is the whole point. Archiving them, which `autohelix clear` does, would throw
-          away the material that motivated the round.
+        - **`notes/` and `reviews/` are carried forward.** Round 2's agent should read what round 1
+          learned; that is the whole point. They are archived with everything else and then copied
+          back, so the archive stays a complete record of the round.
         - **The kernel is the previous round's best accepted commit**, not `HEAD`. With regression
           slack those differ, and starting from a kernel slower than the one you have would spend the
           first iterations getting back to where you were.
@@ -783,11 +783,9 @@ class Pipeline:
         )
         self._restore_commit(repo, target, round_number)
 
-        # Recompiled, not reused: the point of a new round is new prose, and a checker written from
-        # the old prose would judge the agent by a rule it was never told.
-        if self.config.full.schedule.enforceable():
-            self.compile_constraints("full")
-
+        # No explicit compile step: `run_loop` already recompiles when the prose differs from what
+        # the manifest recorded, and the roll archived the old checkers, so a round whose prose
+        # changed gets new ones and a re-run after a failed start does not pay for them twice.
         ok, report = self._run_gate(repo, "optimization.module_checker", "module")
         if not ok:
             raise StageError(
@@ -823,10 +821,10 @@ class Pipeline:
         live = _read_summary(repo, "full")
         if live.get("best_commit"):
             return live
-        rounds = repo / ".autohelix" / "rounds"
-        if not rounds.is_dir():
+        archive = repo / ".autohelix" / "archive"
+        if not archive.is_dir():
             return live
-        for directory in sorted(rounds.iterdir(), reverse=True):
+        for directory in sorted(archive.iterdir(), reverse=True):
             summary = directory / "full-summary.json"
             if not summary.is_file():
                 continue
@@ -851,31 +849,69 @@ class Pipeline:
             cwd=repo, check=True,
         )
 
-    def _roll_round(self, repo: Path, note: str, previous: dict[str, Any]) -> int:
-        """Move the finished round's run state aside and return *its* number, not the next one.
+    #: Archived per round and then put back, because the next round's agent should start knowing what
+    #: the last one learned — that is the whole reason to run a second round rather than a longer
+    #: first one. Everything else `archive_state` moves (observations, logs, output, hints) belongs to
+    #: the round that produced it.
+    CARRIED_FORWARD = ("notes", "reviews")
 
-        `history.jsonl` has to go, because the loop numbers iterations from what it finds there and a
-        second round would otherwise continue at iteration 6 with a budget of 5. The candidate archive
-        and the slot verdicts go with it so the new round's records are its own. Notes and reviews
-        stay.
+    def _rounds_on_record(self, state: Path) -> int:
+        """How many rounds have been archived, counted by the marker this writes.
+
+        Counted by `round.json` rather than by archive directories, because `autohelix clear` writes
+        archives here too and those are not rounds.
         """
-        state = repo / ".autohelix"
-        rounds = state / "rounds"
-        rounds.mkdir(parents=True, exist_ok=True)
-        existing = sum(1 for p in rounds.iterdir() if p.is_dir() and p.name.startswith("round-"))
+        archive = state / "archive"
+        if not archive.is_dir():
+            return 0
+        return sum(1 for d in archive.iterdir() if (d / "round.json").is_file())
 
+    def _roll_round(self, repo: Path, note: str, previous: dict[str, Any]) -> int:
+        """Archive the finished round, the way `autohelix clear` archives a run.
+
+        Through `archive_state`, rather than moving files by hand: it is the convention an operator
+        already knows, it writes to `.autohelix/archive/<timestamp>/`, and it covers the state a
+        hand-rolled version forgets — `observations/`, `logs/`, `output/`, `hints.md`. Leaving those
+        in place, which an earlier version of this did, carries one round's captured measurements and
+        agent logs into the next round's directories.
+
+        Two departures from `clear`. `notes/` and `reviews/` are copied back afterwards, so the
+        archive is a complete record of the round *and* the next agent still reads what the last one
+        learned. And the pipeline's own per-round state — the stage summary, the candidate archive,
+        the compiled checkers — goes into the same directory, since `archive_state` does not know
+        about it.
+
+        Returns the number of the round it archived, not the next one. The kernel is untouched: the
+        working tree keeps the previous round's best, which is what the new round starts from.
+        """
+        from autohelix.state import archive_state
+
+        state = repo / ".autohelix"
         # Nothing to archive means this is a re-run after a start that did not reach iteration 1.
         # Rolling again would file an empty round and shift every later number by one.
         if not (state / "history.jsonl").exists():
+            existing = self._rounds_on_record(state)
             self.console.print(f"  the previous round is already archived ({existing} on record)")
             return existing
 
-        number = existing + 1
-        destination = rounds / f"round-{number}"
-        destination.mkdir(parents=True, exist_ok=True)
+        number = self._rounds_on_record(state) + 1
+        before = {d.name for d in (state / "archive").iterdir()} if (state / "archive").is_dir() \
+            else set()
+        archive_state(repo, self.console)
+        fresh = [d for d in (state / "archive").iterdir() if d.name not in before] \
+            if (state / "archive").is_dir() else []
+        if not fresh:
+            # `archive_state` names a directory by the second, so this means two rounds were rolled
+            # inside one second and the second would have merged into the first's archive. Refusing
+            # beats silently mixing two rounds' records together.
+            raise StageError(
+                f"archiving round {number} produced no new directory under {state / 'archive'}. "
+                f"A round was archived less than a second ago, so this one would have merged into "
+                f"it. Wait a moment and re-run."
+            )
+        destination = max(fresh, key=lambda d: d.name)
 
-        for relative in ("history.jsonl",
-                         "optimization/full-summary.json",
+        for relative in ("optimization/full-summary.json",
                          "optimization/candidates",
                          "optimization/constraints"):
             source = state / relative
@@ -893,7 +929,22 @@ class Pipeline:
             "best_ms": previous.get("best_ms"),
             "best_commit": previous.get("best_commit"),
         }, indent=2))
-        self.console.print(f"  previous round's state kept at {destination}")
+
+        for name in self.CARRIED_FORWARD:
+            archived = destination / name
+            if not archived.is_dir():
+                continue
+            live = state / name
+            live.mkdir(parents=True, exist_ok=True)
+            for item in archived.iterdir():
+                target = live / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+            self.console.print(f"  [dim]carried {name}/ forward into round {number + 1}[/dim]")
+
+        self.console.print(f"  round {number} archived at {destination}")
         return number
 
     def _restore_commit(self, repo: Path, commit: str, round_number: int) -> None:
