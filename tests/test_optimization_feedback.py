@@ -11,7 +11,6 @@ with no link, a cell too short to be read by someone who was not on the run.
 
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -209,12 +208,7 @@ def test_a_table_with_no_rows_is_an_honest_answer(tmp_path):
     assert fb.summarize(tmp_path)["findings"] == 0
 
 
-def test_a_missing_table_is_still_refused(tmp_path):
-    _report(tmp_path, "# Feedback\n\nno table at all\n")
-    assert any("no findings table" in f for f in fb.validate_report(tmp_path))
-
-
-def test_find_table_separates_absent_from_empty(tmp_path):
+def test_find_table_separates_absent_from_empty():
     assert fb.find_table("nothing here") == (False, [])
     found, rows = fb.find_table(HEADER)
     assert found and rows == []

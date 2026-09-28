@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -76,9 +75,8 @@ MANIFEST_REL = ".autohelix/optimization/module.json"
 #: The rank count when the manifest does not say. The logical NeuronCores of one trn2 device, which
 #: is what `PROJECTION_TARGET_UNITS` projects onto — but only a default: the projection deliberately
 #: keeps a placement already narrower than the target, and `floorplan.target_units` is configurable,
-#: so a valid assembly can be 1 or 2 ranks wide. Fixing this at four made the gate launch four
-#: processes and demand four rank markers for a two-rank assembly the stage-4 prompt had asked for,
-#: which no candidate could ever satisfy.
+#: so a valid assembly can be 1 or 2 ranks wide. Fixed at four, the gate demanded four rank markers
+#: from a two-rank assembly its own prompt had asked for, which no candidate could satisfy.
 DEFAULT_RANKS = 4
 
 

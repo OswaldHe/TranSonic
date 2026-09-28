@@ -315,11 +315,6 @@ class Pipeline:
         }
         self._record("projection", payload)
 
-        # Hashes of the bootstrapped module's tensors, written where no agent can reach them. The
-        # repos' copies are hard links to these, and read-only mode bits on a hard link are a speed
-        # bump rather than a guarantee — the owning user can restore write permission and truncate
-        # the shared inode. The gate cannot catch that on its own, because its provenance check
-        # compares against hashes the agent recorded. This record is what makes the loss detectable.
         source_tensors = materialize.fingerprint_tensors(self.config.bootstrap_repo / "tensors")
         self._record("source-tensors", {"tensors": source_tensors})
         self.console.print(f"  recorded {len(source_tensors)} source tensor hash(es)")
@@ -339,9 +334,8 @@ class Pipeline:
     def _verify_source_tensors(self, after: str) -> None:
         """Refuse to go on if the bootstrapped module's recorded bytes have changed.
 
-        Checked after every stage that ran an agent with write access to a repo holding hard links to
-        them. The record is the pipeline's, written at `init` and kept in its own state directory, so
-        an agent cannot make a corrupted file look correct by re-recording it.
+        Run after each stage that gave an agent write access to a repo holding hard links to them.
+        See `materialize.fingerprint_tensors` for why the record lives outside every repo.
         """
         record = (self._read_record("source-tensors") or {}).get("tensors") or {}
         if not record:

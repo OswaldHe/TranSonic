@@ -132,7 +132,7 @@ def test_an_incomplete_bootstrap_repo_is_reported(tmp_path):
     assert any("has no README.md" in p for p in PipelineConfig.load(path).validate())
 
 
-def test_unknown_top_level_keys_are_refused(tmp_path):
+def test_unknown_top_level_keys_are_refused():
     with pytest.raises(ConfigError, match="unknown top-level"):
         PipelineConfig.from_dict({"modules": {}})
 

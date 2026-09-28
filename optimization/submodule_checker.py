@@ -32,7 +32,6 @@ until something works; a red baseline would make the 5% regression gate compare 
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import sys
 from pathlib import Path
@@ -301,7 +300,7 @@ def check_declaration(repo: Path, manifest: dict[str, Any]) -> CheckResult:
                        if not findings else f"{len(findings)} problem(s)", findings)
 
 
-def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
+def check_single_core(repo: Path) -> CheckResult:
     """(g) The run used one NeuronCore.
 
     The gate sets `NEURON_RT_NUM_CORES=1` in the child's environment, so the only way to use more
@@ -336,7 +335,7 @@ def evaluate(repo: Path, manifest: dict[str, Any],
         check_baseline(run, bar, repo),
         check_provenance(repo, manifest),
         check_declaration(repo, manifest),
-        check_single_core(run, repo),
+        check_single_core(repo),
     ]
     return results, run
 

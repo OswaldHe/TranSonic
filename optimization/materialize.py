@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from optimization.projection import Projection
-from optimization.strip import StripResult, strip_tree
+from optimization.strip import strip_tree
 
 #: What a materialized repo carries, by role. `module/` and `reference/` are read-only inputs;
 #: `tensors/` is the agent's to fill from them.
@@ -157,11 +157,14 @@ def _link_or_copy_tensors(src: Path, dst: Path) -> str:
     The links are then made **read-only**, and that part is not cosmetic. A hard link is the same
     inode, and an earlier comment here claimed a write would have to unlink first — it does not:
     `open(path, "wb")` truncates the shared inode, so a validator that opened a tensor for writing
-    by mistake would destroy the recorded golden in the bootstrap repo, which is irreplaceable and
-    which the assembly's provenance hashes would then happily bless. This filesystem is ext4 with no
-    reflink support, so copy-on-write is unavailable and the mode bits are the guard. Clearing write
-    permission on the inode covers the original too, which is the right outcome: recorded tensors are
-    ground truth and nothing in this pipeline should be writing to them.
+    by mistake would destroy the recorded golden in the bootstrap repo, which is irreplaceable. This
+    filesystem is ext4 with no reflink support, so copy-on-write is unavailable and the mode bits are
+    the guard. Clearing write permission on the inode covers the original too, which is the right
+    outcome: recorded tensors are ground truth and nothing here should be writing to them.
+
+    The mode bits are a speed bump rather than a guarantee — the owning user can restore write
+    permission — so they are backed by `fingerprint_tensors`, which records what the bytes were
+    somewhere no agent can reach.
     """
     dst.mkdir(parents=True, exist_ok=True)
     linked = copied = 0
@@ -186,17 +189,12 @@ def _link_or_copy_tensors(src: Path, dst: Path) -> str:
 
 
 def fingerprint_tensors(directory: Path) -> dict[str, dict[str, Any]]:
-    """Content hash and size of every recorded tensor, for a record kept outside both repos.
+    """Content hash and size of every recorded tensor: what `_link_or_copy_tensors`' mode bits cannot
+    guarantee on their own.
 
-    The mode bits on a hard link are a speed bump and not a guarantee: the owning user can `chmod`
-    them back and truncate the shared inode, which would destroy the bootstrapped module's golden —
-    the one irreplaceable thing in the workspace. And the gate cannot catch that on its own, because
-    the provenance check compares the candidate's files against hashes the *agent* recorded, so a
-    corrupted file re-hashed after the fact passes.
-
-    This record is written by the pipeline, into its own state directory, and never appears in a
-    repository an agent can write. Hashing the MoE's 6.8 GiB takes about 7 seconds, which is nothing
-    against the hours a stage spends on the device.
+    The gate's provenance check cannot stand in for this, because it compares against hashes the
+    *agent* recorded — a corrupted tensor re-hashed afterwards passes. So the pipeline keeps this
+    record in its own state directory, where no agent writes. 6.8 GiB hashes in about 7 seconds.
     """
     found: dict[str, dict[str, Any]] = {}
     if not directory.is_dir():
@@ -315,7 +313,7 @@ def materialize_submodule(
 
     (repo / "FLOORPLAN.md").write_text(projection.describe())
     (repo / "README.md").write_text(_submodule_readme(
-        module_id, projection, entry_point, bar, golden, tensors_note,
+        module_id, projection, bar, golden, tensors_note,
     ))
     write_gitignore(repo)
     (repo / "source.py").write_text(_source_stub(entry_point))
@@ -372,7 +370,7 @@ raise NotImplementedError("the validator has not been written yet — see the st
 
 
 def _submodule_readme(
-    module_id: str, projection: Projection, entry_point: str,
+    module_id: str, projection: Projection,
     bar: dict[str, float], golden: TensorRecord, tensors_note: str,
 ) -> str:
     dims = " * ".join(f"{f.dim}x{f.factor}" for f in projection.projected) or "no split"
@@ -509,7 +507,7 @@ def materialize_full(
 
     (repo / "FLOORPLAN.md").write_text(projection.describe())
     (repo / "README.md").write_text(_full_readme(
-        module_id, projection, entry_point, bar, golden,
+        module_id, projection, bar, golden,
         bootstrap_latency_ms, submodule_latency_ms,
     ))
     write_gitignore(repo)
@@ -545,7 +543,7 @@ def materialize_full(
 
 
 def _full_readme(
-    module_id: str, projection: Projection, entry_point: str, bar: dict[str, float],
+    module_id: str, projection: Projection, bar: dict[str, float],
     golden: TensorRecord, bootstrap_latency_ms: float, submodule_latency_ms: float,
 ) -> str:
     ranks = projection.projected_units

@@ -262,7 +262,7 @@ def _rank_markers(values: list[float]) -> str:
     return "".join(f"##autohelix[latency_rank_{r}_ms={v}]\n" for r, v in enumerate(values))
 
 
-def test_the_reported_latency_must_be_the_fastest_rank(tmp_path):
+def test_the_reported_latency_must_be_the_fastest_rank():
     """Otherwise "the fastest rank" is the candidate's unverifiable claim."""
     output = _rank_markers([40.0, 32.0, 35.0, 44.0]) + "##autohelix[latency_ms=20.0]\n"
     result = module_checker.check_measurement(_run(output))
@@ -270,7 +270,7 @@ def test_the_reported_latency_must_be_the_fastest_rank(tmp_path):
     assert any("fastest rank reported 32" in f for f in result.findings)
 
 
-def test_a_consistent_fastest_rank_passes_and_reports_the_spread(tmp_path):
+def test_a_consistent_fastest_rank_passes_and_reports_the_spread():
     output = _rank_markers([40.0, 32.0, 35.0, 44.0]) + "##autohelix[latency_ms=32.0]\n"
     result = module_checker.check_measurement(_run(output))
     assert result.passed, result.findings
@@ -341,7 +341,7 @@ def test_an_unedited_validator_passes(tmp_path):
     assert result.passed, result.findings
 
 
-def test_the_module_bar_is_not_re_derived(tmp_path):
+def test_the_module_bar_is_not_re_derived():
     """Stage 5 inherits the bootstrapped module's five constants; there is no default."""
     with pytest.raises(candidate.CheckerError, match="MIN_COSINE"):
         module_checker.expected_tolerance({"tolerance": {"RTOL": 0.1, "ATOL": 0.1}})
@@ -390,18 +390,17 @@ def test_a_submodule_that_launches_torchrun_is_refused(tmp_path):
     repo = tmp_path / "sub"
     repo.mkdir()
     (repo / "inference.py").write_text("import subprocess\nsubprocess.run(['torchrun', 'x.py'])\n")
-    result = submodule_checker.check_single_core(_run(""), repo)
+    result = submodule_checker.check_single_core(repo)
     assert not result.passed
     assert any("torchrun" in f for f in result.findings)
 
 
-def test_a_submodule_that_sets_the_core_count_itself_is_refused(tmp_path):
+def test_the_single_core_check_applies_the_shared_core_rule(tmp_path):
+    """The rule itself is covered against `candidate.core_allocation_findings`; this is the wiring."""
     repo = tmp_path / "sub"
     repo.mkdir()
-    (repo / "inference.py").write_text(
-        "import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n"
-    )
-    result = submodule_checker.check_single_core(_run(""), repo)
+    (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
+    result = submodule_checker.check_single_core(repo)
     assert not result.passed
     assert any("not the validator's to choose" in f for f in result.findings)
 
@@ -424,7 +423,9 @@ def test_a_declaration_whose_factor_contradicts_the_projection_is_refused(tmp_pa
         "reassembly": {"op": "sum", "shards": [], "dtype": "float32", "shape": [1]},
     }))
     result = submodule_checker.check_declaration(
-        repo, {"projection": {"projected_units": 4}},
+        # The nested shape materialization actually writes. Stating the flat key here let this test
+        # pass throughout the run in which the check was reading 0 and enforcing nothing.
+        repo, {"projection": {"projected": {"units": 4}}},
     )
     assert not result.passed
     assert any("4 ranks" in f and "8-way" in f for f in result.findings)
@@ -739,7 +740,7 @@ def test_a_genuine_size_mismatch_is_still_refused():
     assert not ok and "element(s)" in detail
 
 
-def test_the_module_golden_cannot_be_its_own_shard(tmp_path):
+def test_the_module_golden_cannot_be_its_own_shard():
     """Reassembling the answer from the answer reproduces the target and proves nothing."""
     from optimization.recipe import validate_shards
 
@@ -780,32 +781,6 @@ def test_a_verified_recipe_still_needs_a_legal_shard_list(tmp_path):
     outcome = verify_recipe(tmp_path, declaration, _manifest(shape))
     assert not outcome.reproduces
     assert "1 golden(s) but the cut is 4-way" in outcome.detail
-
-
-def test_the_submodule_may_pin_itself_to_a_core(tmp_path):
-    """`NEURON_RT_VISIBLE_CORES` pins to one core; it does not widen anything."""
-    repo = tmp_path / "sub"
-    repo.mkdir()
-    (repo / "inference.py").write_text(
-        "import os\nos.environ['NEURON_RT_VISIBLE_CORES'] = '0'\n"
-    )
-    assert submodule_checker.check_single_core(_run(""), repo).passed
-
-
-def test_restating_one_core_is_allowed(tmp_path):
-    repo = tmp_path / "sub"
-    repo.mkdir()
-    (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '1'\n")
-    assert submodule_checker.check_single_core(_run(""), repo).passed
-
-
-def test_widening_the_core_count_is_refused(tmp_path):
-    repo = tmp_path / "sub"
-    repo.mkdir()
-    (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
-    result = submodule_checker.check_single_core(_run(""), repo)
-    assert not result.passed
-    assert any("to '4'" in f for f in result.findings)
 
 
 # ======================================================================================

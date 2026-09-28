@@ -197,16 +197,11 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
         "",
     ]
 
-    # Reported as two separate numbers on purpose. Calling the best iteration's figure the
-    # "collective overhead against the 10% bound" printed `-55.7% ... against the 10% the gate
-    # allows`, which invites a reader to hunt for a blown bound. Nothing was blown: the bound is
-    # tight at assembly and slack afterwards, because the submodule is frozen there while the whole
-    # module goes on being optimized past it.
-    #
-    # The divisor is the submodule latency *remeasured at assembly time* and recorded in
-    # `baselines.json`, which is the number the module gate actually holds the ratio to. Dividing by
-    # stage 3's own best instead — which this did — makes the printed percentage disagree with the
-    # enforced one by whatever the run-to-run variance was.
+    # Two numbers, not one: the bound is tight at assembly and slack afterwards, because the
+    # submodule is frozen there while the whole module goes on being optimized past it. Reporting
+    # only the second printed `-55.7% against the 10% the gate allows`, which reads as a blown bound.
+    # The divisor is the submodule latency remeasured at assembly time, which is what the gate holds
+    # the ratio to; stage 3's own best differs from it by the run-to-run variance.
     bound_reference = baselines.get("submodule_latency_ms")
     if not isinstance(bound_reference, (int, float)) or not bound_reference:
         bound_reference = submodule_best
