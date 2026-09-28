@@ -46,8 +46,9 @@ forward; `constraint violated` costs it an iteration.
 not crash: an exception with no report reads as a violation and blames the candidate for your bug.
 Wrap the body and write `{"passed": false, "findings": ["the checker failed: ..."]}` if you have to.
 
-**Static only.** Do not import the candidate, do not run it, do not compile anything. You have 30
-seconds and you are reading one file.
+**Static only.** Read the file and reason about it — `ast` and the standard library, nothing that
+imports the candidate, runs it, or compiles it. The time budget in the contract above is generous for
+reading one file and far too tight for anything else.
 
 ## What the candidate looks like
 

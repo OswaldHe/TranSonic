@@ -40,6 +40,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from optimization.slotcheck import CHECKER_TIMEOUT_SECONDS
+
+#: How an unfilled hint reads if one survives into a slot's prose. Matched as a prefix rather than
+#: as the whole `<FILL IN>` of `config.PLACEHOLDER`, because a slot's hints carry a description
+#: after the colon: `<FILL IN: module-specific guidance for iterations 9-10, if any.>`.
+PLACEHOLDER_MARKER = "<FILL IN"
+
 #: Where compiled checkers live, relative to the project. Inside `.autohelix/`, which is
 #: gitignored and — crucially — *not* among the directories `Sandbox.prepare_worktree` seeds into
 #: an iteration worktree, so a checker is never placed where the agent is working. As in
@@ -79,7 +86,7 @@ class ScheduleError(ValueError):
 
 @dataclass
 class Slot:
-    """One range of iterations and the constraint text that governs them."""
+    """One run of consecutive iterations and the constraint text that governs them."""
 
     iterations: list[int]
     text: str = ""
@@ -234,6 +241,14 @@ class Schedule:
             if slot.enforce_explicit and slot.enforce and not slot.has_text:
                 warnings.append(
                     f"slot {slot.label} has enforce: true but no text — nothing to check"
+                )
+            # A `#` inside a `text: |` block is prompt content, not a YAML comment. The first
+            # shipped template put its fill-in hints there, so a config used as delivered sent
+            # "<FILL IN: module-specific guidance ...>" to the agent as part of its constraint.
+            if PLACEHOLDER_MARKER in slot.text:
+                warnings.append(
+                    f"slot {slot.label} still contains a {PLACEHOLDER_MARKER} placeholder, and "
+                    f"the whole of text: reaches the agent verbatim — fill it in or delete the line"
                 )
         return warnings
 
@@ -511,8 +526,10 @@ def read_slot_verdict(iteration: int, label: str | None, path: Path, output: str
 
 
 #: The contract the compiler agent is held to. Extracted as a constant because it appears both in
-#: the compiler's prompt and in the validation that its output is usable.
-CHECKER_CONTRACT = """\
+#: the compiler's prompt and in the validation that its output is usable. The timeout is
+#: interpolated from where it is enforced: the prompt used to promise 30 seconds while
+#: `run_checker` killed at 120, so a compiler that budgeted honestly budgeted for the wrong number.
+CHECKER_CONTRACT = f"""\
 Each checker is a standalone Python script, run from the candidate repository's root:
 
     python <checker> --repo <dir> --json <report.json>
@@ -520,9 +537,9 @@ Each checker is a standalone Python script, run from the candidate repository's 
 It must:
   - import nothing outside the standard library
   - read only files under `--repo` (the constraint is about the candidate, nothing else)
-  - write `--json` as {"passed": true|false, "findings": ["...", ...]}
+  - write `--json` as {{"passed": true|false, "findings": ["...", ...]}}
   - exit 0 when the constraint was followed and non-zero when it was not
-  - finish in under 30 seconds: it is a static read of a source file, not a build or a run
+  - finish well inside {CHECKER_TIMEOUT_SECONDS}s, where it is killed: it reads one file statically
   - never modify anything
 """
 

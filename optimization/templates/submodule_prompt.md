@@ -30,7 +30,7 @@ binding. Everything else — which tensors are replicated and which are sharded,
 output actually is, whether a term belongs inside a rank's partial or is added after the ranks
 rejoin — is yours to work out from the reference.
 
-Get this wrong and it is not caught here. It is caught two stages later, when the four ranks cannot
+Get this wrong and it is not caught here. It is caught two stages later, when your {{ factor }} ranks cannot
 be reassembled into the module's recorded output, after a full optimization loop has been spent on
 the wrong subproblem. So spend the time now: build a host-side torch version of your cut in a
 scratch file, dump its intermediates, and check them against `module/tensors/` before you commit to
@@ -43,8 +43,8 @@ that takes its tensors as arguments and returns this rank's output. Seed it with
 module's kernel narrowed to one rank*, not with a stub: iteration 0 of the optimization loop has to
 capture a real latency, and a loop whose baseline does not run has no metric to improve.
 
-**`inference.py`** — the validator, and then it is **frozen for the entire optimization loop**. Ten
-iterations will be judged by it and by nothing else, so it is worth more care than the kernel:
+**`inference.py`** — the validator, and then it is **frozen for the entire optimization loop**. Every
+iteration will be judged by it and by nothing else, so it is worth more care than the kernel:
 
   - load every tensor from `tensors/` in this repo, using the dtypes and shapes `README.md` records;
   - trace `{{ entry_point }}` from `source.py` and run it on the device. Trace the *function*, so a

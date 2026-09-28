@@ -32,8 +32,14 @@ from pathlib import Path
 #: checker is not silently read as a compliant candidate.
 BROKEN = 2
 
+#: How long a checker gets before it is killed. Generous for what it does — a static read of one
+#: source file — because a false timeout rejects an iteration that complied. The compiler is told
+#: this number through `constraints.CHECKER_CONTRACT` rather than being given its own copy.
+CHECKER_TIMEOUT_SECONDS = 120
 
-def run_checker(checker: Path, repo: Path, report: Path, timeout: int = 120) -> tuple[bool, str]:
+
+def run_checker(checker: Path, repo: Path, report: Path,
+                timeout: int = CHECKER_TIMEOUT_SECONDS) -> tuple[bool, str]:
     """Run one compiled checker and return whether it passed, plus its output.
 
     The checker writes the verdict itself; this only drives it and decides what the exit code
@@ -81,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checker", required=True, help="the compiled checker for this slot")
     parser.add_argument("--repo", default=".", help="the candidate repository")
     parser.add_argument("--json", required=True, dest="report", help="where the verdict goes")
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--timeout", type=int, default=CHECKER_TIMEOUT_SECONDS)
     parser.add_argument(
         "--advisory", action="store_true",
         help="always exit 0, so the measurement still runs. Used on the last iteration of a "

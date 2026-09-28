@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The slot-checker wrapper, and the end-of-interval acceptance rule it enables.
+"""The slot-checker wrapper, and the end-of-slot acceptance rule it enables.
 
 The wrapper is small but it decides two things that are easy to get backwards: a broken checker must
 read as a violation rather than as a compliant candidate, and `--advisory` must change only the exit
@@ -68,9 +68,19 @@ def test_a_violation_exits_non_zero_when_enforcing(tmp_path):
 
 
 def test_a_violation_exits_zero_when_advisory(tmp_path):
-    """So the real constraints and the measurement still run on the interval's last iteration."""
+    """So the real constraints and the measurement still run on the slot's last iteration."""
     report = tmp_path / "iter-3.json"
     assert _run(_checker(tmp_path, VIOLATES), tmp_path, report, advisory=True) == 0
+
+
+def test_the_contract_quotes_the_timeout_that_is_actually_enforced():
+    """The prompt promised 30s while `run_checker` killed at 120, so a compiler that budgeted
+    honestly budgeted for the wrong number. One constant, interpolated, and no second copy."""
+    from optimization.constraints import CHECKER_CONTRACT
+    from optimization.slotcheck import CHECKER_TIMEOUT_SECONDS
+
+    assert f"{CHECKER_TIMEOUT_SECONDS}s" in CHECKER_CONTRACT
+    assert "30 seconds" not in CHECKER_CONTRACT
 
 
 def test_advisory_changes_only_the_exit_code(tmp_path):

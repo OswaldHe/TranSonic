@@ -99,6 +99,32 @@ def test_an_explicit_enforce_with_no_text_does_warn():
     assert any("nothing to check" in w for w in schedule.validate(8))
 
 
+def test_an_unfilled_hint_left_in_a_slot_is_reported():
+    """A `#` inside a `text: |` block is prompt content, not a YAML comment."""
+    schedule = cons.Schedule.from_config(
+        [{"from": 1, "to": 3, "text": "NKI only.\n\n# <FILL IN: guidance, if any.>"}],
+        max_iterations=3,
+    )
+    assert any("placeholder" in w for w in schedule.validate(3))
+
+
+def test_the_shipped_template_leaks_no_hint_into_a_prompt():
+    """The first template put its fill-in hints inside the blocks, so a config used as delivered
+    sent "<FILL IN: module-specific guidance ...>" to the agent as part of its constraint."""
+    import yaml
+
+    from optimization import presets
+
+    data = yaml.safe_load(presets.config_template())
+    for stage in ("submodule", "full"):
+        schedule = cons.Schedule.from_config(
+            data[stage].get("iteration_constraints"), max_iterations=10,
+        )
+        assert schedule.validate(10) == []
+        for slot in schedule.slots:
+            assert cons.PLACEHOLDER_MARKER not in slot.text
+
+
 # -- the prompt's view -----------------------------------------------------------------
 
 
@@ -233,10 +259,10 @@ def test_checkers_live_outside_what_the_worktree_is_seeded_with():
     assert parts[1] not in seeded
 
 
-# -- the end-of-interval escape --------------------------------------------------------
+# -- the end-of-slot escape --------------------------------------------------------
 
 
-def test_the_last_iteration_of_an_interval_is_identified():
+def test_the_last_iteration_of_a_slot_is_identified():
     schedule = cons.Schedule.from_config([
         {"from": 1, "to": 3, "text": "a"},
         {"iterations": [5, 7, 9], "text": "b"},
@@ -250,7 +276,7 @@ def test_a_single_iteration_slot_is_its_own_last():
     assert schedule.slots[0].last_iteration == 4
 
 
-def test_the_prompt_threatens_rejection_inside_an_interval():
+def test_the_prompt_threatens_rejection_inside_a_slot():
     schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
     for iteration in (1, 2):
         text = schedule.describe_for_prompt(iteration)

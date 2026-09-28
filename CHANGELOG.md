@@ -12,12 +12,12 @@
   rejoin the ranks with `nki.collectives`, accepted by a nine-check gate that compares the
   reassembled output against the bootstrapped module's own recorded golden and holds it to
   two latency bounds; `run-full` loops on the whole module. See `optimization/README.md`.
-- Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` ranges
+- Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` slots
   of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
   unconstrained for aggressive exploration, and the last ones returned to the disciplined
   regime — because ten iterations of "do whatever you like" converge on whatever the first
   one happened to try. A *constraint compiler* agent runs once before the loop and turns
-  each range's prose into a checker script the optimizing agent never sees; the prose goes
+  each slot's prose into a checker script the optimizing agent never sees; the prose goes
   into that iteration's prompt, and a candidate that does not follow it is rejected by a
   static check before the device run rather than after it.
 - `optimization/recipe.py` checks a declared cut arithmetically without knowing what the
@@ -38,11 +38,11 @@
   design around a wrong one without testing it — this repository's own `floorplan/README.md` claim
   that NKI 0.6.0 has no collective primitive is the worked example. The frozen references,
   `vendor/` and `compat/` keep theirs: that code is the specification, not inference.
-- On the last iteration of a constraint range the constraint is checked but no longer fatal. A
-  candidate that still misses it, passes the correctness gate and is *strictly faster* than the best
-  so far is kept — by then the agent has had every iteration the range allows, and discarding
-  something correct and faster buys nothing. It forfeits the 5% of regression slack a compliant
-  iteration gets, so the escape is earned rather than taken.
+- On a constraint slot's last iteration the constraint is checked but no longer fatal — it runs
+  *advisory*. A candidate that still misses it, passes the correctness gate and is *strictly faster*
+  than the best so far is kept — by then the agent has had every iteration that slot allows, and
+  discarding something correct and faster buys nothing. It forfeits the regression slack a compliant
+  iteration gets (`acceptance.max_regression_pct`), so the escape is earned rather than taken.
 - The gate's own first contact with reality. A real run of stage 2 reached 5 of 7 checks and failed
   on two checker bugs rather than on the candidate: a literal `"/"` used as a `str.join` separator
   was read as an absolute path, and 586 provenance findings came from a manifest shape the prompt
@@ -115,6 +115,31 @@
 
 ### Fixed
 
+- `optimization`: three ways the run's report misled a reader, all found by reading the report the
+  first full MoE run produced. It called the best iteration's figure the collective overhead
+  "against the 10% the gate allows" and printed `-55.7%`, sending a reader to hunt for a bound that
+  was never blown — the bound is tight at assembly and slack afterwards, because the submodule is
+  frozen there while the whole module goes on being optimized past it. The projection section
+  spliced in `FLOORPLAN.md` with its own `#` title, so "What the projection gave up" appeared as a
+  top-level finding of the run. And the constraint schedule cut each slot's prose at its first
+  physical line, ending a table cell mid-sentence with no ellipsis; it now cuts on a word boundary,
+  marks the cut, closes a bold run the cut split, and escapes a pipe that would have broken the row.
+- `optimization`: a wrong number in `projection.py`, which claimed a literal one-device check "fails
+  on 85 of the 89 placements worth optimizing". Counted from the scheme: 271 placements, 182 fit,
+  and all 89 that do not are exactly the interesting ones — every `.ffn`, every `.attention`,
+  `lm_head` and both Engram tables.
+- `optimization`: the constraint compiler was told its checkers had 30 seconds while `run_checker`
+  killed them at 120, so a compiler that budgeted honestly budgeted for the wrong number. The
+  timeout is now interpolated into `CHECKER_CONTRACT` from the one place it is enforced.
+- `optimization`: the loop prompt stated a literal "more than 5% above it is rejected", which is
+  wrong the moment an operator changes `acceptance.max_regression_pct`. It now quotes the configured
+  allowance, and says nothing when no metric gate names the metric.
+- `optimization`: the config template put its `<FILL IN>` hints *inside* the `text: |` blocks of
+  each constraint slot, where a `#` is not a YAML comment but literal prose. A config used as
+  delivered therefore sent "`# <FILL IN: module-specific guidance for iterations 9-10, if any.>`" to
+  the optimizing agent as part of its constraint — the first MoE run did exactly that for four
+  iterations. The hints now sit outside the blocks, and a placeholder surviving into a slot's prose
+  is reported as a warning before the loop starts.
 - `floorplan`: seventeen findings from the review of #5, several of which changed the
   simulator's numbers materially. The cost-model corrections: `stage` now constrains the
   schedule instead of being an inert label, so pipeline depth can move a metric;
@@ -143,6 +168,17 @@
 
 ### Changed
 
+- `CONTEXT.md` at the repo root is the project's glossary, and `docs/adr/` holds the decisions that
+  were hard to reverse and surprising without their reasons. `optimization/` coined a lot of
+  vocabulary and defined none of it; worse, "gate" was doing three jobs — the submodule checker, the
+  whole-module checker, and AutoHelix's `acceptance.metric_gates`. The two gates are now always named
+  apart, and three ADRs record who chooses how a module is cut, why a stage's gate is the only thing
+  that runs a candidate, and what projecting a 16-device placement onto one device gives up.
+- `optimization/gate.py` is `optimization/candidate.py`. It holds what the two gates share and is not
+  itself a gate, which the glossary's own rule forbids; it runs a candidate repository and reads
+  facts out of it. `gate.json` is unchanged — a verdict is written by a gate, so that name was right.
+- "interval" and "range" no longer stand in for **slot** in the code, the tests, the config template
+  or this file. Both are on the term's avoid list now.
 - `floorplan`: batch size is a metric axis. The workload grid is now phase x context length x
   batch size — 1, 4, 8 and 32 samples — so sixteen metrics named
   `{phase}_{context}_b{batch}_ms`, each with its own 10% regression gate. Batch is an axis

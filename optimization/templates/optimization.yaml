@@ -108,23 +108,30 @@ submodule:
 
   # ### EDIT ME ########################################################################
   #
-  #  The per-iteration constraint schedule. Each range's `text` is prose: it goes into that
-  #  iteration's prompt verbatim, and — before the loop starts — a constraint-compiler agent
-  #  turns it into a checker script the optimizing agent never sees. A candidate that does not
-  #  follow its slot is rejected before the device run, and the iteration is spent.
+  #  The per-iteration constraint schedule. Each entry is a **slot**: a run of iterations governed
+  #  by one constraint. A slot's `text` is prose. It goes into those iterations' prompts verbatim,
+  #  and — before the loop starts — a constraint-compiler agent turns it into a checker script the
+  #  optimizing agent never sees. A candidate that does not follow its slot is rejected before the
+  #  device run, and the iteration is spent.
   #
-  #  Ranges may not overlap. A range with no text leaves those iterations unconstrained. Set
+  #  Slots may not overlap. A slot with no text leaves those iterations unconstrained. Set
   #  `enforce: false` to have text appear in the prompt as guidance without being checked.
   #
-  #  On the **last iteration of each range** the constraint is checked but is no longer fatal: if
-  #  the candidate still misses it while passing the correctness gate and being *strictly faster*
-  #  than the best so far, it is kept anyway. By then the agent has had every iteration the range
+  #  On **each slot's last iteration** the constraint is checked but is no longer fatal: if the
+  #  candidate still misses it while passing the correctness gate and being *strictly faster* than
+  #  the best so far, it is kept anyway. By then the agent has had every iteration that slot
   #  allows, and throwing away something correct and faster buys nothing. What it gives up is the
-  #  5% of regression slack every compliant iteration gets — so the escape has to be earned.
+  #  regression slack every compliant iteration gets (`acceptance.max_regression_pct`, just
+  #  above) — so the escape has to be earned rather than taken.
   #
-  #  Add module-specific guidance to any `text:` below — that is what the space is for.
+  #  Add module-specific guidance to any `text:` below — that is what the space is for. Write it
+  #  inside the block, as prose. A `#` line inside a `text: |` block is **not** a YAML comment:
+  #  the whole block reaches the agent verbatim, so a leftover hint is something it reads as part
+  #  of its constraint. The hints below therefore sit outside the blocks, where they cannot leak.
   #
   iteration_constraints:
+    #  Guidance for iterations 1-3, if any: which engine to target first, a tiling to try, a dtype
+    #  to keep, an idiom the bootstrapping notes say did or did not compile. Add it to `text:`.
     - from: 1
       to: 3
       text: |
@@ -135,10 +142,7 @@ submodule:
         These three iterations exist to establish that the fast path is reachable in NKI at all.
         Reaching for torch here would answer a different question.
 
-        # <FILL IN: module-specific guidance for iterations 1-3, if any. For example, which
-        # engine to target first, a tiling to try, a dtype to keep, an idiom the notes from
-        # bootstrapping say did or did not compile.>
-
+    #  Guidance for iterations 4-6, if any. Add it to `text:`.
     - from: 4
       to: 6
       text: |
@@ -149,8 +153,7 @@ submodule:
         The work must still happen in the traced graph on the device. Computing on the host and
         returning the answer is not a fast kernel, it is a slow one with the timer moved.
 
-        # <FILL IN: module-specific guidance for iterations 4-6, if any.>
-
+    #  Ideas worth trying in the free iterations, if any. Add them to `text:`.
     - from: 7
       to: 8
       text: |
@@ -161,18 +164,15 @@ submodule:
 
         Both of these iterations' candidates are archived whether or not they are accepted, so an
         experiment that lands slower is still worth running and still worth writing up.
-
-        # <FILL IN: module-specific ideas worth trying in the free iterations, if any.>
       enforce: false
 
+    #  Guidance for iterations 9-10, if any. Add it to `text:`.
     - from: 9
       to: 10
       text: |
         **NKI and torch-xla are both allowed.** Consolidate: take what iterations 7-8 learned and
         land it as something that holds up. Prefer a change you can attribute to a profile over
         one that happened to measure well once.
-
-        # <FILL IN: module-specific guidance for iterations 9-10, if any.>
   #
   # ####################################################################################
 
@@ -224,7 +224,7 @@ full:
   acceptance:
     max_regression_pct: 5
 
-  #  No per-iteration constraints by default. The mechanism is here so ranges can be added
+  #  No per-iteration constraints by default. The mechanism is here so slots can be added
   #  without a code change — same shape as `submodule.iteration_constraints` above.
   iteration_constraints: []      ### EDIT ME (optional)
 

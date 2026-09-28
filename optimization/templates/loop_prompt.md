@@ -1,6 +1,6 @@
 Goal: {{ goal }}
 
-Your working directory is {{ worktree }}. Don't modify files outside it.
+Your working directory is {{ worktree }}. Work only inside it.
 
 This is iteration {{ iteration }} of the **{{ stage }}** stage. Baseline is iter-0.
 
@@ -13,8 +13,9 @@ The whole schedule, so you know what this iteration is for and what the next one
 {% endif %}
 
 {% if best_so_far %}
-Best {{ metric }} so far: **{{ best_so_far }}**. An iteration more than 5% above it is rejected
-and discarded — so a change you are unsure about belongs behind a measurement, not in the commit.
+Best {{ metric }} so far: **{{ best_so_far }}**.{% if regression_allowance %} An iteration more than
+{{ regression_allowance }}% above it is rejected and discarded — so a change you are unsure about
+belongs behind a measurement, not in the commit.{% endif %}
 {% endif %}
 
 {% if history_summary %}

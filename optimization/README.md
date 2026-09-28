@@ -139,6 +139,12 @@ leaves those iterations unconstrained; `enforce: false` puts text in the prompt 
 Editing a slot's prose after its checker was compiled is **drift**, and the pipeline refuses to run
 until the checker is recompiled.
 
+Write that guidance as prose inside the block. A `#` line inside a `text: |` block is not a YAML
+comment — the whole block reaches the agent verbatim — so the template's own fill-in hints sit
+*outside* the blocks, and a placeholder that survives into a slot is reported as a warning. The first
+MoE run sent `# <FILL IN: module-specific guidance for iterations 9-10, if any.>` to the agent as
+part of its constraint for four iterations, which is how this was found.
+
 ## The frozen validator
 
 In both loop stages `scope.editable` is `[source.py]` and **`inference.py` is frozen** — written by

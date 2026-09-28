@@ -108,6 +108,13 @@ class OptimizationLoop(Harness):
         variables["metric"] = METRIC
         best = self.history.get_best_metrics(self.config.metric_directions()).get(METRIC)
         variables["best_so_far"] = f"{best[0]:g}" if best else ""
+        # Taken from the config rather than written into the prompt as a number. The template said
+        # "more than 5% above it is rejected", which is only true while the operator leaves
+        # `acceptance.max_regression_pct` at its default — and an agent told the wrong allowance
+        # either wastes an iteration it could have kept or throws away one it could not.
+        allowance = next((g.max_regression_pct for g in self.config.acceptance.metric_gates
+                          if g.metric == METRIC), None)
+        variables["regression_allowance"] = f"{allowance:g}" if allowance is not None else ""
         # The packaged template, not `.autohelix/prompt.md`'s default: the stock one renders the
         # constraint commands, and here constraint zero is the hidden slot checker.
         return render_template(presets.project_prompt(self.project_path), variables)

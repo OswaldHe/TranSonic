@@ -484,7 +484,7 @@ def test_the_template_documents_the_two_editable_regions():
 
 
 # ======================================================================================
-# the reviewer timeout, and the end-of-interval acceptance rule
+# the reviewer timeout, and the end-of-slot acceptance rule
 # ======================================================================================
 
 
@@ -522,6 +522,39 @@ def test_autohelix_applies_the_reviewer_timeout(tmp_path):
     parsed = Config.from_dict(config.derive_loop_config("submodule"))
     assert parsed.reviewer is not None
     assert parsed.reviewer.timeout_seconds == 2000
+
+
+def test_the_prompt_quotes_the_configured_allowance(tmp_path):
+    """The template stated a literal 5%, which is wrong the moment an operator changes it."""
+    from autohelix.config import Config
+    from autohelix.prompt_template import render_template
+
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["submodule"]["acceptance"] = {"max_regression_pct": 12}
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    parsed = Config.from_dict(PipelineConfig.load(path).derive_loop_config("submodule"))
+    allowance = next(g.max_regression_pct for g in parsed.acceptance.metric_gates
+                     if g.metric == "latency_ms")
+    assert allowance == 12
+
+    rendered = render_template(presets.loop_prompt(), {
+        "best_so_far": "33.48", "metric": "latency_ms",
+        "regression_allowance": f"{allowance:g}",
+    })
+    assert "12% above it is rejected" in rendered
+    assert "5%" not in rendered
+
+
+def test_the_prompt_omits_the_allowance_when_no_gate_names_the_metric():
+    """Better silent than stating a bound nothing enforces."""
+    from autohelix.prompt_template import render_template
+
+    rendered = render_template(presets.loop_prompt(), {
+        "best_so_far": "33.48", "metric": "latency_ms", "regression_allowance": "",
+    })
+    assert "Best latency_ms so far" in rendered
+    assert "above it is rejected" not in rendered
 
 
 class _FakeHistory:
@@ -567,7 +600,7 @@ def _violation(iteration, label):
                        findings=["source.py:4 imports torch"])
 
 
-def test_an_end_of_interval_violation_is_kept_when_it_improves(tmp_path):
+def test_an_end_of_slot_violation_is_kept_when_it_improves(tmp_path):
     """Correct and strictly faster: the constraint shaped the search, and the search is over."""
     from optimization.constraints import Schedule
 
@@ -577,7 +610,7 @@ def test_an_end_of_interval_violation_is_kept_when_it_improves(tmp_path):
     assert loop._check_metric_gates({"latency_ms": 90.0}) is None
 
 
-def test_an_end_of_interval_violation_is_rejected_when_it_does_not_improve(tmp_path):
+def test_an_end_of_slot_violation_is_rejected_when_it_does_not_improve(tmp_path):
     """It does not get the 5% of slack a compliant iteration gets — it has to earn the escape."""
     from optimization.constraints import Schedule
 
@@ -705,7 +738,7 @@ def test_edited_constraint_prose_forces_a_recompile(tmp_path):
     assert any("text has changed" in f for f in cons.schedule_drift(tmp_path, edited))
 
 
-def test_a_changed_range_forces_a_recompile(tmp_path):
+def test_a_changed_slot_forces_a_recompile(tmp_path):
     from optimization import constraints as cons
 
     schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
