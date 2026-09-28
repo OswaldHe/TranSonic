@@ -100,6 +100,8 @@ def check(config: str | None) -> None:
         console.print(f"\n[red]{len(problems)} problem(s).[/red]")
         raise SystemExit(1)
     console.print("  [green]OK[/green] the config is complete")
+    for warning in pipeline.config.warnings():
+        console.print(f"  [yellow]note[/yellow] {warning}")
     try:
         projection = pipeline.projection()
     except StageError as exc:

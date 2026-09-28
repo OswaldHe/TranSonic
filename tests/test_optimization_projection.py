@@ -267,3 +267,24 @@ def test_an_identical_projection_reports_no_difference():
 def test_an_unreadable_factor_label_is_refused():
     with pytest.raises(ProjectionError):
         Factor.parse("not a factor")
+
+
+def test_a_fractional_multi_placement_that_halves_the_width_is_divergent():
+    """Fractional placements have their units summed while only the widest entry's factors are
+    projected, so this changes no factor and halves the parallelism. Judging divergence by
+    dropped/scaled alone let `on_oversized: error` accept it and made the report claim nothing was
+    given up."""
+    projection = Projection(
+        module="m", planned=[Factor("expert", 4)], planned_units=8, planned_devices=2,
+        projected=[Factor("expert", 4)], projected_units=4,
+    )
+    assert projection.dropped == [] and projection.scaled == []
+    assert projection.diverges
+
+
+def test_a_placement_that_already_fit_is_not_divergent():
+    projection = Projection(
+        module="m", planned=[Factor("expert", 4)], planned_units=4, planned_devices=1,
+        projected=[Factor("expert", 4)], projected_units=4,
+    )
+    assert not projection.diverges

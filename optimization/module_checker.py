@@ -172,8 +172,10 @@ def expected_tolerance(manifest: dict[str, Any]) -> dict[str, float]:
 # --------------------------------------------------------------------------------------
 
 
-def check_frozen_validator(repo: Path, manifest: dict[str, Any]) -> CheckResult:
-    """(a) `inference.py` is byte-identical to what stage 4 froze, and it drives `source.py`.
+def check_frozen_validator(repo: Path, manifest: dict[str, Any],
+                           ranks: int = DEFAULT_RANKS) -> CheckResult:
+    """(a) `inference.py` is what stage 4 froze, it drives `source.py`, and it takes the gate's
+    core count rather than choosing its own.
 
     Scope enforcement already reverts an edit to `inference.py`, but that depends on git noticing.
     This verifies the hash recorded at the freeze — the same belt-and-braces reasoning as the
@@ -212,6 +214,11 @@ def check_frozen_validator(repo: Path, manifest: dict[str, Any]) -> CheckResult:
             f"{INFERENCE_FILE} imports {SOURCE_FILE} but never traces or calls '{entry}' — "
             f"nothing connects the frozen validator to the kernel it is supposed to measure"
         )
+    # The gate sets the core count in the child's environment, and this file can overwrite it. The
+    # submodule gate has always refused that; the module gate did not, so a two-rank assembly could
+    # keep a hard-coded four and benchmark more of the device than its projection allows — once,
+    # before being frozen by hash for the rest of the run.
+    findings += candidate.core_allocation_findings(inference, INFERENCE_FILE, str(ranks))
     return CheckResult("a", CHECK_TITLES["a"], not findings,
                        f"frozen, drives '{entry}'" if not findings
                        else f"{len(findings)} problem(s)", findings)
@@ -277,7 +284,11 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
                     f"({', '.join(sorted(ALLOWED_DIST_CALLS))}) but may not move tensor data"
                 )
 
-    if not resolved_from_nki and not findings:
+    # A one-rank assembly has nothing to reduce. `project()` deliberately preserves a placement the
+    # floorplan already fits on one unit, so this is a legal projection rather than a degenerate
+    # one — and requiring a collective of it would fail every natural kernel for it. The host-side
+    # ban above still applies: one rank must not reach for `torch.distributed` either.
+    if ranks > 1 and not resolved_from_nki and not findings:
         findings.append(
             f"{SOURCE_FILE} calls no collective at all. {ranks} ranks each holding part of the "
             f"module cannot produce the whole module's output without one"
@@ -489,7 +500,7 @@ def evaluate(repo: Path, manifest: dict[str, Any],
         env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
     return [
-        check_frozen_validator(repo, manifest),
+        check_frozen_validator(repo, manifest, ranks),
         check_self_contained(repo),
         check_nki_collectives(repo, ranks),
         check_all_ranks(run, ranks),

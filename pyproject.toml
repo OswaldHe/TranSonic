@@ -76,6 +76,10 @@ packages = ["src/autohelix", "partition/model_partition", "bootstrap", "floorpla
 # them installs a configuration that resolves its own renames nowhere.
 "partition/compat" = "model_partition/compat"
 "partition/scripts" = "model_partition/scripts"
+# The glossary, which `optimization/` ships as a template. The feedback stage points its agent at
+# it and asks it to write against those terms, so outside an editable checkout the repository-root
+# copy is not there to point at.
+"CONTEXT.md" = "optimization/templates/CONTEXT.md"
 
 # Scope the source distribution to the package + packaging metadata only, so it
 # doesn't sweep in the whole working tree (docs, examples, assets, CI config, or
@@ -88,6 +92,7 @@ only-include = ["src/autohelix", "partition/model_partition", "partition/config"
 
 [tool.hatch.build.targets.sdist.force-include]
 "assets/README-pypi.md" = "assets/README-pypi.md"
+"CONTEXT.md" = "CONTEXT.md"
 "LICENSE" = "LICENSE"
 "NOTICE" = "NOTICE"
 "pyproject.toml" = "pyproject.toml"

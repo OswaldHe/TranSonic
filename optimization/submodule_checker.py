@@ -309,22 +309,8 @@ def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
     inspecting the profile: a candidate that sets the variable is stating an intent, and the
     intent is what the check is about.
     """
-    findings: list[str] = []
     inference = candidate._parse(repo / INFERENCE_FILE)
-    # Only the *count* is out of bounds. `NEURON_RT_VISIBLE_CORES` is how a single-core run pins
-    # itself to a particular core, which is ordinary and does not widen anything — the first real
-    # run failed this check for doing exactly that.
-    assigned = _environ_assignments(inference)
-    if "NEURON_RT_NUM_CORES" in assigned:
-        values = _environ_values(inference, "NEURON_RT_NUM_CORES")
-        widened = [v for v in values if v.strip() not in {SUBMODULE_CORES, ""}]
-        if widened or not values:
-            findings.append(
-                f"{INFERENCE_FILE} sets NEURON_RT_NUM_CORES"
-                + (f" to {', '.join(widened)}" if widened else " itself")
-                + f". How much of the device a submodule may use is not the validator's to "
-                f"choose — it is {SUBMODULE_CORES}"
-            )
+    findings = candidate.core_allocation_findings(inference, INFERENCE_FILE, SUBMODULE_CORES)
     if "torchrun" in (repo / INFERENCE_FILE).read_text():
         findings.append(
             f"{INFERENCE_FILE} mentions torchrun: a submodule is a single-rank kernel, and a "
@@ -333,57 +319,6 @@ def check_single_core(run: RunOutcome, repo: Path) -> CheckResult:
     return CheckResult("g", CHECK_TITLES["g"], not findings,
                        f"ran with NEURON_RT_NUM_CORES={SUBMODULE_CORES}" if not findings
                        else f"{len(findings)} problem(s)", findings)
-
-
-def _environ_values(tree: ast.Module, name: str) -> list[str]:
-    """String values assigned to one environment variable, where they are plain literals.
-
-    Lets the check distinguish `NEURON_RT_NUM_CORES = "1"` — restating what the gate already set,
-    which is harmless — from a validator quietly widening itself to the whole device.
-    """
-    values: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if not (isinstance(target, ast.Subscript)
-                    and isinstance(target.slice, ast.Constant)
-                    and target.slice.value == name):
-                continue
-            if isinstance(node.value, ast.Constant):
-                values.append(str(node.value.value))
-            else:
-                # An expression rather than a literal — `str(n)`, an f-string, a name bound
-                # elsewhere. Its value is not knowable from the source, so it is recorded under a
-                # placeholder that matches no permitted count and therefore fails the check. An
-                # unreadable assignment is treated as a possible violation, not waved through.
-                values.append("<computed>")
-    return values
-
-
-def _environ_assignments(tree: ast.Module) -> set[str]:
-    """Environment variables the file assigns, as in `os.environ["X"] = ...`."""
-    assigned: set[str] = set()
-    for node in ast.walk(tree):
-        targets: list[Any] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, ast.Call):
-            dotted = candidate.called_attributes(ast.Module(body=[ast.Expr(node)], type_ignores=[]))
-            if any(d.endswith("setdefault") or d.endswith("putenv") for d in dotted):
-                for arg in node.args[:1]:
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        assigned.add(arg.value)
-        for target in targets:
-            if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
-                if isinstance(target.slice.value, str):
-                    assigned.add(target.slice.value)
-    return assigned
-
-
-# --------------------------------------------------------------------------------------
-# driving
-# --------------------------------------------------------------------------------------
 
 
 def evaluate(repo: Path, manifest: dict[str, Any],

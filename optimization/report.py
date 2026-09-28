@@ -202,15 +202,24 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
     # allows`, which invites a reader to hunt for a blown bound. Nothing was blown: the bound is
     # tight at assembly and slack afterwards, because the submodule is frozen there while the whole
     # module goes on being optimized past it.
-    if isinstance(submodule_best, (int, float)) and submodule_best:
-        note = [f"Both latency bounds are measured against the submodule's {submodule_best:g} ms on "
-                f"one rank, and the module gate re-checks them every iteration."]
+    #
+    # The divisor is the submodule latency *remeasured at assembly time* and recorded in
+    # `baselines.json`, which is the number the module gate actually holds the ratio to. Dividing by
+    # stage 3's own best instead — which this did — makes the printed percentage disagree with the
+    # enforced one by whatever the run-to-run variance was.
+    bound_reference = baselines.get("submodule_latency_ms")
+    if not isinstance(bound_reference, (int, float)) or not bound_reference:
+        bound_reference = submodule_best
+    if isinstance(bound_reference, (int, float)) and bound_reference:
+        note = [f"The module gate holds every iteration to two bounds, re-checked each time: faster "
+                f"than the bootstrapped module ({_fmt(bootstrap_ms)} ms), and no slower than 1.1x "
+                f"the submodule as remeasured at assembly time ({bound_reference:g} ms)."]
         if isinstance(full_baseline, (int, float)):
             note.append(f" Rejoining the ranks cost "
-                        f"**{(full_baseline / submodule_best - 1.0) * 100:+.1f}%** against the 10% "
-                        f"allowance — that is where the bound is tight.")
+                        f"**{(full_baseline / bound_reference - 1.0) * 100:+.1f}%** of that "
+                        f"submodule measurement — that is where the second bound is tight.")
         if isinstance(full_best, (int, float)):
-            delta = (full_best / submodule_best - 1.0) * 100
+            delta = (full_best / bound_reference - 1.0) * 100
             note.append(f" Stage 5 then finished at **{delta:+.1f}%** of it"
                         + (": faster than the single rank it was cut from, because the submodule "
                            "was frozen at assembly while the whole module kept being optimized."

@@ -196,3 +196,50 @@ def test_the_prompt_renders_with_the_variables_the_driver_supplies():
     })
     assert "{{" not in rendered
     assert "layers.1.ffn" in rendered and "82,708" in rendered and "14.8425 ms" in rendered
+
+
+# -- the review of #6, third pass -------------------------------------------------------
+
+
+def test_a_table_with_no_rows_is_an_honest_answer(tmp_path):
+    """Every obstacle worked around is a legitimate outcome, and the prompt says to omit those. The
+    alternative is an agent choosing between inventing a row and failing the stage."""
+    _report(tmp_path, HEADER)
+    assert fb.validate_report(tmp_path) == []
+    assert fb.summarize(tmp_path)["findings"] == 0
+
+
+def test_a_missing_table_is_still_refused(tmp_path):
+    _report(tmp_path, "# Feedback\n\nno table at all\n")
+    assert any("no findings table" in f for f in fb.validate_report(tmp_path))
+
+
+def test_find_table_separates_absent_from_empty(tmp_path):
+    assert fb.find_table("nothing here") == (False, [])
+    found, rows = fb.find_table(HEADER)
+    assert found and rows == []
+
+
+def test_the_deliverables_are_restored_if_the_agent_edits_them(tmp_path):
+    """The stage has no worktree and no scope enforcement, and its prompt asks the agent to run
+    experiments on the device."""
+    for name in ("rank0", "full"):
+        repo = tmp_path / name
+        repo.mkdir()
+        (repo / "source.py").write_text(f"# {name} kernel\n")
+        (repo / "inference.py").write_text(f"# {name} validator\n")
+    snapshot = fb.snapshot_deliverables(tmp_path / "rank0", tmp_path / "full")
+    assert len(snapshot) == 4
+
+    (tmp_path / "rank0" / "source.py").write_text("# an experiment overwrote this\n")
+    touched = fb.restore_deliverables(snapshot)
+    assert touched == ["rank0/source.py"]
+    assert (tmp_path / "rank0" / "source.py").read_text() == "# rank0 kernel\n"
+
+
+def test_untouched_deliverables_report_nothing(tmp_path):
+    repo = tmp_path / "full"
+    repo.mkdir()
+    (repo / "source.py").write_text("# kernel\n")
+    snapshot = fb.snapshot_deliverables(repo)
+    assert fb.restore_deliverables(snapshot) == []

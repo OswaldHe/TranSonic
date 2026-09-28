@@ -198,6 +198,8 @@ class Pipeline:
         fault rather than the environment's.
         """
         problems = self.config.validate()
+        for warning in self.config.warnings():
+            self.console.print(f"  [yellow]note[/yellow] {warning}")
         # Probe the interpreter the *derived commands* invoke, which is bare `python` from PATH, not
         # `sys.executable`. Launched through an absolute venv console script, pipx, or any wrapper
         # that does not put its own bin first, the two are different interpreters — and this
@@ -301,6 +303,7 @@ class Pipeline:
             raise StageError(f"{len(problems)} configuration problem(s); nothing was created")
 
         projection = self.projection()
+        self._require_expressible_cut(projection)  # before hours of work, not after
         self.config.workspace_root.mkdir(parents=True, exist_ok=True)
         payload = {
             "module": self.config.module_id,
@@ -311,6 +314,15 @@ class Pipeline:
             "full_repo": str(self.config.full_repo),
         }
         self._record("projection", payload)
+
+        # Hashes of the bootstrapped module's tensors, written where no agent can reach them. The
+        # repos' copies are hard links to these, and read-only mode bits on a hard link are a speed
+        # bump rather than a guarantee — the owning user can restore write permission and truncate
+        # the shared inode. The gate cannot catch that on its own, because its provenance check
+        # compares against hashes the agent recorded. This record is what makes the loss detectable.
+        source_tensors = materialize.fingerprint_tensors(self.config.bootstrap_repo / "tensors")
+        self._record("source-tensors", {"tensors": source_tensors})
+        self.console.print(f"  recorded {len(source_tensors)} source tensor hash(es)")
 
         self.console.print(Panel(Text(projection.describe().strip()),
                                  title="projection", border_style="cyan"))
@@ -324,9 +336,59 @@ class Pipeline:
 
     # -- stage: submodule ----------------------------------------------------------
 
+    def _verify_source_tensors(self, after: str) -> None:
+        """Refuse to go on if the bootstrapped module's recorded bytes have changed.
+
+        Checked after every stage that ran an agent with write access to a repo holding hard links to
+        them. The record is the pipeline's, written at `init` and kept in its own state directory, so
+        an agent cannot make a corrupted file look correct by re-recording it.
+        """
+        record = (self._read_record("source-tensors") or {}).get("tensors") or {}
+        if not record:
+            return
+        findings = materialize.verify_tensors(record, self.config.bootstrap_repo / "tensors")
+        if not findings:
+            return
+        for finding in findings[:10]:
+            self.console.print(f"  [red]FAIL[/red] {finding}")
+        raise StageError(
+            f"{len(findings)} of the bootstrapped module's recorded tensors changed during "
+            f"{after}. They are hard-linked into the optimization repos, so a write through either "
+            f"link reaches {self.config.bootstrap_repo}/tensors — and those bytes are the golden "
+            f"every stage is judged against.\n"
+            f"Restore them from the partition artifact before continuing; nothing measured after "
+            f"this point means anything."
+        )
+
+    def _require_expressible_cut(self, projection: Projection) -> None:
+        """Refuse a projection the declaration format cannot state, instead of mis-stating it.
+
+        `submodule.json` carries one scalar `dim`, one `factor` and one reassembly operation, and the
+        prompt used to be handed `projected[0].dim` with `projected_units` as its width. For a
+        projection like `head x2 * hidden x2` that presents a four-way `head` cut when the head factor
+        is two, and the two dimensions need different collectives to rejoin — so the agent would be
+        asked for a cut that cannot be described, let alone verified.
+
+        No module in the shipped DeepSeek schemes projects to more than one factor, so this refuses
+        rather than guesses. Supporting mixed-dimensional cuts means giving the declaration per-rank
+        coordinates and a reassembly per dimension, which is a real feature and not a default.
+        """
+        if len(projection.projected) <= 1:
+            return
+        shape = " * ".join(f.label() for f in projection.projected)
+        raise StageError(
+            f"{self.config.module_id} projects onto {shape}, which is more than one dimension.\n"
+            f"The submodule declaration states a single `dim`, `factor` and reassembly operation, so "
+            f"a mixed-dimensional cut cannot be described in it — and each dimension would need its "
+            f"own collective to rejoin.\n"
+            f"Pick a module whose projection is one dimension wide, or narrow this scheme's "
+            f"placement for {self.config.module_id} to a single split."
+        )
+
     def submodule(self) -> StageOutcome:
         """Cut the module down to one rank, and accept the repo only when the gate agrees."""
         projection = self.projection()
+        self._require_expressible_cut(projection)
         repo = self.config.submodule_repo
         prompt_template = presets.submodule_prompt()
 
@@ -345,6 +407,7 @@ class Pipeline:
                 "entry_point": "kernel",
                 "dim": (projection.projected[0].dim if projection.projected else "none"),
                 "factor": projection.projected_units,
+                "splits": " * ".join(f.label() for f in projection.projected) or "no split",
             })
             held = custody.take_custody(
                 prepared, custody.SUBMODULE_OWNED,
@@ -366,6 +429,7 @@ class Pipeline:
                 latency = _latency_from_gate(
                     repo / ".autohelix" / "optimization" / "submodule-gate.json"
                 )
+                self._verify_source_tensors("the submodule stage")
                 self.console.print(
                     f"  [green]submodule accepted[/green] — baseline {latency or float('nan'):g} ms"
                 )
@@ -656,6 +720,7 @@ class Pipeline:
                 latency = _latency_from_gate(
                     repo / ".autohelix" / "optimization" / "module-gate.json"
                 )
+                self._verify_source_tensors("the assembly stage")
                 self.console.print(
                     f"  [green]assembly accepted[/green] — baseline {latency or float('nan'):g} ms "
                     f"against {bootstrap_ms:g} ms bootstrapped"
@@ -702,6 +767,17 @@ class Pipeline:
         sub_summary = _read_summary(sub, "submodule")
         full_summary = _read_summary(full, "full")
 
+        # The prompt promises the agent that REPORT.md is there to read, and in the `all()` flow
+        # nothing had written it: `optimize report` is a separate command and not one of the stages.
+        # Written here rather than in `all()` so the standalone command works the same way.
+        try:
+            from optimization.report import write_report
+
+            write_report(self.config, self.console)
+        except Exception as exc:  # the report is context, not a precondition
+            self.console.print(f"  [yellow]![/yellow] could not write the run report: {exc}")
+
+        deliverables = fb.snapshot_deliverables(sub, full)
         fb.repro_dir(self.config.workspace_root).mkdir(parents=True, exist_ok=True)
         prompt = _render(presets.feedback_prompt(), {
             "module": self.config.module_id,
@@ -729,9 +805,20 @@ class Pipeline:
                 self.config.workspace_root, prompt, f"feedback-{attempt}",
                 self.config.feedback_timeout, model=self.config.feedback_model,
             )
+            # The prompt asks this agent to test disputed claims on the device, and it runs at the
+            # workspace root with both finished repositories writable under it — no worktree, because
+            # it is not producing a candidate. So the deliverables are put back rather than trusted:
+            # the first real run compiled inside the submodule repo and left artifacts in its
+            # `build/`, which is harmless, but nothing was stopping it editing `source.py`.
+            touched = fb.restore_deliverables(deliverables)
             problems = fb.validate_report(self.config.workspace_root)
             self._record(f"feedback-attempt-{attempt}",
-                         {"agent_ok": ok, "problems": problems})
+                         {"agent_ok": ok, "problems": problems, "restored": touched})
+            for name in touched:
+                self.console.print(
+                    f"  [yellow]![/yellow] the feedback agent changed {name}; restored it from the "
+                    f"gated version"
+                )
             if ok and not problems:
                 counts = fb.summarize(self.config.workspace_root)
                 levels = ", ".join(f"{k} {v}" for k, v in counts["by_level"].items())
@@ -753,15 +840,34 @@ class Pipeline:
     # -- the whole thing -----------------------------------------------------------
 
     def all(self) -> list[StageOutcome]:
-        outcomes = [self.init()]
-        outcomes.append(self.submodule())
-        outcomes.append(self.compile_constraints("submodule"))
-        outcomes.append(self.run_loop("submodule"))
-        outcomes.append(self.assemble())
+        """Every stage in order, stopping at the first that did not succeed.
+
+        Each stage here is minutes to hours of device time, so a failure has to stop the sequence
+        rather than be collected into the returned list: `run_loop` reports "no accepted iteration"
+        as `ok=False` without raising, and the earlier version appended that and walked into
+        assembly. The CLI cannot catch it either — what it receives from this method is a list, which
+        has no `ok` to inspect.
+        """
+        outcomes: list[StageOutcome] = []
+
+        def step(outcome: StageOutcome) -> None:
+            outcomes.append(outcome)
+            if not outcome.ok:
+                raise StageError(
+                    f"{outcome.stage} did not succeed ({outcome.detail}), so the remaining stages "
+                    f"are not started. Fix that stage and re-run it on its own, then `optimize all` "
+                    f"again — the finished stages are recorded and will not be redone."
+                )
+
+        step(self.init())
+        step(self.submodule())
+        step(self.compile_constraints("submodule"))
+        step(self.run_loop("submodule"))
+        step(self.assemble())
         if self.config.full.schedule.enforceable():
-            outcomes.append(self.compile_constraints("full"))
-        outcomes.append(self.run_loop("full"))
-        outcomes.append(self.feedback())
+            step(self.compile_constraints("full"))
+        step(self.run_loop("full"))
+        step(self.feedback())
         return outcomes
 
 
@@ -794,9 +900,15 @@ def _ms(value: Any) -> str:
 def _context_md() -> Path:
     """This project's glossary, which the feedback agent is told to write against.
 
-    Found from this file rather than from the workspace: the agent runs in `optimization-runs`,
-    which is not the repository the glossary lives in.
+    Not `__file__/../../CONTEXT.md`: in an installed wheel that resolves to a `site-packages` path
+    with nothing at it, so the prompt pointed its agent at a glossary that did not exist and the
+    vocabulary step it is told to take had nothing to take. `pyproject.toml` force-includes the file
+    into the package's templates, and the repository-root copy is the fallback for a source checkout
+    where the package data is not present.
     """
+    packaged = Path(__file__).resolve().parent / "templates" / "CONTEXT.md"
+    if packaged.is_file():
+        return packaged
     return Path(__file__).resolve().parent.parent / "CONTEXT.md"
 
 

@@ -93,6 +93,41 @@ def _iteration_order(path: Path) -> tuple[int, str]:
     return (int(match.group(1)) if match else -1, path.name)
 
 
+#: The files in each finished repository that are the run's deliverable. Both have already passed a
+#: gate, and `inference.py`'s hash is itself a gate check, so either changing afterwards invalidates
+#: the result the report is about.
+DELIVERABLE_FILES = ("source.py", "inference.py")
+
+
+def snapshot_deliverables(*repos: Path) -> dict[Path, bytes]:
+    """The exact bytes of every deliverable file, to put back if the feedback agent edits one.
+
+    Taken rather than trusted because this stage has no worktree and no scope enforcement: it runs an
+    agent at the workspace root, both finished repositories are writable under it, and the prompt
+    asks that agent to test claims on the device. A gated kernel silently modified afterwards would
+    make the run's own numbers describe code nobody measured.
+    """
+    return {repo / name: (repo / name).read_bytes()
+            for repo in repos for name in DELIVERABLE_FILES if (repo / name).is_file()}
+
+
+def restore_deliverables(snapshot: dict[Path, bytes]) -> list[str]:
+    """Put back anything that changed, and name what did. Empty when the agent left them alone."""
+    touched: list[str] = []
+    for path, original in snapshot.items():
+        try:
+            if path.is_file() and path.read_bytes() == original:
+                continue
+        except OSError:
+            pass
+        touched.append(f"{path.parent.name}/{path.name}")
+        try:
+            path.write_bytes(original)
+        except OSError:
+            continue
+    return touched
+
+
 def word_count(files: dict[str, list[Path]]) -> int:
     total = 0
     for paths in files.values():
@@ -105,10 +140,17 @@ def word_count(files: dict[str, list[Path]]) -> int:
 
 
 def parse_rows(text: str) -> list[dict[str, str]]:
-    """The findings table, as one dict per row keyed by the column headers.
+    """The findings table's rows. Empty both when the table is missing and when it holds no rows."""
+    return find_table(text)[1]
 
-    Reads the first table whose header names every column in `COLUMNS`, so the agent is free to put
-    other tables in the document — a summary, a timeline — without them being mistaken for findings.
+
+def find_table(text: str) -> tuple[bool, list[dict[str, str]]]:
+    """Whether the findings table is present, and its rows.
+
+    The two are reported separately because they mean opposite things: no table is a malformed
+    report, and a table with no rows is a run that hit no unresolved blocker. Reads the first table
+    whose header names every column in `COLUMNS`, so the agent is free to put other tables in the
+    document — a summary, a timeline — without them being mistaken for findings.
     """
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -130,8 +172,8 @@ def parse_rows(text: str) -> list[dict[str, str]]:
             if len(cells) < len(header):
                 cells += [""] * (len(header) - len(cells))
             rows.append({header[i]: cells[i] for i in range(len(header))})
-        return rows
-    return []
+        return True, rows
+    return False, []
 
 
 def _normalize(text: str) -> str:
@@ -161,12 +203,17 @@ def validate_report(workspace_root: Path) -> list[str]:
         return [f"{REPORT_NAME} was not written"]
 
     text = path.read_text(errors="replace")
-    rows = parse_rows(text)
-    if not rows:
+    found, rows = find_table(text)
+    if not found:
         findings.append(
             f"{REPORT_NAME} has no findings table with the columns "
             f"{', '.join(COLUMNS)} — that table is the deliverable"
         )
+        return findings
+    # A table with a header and no rows is a legitimate answer: every obstacle this run met was
+    # worked around, and the prompt says to leave those out. Rejecting it would leave the agent
+    # choosing between inventing a row and failing the stage.
+    if not rows:
         return findings
 
     for number, row in enumerate(rows, start=1):

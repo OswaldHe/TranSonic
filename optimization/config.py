@@ -226,9 +226,21 @@ class PipelineConfig:
                     f"{stage.name}.reviewer.prompt is still '{PLACEHOLDER}'. Write the review "
                     f"you want, or delete the `reviewer:` block to run without one"
                 )
-            for warning in stage.schedule.validate(stage.iterations):
-                problems.append(f"{stage.name}: {warning}")
         return problems
+
+    def warnings(self) -> list[str]:
+        """Things worth saying out loud that are not reasons to refuse the run.
+
+        Kept apart from `validate()` because `Schedule.validate` documents an uncovered iteration as
+        legal — `describe_for_prompt` and `run_iteration` both implement it as unconstrained
+        exploration — and folding its output into the fatal list made a deliberately partial schedule
+        unable to pass `optimize check` at all.
+        """
+        found: list[str] = []
+        for stage in (self.submodule, self.full):
+            for warning in stage.schedule.validate(stage.iterations):
+                found.append(f"{stage.name}: {warning}")
+        return found
 
     # -- the derived AutoHelix config ----------------------------------------------
 

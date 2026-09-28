@@ -107,8 +107,17 @@ class Projection:
 
     @property
     def diverges(self) -> bool:
-        """Whether the projection is a different plan, rather than the plan restated."""
-        return bool(self.dropped or self.scaled)
+        """Whether the projection is a different plan, rather than the plan restated.
+
+        The unit count is part of the test and not only the factors. A module represented by several
+        *fractional* placements has its units summed while only the widest entry's factors are
+        projected, so two four-unit fractions plan 8 units, project to 4, and change no factor at
+        all. Judging by `dropped or scaled` alone called that a restatement of the plan — which made
+        `floorplan.on_oversized: error` accept a placement twice as wide as the target, and made the
+        report say nothing was given up when half the parallelism was.
+        """
+        return bool(self.dropped or self.scaled
+                    or self.planned_units != self.projected_units)
 
     @property
     def shard_fraction(self) -> str:

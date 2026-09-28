@@ -805,7 +805,7 @@ def test_widening_the_core_count_is_refused(tmp_path):
     (repo / "inference.py").write_text("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
     result = submodule_checker.check_single_core(_run(""), repo)
     assert not result.passed
-    assert any("to 4" in f for f in result.findings)
+    assert any("to '4'" in f for f in result.findings)
 
 
 # ======================================================================================
@@ -859,3 +859,75 @@ def test_importing_source_without_running_it_does_not_count():
 def test_tracing_some_other_function_does_not_count():
     tree = ast.parse("import nki\nf = nki.trace(helper)\nout = f(x)\n")
     assert not candidate.invokes_entry_point(tree, "kernel")
+
+
+# ======================================================================================
+# the review of #6, third pass
+# ======================================================================================
+
+
+def test_a_one_rank_assembly_needs_no_collective(tmp_path):
+    """`project()` preserves a placement the floorplan already fits on one unit, so a one-rank
+    assembly is legal — and it has nothing to reduce."""
+    repo = _module_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        def kernel(x):
+            return nl.copy(x)
+    """)
+    assert module_checker.check_nki_collectives(repo, ranks=1).passed
+
+
+def test_more_than_one_rank_still_needs_a_collective(tmp_path):
+    repo = _module_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        def kernel(x):
+            return nl.copy(x)
+    """)
+    result = module_checker.check_nki_collectives(repo, ranks=2)
+    assert not result.passed
+    assert any("no collective at all" in f for f in result.findings)
+
+
+def test_one_rank_may_still_not_reach_for_a_host_collective(tmp_path):
+    repo = _module_repo(tmp_path, """
+        import nki
+        import torch.distributed as dist
+
+        def kernel(x):
+            dist.all_reduce(x)
+            return x
+    """)
+    assert not module_checker.check_nki_collectives(repo, ranks=1).passed
+
+
+def test_a_literal_core_count_that_disagrees_is_refused():
+    """The bot's scenario: a two-rank validator keeping a hard-coded four."""
+    tree = ast.parse("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
+    assert candidate.core_allocation_findings(tree, "inference.py", "2")
+
+
+def test_a_literal_core_count_that_agrees_is_allowed():
+    tree = ast.parse("import os\nos.environ['NEURON_RT_NUM_CORES'] = '4'\n")
+    assert candidate.core_allocation_findings(tree, "inference.py", "4") == []
+
+
+def test_setdefault_is_not_an_override():
+    """It cannot replace what the gate set, which is why the real validator uses it."""
+    tree = ast.parse("import os\nos.environ.setdefault('NEURON_RT_NUM_CORES', '8')\n")
+    assert candidate.core_allocation_findings(tree, "inference.py", "4") == []
+
+
+def test_a_count_computed_from_the_launch_is_allowed():
+    """`env['NEURON_RT_NUM_CORES'] = str(WORLD_SIZE)` is how the real assembly passes the gate's own
+    count to the child process that touches the device."""
+    tree = ast.parse("env = {}\nenv['NEURON_RT_NUM_CORES'] = str(WORLD_SIZE)\n")
+    assert candidate.core_allocation_findings(tree, "inference.py", "4") == []
+
+
+def test_visible_cores_is_not_a_widening():
+    tree = ast.parse("import os\nos.environ['NEURON_RT_VISIBLE_CORES'] = '2'\n")
+    assert candidate.core_allocation_findings(tree, "inference.py", "1") == []

@@ -16,6 +16,7 @@ copies, it records, and it states the constraints.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -182,6 +183,47 @@ def _link_or_copy_tensors(src: Path, dst: Path) -> str:
             pass
     parts = [f"{linked} hard-linked" if linked else "", f"{copied} copied" if copied else ""]
     return ", ".join(p for p in parts if p) + ", read-only"
+
+
+def fingerprint_tensors(directory: Path) -> dict[str, dict[str, Any]]:
+    """Content hash and size of every recorded tensor, for a record kept outside both repos.
+
+    The mode bits on a hard link are a speed bump and not a guarantee: the owning user can `chmod`
+    them back and truncate the shared inode, which would destroy the bootstrapped module's golden —
+    the one irreplaceable thing in the workspace. And the gate cannot catch that on its own, because
+    the provenance check compares the candidate's files against hashes the *agent* recorded, so a
+    corrupted file re-hashed after the fact passes.
+
+    This record is written by the pipeline, into its own state directory, and never appears in a
+    repository an agent can write. Hashing the MoE's 6.8 GiB takes about 7 seconds, which is nothing
+    against the hours a stage spends on the device.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.glob("*.bin")):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(4 << 20):
+                digest.update(chunk)
+        found[path.name] = {"sha256": digest.hexdigest(), "bytes": path.stat().st_size}
+    return found
+
+
+def verify_tensors(record: dict[str, dict[str, Any]], directory: Path) -> list[str]:
+    """Which recorded tensors no longer match, as findings. Empty when the bytes are untouched."""
+    findings: list[str] = []
+    current = fingerprint_tensors(directory)
+    for name, expected in sorted(record.items()):
+        actual = current.get(name)
+        if actual is None:
+            findings.append(f"{name} is gone from {directory}")
+        elif actual["sha256"] != expected.get("sha256"):
+            findings.append(
+                f"{name} has changed ({expected.get('bytes')} bytes -> {actual['bytes']}); "
+                f"recorded {str(expected.get('sha256'))[:12]}, found {actual['sha256'][:12]}"
+            )
+    return findings
 
 
 def git_init(repo: Path, message: str) -> None:

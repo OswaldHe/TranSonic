@@ -503,6 +503,98 @@ def invokes_entry_point(tree: ast.Module, entry: str) -> bool:
     return False
 
 
+#: The two variables that decide how much of the device a run gets. A gate sets the first in the
+#: child's environment; a validator that assigns either is choosing its own allocation.
+CORE_ALLOCATION_VARS = ("NEURON_RT_NUM_CORES", "NEURON_RT_VISIBLE_CORES")
+
+
+def environ_values(tree: ast.Module, name: str) -> list[str]:
+    """String values assigned to one environment variable, where they are plain literals.
+
+    Lets a check distinguish `NEURON_RT_NUM_CORES = "1"` — restating what the gate already set,
+    which is harmless — from a validator quietly widening itself to the whole device.
+    """
+    values: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == name):
+                continue
+            if isinstance(node.value, ast.Constant):
+                values.append(str(node.value.value))
+            else:
+                # An expression rather than a literal — `str(n)`, an f-string, a name bound
+                # elsewhere. Its value is not knowable from the source, so it is recorded under a
+                # placeholder that matches no permitted count and therefore fails the check. An
+                # unreadable assignment is treated as a possible violation, not waved through.
+                values.append("<computed>")
+    return values
+
+
+def environ_assignments(tree: ast.Module) -> set[str]:
+    """Environment variables the file assigns, as in `os.environ["X"] = ...`."""
+    assigned: set[str] = set()
+    for node in ast.walk(tree):
+        targets: list[Any] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.Call):
+            dotted = called_attributes(ast.Module(body=[ast.Expr(node)], type_ignores=[]))
+            if any(d.endswith("setdefault") or d.endswith("putenv") for d in dotted):
+                for arg in node.args[:1]:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        assigned.add(arg.value)
+        for target in targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
+                if isinstance(target.slice.value, str):
+                    assigned.add(target.slice.value)
+    return assigned
+
+
+def core_allocation_findings(tree: ast.Module, filename: str, allowed: str) -> list[str]:
+    """Where this validator hard-codes a share of the device that disagrees with the gate's.
+
+    The gate sets `NEURON_RT_NUM_CORES` in the child's environment, and the validator is frozen by
+    hash after one gate run, so an override here survives every later iteration: a two-rank assembly
+    keeping a literal four would benchmark twice the device its projection allows.
+
+    Three things are deliberately *not* findings, because each is how a correct validator behaves:
+
+    - `os.environ.setdefault(...)`, which by definition cannot override what the gate set;
+    - a value computed from the launch, like `str(WORLD_SIZE)` where `torchrun --nproc_per_node` came
+      from the gate — the real assembly does exactly this, twice, to pass the count to the child
+      process that touches the device;
+    - `NEURON_RT_VISIBLE_CORES`, which pins a run to a particular core and widens nothing. The first
+      real submodule run was failed for that, wrongly.
+
+    So this catches the literal disagreement and says nothing about a computed one, which no static
+    read can decide. What bounds the computed case is that the count comes from the gate's own
+    `torchrun` line, and that checks (d) and (f) require exactly `ranks` markers and a profile
+    covering exactly those ranks.
+    """
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "NEURON_RT_NUM_CORES"):
+                continue
+            if not isinstance(node.value, ast.Constant):
+                continue
+            written = str(node.value.value).strip()
+            if written != allowed:
+                findings.append(
+                    f"{filename}:{node.lineno} sets NEURON_RT_NUM_CORES to '{written}'. How much of "
+                    f"the device a run may use is not the validator's to choose — it is {allowed}"
+                )
+    return findings
+
+
 def projected_units(manifest: dict[str, Any]) -> int:
     """How many ranks the recorded projection calls for, or 0 when the manifest does not say.
 

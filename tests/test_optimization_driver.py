@@ -1013,3 +1013,50 @@ def test_the_derived_commands_and_the_preflight_name_one_interpreter(tmp_path):
         assert commands, stage
         for command in commands:
             assert command.startswith(f"{GATE_PYTHON} -m "), command
+
+
+def test_a_legal_schedule_gap_is_a_warning_not_a_configuration_error(tmp_path):
+    """`describe_for_prompt` and `run_iteration` both implement an uncovered iteration as
+    unconstrained exploration, so a partial schedule must still pass `optimize check`."""
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["submodule"]["budget"]["iterations"] = 6
+    data["submodule"]["iteration_constraints"] = [
+        {"from": 1, "to": 3, "text": "NKI only."},
+    ]
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    config = PipelineConfig.load(path)
+    assert config.validate() == []
+    assert any("no constraint slot" in w for w in config.warnings())
+
+
+def test_a_multi_dimensional_projection_is_refused_rather_than_mis_described(tmp_path):
+    """The declaration carries one `dim`, one `factor` and one reassembly operation, and the prompt
+    used to be handed `projected[0].dim` with the product of every factor as its width."""
+    from optimization.driver import Pipeline, StageError
+    from optimization.projection import Factor, Projection
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    mixed = Projection(
+        module="m", planned=[Factor("head", 2), Factor("hidden", 2)], planned_units=4,
+        planned_devices=1, projected=[Factor("head", 2), Factor("hidden", 2)], projected_units=4,
+    )
+    with pytest.raises(StageError, match="more than one dimension"):
+        pipeline._require_expressible_cut(mixed)
+
+
+def test_a_single_dimensional_projection_is_allowed(tmp_path):
+    from optimization.driver import Pipeline
+    from optimization.projection import Factor, Projection
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    single = Projection(module="m", planned=[Factor("expert", 8)], planned_units=8,
+                        planned_devices=2, projected=[Factor("expert", 4)], projected_units=4)
+    pipeline._require_expressible_cut(single)  # does not raise
+
+
+def test_the_glossary_the_feedback_prompt_points_at_exists():
+    """In a wheel this used to resolve to a site-packages path with nothing at it."""
+    from optimization.driver import _context_md
+
+    assert _context_md().is_file()

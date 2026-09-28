@@ -191,9 +191,10 @@ class OptimizationLoop(Harness):
             report.unlink()  # a stale verdict from a re-run would be read as this iteration's
 
         advisory = iteration >= slot.last_iteration
-        command = cons.CHECKER_COMMAND.format(
-            checker=checker, report=report, advisory=" --advisory" if advisory else "",
-        )
+        # Through the helper, which quotes both paths. Formatting `CHECKER_COMMAND` here instead —
+        # which this did — bypasses the quoting on the one call site that actually runs, so a
+        # workspace path with a space in it split the command and failed every governed iteration.
+        command = cons.checker_command(checker, report, advisory=advisory)
         if advisory:
             self.console.print(
                 f"  [dim]slot {slot.label}: last iteration of the slot, so the constraint is "
