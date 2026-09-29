@@ -192,7 +192,43 @@ def test_the_derived_config_carries_the_schedule(tmp_path):
     derived = config.derive_loop_config("submodule")
     slots = derived["iteration_constraints"]
     assert [s["iterations"] for s in slots] == [[1, 2, 3], [4, 5, 6], [7, 8], [9, 10]]
-    assert slots[2]["enforce"] is False
+    assert slots[2]["enforcement"] == "off"
+
+
+def test_the_derived_config_survives_the_round_trip_into_the_loop(tmp_path):
+    """The operator's schedule, through the derived config, judged the same by the loop.
+
+    The gap this closes cost two iterations of a real round. The derived config carried only the
+    legacy `enforce` boolean, which is true for `hard` and `soft` alike; the loop re-parsed it and
+    `_ENFORCE_ALIAS` turned every `True` back into `hard`. So a slot the operator wrote as `soft`
+    reached the loop as `hard`, ran its checker without `--advisory`, and rejected a candidate that
+    only owed a strict improvement. `soften_last: false` was lost the same way.
+
+    Both halves were covered on their own. Only the round trip was not.
+    """
+    from optimization import constraints as cons
+
+    schedule = [
+        {"at": 1, "enforcement": "hard", "text": "one"},
+        {"at": 2, "enforcement": "soft", "text": "two"},
+        {"from": 3, "to": 4, "enforcement": "hard", "soften_last": False, "text": "three"},
+        {"at": 5, "enforcement": "off", "text": "four"},
+    ]
+    raw = yaml.safe_load(_filled(tmp_path).read_text())
+    raw["full"]["budget"]["iterations"] = 5
+    raw["full"]["iteration_constraints"] = schedule
+    path = tmp_path / "round-trip.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    config = PipelineConfig.load(path)
+    operator = cons.Schedule.from_config(schedule, max_iterations=5)
+    through = cons.Schedule.from_config(
+        config.derive_loop_config("full")["iteration_constraints"], max_iterations=5,
+    )
+    modes = {i: through.slot_for(i).enforcement_for(i) for i in range(1, 6)}
+    assert modes == {i: operator.slot_for(i).enforcement_for(i) for i in range(1, 6)}
+    # Spelled out, so a future change that makes both sides equally wrong still fails.
+    assert modes == {1: "hard", 2: "soft", 3: "hard", 4: "hard", 5: "off"}
 
 
 def test_the_derived_config_is_accepted_by_autohelixs_own_parser(tmp_path):
@@ -774,6 +810,59 @@ def test_a_toggled_enforcement_forces_a_recompile(tmp_path):
     )
     # With enforcement off there is nothing to compile, so drift is moot rather than reported.
     assert cons.schedule_drift(tmp_path, off) == []
+
+
+def test_hard_to_soft_is_drift(tmp_path):
+    """The change `enforce`'s boolean could not see.
+
+    A round configured `at: 4, enforcement: soft` enforced iteration 4 as hard and rejected a
+    candidate that only owed a strict improvement. Drift compared two booleans, so `hard` and
+    `soft` were the same value, and nothing anywhere recorded the disagreement.
+    """
+    from optimization import constraints as cons
+
+    compiled_as = cons.Schedule.from_config(
+        [{"at": 4, "text": "Use tensor_scalar.", "enforcement": "hard"}],
+    )
+    slot = compiled_as.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        compiled_as,
+    )
+    assert cons.schedule_drift(tmp_path, compiled_as) == []
+
+    softened = cons.Schedule.from_config(
+        [{"at": 4, "text": "Use tensor_scalar.", "enforcement": "soft"}],
+    )
+    findings = cons.schedule_drift(tmp_path, softened)
+    assert any("compiled as hard" in f for f in findings), findings
+
+
+def test_soften_last_changing_one_iteration_of_a_range_is_drift(tmp_path):
+    """Same three iterations, same text, same `enforcement`: only the last one's mode moves."""
+    from optimization import constraints as cons
+
+    strict = cons.Schedule.from_config(
+        [{"from": 1, "to": 3, "text": "NKI only.", "soften_last": False}],
+    )
+    slot = strict.slots[0]
+    path = cons.checker_path(tmp_path, slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# --repo --json 'passed' 'findings'\n")
+    cons.write_manifest(
+        tmp_path,
+        [cons.CompiledSlot(slot.label, slot.iterations, path, cons.sha256_file(path))],
+        strict,
+    )
+    assert cons.schedule_drift(tmp_path, strict) == []
+
+    relaxed = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
+    findings = cons.schedule_drift(tmp_path, relaxed)
+    assert any("iteration(s) 3" in f for f in findings), findings
 
 
 def test_an_empty_schedule_never_reports_drift(tmp_path):

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from optimization.report import _GIST_WIDTH, _embed, _slot_gist
+from optimization.report import _GIST_WIDTH, _embed, _slot_enforcement, _slot_gist
 
 pytestmark = pytest.mark.optimization
 
@@ -71,3 +71,60 @@ def test_slot_gist_distinguishes_two_slots_sharing_a_lead():
     lead = "**NKI and torch-xla are both allowed.** "
     assert _slot_gist(lead + "Mix them however serves the kernel, " * 4) != \
            _slot_gist(lead + "Consolidate what iterations 7-8 learned, " * 4)
+
+
+# -- the enforcement column ----------------------------------------------------------
+
+
+def _recorded(**over):
+    """A slot as `Slot.to_dict` writes it into the checker manifest."""
+    slot = {
+        "iterations": [4],
+        "label": "4",
+        "text": "Use tensor_scalar.",
+        "enforcement": "soft",
+        "soften_last": True,
+        "per_iteration": {"4": "soft"},
+    }
+    slot.update(over)
+    return slot
+
+
+def test_the_enforcement_column_reads_what_the_manifest_writes():
+    """It asked for `enforce`, a key `to_dict` has never written, so every slot read as not
+    enforced — including the ones that had just rejected a candidate and spent its iteration."""
+    assert _slot_enforcement(_recorded(), "Use tensor_scalar.") == "soft"
+    assert _slot_enforcement(
+        _recorded(enforcement="hard", per_iteration={"4": "hard"}), "x",
+    ) == "hard"
+
+
+def test_the_enforcement_column_names_a_softened_last_iteration():
+    slot = _recorded(
+        iterations=[1, 2, 3], label="1-3", enforcement="hard",
+        per_iteration={"1": "hard", "2": "hard", "3": "soft"},
+    )
+    assert _slot_enforcement(slot, "x") == "hard, soft on 3"
+
+
+def test_the_enforcement_column_sorts_iterations_numerically():
+    """String keys put "10" before "9", which would report the wrong iteration as the softened one."""
+    slot = _recorded(
+        iterations=[9, 10], label="9-10", enforcement="hard",
+        per_iteration={"9": "hard", "10": "soft"},
+    )
+    assert _slot_enforcement(slot, "x") == "hard, soft on 10"
+
+
+def test_an_unconstrained_slot_has_no_enforcement_to_show():
+    assert _slot_enforcement(_recorded(), "") == "—"
+
+
+def test_the_enforcement_column_falls_back_to_a_legacy_record():
+    """A manifest written before `per_iteration` existed still renders."""
+    assert _slot_enforcement(
+        {"label": "1", "text": "x", "enforce": True, "per_iteration": {}}, "x",
+    ) == "hard"
+    assert _slot_enforcement(
+        {"label": "1", "text": "x", "enforce": False, "per_iteration": {}}, "x",
+    ) == "off"

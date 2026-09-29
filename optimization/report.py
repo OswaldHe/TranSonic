@@ -119,6 +119,35 @@ def _slot_gist(text: str) -> str:
     return f"{cut}…"
 
 
+def _slot_enforcement(slot: dict, text: str) -> str:
+    """How one recorded slot was judged, per iteration.
+
+    Reads `per_iteration` and `enforcement`, which is what `Slot.to_dict` writes. This column asked
+    for `enforce` — a key the manifest has never carried — so `.get` returned None and every slot in
+    every report rendered as not enforced, including the ones that had just rejected a candidate.
+    """
+    if not text:
+        return "—"
+    modes = [str(v) for _, v in sorted((slot.get("per_iteration") or {}).items(), key=_by_iteration)]
+    if not modes:
+        recorded = str(slot.get("enforcement", "")) or (
+            "hard" if slot.get("enforce", True) else "off"
+        )
+        return recorded
+    if len(set(modes)) == 1:
+        return modes[0]
+    last = max((slot.get("per_iteration") or {}), key=lambda k: int(k))
+    return f"{modes[0]}, {modes[-1]} on {last}"
+
+
+def _by_iteration(item: tuple[str, object]) -> int:
+    """Sort a `per_iteration` mapping numerically: its keys are strings, so "10" precedes "9"."""
+    try:
+        return int(item[0])
+    except (TypeError, ValueError):
+        return 0
+
+
 def write_report(config: PipelineConfig, console: Console | None = None) -> Path:
     """Assemble the report from what each stage recorded, and write it to the workspace."""
     console = console or Console()
@@ -235,11 +264,11 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
     ]
     schedule = submodule_summary.get("schedule") or []
     if schedule:
-        parts += ["| iterations | enforced | constraint |", "|---|---|---|"]
+        parts += ["| iterations | enforcement | constraint |", "|---|---|---|"]
         for slot in schedule:
             text = (slot.get("text") or "").strip()
-            enforced = "yes" if (slot.get("enforce") and text) else "no"
-            parts.append(f"| {slot.get('label')} | {enforced} | {_slot_gist(text)} |")
+            parts.append(f"| {slot.get('label')} | {_slot_enforcement(slot, text)} | "
+                         f"{_slot_gist(text)} |")
     else:
         parts.append("_no per-iteration constraints_")
 

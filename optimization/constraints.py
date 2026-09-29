@@ -558,8 +558,31 @@ def schedule_drift(project_path: Path, schedule: Schedule) -> list[str]:
             findings.append(f"slot {slot.label} now covers different iterations")
         if str(entry.get("text") or "").strip() != slot.text.strip():
             findings.append(f"slot {slot.label}'s constraint text has changed since it was compiled")
-        if bool(entry.get("enforce", True)) != slot.enforce:
-            findings.append(f"slot {slot.label}'s enforcement has been toggled")
+        # Compared three-valued, and per iteration. This read `entry.get("enforce", True)` against
+        # `slot.enforce`, both booleans — so `hard` and `soft` were the same value and a schedule
+        # recompiled from one to the other drifted silently. Worse, the manifest records
+        # `enforcement`, never `enforce`, so the default made it a no-op for every slot but `off`.
+        # A round whose config said soft then ran hard, rejected a candidate that only owed a strict
+        # improvement, and left no finding anywhere.
+        recorded_mode = str(entry.get("enforcement", "")) or (
+            "hard" if entry.get("enforce", True) else "off"
+        )
+        if recorded_mode != slot.enforcement:
+            findings.append(
+                f"slot {slot.label}'s enforcement is now {slot.enforcement} but its checker was "
+                f"compiled as {recorded_mode}"
+            )
+        recorded_per = {str(k): str(v) for k, v in (entry.get("per_iteration") or {}).items()}
+        current_per = {str(i): slot.enforcement_for(i) for i in slot.iterations}
+        if recorded_per and recorded_per != current_per:
+            changed = sorted(
+                i for i in set(recorded_per) | set(current_per)
+                if recorded_per.get(i) != current_per.get(i)
+            )
+            findings.append(
+                f"slot {slot.label} now judges iteration(s) {', '.join(changed)} differently than "
+                f"when its checker was compiled"
+            )
     # The reverse direction compares against what was *compiled*, not against the recorded schedule.
     # The manifest records every slot, enforceable or not, so comparing the recorded schedule with
     # `enforceable()` reported each unconstrained slot as "compiled but no longer in the schedule" —

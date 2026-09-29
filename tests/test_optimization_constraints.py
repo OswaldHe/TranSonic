@@ -305,6 +305,45 @@ def test_the_checker_command_carries_the_advisory_flag():
     assert advisory.endswith("--advisory")
 
 
+def test_a_configured_soft_slot_reaches_the_command_as_advisory(tmp_path):
+    """The whole chain, on the schedule shape an operator actually writes.
+
+    Every link of this was already covered on its own — `enforcement_for` returns "soft",
+    `checker_command(advisory=True)` appends the flag, `slotcheck --advisory` exits 0 — and a real
+    round still enforced its two soft slots as hard, because nothing tested them composed. So this
+    walks a per-iteration `hard/soft/hard/soft/off` schedule from YAML keys to the command line.
+    """
+    schedule = cons.Schedule.from_config(
+        [
+            {"at": 1, "enforcement": "hard", "text": "a"},
+            {"at": 2, "enforcement": "soft", "text": "a"},
+            {"at": 3, "enforcement": "hard", "text": "b"},
+            {"at": 4, "enforcement": "soft", "text": "b"},
+            # Bare `off` in YAML 1.1 is the boolean False, which is why the alias exists.
+            {"at": 5, "enforcement": False, "text": "c"},
+        ],
+        max_iterations=5,
+    )
+    modes, flagged = {}, {}
+    for iteration in range(1, 6):
+        slot = schedule.slot_for(iteration)
+        assert slot is not None
+        modes[iteration] = slot.enforcement_for(iteration)
+        command = cons.checker_command(
+            cons.checker_path(tmp_path, slot),
+            cons.report_path(tmp_path, iteration),
+            advisory=modes[iteration] == "soft",
+        )
+        flagged[iteration] = "--advisory" in command
+
+    assert modes == {1: "hard", 2: "soft", 3: "hard", 4: "soft", 5: "off"}
+    # The soft iterations, and only those, run the checker non-fatally.
+    assert flagged == {1: False, 2: True, 3: False, 4: True, 5: False}
+    # And iteration 5 is never governed at all: an `off` slot gets no checker written for it.
+    assert not schedule.slot_for(5).enforce
+    assert [slot.label for slot in schedule.enforceable()] == ["1", "2", "3", "4"]
+
+
 # -- the review of #6: the checker's read-only contract, checked statically -------------
 
 

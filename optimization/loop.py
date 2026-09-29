@@ -198,12 +198,21 @@ class OptimizationLoop(Harness):
         # which this did — bypasses the quoting on the one call site that actually runs, so a
         # workspace path with a space in it split the command and failed every governed iteration.
         command = cons.checker_command(checker, report, advisory=advisory)
+        # Printed for every governed iteration, hard included. A round whose schedule said soft and
+        # whose log said nothing is a round where the only record of which rule ran is the absence
+        # of `--advisory` inside a wrapped command line, which is not somewhere an operator looks.
         if advisory:
             because = ("the last iteration of the slot" if slot.enforcement == "hard"
                        else "a soft slot")
             self.console.print(
-                f"  [dim]slot {slot.label}: {because}, so the constraint is checked but not fatal "
-                f"— acceptance needs a strict improvement instead[/dim]"
+                f"  [dim]slot {slot.label}: soft on iteration {iteration} ({because}), so the "
+                f"constraint is checked but not fatal — acceptance needs a strict improvement "
+                f"instead[/dim]"
+            )
+        else:
+            self.console.print(
+                f"  [dim]slot {slot.label}: hard on iteration {iteration}, so a violation rejects "
+                f"the candidate before it is measured[/dim]"
             )
 
         original = list(self.config.constraints)

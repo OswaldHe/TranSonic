@@ -312,8 +312,19 @@ class PipelineConfig:
         if spec.iteration_time:
             payload["budget"]["iteration_time"] = spec.iteration_time
         if spec.schedule.slots:
+            # `enforcement` and `soften_last`, not the legacy `enforce` boolean. The loop re-parses
+            # this derived config, and `enforce` collapses hard and soft to the same `True` — which
+            # `_ENFORCE_ALIAS` then reads back as `hard`. So a schedule the operator wrote as
+            # `soft` arrived at the loop as `hard`, its checker ran without `--advisory`, and a
+            # candidate that only owed a strict improvement was rejected and discarded instead.
+            # `soften_last: false` was lost the same way, in the other direction.
             payload["iteration_constraints"] = [
-                {"iterations": slot.iterations, "text": slot.text, "enforce": slot.enforce}
+                {
+                    "iterations": slot.iterations,
+                    "text": slot.text,
+                    "enforcement": slot.enforcement,
+                    "soften_last": slot.soften_last,
+                }
                 for slot in spec.schedule.slots
             ]
         if spec.has_reviewer:
