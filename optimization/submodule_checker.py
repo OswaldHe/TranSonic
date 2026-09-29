@@ -285,6 +285,22 @@ def check_declaration(repo: Path, manifest: dict[str, Any]) -> CheckResult:
             f"{factor}-way cut cannot be reassembled into the whole module"
         )
 
+    # The dimension too, not only its width. Checking the factor alone let a declaration claim
+    # `head x4` against an `expert x4` projection: the recipe verifier only asks whether the shards
+    # recombine to the golden, and the module gate only asks for correctness and a collective, so a
+    # valid kernel for a *different* four-way placement passed while the report attributed its
+    # measurements to the recorded floorplan. Only checked when the projection splits one dimension,
+    # because a multi-dimension projection has no single dimension the declaration must name.
+    dims = candidate.projected_dims(manifest)
+    declared_dim = str(declaration.get("dim") or "").strip()
+    if len(dims) == 1 and declared_dim and declared_dim.lower() != dims[0].lower():
+        findings.append(
+            f"{DECLARATION_FILE} declares the cut along '{declared_dim}', but the floorplan "
+            f"projection for this module splits '{dims[0]}'. A {factor}-way cut along another "
+            f"dimension can still reproduce the golden, so nothing downstream catches this — and "
+            f"the report would then credit this kernel to a placement it does not implement"
+        )
+
     try:
         outcome = verify_recipe(repo, declaration, manifest)
     except RecipeError as exc:

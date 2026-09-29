@@ -222,6 +222,47 @@ def test_an_xla_reduction_is_refused(tmp_path):
     assert any("xm.all_reduce" in f for f in result.findings)
 
 
+def test_a_collective_only_in_the_validator_does_not_satisfy_the_check(tmp_path):
+    """The validator runs outside the traced kernel, so a collective there rejoins nothing on device.
+
+    Both files' `nki.collectives` calls were pooled into one list, and a non-empty list suppressed
+    the "calls no collective at all" finding — so an assembly whose ranks never rejoin passed the one
+    check that exists to prove they do.
+    """
+    repo = _module_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        def kernel(x, replica_group):
+            return x
+    """, inference="""
+        import nki.collectives as ncc
+        import source
+        from source import kernel
+        RTOL = 0.1
+
+        def run(x, group):
+            out = kernel[2](x, group)
+            return ncc.all_reduce(out, op=ncc.ReduceOp.add, replica_group=group)
+    """)
+    result = module_checker.check_nki_collectives(repo)
+    assert not result.passed
+    assert any("calls no collective at all" in f for f in result.findings)
+    assert any("outside the traced kernel" in f for f in result.findings)
+
+
+def test_one_rank_needs_no_collective_in_either_file(tmp_path):
+    """A projection the floorplan already fits on one unit has nothing to reduce."""
+    repo = _module_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        def kernel(x, replica_group):
+            return x
+    """)
+    assert module_checker.check_nki_collectives(repo, ranks=1).passed
+
+
 def test_process_group_setup_is_allowed(tmp_path):
     """torch.distributed may organize the four processes; it may not move tensor data."""
     repo = _module_repo(tmp_path, NKI_SOURCE, inference="""
@@ -429,6 +470,61 @@ def test_a_declaration_whose_factor_contradicts_the_projection_is_refused(tmp_pa
     )
     assert not result.passed
     assert any("4 ranks" in f and "8-way" in f for f in result.findings)
+
+
+def _cut_declaration(repo: Path, dim: str, factor: int = 4) -> None:
+    (repo / "submodule.json").write_text(json.dumps({
+        "module": "layers.1.ffn", "dim": dim, "factor": factor, "shard": 0,
+        "inputs": [], "outputs": [],
+        "reassembly": {"op": "sum", "shards": [], "dtype": "float32", "shape": [1]},
+    }))
+
+
+_PROJECTED_EXPERT = {"projection": {"projected": {
+    "units": 4, "devices": 1, "splits": [{"dim": "expert", "factor": 4}],
+}}}
+
+
+def test_a_declaration_whose_dimension_contradicts_the_projection_is_refused(tmp_path):
+    """Right width, wrong axis.
+
+    Only the factor was compared, so `head x4` passed against an `expert x4` projection: the recipe
+    verifier only asks whether the shards recombine to the golden, and the module gate only asks for
+    correctness and a collective. So a valid kernel for a different four-way placement passed while
+    the report credited it to the recorded floorplan.
+    """
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    _cut_declaration(repo, "head")
+    result = submodule_checker.check_declaration(repo, _PROJECTED_EXPERT)
+    assert not result.passed
+    assert any("'head'" in f and "'expert'" in f for f in result.findings)
+
+
+def test_a_declaration_matching_the_projected_dimension_is_accepted(tmp_path):
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    _cut_declaration(repo, "Expert")  # case is not the point
+    result = submodule_checker.check_declaration(repo, _PROJECTED_EXPERT)
+    assert not any("dimension" in f for f in result.findings), result.findings
+
+
+def test_a_multi_dimension_projection_does_not_pin_the_declared_dimension(tmp_path):
+    """`expert x2 * head x2` has no single dimension the declaration must name."""
+    repo = tmp_path / "sub"
+    repo.mkdir()
+    _cut_declaration(repo, "head")
+    manifest = {"projection": {"projected": {"units": 4, "devices": 1, "splits": [
+        {"dim": "expert", "factor": 2}, {"dim": "head", "factor": 2},
+    ]}}}
+    result = submodule_checker.check_declaration(repo, manifest)
+    assert not any("splits" in f for f in result.findings), result.findings
+
+
+def test_the_projected_dimensions_are_read_from_the_nested_splits():
+    assert candidate.projected_dims(_PROJECTED_EXPERT) == ["expert"]
+    assert candidate.projected_dims({}) == []
+    assert candidate.projected_dims({"projection": {"projected": {"splits": [{"factor": 4}]}}}) == []
 
 
 # ======================================================================================

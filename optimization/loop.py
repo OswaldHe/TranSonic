@@ -315,6 +315,45 @@ class OptimizationLoop(Harness):
             f"An iteration that ignores its constraint has to earn it with a strict improvement"
         )
 
+    # -- review --------------------------------------------------------------------
+
+    def run_reviewer(self, worktree, iteration: int) -> bool:
+        """Upstream's reviewer, with the editable scope held to what the gate measured.
+
+        The reviewer is a second write-capable agent in the same worktree, and it runs *after* scope
+        reversion, the constraints and the metrics — then the iteration is staged and merged. So a
+        reviewer that edits `source.py` while investigating it replaces the candidate that was gated
+        with code nothing ever ran, and that is what gets merged and reported.
+
+        Not solved by telling the reviewer not to: its whole job is adversarial reading, it has the
+        tools to edit, and one stray `Edit` is indistinguishable in the result from a deliberate one.
+        So the files are snapshotted and put back. Restoring rather than rejecting, because the
+        review is not the candidate's fault and its verdict is still worth having.
+
+        Overridden here rather than in `Harness`, because only this pipeline's contract says the
+        measured bytes and the merged bytes must be identical.
+        """
+        editable = [
+            worktree.working_dir / name
+            for name in (self.config.scope.editable or [])
+        ]
+        snapshot = {path: path.read_bytes() for path in editable if path.is_file()}
+        try:
+            return super().run_reviewer(worktree, iteration)
+        finally:
+            changed = [
+                path for path, body in snapshot.items()
+                if not path.is_file() or path.read_bytes() != body
+            ]
+            for path in changed:
+                path.write_bytes(snapshot[path])
+            if changed:
+                self.console.print(
+                    f"  [yellow]![/yellow] the reviewer modified "
+                    f"{', '.join(p.name for p in changed)} and it was restored: the candidate that "
+                    f"is merged has to be the one the gate measured"
+                )
+
     # -- candidate archive ---------------------------------------------------------
 
     def archive_candidate(self, iteration: int, result: IterationResult) -> Path | None:

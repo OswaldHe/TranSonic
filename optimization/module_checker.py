@@ -254,7 +254,12 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
     source = candidate._parse(repo / SOURCE_FILE)
     inference = candidate._parse(repo / INFERENCE_FILE)
 
+    # Kept apart by file. Pooled, a `nki.collectives` call in the agent-written `inference.py`
+    # satisfied the "calls no collective at all" test below — but the validator runs outside the
+    # traced kernel, so an assembly whose ranks never rejoin on device passed the one check that
+    # exists to prove they do.
     resolved_from_nki: list[str] = []
+    in_source: list[str] = []
     for where, tree in ((SOURCE_FILE, source), (INFERENCE_FILE, inference)):
         aliases = candidate.import_aliases(tree)
         for dotted, line in sorted(candidate.called_attributes(tree).items(), key=lambda kv: kv[1]):
@@ -264,6 +269,8 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
             if tail in COLLECTIVE_OPS:
                 if resolved.startswith(COLLECTIVE_MODULE):
                     resolved_from_nki.append(f"{resolved} ({where})")
+                    if where == SOURCE_FILE:
+                        in_source.append(resolved)
                 else:
                     findings.append(
                         f"{where}:{line} calls '{dotted}'"
@@ -286,10 +293,13 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
     # floorplan already fits on one unit, so this is a legal projection rather than a degenerate
     # one — and requiring a collective of it would fail every natural kernel for it. The host-side
     # ban above still applies: one rank must not reach for `torch.distributed` either.
-    if ranks > 1 and not resolved_from_nki and not findings:
+    if ranks > 1 and not in_source and not findings:
         findings.append(
             f"{SOURCE_FILE} calls no collective at all. {ranks} ranks each holding part of the "
             f"module cannot produce the whole module's output without one"
+            + (f". {INFERENCE_FILE} calls {', '.join(sorted(resolved_from_nki))}, but the validator "
+               f"runs outside the traced kernel, so a collective there does not rejoin the ranks "
+               f"on device" if resolved_from_nki else "")
         )
     return CheckResult("c", CHECK_TITLES["c"], not findings,
                        f"reduction via {', '.join(sorted(resolved_from_nki))}" if not findings

@@ -87,6 +87,52 @@ def test_the_word_count_is_reported_so_the_prompt_can_say_how_much_there_is(tmp_
     assert fb.word_count(fb.corpus(repo)) == 14
 
 
+def _archived_round(repo: Path, stamp: str, notes: dict[str, str]) -> Path:
+    """One archived round, as `_roll_round` leaves it: a `round.json` marker beside the notes."""
+    round_dir = repo / ".autohelix" / "archive" / stamp
+    (round_dir / "notes").mkdir(parents=True, exist_ok=True)
+    (round_dir / "round.json").write_text('{"round": 1}')
+    for name, body in notes.items():
+        (round_dir / "notes" / name).write_text(body)
+    return round_dir
+
+
+def test_an_archived_rounds_notes_are_part_of_the_corpus(tmp_path):
+    """`rerun-full` restarts iteration numbering at 1, so round 2's `iter-3.md` lands on round 1's.
+
+    This agent exists to reconcile the whole optimization history; reading only the live directories
+    made it silently blind to every round but the last.
+    """
+    repo = _corpus(tmp_path, "full", notes=2, reviews=0)
+    _archived_round(repo, "20260928-213824", {
+        "iter-1.md": "round one iteration one, the lnc2 split\n",
+        "iter-3.md": "round one iteration three, the accumulator cut\n",
+    })
+    names = [p.name for p in fb.corpus(repo)["full"]]
+    bodies = "".join(p.read_text() for p in fb.corpus(repo)["full"])
+    assert names.count("iter-1.md") == 2, names  # the live one and the archived one
+    assert "the accumulator cut" in bodies
+
+
+def test_an_archive_without_a_round_marker_is_not_read(tmp_path):
+    """`autohelix clear` archives here too, and those are not rounds."""
+    repo = _corpus(tmp_path, "full", notes=1, reviews=0)
+    cleared = repo / ".autohelix" / "archive" / "20260901-000000" / "notes"
+    cleared.mkdir(parents=True)
+    (cleared / "iter-7.md").write_text("from a cleared run\n")
+    assert [p.name for p in fb.corpus(repo)["full"]] == ["iter-1.md"]
+
+
+def test_a_note_carried_forward_is_not_counted_twice(tmp_path):
+    """A carried note lives in both the live directory and its round's archive. The corpus is fed to
+    an agent by the word, and two copies invite reading one finding as two."""
+    repo = _corpus(tmp_path, "full", notes=0, reviews=0)
+    shared = "the very same note, byte for byte\n"
+    (repo / ".autohelix" / "notes" / "iter-1-round1.md").write_text(shared)
+    _archived_round(repo, "20260928-213824", {"iter-1.md": shared})
+    assert len(fb.corpus(repo)["full"]) == 1
+
+
 # -- the report's shape ----------------------------------------------------------------
 
 

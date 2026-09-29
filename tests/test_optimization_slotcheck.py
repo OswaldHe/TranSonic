@@ -200,3 +200,52 @@ def test_a_well_behaved_checker_leaves_the_candidate_alone(tmp_path):
     report = tmp_path / "iter-2.json"
     assert slotcheck.run_checker(_checker(tmp_path, PASSES), tmp_path, report)[0] is True
     assert (tmp_path / "source.py").read_text() == before
+
+
+def test_a_checkers_edit_to_the_candidate_is_undone(tmp_path):
+    """Detecting the mutation was not enough.
+
+    An advisory run exits 0 after this violation on purpose, so the gate went on to measure the
+    checker-modified `source.py` and could accept and merge it on a strict improvement. Whichever
+    mode the slot is in, the candidate the gate sees has to be the agent's.
+    """
+    original = "import nki\n# the agent's kernel\n"
+    (tmp_path / "source.py").write_text(original)
+    report = tmp_path / "iter-1.json"
+
+    passed, _ = slotcheck.run_checker(
+        _checker(tmp_path, WRITES_THE_CANDIDATE), tmp_path, report,
+    )
+    assert passed is False
+    assert (tmp_path / "source.py").read_text() == original
+    findings = json.loads(report.read_text())["findings"]
+    assert any("modified source.py" in f for f in findings)
+    assert any("restored source.py" in f for f in findings)
+
+
+def test_an_advisory_run_still_undoes_a_checkers_edit(tmp_path):
+    """The path that actually reaches the gate: advisory exits 0, so the file must already be back."""
+    original = "import nki\n"
+    (tmp_path / "source.py").write_text(original)
+    assert _run(
+        _checker(tmp_path, WRITES_THE_CANDIDATE), tmp_path, tmp_path / "r.json", advisory=True,
+    ) == 0
+    assert (tmp_path / "source.py").read_text() == original
+
+
+CREATES_A_GUARDED_FILE = (
+    '__import__("pathlib").Path(a.repo, "inference.py").write_text("# planted\\n")\n'
+    '        open(a.json, "w").write(json.dumps({"passed": True, "findings": []}))\n'
+    "        sys.exit(0)"
+)
+
+
+def test_a_guarded_file_the_checker_created_is_removed(tmp_path):
+    """Restoring a file that did not exist means deleting it, not writing an empty one."""
+    (tmp_path / "source.py").write_text("import nki\n")
+    report = tmp_path / "iter-1.json"
+    passed, _ = slotcheck.run_checker(
+        _checker(tmp_path, CREATES_A_GUARDED_FILE), tmp_path, report,
+    )
+    assert passed is False
+    assert not (tmp_path / "inference.py").exists()

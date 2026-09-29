@@ -1205,20 +1205,88 @@ def _archive_of(repo: Path) -> Path:
 
 def test_rolling_a_round_archives_it_and_carries_the_notes_forward(tmp_path):
     """Round 2's agent should read what round 1 learned — that is why the round exists. The archive
-    keeps its own copy, so it stays a complete record."""
+    keeps its own copy, so it stays a complete record.
+
+    Carried forward under the round's own name. Iteration numbering restarts at 1 each round, so an
+    unstamped `iter-1.md` is exactly the name round 2's first iteration writes: the real round 2
+    overwrote round 1's notes for four iterations and two of them were lost outright.
+    """
     pipeline, repo = _round_one(tmp_path)
 
     number = pipeline._roll_round(repo, note="trying the expert skip", previous={"best_ms": 14.84})
     assert number == 1
     state = repo / ".autohelix"
-    assert (state / "notes" / "iter-1.md").is_file()
-    assert (state / "reviews" / "iter-1.md").is_file()
+    assert (state / "notes" / "iter-1-round1.md").is_file()
+    assert (state / "reviews" / "iter-1-round1.md").is_file()
+    # And the name the next round will write is free.
+    assert not (state / "notes" / "iter-1.md").exists()
     assert not (state / "history.jsonl").exists()
     archived = _archive_of(repo)
     assert (archived / "history.jsonl").is_file()
     assert (archived / "notes" / "iter-1.md").is_file()
     assert (archived / "full-summary.json").is_file()
     assert json.loads((archived / "round.json").read_text())["note"] == "trying the expert skip"
+
+
+def test_the_full_stage_delivers_the_best_commit_not_head(tmp_path):
+    """The metric gate allows a regression, so HEAD can be a slower accepted candidate than an
+    earlier one. Round 2 of the real stage 5 ended with HEAD at 14.8703 ms while an earlier commit
+    held 14.8456, and only the number was reported from the better one."""
+    import subprocess
+
+    pipeline, repo = _round_one(tmp_path)
+    best = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    (repo / "source.py").write_text("# a later, slower accepted kernel\n")
+    pipeline._commit_tree(repo, "iteration 5")
+
+    pipeline._materialize_best(repo, best, 14.8456)
+    assert (repo / "source.py").read_text() == "# round one kernel\n"
+    assert not subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+
+
+def test_delivering_the_best_commit_is_a_no_op_when_head_already_is_it(tmp_path):
+    import subprocess
+
+    pipeline, repo = _round_one(tmp_path)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    before = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=repo,
+                            capture_output=True, text=True).stdout.strip()
+    pipeline._materialize_best(repo, head, 14.84)
+    after = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=repo,
+                           capture_output=True, text=True).stdout.strip()
+    assert before == after, "no empty commit for a tree that is already the best"
+
+
+def test_an_exhausted_budget_is_not_an_aborted_start(tmp_path):
+    """`Harness.run()` walks an empty range when every budgeted iteration is on record, returning
+    with the history unchanged -- which is exactly what an abort looks like. Re-running a finished
+    stage therefore failed instead of reusing what it had already produced."""
+    from optimization.driver import Pipeline
+
+    class _Loop:
+        def __init__(self, entries):
+            self.history = type("H", (), {"load": staticmethod(lambda: entries)})()
+
+    assert Pipeline._last_iteration(_Loop([])) == 0
+    assert Pipeline._last_iteration(_Loop([{"iteration": 1}, {"iteration": 5}])) == 5
+    # Malformed rows are skipped rather than crashing the stage on its way out.
+    assert Pipeline._last_iteration(_Loop([{"iteration": "x"}, {}, {"iteration": 3}])) == 3
+
+
+def test_stamping_a_round_twice_does_not_double_the_suffix(tmp_path):
+    """A third round must not produce `iter-1-round1-round2.md`."""
+    pipeline, repo = _round_one(tmp_path)
+    notes = repo / ".autohelix" / "notes"
+
+    assert pipeline._stamp_round(notes, 1) == 1
+    assert (notes / "iter-1-round1.md").is_file()
+    # Already stamped, so the second roll leaves it alone and finds nothing new to rename.
+    assert pipeline._stamp_round(notes, 2) == 0
+    assert (notes / "iter-1-round1.md").is_file()
+    assert not (notes / "iter-1-round1-round2.md").exists()
 
 
 def test_rolling_a_round_does_not_carry_observations_or_logs_forward(tmp_path):

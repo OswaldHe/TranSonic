@@ -24,6 +24,7 @@ of iteration 7 could be written around what iteration 6 already did.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -538,19 +539,79 @@ class Pipeline:
         loop.run()
         after = len(loop.history.load())
         budgeted = (self.config.submodule if stage == "submodule" else self.config.full).iterations
-        if after == before and budgeted > 0:
+        # An exhausted budget is not an aborted start. `Harness.run()` walks an empty range when the
+        # history already holds every budgeted iteration, so it returns with `after == before` —
+        # exactly what an abort looks like from here. Re-running `optimize run` or `optimize all`
+        # over a finished stage therefore failed instead of reusing the result it had already
+        # produced. Told apart by whether the loop reached its last iteration, which an abort never
+        # does.
+        exhausted = self._last_iteration(loop) >= budgeted > 0
+        if after == before and budgeted > 0 and not exhausted:
             raise StageError(
                 f"the {stage} loop recorded no iteration, so it did not start. The usual causes "
                 f"print above: the repository has uncommitted changes, a file named in "
                 f"scope.editable is missing, or the derived config no longer matches the saved "
                 f"run state."
             )
+        if after == before and exhausted:
+            self.console.print(
+                f"  [dim]{stage}: all {budgeted} budgeted iteration(s) are already on record, so "
+                f"the loop had nothing to run — reusing the recorded outcome[/dim]"
+            )
 
         best_commit, best_value = loop.best_commit()
+        # The best commit becomes the deliverable, not merely a metadata field. The metric gate
+        # allows `acceptance.max_regression_pct`, so the last accepted iteration at HEAD can be
+        # slower than an earlier accepted one — round 2 of the real stage 5 ended with HEAD at
+        # 14.8703 ms while an earlier commit held 14.8456. Assembly reads the submodule's best commit
+        # explicitly, but nothing downstream does that for the full repo, so the headline latency and
+        # the `source.py` a reader opens described different code.
+        if stage == "full" and best_commit:
+            self._materialize_best(repo, best_commit, best_value)
         return StageOutcome(
             stage=f"run-{stage}", ok=best_value is not None,
             detail=f"best {best_value} ms" if best_value else "no accepted iteration",
             payload={"best_commit": best_commit, "best_ms": best_value},
+        )
+
+    @staticmethod
+    def _last_iteration(loop: OptimizationLoop) -> int:
+        """The highest iteration number the history records, or 0 when it records none."""
+        numbers = []
+        for entry in loop.history.load():
+            try:
+                numbers.append(int(getattr(entry, "iteration", None) or entry["iteration"]))
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        return max(numbers, default=0)
+
+    def _materialize_best(self, repo: Path, commit: str, value: float | None) -> None:
+        """Leave `source.py` at the stage's best accepted commit rather than at HEAD.
+
+        A no-op when they are already the same code, which is the common case. Reported rather than
+        silent: a reader who sees the headline number has to be able to tell that the file beside it
+        was moved to match, and from where.
+        """
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True)
+        if head.returncode == 0 and head.stdout.strip().startswith(commit[:12]):
+            return
+        current = (repo / "source.py").read_text() if (repo / "source.py").is_file() else None
+        shown = subprocess.run(["git", "show", f"{commit}:source.py"], cwd=repo,
+                               capture_output=True, text=True)
+        if shown.returncode != 0 or shown.stdout == current:
+            return
+        (repo / "source.py").write_text(shown.stdout)
+        shown_value = f"{value:g} ms" if value is not None else "the best accepted result"
+        # Its own commit rather than `_restore_commit`, whose message says "start from" — this is the
+        # stage finishing, not a round beginning. The identity flags match `_commit_tree`: a host with
+        # no configured `user.email` would otherwise fail the commit and leave the tree dirty.
+        self._commit_tree(
+            repo, f"stage 5: deliver {commit[:12]}, the best accepted iteration ({shown_value})",
+        )
+        self.console.print(
+            f"  [dim]source.py moved to {commit[:12]}, the best accepted iteration ({shown_value}); "
+            f"HEAD held a slower accepted candidate within the regression allowance[/dim]"
         )
 
     def _seed_baseline_verdict(self, repo: Path, stage: str) -> None:
@@ -931,21 +992,52 @@ class Pipeline:
         }, indent=2))
 
         for name in self.CARRIED_FORWARD:
-            archived = destination / name
-            if not archived.is_dir():
-                continue
             live = state / name
-            live.mkdir(parents=True, exist_ok=True)
-            for item in archived.iterdir():
-                target = live / item.name
-                if item.is_dir():
-                    shutil.copytree(item, target, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, target)
-            self.console.print(f"  [dim]carried {name}/ forward into round {number + 1}[/dim]")
+            archived = destination / name
+            # Stamped with the round that wrote them, *before* the next round starts. Iteration
+            # numbering restarts at 1 each round, so a carried-forward `iter-3.md` is the exact name
+            # the new round's third iteration writes: round 2 overwrote round 1's notes for
+            # iterations 1-4 and two of them are simply gone, which is evidence the feedback agent
+            # was meant to reconcile. The suffix goes after the number so `_iteration_order` still
+            # sorts a carried note next to the same iteration's new one.
+            carried = self._stamp_round(live, number)
+            if archived.is_dir():
+                live.mkdir(parents=True, exist_ok=True)
+                for item in archived.iterdir():
+                    target = live / item.name
+                    if item.is_dir():
+                        shutil.copytree(item, target, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, target)
+                carried += self._stamp_round(live, number)
+            if carried:
+                self.console.print(
+                    f"  [dim]carried {carried} {name[:-1]}(s) forward into round {number + 1}, "
+                    f"stamped round {number}[/dim]"
+                )
 
         self.console.print(f"  round {number} archived at {destination}")
         return number
+
+    @staticmethod
+    def _stamp_round(directory: Path, number: int) -> int:
+        """Rename a round's files so the next round's identical names cannot overwrite them.
+
+        `iter-3.md` becomes `iter-3-round2.md`. Already-stamped files are left alone, so rolling a
+        third round does not produce `iter-3-round2-round3.md`. Returns how many were renamed.
+        """
+        if not directory.is_dir():
+            return 0
+        stamped = 0
+        for item in sorted(directory.iterdir()):
+            if not item.is_file() or re.search(r"-round\d+(?=\.|$)", item.stem):
+                continue
+            target = item.with_name(f"{item.stem}-round{number}{item.suffix}")
+            if target.exists():
+                continue
+            item.rename(target)
+            stamped += 1
+        return stamped
 
     def _restore_commit(self, repo: Path, commit: str, round_number: int) -> None:
         """Put `source.py` at `commit` and commit it, so the loop starts on a clean tree.

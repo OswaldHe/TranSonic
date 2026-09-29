@@ -23,6 +23,7 @@ instead is `validate_report`: the structure is checkable, the claims are not.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -82,9 +83,38 @@ def corpus(*repos: Path) -> dict[str, list[Path]]:
             directory = repo / ".autohelix" / kind
             if directory.is_dir():
                 files += sorted(directory.glob("*.md"), key=_iteration_order)
+            # And every archived round's copy. `rerun-full` restarts iteration numbering at 1, so
+            # before the files were stamped with their round a second round's `iter-3.md` landed on
+            # the first round's. This agent's whole job is to reconcile the run's history, so reading
+            # only the live directories made it silently blind to every round but the last.
+            for round_dir in sorted((repo / ".autohelix" / "archive").glob("*")):
+                archived = round_dir / kind
+                if (round_dir / "round.json").is_file() and archived.is_dir():
+                    files += sorted(archived.glob("*.md"), key=_iteration_order)
         if files:
-            found[repo.name] = files
+            found[repo.name] = _deduplicate(files)
     return found
+
+
+def _deduplicate(files: list[Path]) -> list[Path]:
+    """Drop files whose contents another entry already carries.
+
+    A carried-forward note exists both in the live directory and in its round's archive, and the
+    corpus is fed to an agent by the word — paying twice for the same note costs budget and invites
+    it to read one round's finding as two independent ones.
+    """
+    kept: list[Path] = []
+    seen: set[str] = set()
+    for path in files:
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if digest in seen:
+            continue
+        seen.add(digest)
+        kept.append(path)
+    return kept
 
 
 def _iteration_order(path: Path) -> tuple[int, str]:

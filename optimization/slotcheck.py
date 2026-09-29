@@ -45,20 +45,50 @@ CHECKER_TIMEOUT_SECONDS = 120
 GUARDED_FILES = ("source.py", "inference.py")
 
 
-def _repo_fingerprint(repo: Path) -> dict[str, str]:
-    """Content hashes of the files a checker may not change."""
-    seen: dict[str, str] = {}
+def _snapshot(repo: Path) -> dict[str, bytes]:
+    """The contents of the files a checker may not change.
+
+    Contents, not hashes. Detecting the mutation is not enough: on an advisory iteration the run
+    continues past the violation, so the mutated file is what the gate then measures. Restoring it
+    needs the bytes.
+    """
+    kept: dict[str, bytes] = {}
     for name in GUARDED_FILES:
         path = repo / name
         if path.is_file():
-            seen[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return seen
+            kept[name] = path.read_bytes()
+    return kept
+
+
+def _repo_fingerprint(repo: Path) -> dict[str, str]:
+    """Content hashes of the files a checker may not change."""
+    return {name: hashlib.sha256(body).hexdigest() for name, body in _snapshot(repo).items()}
 
 
 def _mutations(before: dict[str, str], after: dict[str, str]) -> list[str]:
     """Which guarded files a checker changed, added or removed."""
     return sorted(name for name in set(before) | set(after)
                   if before.get(name) != after.get(name))
+
+
+def _restore(repo: Path, snapshot: dict[str, bytes], names: list[str]) -> list[str]:
+    """Put the named guarded files back as they were, and report which could not be.
+
+    A file the checker created is deleted; one it edited or removed is rewritten from the snapshot.
+    Failing to restore is worse than the mutation, because the candidate is then neither the agent's
+    nor cleanly rejected — so it is reported rather than swallowed.
+    """
+    failed: list[str] = []
+    for name in names:
+        path = repo / name
+        try:
+            if name in snapshot:
+                path.write_bytes(snapshot[name])
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            failed.append(f"{name} ({exc})")
+    return failed
 
 
 def run_checker(checker: Path, repo: Path, report: Path,
@@ -73,7 +103,8 @@ def run_checker(checker: Path, repo: Path, report: Path,
     if report.exists():
         report.unlink()  # a stale verdict would be read as this iteration's
 
-    before = _repo_fingerprint(repo)
+    snapshot = _snapshot(repo)
+    before = {name: hashlib.sha256(body).hexdigest() for name, body in snapshot.items()}
     try:
         result = subprocess.run(
             [sys.executable, str(checker), "--repo", str(repo), "--json", str(report)],
@@ -92,12 +123,25 @@ def run_checker(checker: Path, repo: Path, report: Path,
     # merged: the program judging the constraint would be able to rewrite what it is judging.
     # Compared by content, so any route to the mutation is caught, not just the ones a static read
     # can name.
+    # Detected *and undone*. Detecting it alone was not enough: an advisory run exits 0 after this
+    # violation by design, so the checker-modified `source.py` went on to be measured by the gate
+    # and could be accepted and merged on a strict improvement. The candidate the gate sees has to
+    # be the agent's, whichever mode the slot is in.
     touched = _mutations(before, _repo_fingerprint(repo))
     if touched:
-        _write(report, False, [
+        unrestored = _restore(repo, snapshot, touched)
+        findings = [
             f"the checker modified {', '.join(touched)}, which its contract forbids. A checker "
             f"reads the candidate and writes only its JSON report.",
-        ])
+        ]
+        findings.append(
+            f"could not be restored: {', '.join(unrestored)}. The candidate in the worktree is "
+            f"neither the agent's nor the checker's, so nothing measured against it means anything"
+            if unrestored else
+            f"restored {', '.join(touched)} from the pre-check snapshot, so what the gate measures "
+            f"is the agent's candidate"
+        )
+        _write(report, False, findings)
         return False, f"checker modified {', '.join(touched)}"
 
     output = result.stdout + result.stderr

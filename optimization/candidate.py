@@ -565,6 +565,25 @@ def projected_units(manifest: dict[str, Any]) -> int:
     return 0
 
 
+def projected_dims(manifest: dict[str, Any]) -> list[str]:
+    """Which dimensions the recorded projection splits, in the order it recorded them.
+
+    Read from ``projection.projected.splits[].dim``, the same nested record `projected_units` reads
+    its count from. The submodule gate compared only the numeric factor, so a declaration could
+    claim `head x4` for an `expert x4` projection: the recipe verifier only asks whether the shards
+    recombine to the golden, and the module gate only asks for correctness and a collective. Nothing
+    downstream recovers the dimension, so the report attributed a kernel for one four-way placement
+    to a different one.
+    """
+    projection = manifest.get("projection") or {}
+    splits = (projection.get("projected") or {}).get("splits") or []
+    dims: list[str] = []
+    for entry in splits:
+        if isinstance(entry, dict) and entry.get("dim"):
+            dims.append(str(entry["dim"]))
+    return dims
+
+
 def recorded_tensors(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """The manifest's tensor record, normalized to ``{relative path: entry}``.
 
