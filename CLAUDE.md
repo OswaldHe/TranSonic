@@ -40,6 +40,12 @@ uv pip install -e ".[dev]"
   `probe` (measure primitives on real silicon), `build` (an agent writes the simulator's
   per-module cost models, then they are frozen by hash), `run` (five iterations editing only
   `floorplan.yaml`), `rank` (a blind agent ranks the top three). See `floorplan/README.md`
+- `optimization/` - the optimization pipeline (`autohelix optimize`): makes one bootstrapped
+  module fast on a single device. Six stages — `init` (project the floorplan's placement onto
+  one device), `submodule` (an agent cuts the module to one rank), `run` (N iterations under a
+  per-iteration constraint schedule), `assemble` (an agent rejoins the ranks with
+  `nki.collectives`), `run-full`, `feedback` (an agent reconciles both loops' notes into a report
+  of what blocked further optimization). See `optimization/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -60,6 +66,7 @@ autohelix report       # Agent-written analysis of the run
 autohelix partition    # Model partitioning / tracing / verification (see partition/)
 autohelix bootstrap    # Bootstrap a Trainium NKI kernel for one module (see bootstrap/)
 autohelix floorplan    # Decide what runs where on a Trainium instance (see floorplan/)
+autohelix optimize     # Make one bootstrapped module fast on one device (see optimization/)
 ```
 
 ## Testing
@@ -69,6 +76,7 @@ pytest                    # run all fast tests
 pytest -k partition       # just the model-partitioning suite (no network, no GPU)
 pytest -m bootstrap       # just the NKI bootstrap suite (no network, no device)
 pytest -m floorplan       # just the floorplan suite (no network, no device)
+pytest -m optimization    # just the optimization suite (no network, no device)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers
@@ -97,3 +105,21 @@ User-facing docs are plain markdown in `docs/` (see `docs/README.md` for the ind
 - **Editable install:** the package is installed with `pip install -e .`, so edits under `src/autohelix/` are live immediately — no reinstall needed. Only re-run `pip install -e .` if `pyproject.toml` dependencies or console-script entry points change.
 - **Agent edits the main repo instead of the worktree:** iterations run in a git worktree, but if an editable install (`.pth`) or a hardcoded absolute path resolves imports/writes back to the *main* repo, the iteration is rejected with "Main repo has uncommitted changes." Keep per-iteration writable paths inside the worktree, and put long-lived outputs (models, large artifacts) at a fixed absolute path *outside* the repo entirely.
 - **Resetting a run is not just `autohelix clear`:** `clear` only archives `.autohelix/` run state — it does NOT touch code or external outputs. A full reset = `clear` + `git reset --hard <initial-commit>` (roll back the agent's per-iteration commits) + delete any outputs written outside the repo (e.g. model checkpoints). Then the tree must be committed-clean or `run` refuses to start. See "Resetting a run" in README.md.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues on `OswaldHe/TranSonic`, via the `gh` CLI. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+`CONTEXT.md` (the glossary) and `docs/adr/` (decisions, each with the alternative it rejected) at the
+repo root. Read them when naming a new concept, when a term in the code reads as ambiguous, or before
+a decision that is hard to reverse. Layout and consumer rules: `docs/agents/domain.md`.

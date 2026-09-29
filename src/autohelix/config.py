@@ -60,6 +60,10 @@ DEFAULT_CHECK_TIMEOUT = 1800
 KNOWN_TOP_LEVEL_KEYS = {
     "goal", "constraints", "constraint", "metrics", "observables",
     "scope", "agent", "acceptance", "budget", "reviewer",
+    # Read by `optimization/` rather than by Config: a per-iteration constraint schedule is
+    # specific to that pipeline, and putting a field for it on the shared dataclass would hand
+    # the concept to every AutoHelix user. Listed here so it does not warn as a typo.
+    "iteration_constraints",
 }
 
 

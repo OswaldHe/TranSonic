@@ -4,6 +4,111 @@
 
 ### Added
 
+- `autohelix optimize`: a five-stage pipeline that makes one bootstrapped module fast on a
+  single Trainium device. `init` projects the module's floorplan placement onto the one
+  device available and records what that cost; `submodule` has an agent cut the module down
+  to the part one NeuronCore runs, accepted by a seven-check module-agnostic gate; `run`
+  loops on that rank under a per-iteration constraint schedule; `assemble` has an agent
+  rejoin the ranks with `nki.collectives`, accepted by a nine-check gate that compares the
+  reassembled output against the bootstrapped module's own recorded golden and holds it to
+  two latency bounds; `run-full` loops on the whole module. See `optimization/README.md`.
+- `autohelix optimize feedback`, a sixth and final stage. One agent reads every note and review
+  both loops wrote — about 83,000 words for the MoE run — reconciles the places where they
+  contradict each other, and writes `FEEDBACK.md`: what stopped the kernel getting faster, as a
+  table of blockers each classified by who would have to fix it (**L0** a toolchain bug, where the
+  documentation or API claims the device supports something it does not; **L1** a missing software
+  feature in the compiler or programming interface; **L2** missing silicon). Every row carries the
+  profiling scenario in detail, a runnable reproduction under `feedback-repro/`, the mechanism in
+  plain words, links into the Neuron documentation and issue tracker, and a specific suggestion.
+  The corpus is self-contradictory by construction — each note was written before the run ended, so
+  iteration 2's theory is disproved by iteration 7 — and the prompt makes the reconciliation rules
+  explicit: a measurement beats an inference, recency alone settles nothing, an unsettled conflict
+  is filed as unsettled with the measurement that would settle it. The agent is asked to run the
+  `domain-modeling` skill and write against `CONTEXT.md`, because "core", "rank", "unit" and
+  "block" each mean at least two things in this toolchain and the report is read by people who were
+  not on the run. It measures nothing and edits no repository, so it has no gate:
+  `feedback.validate_report` checks the report's shape (a level in range, a reproduction file that
+  exists, a link per row) and nothing checks whether a finding is true, because nothing could.
+- Per-iteration constraint enforcement. A slot names its iterations with `at: 5` (one),
+  `from`/`to` (a range) or `iterations: [1, 3, 5]` (a set), and carries `enforcement: hard|soft|off`.
+  `hard` rejects the iteration; `soft` checks and records without rejecting, but costs the
+  regression slack — a candidate that missed its constraint has to be correct and *strictly faster*
+  than the best so far, which is what stops a soft constraint being no constraint; `off` is prompt
+  guidance nothing checks. `soften_last` (default true) drops a hard slot's last iteration to soft,
+  so one slot per iteration with `soften_last: false` is a constraint with no escape at all. The
+  older `enforce: true|false` still works and means `hard|off`. Both loop stages read a schedule;
+  stage 5's is empty by default because the first round has nothing to go on.
+- `autohelix optimize rerun-full`, another round of the whole-module loop starting from the kernel
+  the last round produced. The first round's notes are where the second round's ideas come from, so
+  this starts from the previous round's *best accepted commit* rather than `HEAD` (regression slack
+  can leave `HEAD` slower), re-measures that kernel's baseline with the gate rather than trusting a
+  verdict describing different code, and recompiles the checkers from whatever the prose now says.
+  The old round's run state is archived to `.autohelix/archive/<timestamp>/` through the same
+  `archive_state` that `autohelix clear` uses, so there is one convention rather than two, and the
+  pipeline's own per-round records — the stage summary, the candidate archive, the compiled checkers —
+  go into the same directory. `notes/` and `reviews/` are copied back afterwards, because the next
+  agent reading them is the point; `observations/`, `logs/` and `output/` are not, because they
+  belong to the round that produced them.
+- Per-iteration soft constraints, in `optimization.yaml` as `iteration_constraints:` slots
+  of prose. Early iterations are held to NKI alone, middle ones opened to torch, a pair left
+  unconstrained for aggressive exploration, and the last ones returned to the disciplined
+  regime — because ten iterations of "do whatever you like" converge on whatever the first
+  one happened to try. A *constraint compiler* agent runs once before the loop and turns
+  each slot's prose into a checker script the optimizing agent never sees; the prose goes
+  into that iteration's prompt, and a candidate that does not follow it is rejected by a
+  static check before the device run rather than after it.
+- `optimization/recipe.py` checks a declared cut arithmetically without knowing what the
+  module computes: the per-rank goldens the stage-2 agent dumped, combined the way it
+  declared, must reproduce the module's recorded output. That catches a cut which drops a
+  shard, double-counts a shared path or shards along the wrong axis — the class of error
+  that would otherwise survive a whole optimization loop — while leaving *how* to cut the
+  module entirely to the agent, so the pipeline is not shaped around one architecture.
+- `optimization/projection.py` narrows an oversized floorplan placement to what one device
+  holds, dropping activation-only factors before narrowing weight-partitioning ones. Needed
+  because in the shipped DeepSeek schemes only 182 of 271 placements fit one device: all 43
+  `.ffn`, all 43 `.attention` and `lm_head` span two, and both Engram tables span four. The
+  projection is reported as a divergence from the ranked plan, with the per-core weight
+  residency it costs.
+- `source.py` and `inference.py` are carried into an optimization repo with their comments and
+  docstrings removed. They were written by an earlier agent and are its claims about the hardware
+  and the compiler, indistinguishable at a glance from established fact, and the next agent will
+  design around a wrong one without testing it — this repository's own `floorplan/README.md` claim
+  that NKI 0.6.0 has no collective primitive is the worked example. The frozen references,
+  `vendor/` and `compat/` keep theirs: that code is the specification, not inference.
+- On a constraint slot's last iteration the constraint is checked but no longer fatal — it runs
+  *advisory*. A candidate that still misses it, passes the correctness gate and is *strictly faster*
+  than the best so far is kept — by then the agent has had every iteration that slot allows, and
+  discarding something correct and faster buys nothing. It forfeits the regression slack a compliant
+  iteration gets (`acceptance.max_regression_pct`), so the escape is earned rather than taken.
+- The gate's own first contact with reality. A real run of stage 2 reached 5 of 7 checks and failed
+  on two checker bugs rather than on the candidate: a literal `"/"` used as a `str.join` separator
+  was read as an absolute path, and 586 provenance findings came from a manifest shape the prompt
+  had never specified. Both are fixed — the tensor record is now read keyed by path, keyed by name
+  or as a list, and the prompt states the shape — and both now have tests, because a gate that
+  enforces what its prompt does not state is a trap rather than a requirement.
+- Also from that run: a rank's partial legitimately has the reference's flattened `(tokens, dim)`
+  shape where the module's golden is `(batch, tokens, dim)`, so the reassembly check reshapes when
+  the element count matches; and `NEURON_RT_VISIBLE_CORES` is how a single-core run pins itself to a
+  core, so only a widened `NEURON_RT_NUM_CORES` is refused now.
+- Hardened the places where the gates could be satisfied without the work. Collective calls are
+  resolved through the file's import table, so `import torch.distributed as ncc; ncc.all_reduce(...)`
+  no longer reads as the NKI collective. The reassembly check requires one distinct golden per rank
+  and refuses the module's own recorded output as a shard, closing the path where a declaration
+  reproduces the target without involving any rank. Non-finite marker values are dropped rather than
+  parsed, since `nan` defeats every comparison that guards the pipeline. The preparation agents no
+  longer own the manifest fields the gates read back. And the assembly's rank count comes from the
+  recorded projection instead of a hardcoded four, which a one- or two-unit placement could never
+  have satisfied.
+- Fixed the candidate archive, which retained nothing: it read each iteration back out of its branch
+  after the loop, and `Sandbox.remove_worktree` deletes that branch inside the iteration. Candidates
+  are now captured in the last moment the worktree exists.
+- Reviewers get 2000 seconds. Reviewing a kernel here means reading a few hundred lines of NKI
+  against a reference and forming an adversarial view of whether the iteration is real, and a
+  reviewer killed mid-read leaves the iteration with no verdict at all.
+- In both loop stages the agent may edit `source.py` alone; `inference.py` is written once
+  by the preparation agent, gated, then frozen, so one iteration's latency is comparable to
+  another's. The metric is read back from the gate's verdict rather than measured again, so
+  the gate is the only thing that runs the candidate.
 - `autohelix floorplan`: a four-stage pipeline that decides how to distribute a
   partitioned model across a Trainium instance's hierarchy — which of the 64 logical
   NeuronCores on a trn2.48xlarge holds each module, how each is split and along which
@@ -47,6 +152,31 @@
 
 ### Fixed
 
+- `optimization`: three ways the run's report misled a reader, all found by reading the report the
+  first full MoE run produced. It called the best iteration's figure the collective overhead
+  "against the 10% the gate allows" and printed `-55.7%`, sending a reader to hunt for a bound that
+  was never blown — the bound is tight at assembly and slack afterwards, because the submodule is
+  frozen there while the whole module goes on being optimized past it. The projection section
+  spliced in `FLOORPLAN.md` with its own `#` title, so "What the projection gave up" appeared as a
+  top-level finding of the run. And the constraint schedule cut each slot's prose at its first
+  physical line, ending a table cell mid-sentence with no ellipsis; it now cuts on a word boundary,
+  marks the cut, closes a bold run the cut split, and escapes a pipe that would have broken the row.
+- `optimization`: a wrong number in `projection.py`, which claimed a literal one-device check "fails
+  on 85 of the 89 placements worth optimizing". Counted from the scheme: 271 placements, 182 fit,
+  and all 89 that do not are exactly the interesting ones — every `.ffn`, every `.attention`,
+  `lm_head` and both Engram tables.
+- `optimization`: the constraint compiler was told its checkers had 30 seconds while `run_checker`
+  killed them at 120, so a compiler that budgeted honestly budgeted for the wrong number. The
+  timeout is now interpolated into `CHECKER_CONTRACT` from the one place it is enforced.
+- `optimization`: the loop prompt stated a literal "more than 5% above it is rejected", which is
+  wrong the moment an operator changes `acceptance.max_regression_pct`. It now quotes the configured
+  allowance, and says nothing when no metric gate names the metric.
+- `optimization`: the config template put its `<FILL IN>` hints *inside* the `text: |` blocks of
+  each constraint slot, where a `#` is not a YAML comment but literal prose. A config used as
+  delivered therefore sent "`# <FILL IN: module-specific guidance for iterations 9-10, if any.>`" to
+  the optimizing agent as part of its constraint — the first MoE run did exactly that for four
+  iterations. The hints now sit outside the blocks, and a placeholder surviving into a slot's prose
+  is reported as a warning before the loop starts.
 - `floorplan`: seventeen findings from the review of #5, several of which changed the
   simulator's numbers materially. The cost-model corrections: `stage` now constrains the
   schedule instead of being an inert label, so pipeline depth can move a metric;
@@ -75,6 +205,17 @@
 
 ### Changed
 
+- `CONTEXT.md` at the repo root is the project's glossary, and `docs/adr/` holds the decisions that
+  were hard to reverse and surprising without their reasons. `optimization/` coined a lot of
+  vocabulary and defined none of it; worse, "gate" was doing three jobs — the submodule checker, the
+  whole-module checker, and AutoHelix's `acceptance.metric_gates`. The two gates are now always named
+  apart, and three ADRs record who chooses how a module is cut, why a stage's gate is the only thing
+  that runs a candidate, and what projecting a 16-device placement onto one device gives up.
+- `optimization/gate.py` is `optimization/candidate.py`. It holds what the two gates share and is not
+  itself a gate, which the glossary's own rule forbids; it runs a candidate repository and reads
+  facts out of it. `gate.json` is unchanged — a verdict is written by a gate, so that name was right.
+- "interval" and "range" no longer stand in for **slot** in the code, the tests, the config template
+  or this file. Both are on the term's avoid list now.
 - `floorplan`: batch size is a metric axis. The workload grid is now phase x context length x
   batch size — 1, 4, 8 and 32 samples — so sixteen metrics named
   `{phase}_{context}_b{batch}_ms`, each with its own 10% regression gate. Batch is an axis

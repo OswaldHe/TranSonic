@@ -6,6 +6,16 @@ AutoHelix runs AI agents in a loop — each iteration is isolated in a git workt
 
 See the [main README](../README.md) for an overview, quick start, and the config reference.
 
+## Design records
+
+- **[CONTEXT.md](../CONTEXT.md)** — the glossary. Every term this project coined, and for each one
+  the synonyms to avoid. Read it before naming a new concept, and when a term in the code reads as
+  ambiguous — `gate` alone was doing three jobs until it was split here.
+- **[docs/adr/](adr/)** — decisions that were hard to reverse and surprising without their reasons,
+  each with the alternative that was rejected and why. Three so far, all from `optimization/`:
+  who chooses how a module is cut, why a gate is the only thing that runs a candidate, and what
+  projecting a 16-device placement onto one device gives up.
+
 ## Guides
 
 - **[Getting Started](getting-started.md)** — install, initialize a project, run your first loop
@@ -25,3 +35,7 @@ See the [main README](../README.md) for an overview, quick start, and the config
   partitioned model across a Trainium instance's device / logical-NeuronCore hierarchy,
   by probing the hardware, building a simulator, searching for a deployment, and ranking
   the results
+- **[Module Optimization](../optimization/README.md)** — `autohelix optimize`: make one
+  bootstrapped module fast on a single device, by cutting it down to what one NeuronCore
+  runs, optimizing that under a per-iteration constraint schedule, and rejoining the ranks
+  with `nki.collectives`
