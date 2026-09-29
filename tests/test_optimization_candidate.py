@@ -446,6 +446,82 @@ def test_the_single_core_check_applies_the_shared_core_rule(tmp_path):
     assert any("not the validator's to choose" in f for f in result.findings)
 
 
+def _entry_repo(tmp_path: Path, source: str) -> Path:
+    repo = tmp_path / "sub"
+    repo.mkdir(exist_ok=True)
+    (repo / "source.py").write_text(textwrap.dedent(source))
+    (repo / "inference.py").write_text(textwrap.dedent("""
+        import source
+        from source import kernel
+        RTOL = 0.1
+        def run(x):
+            return kernel(x)
+    """))
+    return repo
+
+
+def test_a_grid_bound_entry_point_is_a_definition(tmp_path):
+    """`kernel = _impl[2]` binds the NKI launch grid at module scope.
+
+    It is how a kernel reaches both physical cores of an LNC=2 pair while the frozen validator
+    still calls `kernel(*args)` with no subscript — verified end to end: the form traces through
+    `torch_neuronx.trace` on a `torch.nn.Module` wrapper and the compiler builds the 2-wide NEFF.
+    Judging the entry point by `FunctionDef` alone rejected it on every iteration, which would have
+    cost the run the 2x that splitting across the two physical cores is worth.
+    """
+    repo = _entry_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        @nki.jit
+        def _impl(x):
+            return x
+
+        kernel = _impl[2]
+    """)
+    result = submodule_checker.check_shape(repo, {"entry_point": "kernel"})
+    assert result.passed, result.findings
+
+
+def test_a_plain_def_entry_point_still_passes(tmp_path):
+    repo = _entry_repo(tmp_path, """
+        import nki
+
+        @nki.jit
+        def kernel(x):
+            return x
+    """)
+    assert submodule_checker.check_shape(repo, {"entry_point": "kernel"}).passed
+
+
+def test_an_annotated_grid_binding_is_also_a_definition(tmp_path):
+    repo = _entry_repo(tmp_path, """
+        import nki
+        from typing import Any
+
+        @nki.jit
+        def _impl(x):
+            return x
+
+        kernel: Any = _impl[2]
+    """)
+    assert submodule_checker.check_shape(repo, {"entry_point": "kernel"}).passed
+
+
+def test_an_entry_point_bound_nowhere_is_still_refused(tmp_path):
+    """The check still has to catch the thing it exists for."""
+    repo = _entry_repo(tmp_path, """
+        import nki
+
+        @nki.jit
+        def _impl(x):
+            return x
+    """)
+    result = submodule_checker.check_shape(repo, {"entry_point": "kernel"})
+    assert not result.passed
+    assert any("defines no top-level 'kernel'" in f for f in result.findings)
+
+
 def test_a_missing_declaration_blocks_the_next_stage(tmp_path):
     repo = tmp_path / "sub"
     repo.mkdir()
