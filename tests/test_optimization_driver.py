@@ -636,6 +636,83 @@ def _violation(iteration, label):
                        findings=["source.py:4 imports torch"])
 
 
+def _reviewer_loop(tmp_path, editable, reviewer_does):
+    """An OptimizationLoop wired just enough to call `run_reviewer`, with upstream's stubbed out.
+
+    The bug this covers is not in the restore logic, which was right — it is that the override read
+    `config.scope.editable`, a path `Config` does not have. The YAML nests it under `scope:` and the
+    dataclass flattens it, so the attribute error fired at the *baseline* review and killed the stage
+    before iteration 1. Nothing tested it because nothing called `run_reviewer`.
+    """
+    from rich.console import Console
+
+    from optimization.loop import OptimizationLoop
+
+    class _Loop(OptimizationLoop):
+        def __init__(self):
+            pass
+
+        def run_reviewer(self, worktree, iteration):  # the override under test
+            return OptimizationLoop.run_reviewer(self, worktree, iteration)
+
+    # Upstream's `run_reviewer` is what the override wraps; this stands in for the agent.
+    from autohelix.harness import Harness
+    original = Harness.run_reviewer
+    Harness.run_reviewer = lambda self, worktree, iteration: (reviewer_does(), True)[1]
+
+    loop = _Loop()
+    loop.config = _FakeConfig()
+    loop.config.editable = editable
+    loop.console = Console(quiet=True)
+    worktree = type("W", (), {"working_dir": tmp_path})()
+    return loop, worktree, (Harness, original)
+
+
+def test_the_reviewer_cannot_replace_the_validated_candidate(tmp_path):
+    gated = "# the kernel the gate measured\n"
+    (tmp_path / "source.py").write_text(gated)
+
+    def edit():
+        (tmp_path / "source.py").write_text("# what the reviewer scribbled\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], edit)
+    try:
+        assert loop.run_reviewer(worktree, 3) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_a_reviewer_that_touches_nothing_leaves_the_candidate_alone(tmp_path):
+    gated = "# untouched\n"
+    (tmp_path / "source.py").write_text(gated)
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], lambda: None)
+    try:
+        assert loop.run_reviewer(worktree, 1) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_an_empty_editable_scope_still_guards_the_deliverables(tmp_path):
+    """`editable` unset means "everything but `frozen`", where guarding nothing would leave the
+    reviewer free to rewrite the files whose hashes are themselves gate checks."""
+    (tmp_path / "source.py").write_text("a\n")
+    (tmp_path / "inference.py").write_text("b\n")
+
+    def edit_both():
+        (tmp_path / "source.py").write_text("x\n")
+        (tmp_path / "inference.py").write_text("y\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, [], edit_both)
+    try:
+        loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == "a\n"
+    assert (tmp_path / "inference.py").read_text() == "b\n"
+
+
 def test_an_end_of_slot_violation_is_kept_when_it_improves(tmp_path):
     """Correct and strictly faster: the constraint shaped the search, and the search is over."""
     from optimization.constraints import Schedule

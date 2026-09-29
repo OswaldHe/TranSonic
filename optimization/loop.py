@@ -36,6 +36,7 @@ from autohelix.dashboard import generate_dashboard
 from autohelix.harness import Harness
 from autohelix.history import IterationResult
 from optimization import constraints as cons
+from optimization import feedback
 
 #: The metric every stage of this pipeline optimizes. Fixed rather than configurable: the
 #: constraint checkers, the latency bounds and the report all name it, and a configurable metric
@@ -333,11 +334,17 @@ class OptimizationLoop(Harness):
         Overridden here rather than in `Harness`, because only this pipeline's contract says the
         measured bytes and the merged bytes must be identical.
         """
-        editable = [
-            worktree.working_dir / name
-            for name in (self.config.scope.editable or [])
-        ]
-        snapshot = {path: path.read_bytes() for path in editable if path.is_file()}
+        # `Config.editable`, flat. The YAML nests it under `scope:`, but the dataclass does not, and
+        # reading `config.scope.editable` raised `AttributeError` at the baseline review — before any
+        # iteration, so the stage died on startup. The fallback covers a config that leaves `editable`
+        # empty (whitelist unset means "everything but `frozen`"), where guarding nothing would leave
+        # the reviewer able to rewrite the very files whose hashes are gate checks.
+        names = list(self.config.editable) or list(feedback.DELIVERABLE_FILES)
+        snapshot = {
+            path: path.read_bytes()
+            for path in (worktree.working_dir / name for name in names)
+            if path.is_file()
+        }
         try:
             return super().run_reviewer(worktree, iteration)
         finally:
