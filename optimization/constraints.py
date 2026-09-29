@@ -686,6 +686,25 @@ It must:
   - exit 0 when the constraint was followed and non-zero when it was not
   - finish well inside {CHECKER_TIMEOUT_SECONDS}s, where it is killed: it reads one file statically
   - never modify anything
+
+Judge the mechanism, at module scope. A fast kernel spreads one mechanism across helper
+functions and across software-pipeline stages, so the parts of it that the constraint names
+routinely sit in different functions from each other, in the order the pipeline needs rather
+than the order the prose lists them. Look for the parts anywhere in `source.py`; a part found in
+a sibling helper, or issued a stage earlier so its result is ready when the next stage reads it,
+is the constraint followed.
+
+Two rules that follow from that, because a checker that breaks either one rejects every
+well-written candidate:
+
+  - Search the whole module for each part, not one function body. "In the same enclosing
+    function as" is not a property the prose asked for.
+  - Take call order and statement order as evidence, never as a requirement. Where the prose
+    says "X then Y", accept any candidate whose X reaches Y through a variable, a buffer or a
+    pipeline stage.
+
+Report what is genuinely absent. If a part appears nowhere in the module, that is a finding; if
+it appears somewhere and reaches the next part, the constraint is met.
 """
 
 #: Either quote style: the checker is Python source, and a dict literal there is as likely to use
