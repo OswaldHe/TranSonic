@@ -140,12 +140,20 @@ class MemorySpec:
 
         raw_path = section.get("path")
         if raw_path is None or not str(raw_path).strip():
-            # A `prompt:` with no `path:` is a block the operator started and did not finish, and
-            # silently ignoring it would put navigation prose in no prompt at all.
-            if str(section.get("prompt") or "").strip():
+            # A block the operator started and did not finish. Refused rather than quietly
+            # disabled, for either half: a `prompt:` with no `path:` puts navigation prose in no
+            # prompt at all, and a selector with no `path:` names iterations that then run with no
+            # memory and no warning — which is the case an operator hits by writing
+            # `iterations:` in a stage and forgetting `path:` in the shared block.
+            started = [
+                key for key in ("prompt", *_SELECTOR_KEYS)
+                if key in section and str(section.get(key) or "").strip() != ""
+            ]
+            if started:
                 raise MemoryError_(
-                    f"{where}: has a 'prompt:' but no 'path:'. The prompt describes how to "
-                    f"navigate a directory, so there has to be a directory"
+                    f"{where}: has {', '.join(repr(k) for k in started)} but no 'path:'. "
+                    f"Set `path:` here or in the shared top-level `memory:` block, or remove "
+                    f"these keys — as written, those iterations would run with no memory"
                 )
             return cls()
         path = Path(str(raw_path)).expanduser()
@@ -247,24 +255,86 @@ def entry_names(memory: Path) -> list[str]:
     return index + [n for n in names if n not in index]
 
 
+def seed_problem(spec: MemorySpec, worktree_dir: Path) -> str | None:
+    """Why this memory cannot be seeded into this worktree, or None when it can.
+
+    The one that matters is containment. `copytree` from a directory that *contains* its own
+    destination copies its own output as it writes it: the recursion only stops at the path-length
+    limit, and what it leaves behind first is a deeply nested partial tree and a lot of disk. An
+    operator reaches this by pointing `path:` at the workspace root, or at the module repo, rather
+    than at a directory beside them — which is a plausible mistake, not a contrived one.
+    """
+    if not spec.enabled:
+        return None
+    try:
+        source = spec.path.resolve()
+        target = (Path(worktree_dir) / SEEDED_REL).resolve()
+    except OSError as exc:  # pragma: no cover - a path that cannot be resolved at all
+        return f"memory.path {spec.path} could not be resolved: {exc}"
+    if source == target:
+        return f"memory.path {spec.path} *is* the seed destination"
+    if target.is_relative_to(source):
+        return (
+            f"memory.path {spec.path} contains the worktree, so copying it would copy its own "
+            f"output into itself. Point it at a directory beside the workspace root, not at one "
+            f"above it"
+        )
+    if source.is_relative_to(target):
+        return (
+            f"memory.path {spec.path} is inside the seed destination {SEEDED_REL}, which is "
+            f"replaced on every seed"
+        )
+    if not source.is_dir():
+        return f"memory.path {spec.path} is not a readable directory"
+    return None
+
+
+def unlock(worktree_dir: Path) -> None:
+    """Give the write bits back to a seeded tree, so it can be removed.
+
+    `seed` takes the directory bits away as well as the files' — on Unix, write permission on the
+    containing directory is enough to replace a `0444` file, so files alone do not make a snapshot
+    read-only. The cost is that anything which later *deletes* the tree needs them back:
+    `git worktree remove --force`, `shutil.rmtree`, and `seed`'s own replacement of a previous
+    copy. Called from all three, so read-only never turns into a teardown failure.
+    """
+    root = Path(worktree_dir) / SEEDED_REL
+    if not root.exists():
+        return
+    try:
+        for path in [root, *root.rglob("*")]:
+            if path.is_dir():
+                path.chmod(0o755)
+    except OSError:
+        pass
+
+
 def seed(spec: MemorySpec, worktree_dir: Path) -> int:
     """Copy the memory into a worktree, read-only. Returns files seeded, 0 when there is nothing.
 
-    Best-effort, like bootstrap's: a memory directory that cannot be read is a degraded iteration,
-    not a failed one, and an iteration that lost its notes is still worth running.
+    Read-only means the *directories* too, not only the files. Best-effort otherwise, like
+    bootstrap's: a memory directory that cannot be read is a degraded iteration, not a failed one,
+    and an iteration that lost its notes is still worth running.
     """
+    if seed_problem(spec, worktree_dir) is not None:
+        return 0
     try:
-        if not spec.enabled or not spec.path.is_dir():
-            return 0
         target = Path(worktree_dir) / SEEDED_REL
         if target.exists():
+            unlock(worktree_dir)
             shutil.rmtree(target)
         shutil.copytree(spec.path, target)
         count = 0
-        for path in sorted(target.rglob("*")):
+        # Depth-first, so a directory's contents are chmodded before the directory itself. chmod
+        # on an existing entry needs only ownership, but doing it in this order keeps the tree
+        # traversable at every step and makes the loop easy to reason about.
+        for path in sorted(target.rglob("*"), key=lambda p: len(p.parts), reverse=True):
             if path.is_file():
                 path.chmod(0o444)
                 count += 1
+            elif path.is_dir():
+                path.chmod(0o555)
+        target.chmod(0o555)
         return count
     except OSError:
         return 0

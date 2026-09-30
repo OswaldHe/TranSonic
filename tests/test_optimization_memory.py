@@ -9,6 +9,8 @@ import pytest
 
 from optimization.config import ConfigError, PipelineConfig
 from optimization.memory import (
+    seed_problem,
+    unlock,
     EVERY,
     SEEDED_REL,
     MemoryError_,
@@ -310,3 +312,110 @@ def test_unknown_top_level_memory_is_still_reported(tmp_path, store):
     data["memroy"] = {"path": str(store)}
     with pytest.raises(ConfigError, match="unknown top-level key"):
         PipelineConfig.from_dict(data)
+
+
+# -- PR #7: path safety and real read-only ----------------------------------------------
+
+
+def test_a_memory_path_containing_the_worktree_is_refused(tmp_path):
+    """`copytree` from a directory that contains its destination copies its own output."""
+    worktree = tmp_path / "root" / "repo"
+    worktree.mkdir(parents=True)
+    spec = MemorySpec(path=tmp_path / "root", every=True)     # an ancestor of the worktree
+
+    problem = seed_problem(spec, worktree)
+
+    assert problem is not None and "contains the worktree" in problem
+    assert seed(spec, worktree) == 0
+    assert not (worktree / SEEDED_REL).exists()
+
+
+def test_a_memory_path_that_is_the_destination_is_refused(tmp_path):
+    worktree = tmp_path / "wt"
+    (worktree / SEEDED_REL).mkdir(parents=True)
+    spec = MemorySpec(path=worktree / SEEDED_REL, every=True)
+    assert "is* the seed destination" in seed_problem(spec, worktree).replace("*", "*")
+
+
+def test_a_memory_path_inside_the_destination_is_refused(tmp_path):
+    worktree = tmp_path / "wt"
+    inner = worktree / SEEDED_REL / "old"
+    inner.mkdir(parents=True)
+    spec = MemorySpec(path=inner, every=True)
+    assert "inside the seed destination" in seed_problem(spec, worktree)
+
+
+def test_a_sibling_memory_path_is_fine(tmp_path, store):
+    """The shape this pipeline actually uses: <root>/memory beside <root>/<module>-rank0."""
+    worktree = tmp_path / "runs" / "layers-1-ffn-rank0" / ".autohelix" / "worktrees" / "iter-1"
+    worktree.mkdir(parents=True)
+    spec = MemorySpec(path=store, every=True)
+    assert seed_problem(spec, worktree) is None
+    assert seed(spec, worktree) == 4
+
+
+def test_seeded_directories_are_read_only_not_just_the_files(tmp_path, store):
+    """Write permission on a directory is enough to replace a 0444 file inside it."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    seed(MemorySpec(path=store, every=True), worktree)
+
+    landed = worktree / SEEDED_REL
+    for path in [landed, *landed.rglob("*")]:
+        assert not path.stat().st_mode & 0o222, f"{path} is writable"
+
+    # The property that matters: a new entry cannot be created beside a read-only file, which is
+    # how an atomic-save editor would otherwise replace one.
+    with pytest.raises(PermissionError):
+        (landed / "submodule" / "sneaked.py").write_text("x")
+
+
+def test_unlock_makes_the_tree_removable_again(tmp_path, store):
+    """Read-only must not turn into a teardown failure: `git worktree remove` has to succeed."""
+    import shutil as sh
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    seed(MemorySpec(path=store, every=True), worktree)
+
+    with pytest.raises(OSError):
+        sh.rmtree(worktree / SEEDED_REL)
+
+    unlock(worktree)
+    sh.rmtree(worktree / SEEDED_REL)
+    assert not (worktree / SEEDED_REL).exists()
+
+
+def test_reseeding_over_a_read_only_copy_still_replaces_it(tmp_path, store):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    spec = MemorySpec(path=store, every=True)
+    seed(spec, worktree)
+    (store / "submodule" / "source.py").unlink()
+
+    assert seed(spec, worktree) == 3
+    assert not (worktree / SEEDED_REL / "submodule" / "source.py").exists()
+
+
+# -- PR #7: a selector with no path -----------------------------------------------------
+
+
+@pytest.mark.parametrize("block", [
+    {"iterations": [1, 2]}, {"at": 3}, {"from": 1, "to": 2}, {"iterations": EVERY},
+])
+def test_a_selector_with_no_path_anywhere_is_refused(tmp_path, block):
+    """The operator named iterations; running them with no memory and no warning is the bug."""
+    data = _pipeline(tmp_path, block)
+    with pytest.raises(ConfigError, match="no 'path:'"):
+        PipelineConfig.from_dict(data)
+
+
+def test_a_selector_with_an_inherited_path_is_fine(tmp_path, store):
+    data = _pipeline(tmp_path, {"iterations": [1, 2]})
+    data["memory"] = {"path": str(store), "prompt": "x"}
+    assert PipelineConfig.from_dict(data).submodule.memory.reads_at(1)
+
+
+def test_an_empty_memory_block_is_still_just_disabled(tmp_path):
+    data = _pipeline(tmp_path, {})
+    config = PipelineConfig.from_dict(data)
+    assert not config.submodule.memory.enabled

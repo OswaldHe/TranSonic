@@ -228,6 +228,19 @@ A missing directory is a **warning, not a refusal**: the config is written befor
 assembled, and refusing to start over a directory iteration 4 will read is the worse failure. The
 loop says out loud how many files it seeded, or that it seeded none.
 
+Two things about it are less obvious than they look:
+
+- **Read-only means the directory bits too.** On Unix, write permission on the containing directory
+  is enough to replace a `0444` file, so chmodding files alone does not make a snapshot. The
+  directories go to `0555` as well — which means anything that later *deletes* the tree needs them
+  back, so `mem.unlock` is called from the `remove_worktree` wrapper, from `rmtree`, and from
+  `seed`'s own replacement of a previous copy.
+- **A `path` that contains the worktree is refused.** `copytree` from a directory that contains its
+  own destination copies its own output as it writes it, stopping only at the path-length limit
+  after leaving a deep partial tree behind. An operator reaches this by pointing `path:` at the
+  workspace root instead of at a directory beside it, so `seed_problem` names that case
+  specifically rather than reporting a generic "nothing seeded".
+
 ## The frozen validator
 
 In both loop stages `scope.editable` is `[source.py]` and **`inference.py` is frozen** — written by
@@ -247,6 +260,15 @@ And the **metric is read back from the gate's verdict** rather than measured aga
 (`optimization.readback`), because the stage's gate is the only thing that runs the candidate. Why
 that is worth the one wrinkle it introduces at iteration 0:
 [ADR 0002](../docs/adr/0002-a-stages-gate-is-the-only-thing-that-runs-a-candidate.md).
+
+**The reviewer is held to the same scope, commits included.** It is a second write-capable agent in
+the same worktree, and it runs *after* `uncommit_agent_changes`, the scope reversion, the
+constraints and the metrics — so anything it writes lands on a candidate that is already gated.
+`OptimizationLoop.run_reviewer` therefore gives it the agent's three steps in the agent's order:
+reopen its commits, revert what is outside the scope, then restore the deliverables' bytes. All
+three are needed. `merge_worktree` only *stages* the editable files for its own commit, but it
+finishes with `git merge <worktree.branch>`, and that carries every commit already on the branch —
+so a reviewer commit reaches the deliverable by a route a working-tree restore cannot see.
 
 ## The two gates
 

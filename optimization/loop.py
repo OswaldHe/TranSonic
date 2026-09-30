@@ -149,6 +149,13 @@ class OptimizationLoop(Harness):
         """Copy the memory in for an iteration that reads it, and return its prompt block."""
         if not self.memory.reads_at(iteration):
             return ""
+        # Checked before copying, and reported as itself. "Nothing seeded" for a path that contains
+        # the worktree would send the operator looking for an empty directory, when what actually
+        # happened is that the copy was refused to stop it recursing into its own output.
+        problem = mem.seed_problem(self.memory, worktree_dir)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] memory: {problem}")
+            return ""
         seeded = mem.seed(self.memory, worktree_dir)
         if seeded:
             self.console.print(
@@ -390,18 +397,61 @@ class OptimizationLoop(Harness):
         try:
             return super().run_reviewer(worktree, iteration)
         finally:
-            changed = [
-                path for path, body in snapshot.items()
-                if not path.is_file() or path.read_bytes() != body
-            ]
-            for path in changed:
-                path.write_bytes(snapshot[path])
-            if changed:
-                self.console.print(
-                    f"  [yellow]![/yellow] the reviewer modified "
-                    f"{', '.join(p.name for p in changed)} and it was restored: the candidate that "
-                    f"is merged has to be the one the gate measured"
-                )
+            self._undo_reviewer_writes(worktree, snapshot)
+
+    def _undo_reviewer_writes(self, worktree, snapshot: dict[Path, bytes]) -> None:
+        """Put the worktree back to the bytes the gate measured, commits included.
+
+        A byte snapshot of the deliverables is not enough on its own. `Harness.run_iteration` runs
+        the reviewer *after* `uncommit_agent_changes` and `revert_out_of_scope` have already
+        happened, and then `Sandbox.merge_worktree` does `git merge <worktree.branch>` — so while
+        that merge only *stages* the editable files for its own commit, the merge itself carries
+        every commit already on the branch. A reviewer that commits therefore reaches main with
+        whatever it touched, in scope or out, and the working-tree restore below never sees it.
+
+        So the reviewer gets the same three steps the agent gets, in the same order: reopen its
+        commits, revert what is outside the scope, then restore the deliverables it was allowed to
+        touch but must not have changed.
+        """
+        commits = 0
+        try:
+            commits = self.sandbox.uncommit_agent_changes(worktree)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            # Loud, because this is the step that stands between a reviewer commit and the main
+            # branch. The iteration is still merged — the reviewer is advisory upstream — but the
+            # operator has to be able to see that the guard did not run.
+            self.console.print(f"  [red]![/red] could not reopen reviewer commits: {exc}")
+        if commits:
+            self.console.print(
+                f"  [yellow]![/yellow] the reviewer created {commits} commit(s); reopened so scope "
+                f"enforcement sees them instead of `git merge` carrying them into the deliverable"
+            )
+        try:
+            effective = self.sandbox.resolve_editable(
+                self.config.editable, self.config.frozen, cwd=worktree.working_dir,
+            )
+            if effective is not None:
+                reverted = self.sandbox.revert_out_of_scope(worktree, effective)
+                if reverted:
+                    self.console.print(
+                        f"  [yellow]![/yellow] the reviewer touched "
+                        f"{', '.join(sorted(reverted)[:6])} outside the editable scope; reverted"
+                    )
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            self.console.print(f"  [red]![/red] could not revert the reviewer's out-of-scope work: {exc}")
+
+        changed = [
+            path for path, body in snapshot.items()
+            if not path.is_file() or path.read_bytes() != body
+        ]
+        for path in changed:
+            path.write_bytes(snapshot[path])
+        if changed:
+            self.console.print(
+                f"  [yellow]![/yellow] the reviewer modified "
+                f"{', '.join(p.name for p in changed)} and it was restored: the candidate that "
+                f"is merged has to be the one the gate measured"
+            )
 
     # -- candidate archive ---------------------------------------------------------
 
@@ -471,6 +521,11 @@ class OptimizationLoop(Harness):
                     self._captured_source[iteration] = source.read_text()
             except OSError:
                 pass
+            # The seeded memory is read-only down to its directory bits, and both
+            # `git worktree remove --force` and the `shutil.rmtree` behind it need those bits back
+            # to delete what is inside. Given back here, in the same seam, so a read-only snapshot
+            # never turns into a teardown failure that strands a worktree.
+            mem.unlock(Path(worktree_path))
             original(worktree_path)
 
         self.sandbox.remove_worktree = remove  # type: ignore[method-assign]
