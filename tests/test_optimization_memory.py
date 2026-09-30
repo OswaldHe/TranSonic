@@ -9,6 +9,8 @@ import pytest
 
 from optimization.config import ConfigError, PipelineConfig
 from optimization.memory import (
+    NONE,
+    describe_for_preparation,
     seed_problem,
     unlock,
     EVERY,
@@ -184,8 +186,10 @@ def test_missing_directory_warns_rather_than_refusing(tmp_path):
 
 
 def test_path_nobody_reads_warns(store):
-    spec = MemorySpec(path=store, iterations=(), every=False, prompt="x")
-    assert any("no iteration reads it" in w for w in spec.validate())
+    """No loop iteration *and* no preparation agent. With `preparation` on it has a reader."""
+    spec = MemorySpec(path=store, iterations=(), every=False, preparation=False, prompt="x")
+    assert any("nothing reads it" in w for w in spec.validate())
+    assert not MemorySpec(path=store, iterations=(), every=False, prompt="x").validate()
 
 
 def test_empty_prompt_warns(store):
@@ -419,3 +423,90 @@ def test_an_empty_memory_block_is_still_just_disabled(tmp_path):
     data = _pipeline(tmp_path, {})
     config = PipelineConfig.from_dict(data)
     assert not config.submodule.memory.enabled
+
+
+# -- the one-shot preparation agents: stage 2 and stage 4 -------------------------------
+
+
+def test_preparation_defaults_on_when_the_stage_has_memory(store):
+    spec = MemorySpec.from_config({"path": str(store), "at": 1}, max_iterations=5)
+    assert spec.reads_at_preparation
+    assert spec.reads_at(1) and not spec.reads_at(2)
+
+
+def test_preparation_can_be_turned_off_without_touching_the_loop(store):
+    spec = MemorySpec.from_config(
+        {"path": str(store), "iterations": EVERY, "preparation": False}, max_iterations=5,
+    )
+    assert not spec.reads_at_preparation
+    assert spec.reads_at(3)
+
+
+def test_preparation_only_is_expressible(store):
+    """`iterations: none` beside `preparation: true` — build from it, then let the loop start clean."""
+    spec = MemorySpec.from_config(
+        {"path": str(store), "iterations": NONE, "preparation": True}, max_iterations=5,
+    )
+    assert spec.enabled and spec.reads_at_preparation
+    assert not spec.reads_in_loop
+    assert not any(spec.reads_at(i) for i in range(1, 6))
+
+
+def test_nothing_reading_it_is_a_warning(store):
+    spec = MemorySpec.from_config(
+        {"path": str(store), "iterations": NONE, "preparation": False}, max_iterations=5,
+    )
+    assert not spec.enabled
+    assert any("nothing reads it" in w for w in spec.validate())
+
+
+def test_a_non_boolean_preparation_is_refused(store):
+    with pytest.raises(MemoryError_, match="must be true or false"):
+        MemorySpec.from_config({"path": str(store), "preparation": "yes"}, max_iterations=5)
+
+
+def test_the_preparation_block_reads_differently_from_a_loop_block(store):
+    spec = MemorySpec.from_config(
+        {"path": str(store), "prompt": "Open module/ first."}, max_iterations=5,
+    )
+    prep = describe_for_preparation(spec, seeded=4)
+    loop = describe_for_prompt(spec, 1, seeded=4)
+
+    assert "Open module/ first." in prep and "Open module/ first." in loop
+    assert str(SEEDED_REL) in prep
+    # The preparation agent has no gate of its own, and the block has to say so.
+    assert "no gate behind it yet" in prep
+    assert "no gate behind it yet" not in loop
+    # And it is not told about iterations, because it does not have any.
+    assert "iteration" not in prep.lower().replace("iterations could not", "")
+
+
+def test_no_preparation_block_when_it_is_off(store):
+    spec = MemorySpec.from_config({"path": str(store), "preparation": False}, max_iterations=5)
+    assert describe_for_preparation(spec, seeded=4) == ""
+
+
+def test_no_preparation_block_when_nothing_was_seeded(store):
+    spec = MemorySpec.from_config({"path": str(store)}, max_iterations=5)
+    assert describe_for_preparation(spec, seeded=0) == ""
+
+
+def test_preparation_survives_the_round_trip(tmp_path, store):
+    data = _pipeline(tmp_path, {"iterations": NONE, "preparation": True})
+    data["memory"] = {"path": str(store), "prompt": "x"}
+    config = PipelineConfig.from_dict(data)
+
+    payload = config.derive_loop_config("submodule")
+    reparsed = MemorySpec.from_config(payload["memory"], max_iterations=5)
+
+    assert reparsed.reads_at_preparation
+    assert not reparsed.reads_in_loop
+
+
+def test_a_preparation_only_stage_still_emits_a_memory_key(tmp_path, store):
+    """The loop reads this back; a dropped key would make the loop forget the spec exists."""
+    data = _pipeline(tmp_path, {"iterations": NONE})
+    data["memory"] = {"path": str(store), "prompt": "x"}
+    payload = PipelineConfig.from_dict(data).derive_loop_config("submodule")
+    assert payload["memory"]["iterations"] == NONE
+    assert payload["memory"]["preparation"] is True

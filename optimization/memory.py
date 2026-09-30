@@ -52,6 +52,10 @@ SEEDED_REL = Path(".autohelix") / "memory"
 #: not a configuration anybody wants by accident.
 EVERY = "all"
 
+#: `iterations: none` — no loop iteration reads it. Only useful beside `preparation: true`, which
+#: is the "let the one-shot agent see it, leave the loop alone" case.
+NONE = "none"
+
 #: Names an operator's index conventionally takes. Listed first in the prompt's top-level
 #: listing, because the whole point of an index is to be the thing opened first.
 _INDEX_NAMES = ("README.md", "INDEX.md")
@@ -76,18 +80,33 @@ class MemorySpec:
     #: Which iterations read it. Empty tuple with `every=False` means none.
     iterations: tuple[int, ...] = ()
     every: bool = False
+    #: Whether this stage's one-shot *preparation* agent reads it too — stage 2 for `submodule`,
+    #: stage 4 for `full`. Those agents build the repo the matching loop then optimizes, and they
+    #: are the runs that would otherwise re-derive the cut or the collective's placement from
+    #: nothing, so they default to on: having configured memory for a stage, wanting its
+    #: preparation agent blind to it is the unusual ask, not the usual one.
+    preparation: bool = True
     #: Kept so warnings can name the file the operator wrote, not the derived config.
     source: Path | None = field(default=None, compare=False)
 
     @property
     def enabled(self) -> bool:
-        """Whether any iteration reads this. A path with no reader is disabled, not an error."""
+        """Whether anything reads this. A path with no reader at all is disabled, not an error."""
+        return self.path is not None and (self.every or bool(self.iterations) or self.preparation)
+
+    @property
+    def reads_in_loop(self) -> bool:
+        """Whether any loop iteration reads it, as opposed to only the preparation agent."""
         return self.path is not None and (self.every or bool(self.iterations))
 
     def reads_at(self, iteration: int) -> bool:
-        if not self.enabled:
+        if not self.reads_in_loop:
             return False
         return self.every or iteration in self.iterations
+
+    @property
+    def reads_at_preparation(self) -> bool:
+        return self.path is not None and self.preparation
 
     # -- parsing -------------------------------------------------------------------
 
@@ -130,7 +149,7 @@ class MemorySpec:
         if not isinstance(section, dict):
             raise MemoryError_(f"{where}: must be a mapping")
 
-        known = {"path", "prompt", "iterations", "at", "from", "to"}
+        known = {"path", "prompt", "iterations", "at", "from", "to", "preparation"}
         unknown = set(section) - known
         if unknown:
             raise MemoryError_(
@@ -146,7 +165,7 @@ class MemorySpec:
             # memory and no warning — which is the case an operator hits by writing
             # `iterations:` in a stage and forgetting `path:` in the shared block.
             started = [
-                key for key in ("prompt", *_SELECTOR_KEYS)
+                key for key in ("prompt", "preparation", *_SELECTOR_KEYS)
                 if key in section and str(section.get(key) or "").strip() != ""
             ]
             if started:
@@ -161,11 +180,18 @@ class MemorySpec:
             path = (base_dir / path).resolve()
 
         every, iterations = cls._parse_selector(section, max_iterations, where)
+        raw_prep = section.get("preparation", True)
+        if not isinstance(raw_prep, bool):
+            raise MemoryError_(
+                f"{where}: 'preparation' must be true or false (got {raw_prep!r}). It says whether "
+                f"this stage's one-shot preparation agent reads the memory"
+            )
         return cls(
             path=path,
             prompt=str(section.get("prompt") or ""),
             iterations=iterations,
             every=every,
+            preparation=raw_prep,
             source=base_dir,
         )
 
@@ -176,10 +202,15 @@ class MemorySpec:
         """`all`, or the same `at`/`iterations`/`from`/`to` grammar the schedule uses."""
         raw = section.get("iterations")
         if isinstance(raw, str):
-            if raw.strip().lower() != EVERY:
+            word = raw.strip().lower()
+            if word == NONE:
+                # Only useful beside `preparation: true`: let the one-shot agent read the memory
+                # and leave the loop's iterations alone.
+                return False, ()
+            if word != EVERY:
                 raise MemoryError_(
-                    f"{where}: 'iterations' as a string must be '{EVERY}' (got {raw!r}); "
-                    f"otherwise use a list, or 'from'/'to', or 'at'"
+                    f"{where}: 'iterations' as a string must be '{EVERY}' or '{NONE}' "
+                    f"(got {raw!r}); otherwise use a list, or 'from'/'to', or 'at'"
                 )
             return True, ()
         if raw is None and not any(k in section for k in ("at", "from", "to")):
@@ -200,7 +231,15 @@ class MemorySpec:
     def to_payload(self) -> dict[str, Any]:
         """YAML-safe, because `derive_loop_config` writes it and the loop reads it back."""
         payload: dict[str, Any] = {"path": str(self.path)}
-        payload["iterations"] = EVERY if self.every else list(self.iterations)
+        if self.every:
+            payload["iterations"] = EVERY
+        elif self.iterations:
+            payload["iterations"] = list(self.iterations)
+        else:
+            # `[]` would fail the "non-empty list" check on the way back in, and this spec is
+            # reachable: `iterations: none` with `preparation: true`.
+            payload["iterations"] = NONE
+        payload["preparation"] = self.preparation
         if self.prompt:
             payload["prompt"] = self.prompt
         return payload
@@ -218,8 +257,8 @@ class MemorySpec:
         if not self.enabled:
             if self.path is not None:
                 return [
-                    f"memory.path is set to {self.path} but no iteration reads it — "
-                    f"add `iterations: {EVERY}` or a selector"
+                    f"memory.path is set to {self.path} but nothing reads it — add "
+                    f"`iterations: {EVERY}` or a selector, or `preparation: true`"
                 ]
             return []
         found: list[str] = []
@@ -338,6 +377,46 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
         return count
     except OSError:
         return 0
+
+
+def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
+    """The prompt block for a one-shot preparation agent — stage 2's cut, stage 4's assembly.
+
+    Separate from `describe_for_prompt` because the framing is genuinely different. A loop
+    iteration is told "start from this rather than from nothing"; a preparation agent is building
+    the repo the loop will then optimize, so what it wants from the memory is the *shape* the
+    earlier run settled on — which dimension the cut ran along, where the collective ended up —
+    and it has no gate of its own to catch a number it inherited on faith.
+    """
+    if not spec.reads_at_preparation or seeded <= 0:
+        return ""
+    lines = [
+        f"**Earlier work on this module is in `{SEEDED_REL}/`.** {seeded} file(s), read-only. "
+        f"Read it before you design: the run recorded there already settled questions you are "
+        f"about to answer, and the ones it could *not* settle are written down too.",
+        "",
+        _listing(spec),
+    ]
+    if spec.prompt.strip():
+        lines += [spec.prompt.strip(), ""]
+    lines += [
+        "What you are building has no gate behind it yet, so nothing downstream will catch a "
+        "number or a layout you took from there on faith. Use it for the shape of the answer — "
+        "which dimension the cut ran along, what a rank's output is a partial of, where the "
+        "collective ended up — and derive every size, tiling and budget from the repo in front "
+        "of you. Say in your write-up which parts you took from it and which you re-derived.",
+    ]
+    return "\n".join(lines)
+
+
+def _listing(spec: MemorySpec) -> str:
+    """The top-level entries as one prompt line, or empty when the directory is unreadable."""
+    names = entry_names(spec.path) if spec.path else []
+    if not names:
+        return ""
+    shown = ", ".join(f"`{n}`" for n in names[:12])
+    more = f", and {len(names) - 12} more" if len(names) > 12 else ""
+    return f"Top level: {shown}{more}.\n"
 
 
 def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:

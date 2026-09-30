@@ -95,10 +95,10 @@ workspace:
 #  `README.md` indexing them.
 #
 #    path     the directory. Absolute, or relative to THIS file.
-#    prompt   how to navigate it. Goes verbatim into the prompt of every iteration that reads it.
+#    prompt   how to navigate it. Goes verbatim into the prompt of everything that reads it.
 #
-#  Both stages inherit these; each adds its own `iterations:` and may override `prompt:`. A
-#  directory that does not exist yet is a warning, not a refusal.
+#  Both stages inherit these; each adds its own `iterations:` / `preparation:` and may override
+#  `prompt:`. A directory that does not exist yet is a warning, not a refusal.
 #
 # memory:                          ### EDIT ME (optional)
 #   path: ./memory
@@ -222,15 +222,20 @@ submodule:
   #
   # ####################################################################################
 
-  #  Which iterations read the shared `memory:` block at the top of this file, and optionally a
-  #  stage-specific `prompt:` overriding the shared one. Selector grammar is the same as
-  #  `iteration_constraints`: `all` (the default), `[1, 4]`, `from:`/`to:`, `at: 3`.
+  #  Who reads the shared `memory:` block at the top of this file, and optionally a stage-specific
+  #  `prompt:` overriding the shared one.
   #
-  #  Leave the free-exploration slot out: the point of those iterations is to reach something the
-  #  earlier run did not, and handing them its conclusions is how they re-derive it instead.
+  #    iterations   the loop (stage 3). Same grammar as `iteration_constraints`: `all` (the
+  #                 default), `none`, `[1, 4]`, `from:`/`to:`, `at: 3`.
+  #    preparation  stage 2, the one-shot agent that cuts the module to one rank. Default true:
+  #                 it is the run that would otherwise re-derive the cut from nothing.
+  #
+  #  Leave the free-exploration slot out of `iterations`: the point of those iterations is to reach
+  #  something the earlier run did not, and handing them its conclusions is how they re-derive it.
   #
   # memory:                        ### EDIT ME (optional)
   #   iterations: [1, 2]
+  #   preparation: true
   #
   # ####################################################################################
 
@@ -311,10 +316,12 @@ full:
   #      text: |
   #        **Try the thing round 1 could not.** ...
 
-  #  Stage 5's memory. Usually the stage it earns most: the assembly's first iteration is the one
-  #  that would otherwise re-derive the cut, the collective's placement and the rank balance.
+  #  Stage 5's memory, and stage 4's. Usually where it earns most: the assembly is the step that
+  #  would otherwise re-derive the collective's placement and the rank balance from nothing.
+  #  `preparation:` here is stage 4, the assembler; `iterations:` is the stage-5 loop.
   # memory:                        ### EDIT ME (optional)
   #   iterations: [1]
+  #   preparation: true
   #   prompt: |
   #     `module/` is the 4-rank assembly from last round, including the collective's placement.
 

@@ -211,6 +211,35 @@ differs between optimizing one rank and optimizing four. A stage that names any 
 replaces the shared selector **wholesale**, so `iterations: all` at the top level cannot outrank
 `at: 3` in a stage.
 
+### The one-shot preparation agents read it too
+
+`iterations:` governs the loop; `preparation:` governs the **one-shot agent that built the repo the
+loop runs on** — stage 2 under `submodule:`, stage 4 under `full:`. It defaults to **on**, because
+those are the two runs that would otherwise re-derive the cut, or the collective's placement, from
+nothing; having configured memory for a stage, wanting its preparation agent blind to it is the
+unusual ask. `preparation: false` opts out, and `iterations: none` beside it expresses the other
+direction — build the repo from the earlier run, then let the loop start clean.
+
+| | reads `submodule.memory` | reads `full.memory` |
+|---|---|---|
+| stage 2, the cut | `preparation` | |
+| stage 3, one rank | `iterations` | |
+| stage 4, the assembly | | `preparation` |
+| stage 5, four ranks | | `iterations` |
+
+The prompt block differs from the loop's, because the framing does. A loop iteration is told to
+start from this rather than from nothing. A preparation agent is *building* what the loop will be
+judged on and **has no gate of its own yet**, so its block says to take the shape of the answer —
+which dimension the cut ran along, what a rank's output is a partial of, where the collective ended
+up — and to re-derive every size and budget from the repo in front of it, naming in its write-up
+which parts it took and which it re-derived.
+
+`_run_one_shot` runs these agents in the repo itself rather than a worktree, so the memory is seeded
+into the repo and removed in a `finally` once the agent exits — every way out, including a retry.
+Landing under `.autohelix/` is safe either way: `Sandbox.prepare_worktree` copies an explicit
+allowlist (`notes`, `observations`, `logs`, `peer_notes`) that does not include `memory`, so a copy
+left behind could not leak into a later iteration that opted out.
+
 Three deliberate differences from `bootstrap/memory.py`, which carries one module's work to the
 *next module*:
 

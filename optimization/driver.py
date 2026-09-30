@@ -42,6 +42,7 @@ from rich.text import Text
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
+from optimization import memory as mem
 from optimization import feedback as fb
 from optimization.config import GATE_PYTHON, PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
@@ -236,6 +237,37 @@ class Pipeline:
 
     # -- the one-shot preparation agents -------------------------------------------
 
+    def _seed_preparation_memory(self, repo: Path, spec: "mem.MemorySpec") -> str:
+        """Seed the memory for a one-shot preparation agent, and return its prompt block.
+
+        Seeded into the repo itself, because `_run_one_shot` runs the agent there rather than in a
+        worktree. Safe to land under `.autohelix/`: it is gitignored, and `Sandbox.prepare_worktree`
+        copies an explicit allowlist out of it (`notes`, `observations`, `logs`, `peer_notes`) that
+        does not include `memory` — so a copy left here could not leak into a later iteration that
+        opted out. `_drop_preparation_memory` removes it anyway once the agent is done, so the repo
+        the next stage consumes does not carry a second copy or a read-only subtree.
+        """
+        if not spec.reads_at_preparation:
+            return ""
+        problem = mem.seed_problem(spec, repo)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] memory: {problem}")
+            return ""
+        seeded = mem.seed(spec, repo)
+        if seeded:
+            self.console.print(f"  memory: {seeded} file(s) from {spec.path} at {mem.SEEDED_REL}")
+        else:
+            self.console.print(f"  [yellow]![/yellow] memory: nothing seeded from {spec.path}")
+        return mem.describe_for_preparation(spec, seeded)
+
+    def _drop_preparation_memory(self, repo: Path) -> None:
+        """Remove a seeded copy from a repo once its preparation agent has finished."""
+        target = repo / mem.SEEDED_REL
+        if not target.exists():
+            return
+        mem.unlock(repo)
+        shutil.rmtree(target, ignore_errors=True)
+
     def _run_one_shot(
         self, repo: Path, prompt: str, label: str, timeout: str, model: str | None = None,
     ) -> bool:
@@ -266,10 +298,16 @@ class Pipeline:
 
         self.console.print(f"  running the {label} agent (log: {log_path})")
         started = time.monotonic()
-        result = agent.run(
-            worktree_path=repo, prompt=prompt, iteration=0,
-            log_path=log_path, event_callback=on_event, project_path=repo,
-        )
+        try:
+            result = agent.run(
+                worktree_path=repo, prompt=prompt, iteration=0,
+                log_path=log_path, event_callback=on_event, project_path=repo,
+            )
+        finally:
+            # Unconditional and a no-op when nothing was seeded, so every way out of a preparation
+            # attempt — finished, failed, raised, retried — leaves the repo without a stale
+            # read-only copy in it. A retry re-seeds from `_seed_preparation_memory`.
+            self._drop_preparation_memory(repo)
         elapsed = time.monotonic() - started
         if not result.success:
             self.console.print(
@@ -398,12 +436,14 @@ class Pipeline:
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.submodule.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id,
                 "entry_point": "kernel",
                 "dim": (projection.projected[0].dim if projection.projected else "none"),
                 "factor": projection.projected_units,
                 "splits": " * ".join(f.label() for f in projection.projected) or "no split",
+                "memory": memory_block,
             })
             held = custody.take_custody(
                 prepared, custody.SUBMODULE_OWNED,
@@ -747,12 +787,14 @@ class Pipeline:
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.full.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id, "entry_point": "kernel",
                 "ranks": ranks, "last_rank": ranks - 1,
                 "bootstrap_latency": f"{bootstrap_ms:g}",
                 "submodule_latency": f"{submodule_ms:g}",
                 "overhead_ceiling": f"{submodule_ms * 1.10:g}",
+                "memory": memory_block,
             })
             held = custody.take_custody(
                 prepared, custody.MODULE_OWNED,
