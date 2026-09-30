@@ -66,6 +66,19 @@ _INDEX_NAMES = ("README.md", "INDEX.md")
 #: silently outrank `at: 3` in the stage.
 _SELECTOR_KEYS = ("iterations", "at", "from", "to")
 
+#: Said to everything that reads the memory, because the seed is per-run and what an agent leaves
+#: behind is not. A stage-2 agent wrote ``.autohelix/memory/FEEDBACK.md`` rows 2 and 10 into
+#: `source.py` and `SUBMODULE.md` — true while it ran, a dangling path for every later iteration the
+#: operator left out of the selector and for anyone reading the repo afterwards. Nothing had told it
+#: the directory was temporary, so the citation looked like an ordinary cross-reference.
+TRANSIENCE = (
+    "`{rel}/` is seeded for this run only and is gone afterwards; iterations the operator left out "
+    "of the schedule never receive it at all. So do not cite these paths in anything you leave "
+    "behind — not in a comment, not in the repo's docs, not in your notes. Restate what the file "
+    "said, in enough detail to act on, and name the finding rather than where it lives. Someone "
+    "reading without the seed has to be able to follow you."
+)
+
 
 class MemoryError_(ValueError):
     """A memory block that cannot be honoured as written."""
@@ -100,7 +113,10 @@ class MemorySpec:
         return self.path is not None and (self.every or bool(self.iterations))
 
     def reads_at(self, iteration: int) -> bool:
-        if not self.reads_in_loop:
+        # Iterations are 1-based and iteration 0 is the baseline, which has no agent to read
+        # anything — the same rule `_parse_iterations` enforces when an operator writes `at: 0`.
+        # Without this, `iterations: all` claimed to cover iteration 0 as well.
+        if iteration < 1 or not self.reads_in_loop:
             return False
         return self.every or iteration in self.iterations
 
@@ -401,10 +417,16 @@ def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
         lines += [spec.prompt.strip(), ""]
     lines += [
         "What you are building has no gate behind it yet, so nothing downstream will catch a "
-        "number or a layout you took from there on faith. Use it for the shape of the answer — "
-        "which dimension the cut ran along, what a rank's output is a partial of, where the "
-        "collective ended up — and derive every size, tiling and budget from the repo in front "
-        "of you. Say in your write-up which parts you took from it and which you re-derived.",
+        "number or a layout you took from there on faith. Separate the two kinds of thing in "
+        "there. **Sizes** — tile widths, buffer depths, SBUF budgets, loop bounds — were fitted to "
+        "that run's shapes and have to be re-derived from the repo in front of you. **Technique** "
+        "— how a value is decoded, how an axis is laid out, which engine does which pass — is "
+        "usually independent of those shapes, and where it is, port it rather than leaving it for "
+        "the loop to re-earn: the loop has a handful of iterations and you are what it starts "
+        "from. Say in your write-up which you took, which you re-derived, and which you left, "
+        "with the reason.",
+        "",
+        TRANSIENCE.format(rel=SEEDED_REL),
     ]
     return "\n".join(lines)
 
@@ -441,5 +463,7 @@ def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:
         "kernel, and a number that was true then can be false now — your own gate and your own "
         "profile are the only things that decide. Where it records something that *did not* work, "
         "that is the most valuable part: do not spend an iteration rediscovering it.",
+        "",
+        TRANSIENCE.format(rel=SEEDED_REL),
     ]
     return "\n".join(lines)

@@ -228,11 +228,20 @@ direction — build the repo from the earlier run, then let the loop start clean
 | stage 5, four ranks | | `iterations` |
 
 The prompt block differs from the loop's, because the framing does. A loop iteration is told to
-start from this rather than from nothing. A preparation agent is *building* what the loop will be
-judged on and **has no gate of its own yet**, so its block says to take the shape of the answer —
-which dimension the cut ran along, what a rank's output is a partial of, where the collective ended
-up — and to re-derive every size and budget from the repo in front of it, naming in its write-up
-which parts it took and which it re-derived.
+start from this rather than from nothing, and not to re-earn a recorded negative. A preparation
+agent is *building* what the loop will be judged on and **has no gate of its own yet**, so its block
+splits the material in two: **sizes** (tile widths, buffer depths, SBUF budgets, loop bounds) were
+fitted to the earlier run's shapes and must be re-derived, while **technique** (how a value is
+decoded, how an axis is laid out, which engine does which pass) is usually shape-independent and
+should be *ported* rather than left for the loop to re-earn — the loop has a handful of iterations
+and the preparation agent is what it starts from.
+
+Both blocks end with the same warning, and it was added because of a real failure. A stage-2 agent
+cited `.autohelix/memory/FEEDBACK.md rows 2 and 10` in `source.py` and `SUBMODULE.md`: true while it
+ran, a dangling path for every iteration the operator left out of the selector and for anyone
+reading the repo afterwards. Nothing had told it the directory was temporary, so the citation looked
+like an ordinary cross-reference. `TRANSIENCE` now says the seed is per-run, that excluded
+iterations never receive it, and that a finding has to be restated rather than linked.
 
 `_run_one_shot` runs these agents in the repo itself rather than a worktree, so the memory is seeded
 into the repo and removed in a `finally` once the agent exits — every way out, including a retry.
