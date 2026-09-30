@@ -182,6 +182,52 @@ comment — the whole block reaches the agent verbatim — so the template's own
 MoE run sent `# <FILL IN: module-specific guidance for iterations 9-10, if any.>` to the agent as
 part of its constraint for four iterations, which is how this was found.
 
+## Memory: a directory named iterations start from
+
+`memory:` in either stage points at a directory of earlier work. Before each iteration that reads
+it, the directory is copied into the worktree at **`.autohelix/memory/`**, read-only — gitignored
+and outside the editable scope, so the agent can read it and cannot commit it, and a snapshot so it
+cannot change under a running iteration.
+
+```yaml
+memory:                         # shared: both stages inherit these
+  path: ./memory                # absolute, or relative to the config file
+  prompt: |
+    `submodule/` is last round's single-rank kernel; read README.md first.
+
+submodule:
+  memory:
+    iterations: [1, 2, 3]       # `all` (the default), [1, 4], from:/to:, or at: 3
+full:
+  memory:
+    iterations: [1]
+    prompt: |                   # overrides the shared prose for this stage only
+      `module/` is the 4-rank assembly, including where the collective sits.
+```
+
+`path` is written once because both stages of a run read the same directory — it is the same
+module's earlier work. `iterations` and `prompt` stay per-stage because those are exactly what
+differs between optimizing one rank and optimizing four. A stage that names any selector key
+replaces the shared selector **wholesale**, so `iterations: all` at the top level cannot outrank
+`at: 3` in a stage.
+
+Three deliberate differences from `bootstrap/memory.py`, which carries one module's work to the
+*next module*:
+
+- **The operator assembles it.** Nothing is recorded automatically. What is worth carrying into an
+  optimization run is this module's own earlier run — a previous round's `source.py`, both loops'
+  notes and reviews — and which run that is, is a judgement.
+- **It is per-iteration.** An iteration that does not read it is never told the directory exists.
+  Leave the free-exploration slot out: the point of that slot is to reach something the earlier run
+  did not, and handing it the earlier run's conclusions is how it re-derives them instead.
+- **The operator writes the navigation prose.** `prompt` goes into those iterations' prompts
+  verbatim, directly under the pointer. A directory of fifty files with no word on which to open
+  first is one the agent skims and abandons.
+
+A missing directory is a **warning, not a refusal**: the config is written before the memory is
+assembled, and refusing to start over a directory iteration 4 will read is the worse failure. The
+loop says out loud how many files it seeded, or that it seeded none.
+
 ## The frozen validator
 
 In both loop stages `scope.editable` is `[source.py]` and **`inference.py` is frozen** — written by
@@ -319,6 +365,8 @@ optimization/
   slotcheck.py             running a compiled checker, enforcing or advisory
   loop.py                  Harness + the per-iteration constraint, candidate archive, best commit
   constraints.py           the schedule, the compiled checkers, their manifest
+  memory.py                the operator's directory of earlier work: who reads it, how it is
+                           seeded read-only, and the prompt block it produces
   custody.py               holding the fields a gate reads back outside the agent's repo
   candidate.py             running a candidate repo and reading facts out of it: what both
                            gates share (reuses bootstrap/nki_checker's analysis)
@@ -352,7 +400,12 @@ optimization/
   the guard. Clearing write permission covers the shared original too, which is the right outcome.
 - **`iteration_constraints` is read from the raw config, not from `Config`.** It is listed in
   `KNOWN_TOP_LEVEL_KEYS` so it does not warn as a typo, but there is no field for it on the shared
-  dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config.
+  dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config. `memory`
+  is read the same way, for the same reason, and is listed there too.
+- **`memory.path` in the derived config is absolute.** The operator may write it relative to their
+  own config file, and `PipelineConfig.load` resolves it against that file's directory — because the
+  derived config lives beside the *repos*, so a relative path surviving into it would resolve
+  somewhere else entirely.
 - **Preparation agents do not own the fields a gate reads.** They finish the manifest, and the
   tensor record and the declaration are genuinely theirs — but the bar, the golden, the rank count
   and both latency bounds are written by materialization to a copy outside the repo and restored

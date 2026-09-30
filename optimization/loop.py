@@ -36,6 +36,7 @@ from autohelix.dashboard import generate_dashboard
 from autohelix.harness import Harness
 from autohelix.history import IterationResult
 from optimization import constraints as cons
+from optimization import memory as mem
 from optimization import feedback
 
 #: The metric every stage of this pipeline optimizes. Fixed rather than configurable: the
@@ -69,6 +70,7 @@ class OptimizationLoop(Harness):
         self.reports_dir = self.project_path / REPORT_DIR
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.schedule = self._load_schedule()
+        self.memory = self._load_memory()
         self._slot_verdicts: dict[int, cons.SlotVerdict] = {}
         #: Which iteration `_check_metric_gates` is judging. Upstream does not pass it, and the
         #: end-of-slot rule needs to know whose slot verdict to consult.
@@ -94,6 +96,24 @@ class OptimizationLoop(Harness):
             self.console.print(f"  [yellow]![/yellow] {warning}")
         return schedule
 
+    def _load_memory(self) -> mem.MemorySpec:
+        """Parse `memory:` out of the raw config, for the same reason the schedule is read there.
+
+        The path in the derived config is already absolute — `PipelineConfig` resolved it against
+        the operator's config file — so no base directory is needed here.
+        """
+        try:
+            spec = mem.MemorySpec.from_config(
+                (self._raw_config or {}).get("memory"),
+                max_iterations=self.config.max_iterations,
+            )
+        except mem.MemoryError_ as exc:
+            self.console.print(f"  [yellow]![/yellow] memory: {exc}")
+            return mem.MemorySpec()
+        for warning in spec.validate():
+            self.console.print(f"  [yellow]![/yellow] {warning}")
+        return spec
+
     # -- prompt --------------------------------------------------------------------
 
     def build_prompt(self, iteration: int, worktree_dir: Path) -> str:
@@ -104,6 +124,11 @@ class OptimizationLoop(Harness):
 
         variables = build_prompt_variables(self.config, self.history, iteration, worktree_dir)
         variables["iteration_constraint"] = self.schedule.describe_for_prompt(iteration)
+        # Seeded here rather than in `prepare_worktree`, because this is the one hook that knows
+        # both the iteration number and the worktree — and the whole point is that some iterations
+        # read the memory and others do not. An iteration that does not read it never sees the
+        # directory at all, so it cannot be tempted into it by a path in its tree.
+        variables["memory"] = self._seed_memory(iteration, worktree_dir)
         variables["constraint_schedule"] = self.schedule.summary_table()
         variables["stage"] = self.stage
         variables["metric"] = METRIC
@@ -119,6 +144,23 @@ class OptimizationLoop(Harness):
         # The packaged template, not `.autohelix/prompt.md`'s default: the stock one renders the
         # constraint commands, and here constraint zero is the hidden slot checker.
         return render_template(presets.project_prompt(self.project_path), variables)
+
+    def _seed_memory(self, iteration: int, worktree_dir: Path) -> str:
+        """Copy the memory in for an iteration that reads it, and return its prompt block."""
+        if not self.memory.reads_at(iteration):
+            return ""
+        seeded = mem.seed(self.memory, worktree_dir)
+        if seeded:
+            self.console.print(
+                f"  memory: {seeded} file(s) from {self.memory.path} at {mem.SEEDED_REL}"
+            )
+        else:
+            # Said out loud rather than passed over: the operator asked this iteration to start
+            # from earlier work, and it is starting from nothing instead.
+            self.console.print(
+                f"  [yellow]![/yellow] memory: nothing seeded from {self.memory.path}"
+            )
+        return mem.describe_for_prompt(self.memory, iteration, seeded)
 
     def _print_header(self, max_iter: int, start_iter: int = 1) -> None:
         """The stock header with the goal escaped, since the goal quotes `##autohelix[...]`.
