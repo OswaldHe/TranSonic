@@ -11,6 +11,12 @@ autohelix optimize check                          # validate the config, show th
 autohelix optimize all                            # all five stages
 ```
 
+`optimize all` **resumes**. A stage that already recorded a passing gate, and whose repo is still
+there, is skipped with a line saying so — so a run that died in stage 5 is picked up by re-running
+the same command, not started over. To rebuild a finished stage on purpose, name it:
+`optimize submodule` and `optimize assemble` always archive the existing repo into
+`.optimization/attempts/` and build a new one.
+
 The words this pipeline coins — *projection*, *slot*, *checker*, *advisory*, *custody*, *attic*,
 *drift* — are defined in [`CONTEXT.md`](../CONTEXT.md); reach for it when a term here reads as
 ambiguous, or before coining another. Three decisions are recorded with their rejected alternatives

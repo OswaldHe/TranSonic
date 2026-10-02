@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from optimization import constraints as cons
 from optimization import materialize, module_checker, presets, submodule_checker
 from optimization.config import ConfigError, PipelineConfig
 from optimization.projection import project
@@ -1609,3 +1610,82 @@ def test_a_reviewer_that_commits_nothing_leaves_the_branch_where_it_was(tmp_path
     assert git("rev-parse", "HEAD").stdout.strip() == base
     assert (tmp_path / "source.py").read_text() == "# the kernel the gate measured\n"
     assert (tmp_path / "inference.py").read_text() == "# the frozen validator\n"
+
+
+# ---------------------------------------------------------------------------------------------
+#  The checker contract and the validator that enforces it
+# ---------------------------------------------------------------------------------------------
+
+def test_the_contract_quotes_every_module_the_validator_allows():
+    """The compiler is told the real rule, so it cannot be rejected for obeying a looser one.
+
+    The contract used to say "import nothing outside the standard library" while the validator
+    enforced 23 named modules. A checker that imported `operator` — the ordinary way to dispatch
+    `ast.Add` when evaluating a trace-time constant — was therefore correct by the contract it was
+    given and rejected by the code that read it, which stopped a whole pipeline after the compiler
+    had already been paid for.
+    """
+    for module in cons.CHECKER_ALLOWED_IMPORTS:
+        assert module in cons.CHECKER_CONTRACT, (
+            f"'{module}' is allowed but the contract does not mention it, so the compiler cannot "
+            f"know it may be used"
+        )
+
+
+def test_the_pure_stdlib_helpers_a_checker_needs_are_allowed():
+    """Modules with no I/O and no dynamic import cannot reach what the list keeps out."""
+    for module in ("operator", "bisect", "heapq", "statistics", "token"):
+        assert module in cons.CHECKER_ALLOWED_IMPORTS
+
+
+def test_the_modules_that_would_defeat_the_sandbox_stay_out():
+    for module in ("subprocess", "shutil", "importlib", "socket", "pickle", "ctypes", "tempfile"):
+        assert module not in cons.CHECKER_ALLOWED_IMPORTS
+
+
+# ---------------------------------------------------------------------------------------------
+#  Resuming a pipeline that stopped part-way
+# ---------------------------------------------------------------------------------------------
+
+def test_a_preparation_stage_that_already_passed_is_not_rebuilt(tmp_path):
+    """`optimize all` has to pick a stopped run up, not start it over.
+
+    `submodule` and `assemble` both open with `_set_aside`, so running either again archives the
+    finished repo and builds a new one from the bootstrap. Resuming a run that died in stage 5 that
+    way costs the tuned single-rank kernel and every iteration of its history.
+    """
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+
+    outcome = pipeline._prepared("submodule")
+    assert outcome is not None and outcome.ok
+    assert outcome.stage == "submodule"
+
+
+def test_a_passing_record_without_its_repo_does_not_count_as_prepared(tmp_path):
+    """Half the evidence is not enough: the record says the gate passed, the repo says the thing
+    it passed on is still there to run."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+    assert pipeline._prepared("submodule") is None
+
+
+def test_a_failed_attempt_does_not_count_as_prepared(tmp_path):
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": false, "report": ""}')
+    assert pipeline._prepared("submodule") is None
