@@ -313,6 +313,31 @@ def top_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.Asy
     }
 
 
+def top_level_names(tree: ast.Module) -> set[str]:
+    """Every name `import source` then `source.<name>` can reach, however it was bound.
+
+    A `def`, but also a plain assignment — because binding the NKI launch grid at module scope is
+    an assignment, and it is the only way a kernel reaches both physical cores of an LNC=2 pair
+    under a validator that calls `kernel(*args)` with no subscript:
+
+        @nki.jit
+        def _impl(...): ...
+        kernel = _impl[2]          # a 2-wide grid, bound where the caller needs no grammar for it
+
+    Verified end to end: that form traces through `torch_neuronx.trace` on a `torch.nn.Module`
+    wrapper and the compiler builds the 2-wide NEFF. Judging the entry point by `FunctionDef`
+    alone rejected it, which would have cost the run the 2x that splitting across the two physical
+    cores is worth — the largest single gain the MoE pipeline found.
+    """
+    names = set(top_level_functions(tree))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
 def called_attributes(tree: ast.Module) -> dict[str, int]:
     """Dotted names of every call in the tree, mapped to the line of the first occurrence.
 

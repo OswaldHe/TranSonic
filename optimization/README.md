@@ -11,6 +11,12 @@ autohelix optimize check                          # validate the config, show th
 autohelix optimize all                            # all five stages
 ```
 
+`optimize all` **resumes**. A stage that already recorded a passing gate, and whose repo is still
+there, is skipped with a line saying so — so a run that died in stage 5 is picked up by re-running
+the same command, not started over. To rebuild a finished stage on purpose, name it:
+`optimize submodule` and `optimize assemble` always archive the existing repo into
+`.optimization/attempts/` and build a new one.
+
 The words this pipeline coins — *projection*, *slot*, *checker*, *advisory*, *custody*, *attic*,
 *drift* — are defined in [`CONTEXT.md`](../CONTEXT.md); reach for it when a term here reads as
 ambiguous, or before coining another. Three decisions are recorded with their rejected alternatives
@@ -182,6 +188,103 @@ comment — the whole block reaches the agent verbatim — so the template's own
 MoE run sent `# <FILL IN: module-specific guidance for iterations 9-10, if any.>` to the agent as
 part of its constraint for four iterations, which is how this was found.
 
+## Memory: a directory named iterations start from
+
+`memory:` in either stage points at a directory of earlier work. Before each iteration that reads
+it, the directory is copied into the worktree at **`.autohelix/memory/`**, read-only — gitignored
+and outside the editable scope, so the agent can read it and cannot commit it, and a snapshot so it
+cannot change under a running iteration.
+
+```yaml
+memory:                         # shared: both stages inherit these
+  path: ./memory                # absolute, or relative to the config file
+  prompt: |
+    `submodule/` is last round's single-rank kernel; read README.md first.
+
+submodule:
+  memory:
+    iterations: [1, 2, 3]       # `all` (the default), [1, 4], from:/to:, or at: 3
+full:
+  memory:
+    iterations: [1]
+    prompt: |                   # overrides the shared prose for this stage only
+      `module/` is the 4-rank assembly, including where the collective sits.
+```
+
+`path` is written once because both stages of a run read the same directory — it is the same
+module's earlier work. `iterations` and `prompt` stay per-stage because those are exactly what
+differs between optimizing one rank and optimizing four. A stage that names any selector key
+replaces the shared selector **wholesale**, so `iterations: all` at the top level cannot outrank
+`at: 3` in a stage.
+
+### The one-shot preparation agents read it too
+
+`iterations:` governs the loop; `preparation:` governs the **one-shot agent that built the repo the
+loop runs on** — stage 2 under `submodule:`, stage 4 under `full:`. It defaults to **on**, because
+those are the two runs that would otherwise re-derive the cut, or the collective's placement, from
+nothing; having configured memory for a stage, wanting its preparation agent blind to it is the
+unusual ask. `preparation: false` opts out, and `iterations: none` beside it expresses the other
+direction — build the repo from the earlier run, then let the loop start clean.
+
+| | reads `submodule.memory` | reads `full.memory` |
+|---|---|---|
+| stage 2, the cut | `preparation` | |
+| stage 3, one rank | `iterations` | |
+| stage 4, the assembly | | `preparation` |
+| stage 5, four ranks | | `iterations` |
+
+The prompt block differs from the loop's, because the framing does. A loop iteration is told to
+start from this rather than from nothing, and not to re-earn a recorded negative. A preparation
+agent is *building* what the loop will be judged on and **has no gate of its own yet**, so its block
+splits the material in two: **sizes** (tile widths, buffer depths, SBUF budgets, loop bounds) were
+fitted to the earlier run's shapes and must be re-derived, while **technique** (how a value is
+decoded, how an axis is laid out, which engine does which pass) is usually shape-independent and
+should be *ported* rather than left for the loop to re-earn — the loop has a handful of iterations
+and the preparation agent is what it starts from.
+
+Both blocks end with the same warning, and it was added because of a real failure. A stage-2 agent
+cited `.autohelix/memory/FEEDBACK.md rows 2 and 10` in `source.py` and `SUBMODULE.md`: true while it
+ran, a dangling path for every iteration the operator left out of the selector and for anyone
+reading the repo afterwards. Nothing had told it the directory was temporary, so the citation looked
+like an ordinary cross-reference. `TRANSIENCE` now says the seed is per-run, that excluded
+iterations never receive it, and that a finding has to be restated rather than linked.
+
+`_run_one_shot` runs these agents in the repo itself rather than a worktree, so the memory is seeded
+into the repo and removed in a `finally` once the agent exits — every way out, including a retry.
+Landing under `.autohelix/` is safe either way: `Sandbox.prepare_worktree` copies an explicit
+allowlist (`notes`, `observations`, `logs`, `peer_notes`) that does not include `memory`, so a copy
+left behind could not leak into a later iteration that opted out.
+
+Three deliberate differences from `bootstrap/memory.py`, which carries one module's work to the
+*next module*:
+
+- **The operator assembles it.** Nothing is recorded automatically. What is worth carrying into an
+  optimization run is this module's own earlier run — a previous round's `source.py`, both loops'
+  notes and reviews — and which run that is, is a judgement.
+- **It is per-iteration.** An iteration that does not read it is never told the directory exists.
+  Leave the free-exploration slot out: the point of that slot is to reach something the earlier run
+  did not, and handing it the earlier run's conclusions is how it re-derives them instead.
+- **The operator writes the navigation prose.** `prompt` goes into those iterations' prompts
+  verbatim, directly under the pointer. A directory of fifty files with no word on which to open
+  first is one the agent skims and abandons.
+
+A missing directory is a **warning, not a refusal**: the config is written before the memory is
+assembled, and refusing to start over a directory iteration 4 will read is the worse failure. The
+loop says out loud how many files it seeded, or that it seeded none.
+
+Two things about it are less obvious than they look:
+
+- **Read-only means the directory bits too.** On Unix, write permission on the containing directory
+  is enough to replace a `0444` file, so chmodding files alone does not make a snapshot. The
+  directories go to `0555` as well — which means anything that later *deletes* the tree needs them
+  back, so `mem.unlock` is called from the `remove_worktree` wrapper, from `rmtree`, and from
+  `seed`'s own replacement of a previous copy.
+- **A `path` that contains the worktree is refused.** `copytree` from a directory that contains its
+  own destination copies its own output as it writes it, stopping only at the path-length limit
+  after leaving a deep partial tree behind. An operator reaches this by pointing `path:` at the
+  workspace root instead of at a directory beside it, so `seed_problem` names that case
+  specifically rather than reporting a generic "nothing seeded".
+
 ## The frozen validator
 
 In both loop stages `scope.editable` is `[source.py]` and **`inference.py` is frozen** — written by
@@ -201,6 +304,15 @@ And the **metric is read back from the gate's verdict** rather than measured aga
 (`optimization.readback`), because the stage's gate is the only thing that runs the candidate. Why
 that is worth the one wrinkle it introduces at iteration 0:
 [ADR 0002](../docs/adr/0002-a-stages-gate-is-the-only-thing-that-runs-a-candidate.md).
+
+**The reviewer is held to the same scope, commits included.** It is a second write-capable agent in
+the same worktree, and it runs *after* `uncommit_agent_changes`, the scope reversion, the
+constraints and the metrics — so anything it writes lands on a candidate that is already gated.
+`OptimizationLoop.run_reviewer` therefore gives it the agent's three steps in the agent's order:
+reopen its commits, revert what is outside the scope, then restore the deliverables' bytes. All
+three are needed. `merge_worktree` only *stages* the editable files for its own commit, but it
+finishes with `git merge <worktree.branch>`, and that carries every commit already on the branch —
+so a reviewer commit reaches the deliverable by a route a working-tree restore cannot see.
 
 ## The two gates
 
@@ -319,6 +431,8 @@ optimization/
   slotcheck.py             running a compiled checker, enforcing or advisory
   loop.py                  Harness + the per-iteration constraint, candidate archive, best commit
   constraints.py           the schedule, the compiled checkers, their manifest
+  memory.py                the operator's directory of earlier work: who reads it, how it is
+                           seeded read-only, and the prompt block it produces
   custody.py               holding the fields a gate reads back outside the agent's repo
   candidate.py             running a candidate repo and reading facts out of it: what both
                            gates share (reuses bootstrap/nki_checker's analysis)
@@ -352,7 +466,12 @@ optimization/
   the guard. Clearing write permission covers the shared original too, which is the right outcome.
 - **`iteration_constraints` is read from the raw config, not from `Config`.** It is listed in
   `KNOWN_TOP_LEVEL_KEYS` so it does not warn as a typo, but there is no field for it on the shared
-  dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config.
+  dataclass — a pipeline-specific concept does not belong on every AutoHelix user's config. `memory`
+  is read the same way, for the same reason, and is listed there too.
+- **`memory.path` in the derived config is absolute.** The operator may write it relative to their
+  own config file, and `PipelineConfig.load` resolves it against that file's directory — because the
+  derived config lives beside the *repos*, so a relative path surviving into it would resolve
+  somewhere else entirely.
 - **Preparation agents do not own the fields a gate reads.** They finish the manifest, and the
   tensor record and the declaration are genuinely theirs — but the bar, the golden, the rank count
   and both latency bounds are written by materialization to a copy outside the repo and restored

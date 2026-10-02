@@ -20,6 +20,10 @@ The numbers you have to beat, measured on this host rather than copied from a lo
 - the bootstrapped module, one core: **{{ bootstrap_latency }} ms**
 - the optimized submodule, one core: **{{ submodule_latency }} ms**
 
+{% if memory %}
+{{ memory }}
+{% endif %}
+
 ## What you must produce
 
 **`source.py`** — the whole module on {{ ranks }} ranks. Each rank runs the submodule's work for its

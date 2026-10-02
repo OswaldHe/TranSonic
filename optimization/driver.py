@@ -42,6 +42,7 @@ from rich.text import Text
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
+from optimization import memory as mem
 from optimization import feedback as fb
 from optimization.config import GATE_PYTHON, PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
@@ -50,6 +51,33 @@ from optimization.projection import Projection, ProjectionError, project_module
 #: Where the pipeline's own records go, under the workspace root: the projection, each preparation
 #: attempt's log and verdict, and the final report.
 STATE_DIR = ".optimization"
+
+#: How many times the constraint compiler may be asked for a slot's checker. Attempt 1 is the
+#: plain request; the rest carry the validator's findings back. Three is enough for the failures
+#: seen in practice, which are a single contract violation the findings name exactly.
+COMPILER_ATTEMPTS = 3
+
+#: Appended to the compiler's prompt on a retry. It names the files it has to fix and quotes the
+#: contract again, because the violation is always a clause of the contract it did not apply.
+COMPILER_RETRY = """
+
+---
+
+## Your previous attempt is on disk and it does not satisfy the contract
+
+The checkers you wrote were validated and rejected for these reasons:
+
+{{ problems }}
+
+Rewrite the offending checker(s) in place, at the same paths, fixing exactly these findings and
+changing nothing else about what they check. The constraint prose has not changed, and a checker
+that now passes validation but stops judging the mechanism is worse than the one you wrote.
+
+The most common cause is an import: the allowed list is short and deliberate, and anything outside
+it has to be written inline instead. Here is the contract again, in full:
+
+{{ contract }}
+"""
 
 
 class StageError(RuntimeError):
@@ -236,6 +264,37 @@ class Pipeline:
 
     # -- the one-shot preparation agents -------------------------------------------
 
+    def _seed_preparation_memory(self, repo: Path, spec: "mem.MemorySpec") -> str:
+        """Seed the memory for a one-shot preparation agent, and return its prompt block.
+
+        Seeded into the repo itself, because `_run_one_shot` runs the agent there rather than in a
+        worktree. Safe to land under `.autohelix/`: it is gitignored, and `Sandbox.prepare_worktree`
+        copies an explicit allowlist out of it (`notes`, `observations`, `logs`, `peer_notes`) that
+        does not include `memory` — so a copy left here could not leak into a later iteration that
+        opted out. `_drop_preparation_memory` removes it anyway once the agent is done, so the repo
+        the next stage consumes does not carry a second copy or a read-only subtree.
+        """
+        if not spec.reads_at_preparation:
+            return ""
+        problem = mem.seed_problem(spec, repo)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] memory: {problem}")
+            return ""
+        seeded = mem.seed(spec, repo)
+        if seeded:
+            self.console.print(f"  memory: {seeded} file(s) from {spec.path} at {mem.SEEDED_REL}")
+        else:
+            self.console.print(f"  [yellow]![/yellow] memory: nothing seeded from {spec.path}")
+        return mem.describe_for_preparation(spec, seeded)
+
+    def _drop_preparation_memory(self, repo: Path) -> None:
+        """Remove a seeded copy from a repo once its preparation agent has finished."""
+        target = repo / mem.SEEDED_REL
+        if not target.exists():
+            return
+        mem.unlock(repo)
+        shutil.rmtree(target, ignore_errors=True)
+
     def _run_one_shot(
         self, repo: Path, prompt: str, label: str, timeout: str, model: str | None = None,
     ) -> bool:
@@ -266,10 +325,16 @@ class Pipeline:
 
         self.console.print(f"  running the {label} agent (log: {log_path})")
         started = time.monotonic()
-        result = agent.run(
-            worktree_path=repo, prompt=prompt, iteration=0,
-            log_path=log_path, event_callback=on_event, project_path=repo,
-        )
+        try:
+            result = agent.run(
+                worktree_path=repo, prompt=prompt, iteration=0,
+                log_path=log_path, event_callback=on_event, project_path=repo,
+            )
+        finally:
+            # Unconditional and a no-op when nothing was seeded, so every way out of a preparation
+            # attempt — finished, failed, raised, retried — leaves the repo without a stale
+            # read-only copy in it. A retry re-seeds from `_seed_preparation_memory`.
+            self._drop_preparation_memory(repo)
         elapsed = time.monotonic() - started
         if not result.success:
             self.console.print(
@@ -398,12 +463,14 @@ class Pipeline:
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.submodule.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id,
                 "entry_point": "kernel",
                 "dim": (projection.projected[0].dim if projection.projected else "none"),
                 "factor": projection.projected_units,
                 "splits": " * ".join(f.label() for f in projection.projected) or "no split",
+                "memory": memory_block,
             })
             held = custody.take_custody(
                 prepared, custody.SUBMODULE_OWNED,
@@ -473,29 +540,56 @@ class Pipeline:
             "max_iterations": spec.iterations,
         })
 
-        if not self._run_one_shot(repo, prompt, f"compiler-{stage}",
-                                  self.config.compiler_timeout, self.config.compiler_model):
-            raise StageError("the constraint compiler failed; the schedule would go unenforced")
-
+        # The compiler is an agent, so a checker that breaks its contract is a normal outcome, not
+        # an exceptional one — and the findings say exactly what to change. Hand them back and let
+        # it fix its own work. This used to raise on the first attempt, which stopped a whole
+        # pipeline over one `import operator` after the agent had already been paid for.
         compiled: list[cons.CompiledSlot] = []
         problems: list[str] = []
-        for slot in enforceable:
-            path = cons.checker_path(repo, slot)
-            findings = cons.validate_checker_source(path)
-            if findings:
-                problems += [f"slot {slot.label}: {f}" for f in findings]
-                continue
-            compiled.append(cons.CompiledSlot(
-                label=slot.label, iterations=slot.iterations, path=path,
-                sha256=cons.sha256_file(path),
-            ))
-        if problems:
+        for attempt in range(1, COMPILER_ATTEMPTS + 1):
+            label = f"compiler-{stage}" if attempt == 1 else f"compiler-{stage}-retry-{attempt - 1}"
+            this_prompt = prompt if not problems else prompt + _render(COMPILER_RETRY, {
+                "problems": "\n".join(f"  - {p}" for p in problems),
+                "contract": cons.CHECKER_CONTRACT,
+            })
+            if not self._run_one_shot(repo, this_prompt, label,
+                                      self.config.compiler_timeout, self.config.compiler_model):
+                raise StageError("the constraint compiler failed; the schedule would go unenforced")
+
+            compiled, problems = [], []
+            for slot in enforceable:
+                path = cons.checker_path(repo, slot)
+                findings = cons.validate_checker_source(path)
+                if findings:
+                    problems += [f"slot {slot.label}: {f}" for f in findings]
+                    continue
+                compiled.append(cons.CompiledSlot(
+                    label=slot.label, iterations=slot.iterations, path=path,
+                    sha256=cons.sha256_file(path),
+                ))
+            if not problems:
+                break
             for problem in problems:
                 self.console.print(f"  [red]FAIL[/red] {problem}")
-            raise StageError(
-                f"{len(problems)} compiled checker(s) are unusable. A schedule that cannot be "
-                f"enforced is worse than no schedule: the prompts would claim a constraint the "
-                f"loop does not apply."
+            if attempt < COMPILER_ATTEMPTS:
+                self.console.print(
+                    f"  [yellow]retrying the constraint compiler with those findings "
+                    f"({attempt}/{COMPILER_ATTEMPTS - 1})[/yellow]")
+
+        if problems:
+            # Out of attempts. Deleting the unusable checkers is what makes the rest of the run
+            # honest: `loop.run_iteration` finds no checker, says so on every affected iteration,
+            # and enforces nothing — which is the author's rule (never enforce an unvalidated
+            # script, never silently claim a constraint) without throwing away the stage. Stopping
+            # here costs the whole stage; this costs one slot's enforcement.
+            for slot in enforceable:
+                path = cons.checker_path(repo, slot)
+                if path.is_file() and not any(c.path == path for c in compiled):
+                    path.unlink()
+            self.console.print(
+                f"  [red]![/red] {len(problems)} checker(s) still unusable after "
+                f"{COMPILER_ATTEMPTS} attempt(s); removed them. Those slots run "
+                f"**unenforced** and every affected iteration will say so."
             )
         cons.write_manifest(repo, compiled, schedule)
         self.console.print(
@@ -747,12 +841,14 @@ class Pipeline:
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.full.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id, "entry_point": "kernel",
                 "ranks": ranks, "last_rank": ranks - 1,
                 "bootstrap_latency": f"{bootstrap_ms:g}",
                 "submodule_latency": f"{submodule_ms:g}",
                 "overhead_ceiling": f"{submodule_ms * 1.10:g}",
+                "memory": memory_block,
             })
             held = custody.take_custody(
                 prepared, custody.MODULE_OWNED,
@@ -1166,6 +1262,35 @@ class Pipeline:
 
     # -- the whole thing -----------------------------------------------------------
 
+    def _prepared(self, stage: str) -> StageOutcome | None:
+        """The recorded outcome of a preparation stage that already passed, or None.
+
+        `submodule` and `assemble` both open with `_set_aside`, so calling either one again moves
+        the finished repo into `.optimization/attempts/` and builds a new one from the bootstrap.
+        That is the right behaviour for `optimize submodule` run on purpose, and the wrong
+        behaviour for `optimize all` run to pick a pipeline up where it stopped — which is what
+        `all`'s own docstring promises. Resuming a run that died in stage 5 cost a tuned
+        single-rank kernel and five iterations of history before this guard existed; they were
+        recoverable only because `_set_aside` archives rather than deletes.
+
+        Both halves have to hold. A record says the gate passed once; the repo being present says
+        the thing it passed on is still there to run.
+        """
+        repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
+        if not (repo / "source.py").is_file():
+            return None
+        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json")):
+            try:
+                if json.loads(record.read_text()).get("passed"):
+                    self.console.print(
+                        f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
+                        f"is present — skipping it. Run `optimize {stage}` to rebuild on purpose."
+                    )
+                    return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
+            except (OSError, json.JSONDecodeError):
+                continue
+        return None
+
     def all(self) -> list[StageOutcome]:
         """Every stage in order, stopping at the first that did not succeed.
 
@@ -1187,10 +1312,10 @@ class Pipeline:
                 )
 
         step(self.init())
-        step(self.submodule())
+        step(self._prepared("submodule") or self.submodule())
         step(self.compile_constraints("submodule"))
         step(self.run_loop("submodule"))
-        step(self.assemble())
+        step(self._prepared("assemble") or self.assemble())
         if self.config.full.schedule.enforceable():
             step(self.compile_constraints("full"))
         step(self.run_loop("full"))

@@ -12,6 +12,10 @@ The whole schedule, so you know what this iteration is for and what the next one
 {{ constraint_schedule }}
 {% endif %}
 
+{% if memory %}
+{{ memory }}
+{% endif %}
+
 {% if best_so_far %}
 Best {{ metric }} so far: **{{ best_so_far }}**.{% if regression_allowance %} An iteration more than
 {{ regression_allowance }}% above it is rejected and discarded — so a change you are unsure about
@@ -49,6 +53,9 @@ Read before starting:
 {% endif %}
 {% if has_hints %}
 - .autohelix/hints.md — notes from the operator
+{% endif %}
+{% if memory %}
+- .autohelix/memory/ — earlier work on this module, read-only. Start here.
 {% endif %}
 
 The `neuron-nki-*` agents and skills available to you know the NKI API, the compiler's errors and

@@ -135,11 +135,15 @@ def check_shape(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     findings: list[str] = []
 
     source = candidate._parse(repo / SOURCE_FILE)
-    functions = candidate.top_level_functions(source)
-    if entry not in functions:
+    # Any top-level binding, not only a `def`. `kernel = _impl[2]` binds the NKI launch grid at
+    # module scope, which is how a kernel reaches both physical cores of an LNC=2 pair while the
+    # frozen validator still calls `kernel(*args)` with no subscript. Requiring a `FunctionDef`
+    # rejected that, and it is the shape the 2x dual-core split needs.
+    names = candidate.top_level_names(source)
+    if entry not in names:
         findings.append(
             f"{SOURCE_FILE} defines no top-level '{entry}'. "
-            f"Found: {', '.join(sorted(functions)) or 'nothing'}"
+            f"Found: {', '.join(sorted(names)) or 'nothing'}"
         )
 
     inference = candidate._parse(repo / INFERENCE_FILE)

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from optimization import constraints as cons
 from optimization import materialize, module_checker, presets, submodule_checker
 from optimization.config import ConfigError, PipelineConfig
 from optimization.projection import project
@@ -634,6 +635,107 @@ def _violation(iteration, label):
 
     return SlotVerdict(iteration, label, checked=True, passed=False,
                        findings=["source.py:4 imports torch"])
+
+
+def _reviewer_loop(tmp_path, editable, reviewer_does):
+    """An OptimizationLoop wired just enough to call `run_reviewer`, with upstream's stubbed out.
+
+    The bug this covers is not in the restore logic, which was right — it is that the override read
+    `config.scope.editable`, a path `Config` does not have. The YAML nests it under `scope:` and the
+    dataclass flattens it, so the attribute error fired at the *baseline* review and killed the stage
+    before iteration 1. Nothing tested it because nothing called `run_reviewer`.
+    """
+    from rich.console import Console
+
+    from optimization.loop import OptimizationLoop
+
+    class _Loop(OptimizationLoop):
+        def __init__(self):
+            pass
+
+        def run_reviewer(self, worktree, iteration):  # the override under test
+            return OptimizationLoop.run_reviewer(self, worktree, iteration)
+
+    # Upstream's `run_reviewer` is what the override wraps; this stands in for the agent.
+    from autohelix.harness import Harness
+    original = Harness.run_reviewer
+    Harness.run_reviewer = lambda self, worktree, iteration: (reviewer_does(), True)[1]
+
+    loop = _Loop()
+    loop.config = _FakeConfig()
+    loop.config.editable = editable
+    # `resolve_editable(editable, frozen, ...)` reads both. Set here rather than caught: an
+    # `AttributeError` from a config path that does not exist is the exact bug that killed stage 3
+    # at the baseline review, so the guard must not swallow that class of mistake.
+    loop.config.frozen = []
+    loop.console = Console(quiet=True)
+    # The guard now also reopens the reviewer's commits and reverts what it touched out of scope,
+    # which means it talks to the sandbox. These tests are about the byte restore, so the sandbox
+    # records the calls and does nothing; `_reviewer_git_loop` exercises the real one.
+    loop.sandbox = _RecordingSandbox()
+    worktree = type("W", (), {"working_dir": tmp_path})()
+    return loop, worktree, (Harness, original)
+
+
+class _RecordingSandbox:
+    def __init__(self):
+        self.uncommitted = 0
+        self.reverted: list[str] = []
+
+    def uncommit_agent_changes(self, worktree):
+        self.uncommitted += 1
+        return 0
+
+    def resolve_editable(self, editable, frozen, cwd=None):
+        return list(editable) or None
+
+    def revert_out_of_scope(self, worktree, effective_editable):
+        return list(self.reverted)
+
+
+def test_the_reviewer_cannot_replace_the_validated_candidate(tmp_path):
+    gated = "# the kernel the gate measured\n"
+    (tmp_path / "source.py").write_text(gated)
+
+    def edit():
+        (tmp_path / "source.py").write_text("# what the reviewer scribbled\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], edit)
+    try:
+        assert loop.run_reviewer(worktree, 3) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_a_reviewer_that_touches_nothing_leaves_the_candidate_alone(tmp_path):
+    gated = "# untouched\n"
+    (tmp_path / "source.py").write_text(gated)
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], lambda: None)
+    try:
+        assert loop.run_reviewer(worktree, 1) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_an_empty_editable_scope_still_guards_the_deliverables(tmp_path):
+    """`editable` unset means "everything but `frozen`", where guarding nothing would leave the
+    reviewer free to rewrite the files whose hashes are themselves gate checks."""
+    (tmp_path / "source.py").write_text("a\n")
+    (tmp_path / "inference.py").write_text("b\n")
+
+    def edit_both():
+        (tmp_path / "source.py").write_text("x\n")
+        (tmp_path / "inference.py").write_text("y\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, [], edit_both)
+    try:
+        loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == "a\n"
+    assert (tmp_path / "inference.py").read_text() == "b\n"
 
 
 def test_an_end_of_slot_violation_is_kept_when_it_improves(tmp_path):
@@ -1405,3 +1507,211 @@ def test_committing_the_tree_absorbs_what_the_gates_run_left(tmp_path):
     pipeline._commit_tree(repo, "round 2 baseline")
     assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
                           capture_output=True, text=True).stdout.strip() == ""
+
+
+# -- PR #7: a reviewer commit must not ride `git merge` into the deliverable --------------
+
+
+def _reviewer_git_loop(tmp_path, reviewer_does):
+    """A real `Sandbox` over a real git repo, so the commit path is exercised, not stubbed.
+
+    The finding this covers: `Harness.run_iteration` runs the reviewer *after*
+    `uncommit_agent_changes` and `revert_out_of_scope`, and `Sandbox.merge_worktree` then does
+    `git merge <worktree.branch>`. That merge only *stages* the editable files for its own commit,
+    but it carries every commit already on the branch — so a reviewer that commits reaches main
+    with whatever it touched, and a working-tree byte restore never sees it.
+    """
+    import subprocess as sp
+
+    from rich.console import Console
+
+    from autohelix.harness import Harness
+    from autohelix.sandbox import Sandbox, Worktree
+    from optimization.loop import OptimizationLoop
+
+    def git(*args):
+        return sp.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "source.py").write_text("# the kernel the gate measured\n")
+    (tmp_path / "inference.py").write_text("# the frozen validator\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "baseline")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    class _Loop(OptimizationLoop):
+        def __init__(self):
+            pass
+
+        def run_reviewer(self, worktree, iteration):
+            return OptimizationLoop.run_reviewer(self, worktree, iteration)
+
+    original = Harness.run_reviewer
+    Harness.run_reviewer = lambda self, worktree, iteration: (reviewer_does(), True)[1]
+
+    loop = _Loop()
+    loop.config = _FakeConfig()
+    loop.config.editable = ["source.py"]
+    loop.config.frozen = []
+    loop.console = Console(quiet=True)
+    loop.sandbox = Sandbox(tmp_path)
+    worktree = Worktree(path=tmp_path, branch="main", iteration=3,
+                        working_dir=tmp_path, base_commit=base)
+    return loop, worktree, (Harness, original), base, git
+
+
+def test_a_reviewer_commit_outside_scope_is_reopened_and_reverted(tmp_path):
+    def commit_the_validator():
+        (tmp_path / "inference.py").write_text("# RTOL = 9.0\n")
+        for args in (("add", "-A"), ("commit", "-q", "-m", "reviewer tidied the validator")):
+            __import__("subprocess").run(["git", *args], cwd=tmp_path, check=True,
+                                         capture_output=True)
+
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(
+        tmp_path, commit_the_validator,
+    )
+    try:
+        assert loop.run_reviewer(worktree, 3) is True
+    finally:
+        cls.run_reviewer = original
+
+    # The commit is gone from the branch, so `git merge` has nothing extra to carry...
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    # ...and the validator is the one the gate ran, not the one the reviewer wrote.
+    assert (tmp_path / "inference.py").read_text() == "# the frozen validator\n"
+
+
+def test_a_reviewer_commit_inside_scope_is_reopened_and_the_bytes_restored(tmp_path):
+    """In scope, so `revert_out_of_scope` leaves it — the byte snapshot is what catches it."""
+    def commit_the_kernel():
+        (tmp_path / "source.py").write_text("# what the reviewer scribbled\n")
+        for args in (("add", "-A"), ("commit", "-q", "-m", "reviewer edited the kernel")):
+            __import__("subprocess").run(["git", *args], cwd=tmp_path, check=True,
+                                         capture_output=True)
+
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(tmp_path, commit_the_kernel)
+    try:
+        loop.run_reviewer(worktree, 3)
+    finally:
+        cls.run_reviewer = original
+
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    assert (tmp_path / "source.py").read_text() == "# the kernel the gate measured\n"
+
+
+def test_a_reviewer_that_commits_nothing_leaves_the_branch_where_it_was(tmp_path):
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(tmp_path, lambda: None)
+    try:
+        loop.run_reviewer(worktree, 3)
+    finally:
+        cls.run_reviewer = original
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    assert (tmp_path / "source.py").read_text() == "# the kernel the gate measured\n"
+    assert (tmp_path / "inference.py").read_text() == "# the frozen validator\n"
+
+
+# ---------------------------------------------------------------------------------------------
+#  The checker contract and the validator that enforces it
+# ---------------------------------------------------------------------------------------------
+
+def test_the_contract_quotes_every_module_the_validator_allows():
+    """The compiler is told the real rule, so it cannot be rejected for obeying a looser one.
+
+    The contract used to say "import nothing outside the standard library" while the validator
+    enforced 23 named modules. A checker that imported `operator` — the ordinary way to dispatch
+    `ast.Add` when evaluating a trace-time constant — was therefore correct by the contract it was
+    given and rejected by the code that read it, which stopped a whole pipeline after the compiler
+    had already been paid for.
+    """
+    for module in cons.CHECKER_ALLOWED_IMPORTS:
+        assert module in cons.CHECKER_CONTRACT, (
+            f"'{module}' is allowed but the contract does not mention it, so the compiler cannot "
+            f"know it may be used"
+        )
+
+
+def test_the_pure_stdlib_helpers_a_checker_needs_are_allowed():
+    """Modules with no I/O and no dynamic import cannot reach what the list keeps out."""
+    for module in ("operator", "bisect", "heapq", "statistics", "token"):
+        assert module in cons.CHECKER_ALLOWED_IMPORTS
+
+
+def test_the_modules_that_would_defeat_the_sandbox_stay_out():
+    for module in ("subprocess", "shutil", "importlib", "socket", "pickle", "ctypes", "tempfile"):
+        assert module not in cons.CHECKER_ALLOWED_IMPORTS
+
+
+# ---------------------------------------------------------------------------------------------
+#  Resuming a pipeline that stopped part-way
+# ---------------------------------------------------------------------------------------------
+
+def test_a_preparation_stage_that_already_passed_is_not_rebuilt(tmp_path):
+    """`optimize all` has to pick a stopped run up, not start it over.
+
+    `submodule` and `assemble` both open with `_set_aside`, so running either again archives the
+    finished repo and builds a new one from the bootstrap. Resuming a run that died in stage 5 that
+    way costs the tuned single-rank kernel and every iteration of its history.
+    """
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+
+    outcome = pipeline._prepared("submodule")
+    assert outcome is not None and outcome.ok
+    assert outcome.stage == "submodule"
+
+
+def test_a_passing_record_without_its_repo_does_not_count_as_prepared(tmp_path):
+    """Half the evidence is not enough: the record says the gate passed, the repo says the thing
+    it passed on is still there to run."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+    assert pipeline._prepared("submodule") is None
+
+
+def test_a_failed_attempt_does_not_count_as_prepared(tmp_path):
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": false, "report": ""}')
+    assert pipeline._prepared("submodule") is None
+
+
+def test_an_unreopenable_reviewer_commit_stops_the_merge(tmp_path):
+    """The reopen step is the only thing between a reviewer commit and the main branch.
+
+    It fails before reporting what it found, so there is no way to tell "nothing to reopen" from
+    "commits I could not reopen". Carrying on lets `merge_worktree` take the branch as it stands —
+    reviewer commits and all — into the deliverable that was just gated.
+    """
+    (tmp_path / "source.py").write_text("# the kernel the gate measured\n")
+
+    def noop():
+        return None
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], noop)
+
+    class _Failing(_RecordingSandbox):
+        def uncommit_agent_changes(self, worktree):
+            raise RuntimeError("git is wedged")
+
+    loop.sandbox = _Failing()
+    try:
+        with pytest.raises(RuntimeError, match="must not be merged"):
+            loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original

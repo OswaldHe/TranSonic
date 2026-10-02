@@ -22,6 +22,10 @@ the bytes in `module/tensors/`. `reference_torch.py` is the authority on *semant
 find out what a per-rank computation even is for this module. For a model whose reference already
 carries a `rank`/`world_size` notion, the cut you need may be the one the reference itself describes.
 
+{% if memory %}
+{{ memory }}
+{% endif %}
+
 ## The cut is yours to choose
 
 There is no script that will tell you how to divide this module, because how to divide a module is a
