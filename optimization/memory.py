@@ -282,8 +282,17 @@ class MemorySpec:
             found.append(f"memory.path {self.path} does not exist; those iterations get nothing")
         elif not self.path.is_dir():
             found.append(f"memory.path {self.path} is not a directory")
-        elif not entry_names(self.path):
-            found.append(f"memory.path {self.path} holds nothing to read")
+        else:
+            # `warnings()` runs in `_preflight`, before a stage starts, so an unreadable directory
+            # has to come back as a warning. Raising here turns a permissions problem on one path
+            # into a crash of the whole command.
+            try:
+                empty = not entry_names(self.path)
+            except OSError as exc:
+                found.append(f"memory.path {self.path} cannot be listed ({exc.strerror or exc})")
+            else:
+                if empty:
+                    found.append(f"memory.path {self.path} holds nothing to read")
         if not self.prompt.strip():
             found.append(
                 "memory.prompt is empty — the agent is handed a directory with no word on how to "
@@ -378,21 +387,43 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
         if target.exists():
             unlock(worktree_dir)
             shutil.rmtree(target)
-        shutil.copytree(spec.path, target)
+        # `symlinks=True` copies a link as a link instead of following it. Following is how a
+        # memory holding a link to its own parent, or to a large external tree, both escapes
+        # `seed_problem` — which compares only the two root paths — and copies far more than the
+        # operator pointed at.
+        shutil.copytree(spec.path, target, symlinks=True)
         count = 0
         # Depth-first, so a directory's contents are chmodded before the directory itself. chmod
         # on an existing entry needs only ownership, but doing it in this order keeps the tree
         # traversable at every step and makes the loop easy to reason about.
         for path in sorted(target.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            # `Path.chmod` follows symlinks, so chmodding a copied link would change the mode of
+            # whatever it points at — a file outside the snapshot, possibly outside the workspace.
+            if path.is_symlink():
+                continue
             if path.is_file():
-                path.chmod(0o444)
+                path.chmod(_locked(path, 0o444))
                 count += 1
             elif path.is_dir():
-                path.chmod(0o555)
-        target.chmod(0o555)
+                path.chmod(_locked(path, 0o555))
+        target.chmod(_locked(target, 0o555))
         return count
     except OSError:
         return 0
+
+
+def _locked(path: Path, fallback: int) -> int:
+    """`path`'s own mode with every write bit cleared, or `fallback` if it cannot be read.
+
+    Forcing 0444 and 0555 is the obvious way to lock a snapshot and it *widens* access: a memory
+    file carried in at 0600 becomes readable by every local user on the host, and a 0700 directory
+    becomes traversable by them. Read-only is the requirement; who may read was already decided by
+    whoever owns the source.
+    """
+    try:
+        return path.stat().st_mode & 0o7777 & ~0o222
+    except OSError:
+        return fallback
 
 
 def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:

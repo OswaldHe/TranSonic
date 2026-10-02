@@ -1689,3 +1689,29 @@ def test_a_failed_attempt_does_not_count_as_prepared(tmp_path):
     pipeline.state_dir.mkdir(parents=True, exist_ok=True)
     (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": false, "report": ""}')
     assert pipeline._prepared("submodule") is None
+
+
+def test_an_unreopenable_reviewer_commit_stops_the_merge(tmp_path):
+    """The reopen step is the only thing between a reviewer commit and the main branch.
+
+    It fails before reporting what it found, so there is no way to tell "nothing to reopen" from
+    "commits I could not reopen". Carrying on lets `merge_worktree` take the branch as it stands —
+    reviewer commits and all — into the deliverable that was just gated.
+    """
+    (tmp_path / "source.py").write_text("# the kernel the gate measured\n")
+
+    def noop():
+        return None
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], noop)
+
+    class _Failing(_RecordingSandbox):
+        def uncommit_agent_changes(self, worktree):
+            raise RuntimeError("git is wedged")
+
+    loop.sandbox = _Failing()
+    try:
+        with pytest.raises(RuntimeError, match="must not be merged"):
+            loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original

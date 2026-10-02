@@ -417,10 +417,17 @@ class OptimizationLoop(Harness):
         try:
             commits = self.sandbox.uncommit_agent_changes(worktree)
         except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-            # Loud, because this is the step that stands between a reviewer commit and the main
-            # branch. The iteration is still merged — the reviewer is advisory upstream — but the
-            # operator has to be able to see that the guard did not run.
+            # This step is the only thing between a reviewer commit and the main branch, and when it
+            # fails it fails *before* reporting what it found — so there is no way to tell "no
+            # commits to reopen" from "commits I could not reopen". Carrying on would let
+            # `merge_worktree` take the branch as it stands, reviewer commits and all, into the
+            # deliverable that was just gated. Losing this iteration is the cheaper mistake.
             self.console.print(f"  [red]![/red] could not reopen reviewer commits: {exc}")
+            raise RuntimeError(
+                f"the reviewer's commits could not be reopened ({exc}), so this worktree cannot be "
+                f"shown to be free of them and must not be merged. The candidate is still on its "
+                f"branch; reopen or drop the reviewer's commits by hand and re-run the stage."
+            ) from exc
         if commits:
             self.console.print(
                 f"  [yellow]![/yellow] the reviewer created {commits} commit(s); reopened so scope "

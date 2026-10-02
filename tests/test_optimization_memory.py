@@ -546,3 +546,72 @@ def test_iteration_zero_never_reads_the_memory(store):
     spec = MemorySpec.from_config({"path": str(store), "iterations": EVERY}, max_iterations=5)
     assert not spec.reads_at(0)
     assert describe_for_prompt(spec, 0, seeded=4) == ""
+
+
+# -- what a hostile or merely untidy memory directory must not be able to do -------------
+
+
+def test_a_symlinked_directory_is_copied_as_a_link_and_never_followed(tmp_path, store):
+    """`seed_problem` compares the two root paths, so a link inside the tree slips past it.
+
+    Followed, a link to the memory's own parent copies the snapshot into itself, and a link to a
+    large external tree copies far more than the operator pointed at.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "huge.bin").write_text("not mine to copy\n")
+    (store / "link-to-outside").symlink_to(outside, target_is_directory=True)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    seed(MemorySpec(path=store, every=True), worktree)
+
+    landed = worktree / SEEDED_REL / "link-to-outside"
+    assert landed.is_symlink(), "the link was followed instead of being copied as a link"
+    assert not (worktree / SEEDED_REL / "link-to-outside" / "huge.bin").is_file() or \
+        landed.is_symlink()
+
+
+def test_locking_the_snapshot_does_not_chmod_through_a_symlink(tmp_path, store):
+    """`Path.chmod` follows links, so locking a copied link would re-mode its target."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "private.txt"
+    victim.write_text("secret\n")
+    victim.chmod(0o600)
+    (store / "link-to-file").symlink_to(victim)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    seed(MemorySpec(path=store, every=True), worktree)
+
+    assert victim.stat().st_mode & 0o777 == 0o600, "the target's mode was changed through the link"
+
+
+def test_locking_preserves_a_private_files_own_read_permissions(tmp_path, store):
+    """Forcing 0444 on a 0600 file publishes it to every local user. Clear write, keep the rest."""
+    private = store / "submodule" / "private-notes.md"
+    private.write_text("for me only\n")
+    private.chmod(0o600)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    seed(MemorySpec(path=store, every=True), worktree)
+
+    landed = worktree / SEEDED_REL / "submodule" / "private-notes.md"
+    mode = landed.stat().st_mode & 0o777
+    assert mode == 0o400, f"expected 0o400 (read-only, still private), got {oct(mode)}"
+    # and an ordinary file keeps its ordinary readability
+    ordinary = worktree / SEEDED_REL / "README.md"
+    assert ordinary.stat().st_mode & 0o222 == 0, "write bits survived on an ordinary file"
+    assert ordinary.stat().st_mode & 0o044 != 0, "an ordinary file stopped being group/world readable"
+
+
+def test_an_unlistable_memory_directory_is_a_warning_not_a_crash(tmp_path, store):
+    """`warnings()` runs in `_preflight`, before a stage starts: raising there kills the command."""
+    store.chmod(0o000)
+    try:
+        found = MemorySpec(path=store, every=True).validate()
+    finally:
+        store.chmod(0o755)
+    assert any("cannot be listed" in f for f in found), found
