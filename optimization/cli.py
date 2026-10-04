@@ -61,6 +61,12 @@ _config_option = click.option(
     help=f"the pipeline config (default: ./{DEFAULT_CONFIG})",
 )
 _verbose_option = click.option("--verbose", "-v", is_flag=True, help="stream agent output")
+#: `submodule` and `assemble` archive the repo they find and have an agent build another. Opt-in,
+#: because on a stage that already passed its gate that throws away a tuned kernel and its history.
+_rebuild_option = click.option(
+    "--rebuild", is_flag=True,
+    help="replace the repo even if this stage already passed (archives it to .optimization/attempts)",
+)
 
 
 @click.group(name="optimize")
@@ -132,13 +138,14 @@ def init(config: str | None, verbose: bool) -> None:
 @optimize.command()
 @_config_option
 @_verbose_option
-def submodule(config: str | None, verbose: bool) -> None:
+@_rebuild_option
+def submodule(config: str | None, verbose: bool, rebuild: bool) -> None:
     """Have an agent cut the module down to the part one NeuronCore runs."""
     pipeline = _pipeline(config, verbose)
 
     def go() -> None:
         pipeline.init()
-        pipeline.submodule()
+        pipeline.submodule(rebuild=rebuild)
 
     raise SystemExit(_run("submodule", go))
 
@@ -165,10 +172,11 @@ def run(config: str | None, verbose: bool) -> None:
 @optimize.command()
 @_config_option
 @_verbose_option
-def assemble(config: str | None, verbose: bool) -> None:
+@_rebuild_option
+def assemble(config: str | None, verbose: bool, rebuild: bool) -> None:
     """Have an agent rebuild the whole module across all ranks, rejoined with nki.collectives."""
     pipeline = _pipeline(config, verbose)
-    raise SystemExit(_run("assemble", pipeline.assemble))
+    raise SystemExit(_run("assemble", lambda: pipeline.assemble(rebuild=rebuild)))
 
 
 @optimize.command(name="run-full")

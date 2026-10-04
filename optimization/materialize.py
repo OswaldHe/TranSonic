@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -237,8 +238,59 @@ def git_init(repo: Path, message: str) -> None:
     )
 
 
+def _git_ignored(repo: Path, path: str) -> bool:
+    """Whether the repo's own `.gitignore` excludes this path.
+
+    `git add` on an explicitly named ignored path is an error, not a no-op, so an ignored path has
+    to be dropped before staging rather than discovered during it.
+    """
+    return subprocess.run(
+        ["git", "check-ignore", "-q", "--", path], cwd=repo, check=False,
+    ).returncode == 0
+
+
+def git_commit_paths(repo: Path, message: str, paths: Sequence[str]) -> bool:
+    """Commit named paths, if the repo is a git repo and any of them actually moved.
+
+    For edits the pipeline makes to an already-initialized repo. The loop refuses to start in a
+    dirty repository, so a pipeline-side rewrite of a tracked file has to land in a commit of its
+    own or it reads as the agent having left work behind.
+    """
+    if not (repo / ".git").is_dir():
+        return False
+    present = [p for p in paths if (repo / p).exists() and not _git_ignored(repo, p)]
+    if not present:
+        return False
+    subprocess.run(["git", "add", "--", *present], cwd=repo, check=True)
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--quiet", "--", *present], cwd=repo, check=False)
+    if staged.returncode == 0:
+        return False
+    subprocess.run(
+        ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
+         "commit", "-q", "-m", message, "--", *present],
+        cwd=repo, check=True,
+    )
+    return True
+
+
+#: What the Neuron toolchain regenerates beside the repo root rather than under `build/`: the
+#: compiler's own log, the metric store it appends to, and the per-kernel compile caches it names by
+#: content hash (a `.colz` and a `.done` in a directory whose name is the hash). Kept in one place
+#: because `untrack_regenerated` has to recognize what `write_gitignore` excluded.
+REGENERATED = ("log-neuron-cc.txt", "global_metric_store.json", "*.colz", "**/.done")
+
+_REGENERATED_NOTE = (
+    "# What the Neuron toolchain writes beside the repo root rather than under build/: the\n"
+    "# compiler's own log, the metric store it appends to, and the per-kernel compile caches it\n"
+    "# names by content hash. A tracked one of these turns any measurement taken in the main repo\n"
+    "# — a gate run, the bar's own re-pin — into uncommitted changes, and the loop then refuses to\n"
+    "# start for a reason that has nothing to do with the kernel."
+)
+
+
 def write_gitignore(repo: Path) -> None:
-    """Keep run state and profile artifacts out of the history.
+    """Keep run state and regenerated artifacts out of the history.
 
     Profiles especially: an iteration leaves a `.neff` and one `.ntff` per rank, and committing them
     would put tens of megabytes of binary into every iteration's diff.
@@ -257,9 +309,60 @@ def write_gitignore(repo: Path) -> None:
             "# compares. Regenerated every run, and tracking it means every gate run leaves the",
             "# tree dirty — which the loop refuses to start on.",
             "build/",
+            _REGENERATED_NOTE,
+            *REGENERATED,
             "",
         ])
     )
+
+
+def untrack_regenerated(repo: Path) -> list[str]:
+    """Ignore and un-stage the artifacts the toolchain rewrites. Returns what it un-staged.
+
+    For repos materialized before `REGENERATED` was excluded, where `git_init`'s `git add -A` took
+    the compiler log and the compile cache into the first commit. Every later measurement in the
+    main repo then rewrites a tracked file, and the loop — which refuses to start in a dirty
+    repository — stops on `M log-neuron-cc.txt`, naming a file that has nothing to do with the
+    kernel. `02-Attention`'s stage 3 stopped on exactly that, four minutes in.
+
+    Appends rather than rewriting `.gitignore`, and un-stages with `git rm --cached`, so nothing on
+    disk is touched and a cache the next compile wants is still there to be found. Idempotent: on a
+    repo already clean of them it appends nothing and un-stages nothing.
+    """
+    if not (repo / ".git").is_dir():
+        return []
+    ignore = repo / ".gitignore"
+    existing = ignore.read_text() if ignore.is_file() else ""
+    missing = [p for p in REGENERATED if p not in existing.splitlines()]
+    if missing:
+        body = existing if existing.endswith("\n") or not existing else existing + "\n"
+        ignore.write_text(body + _REGENERATED_NOTE + "\n" + "\n".join(missing) + "\n")
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
+    # `--no-index` because by default `check-ignore` says nothing about a tracked path, and every
+    # path here is tracked — that is the whole problem being fixed.
+    now_ignored = [
+        path for path in tracked
+        if path and subprocess.run(
+            ["git", "check-ignore", "-q", "--no-index", "--", path], cwd=repo, check=False,
+        ).returncode == 0
+    ]
+    if not now_ignored:
+        return []
+    subprocess.run(["git", "rm", "-r", "--cached", "-q", "--", *now_ignored],
+                   cwd=repo, check=True)
+    subprocess.run(["git", "add", "--", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
+         "commit", "-q", "-m",
+         "Stop tracking what the toolchain regenerates\n\n"
+         "A tracked compiler log or compile cache makes every measurement taken in the main "
+         "repo leave the tree dirty, and the loop refuses to start on a dirty tree."],
+        cwd=repo, check=True,
+    )
+    return now_ignored
 
 
 # --------------------------------------------------------------------------------------

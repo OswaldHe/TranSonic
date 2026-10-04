@@ -21,6 +21,7 @@ from optimization.memory import (
     MemorySpec,
     describe_for_prompt,
     entry_names,
+    rmtree_unlocked,
     seed,
 )
 
@@ -632,3 +633,29 @@ def test_an_unlistable_memory_directory_is_a_warning_not_a_crash(tmp_path, store
     finally:
         store.chmod(0o755)
     assert any("cannot be listed" in f for f in found), found
+
+
+def test_a_read_only_snapshot_does_not_block_removing_the_tree_that_holds_it(tmp_path):
+    """`unlock` restores one worktree's snapshot. A set-aside attempt is a whole repo with one
+    snapshot per iteration worktree, so a plain rmtree stops on the first read-only directory —
+    `02-Attention`'s stage 4 died on `REPORT.md` after its loop had already succeeded."""
+    import shutil
+
+    attempt = tmp_path / "assemble-1"
+    snapshot = attempt / ".autohelix" / "worktrees" / "iter-2" / SEEDED_REL / "02-Attention"
+    snapshot.mkdir(parents=True)
+    (snapshot / "REPORT.md").write_text("what the run found")
+    (snapshot / "REPORT.md").chmod(0o444)
+    for directory in (snapshot, snapshot.parent, snapshot.parent.parent):
+        directory.chmod(0o555)
+
+    with pytest.raises(PermissionError):
+        shutil.rmtree(attempt)
+
+    rmtree_unlocked(attempt)
+    assert not attempt.exists()
+
+
+def test_removing_a_tree_that_is_not_there_is_not_an_error_when_asked_to_ignore(tmp_path):
+    """`_prune_attempts` runs on whatever it finds and must not raise on a race."""
+    rmtree_unlocked(tmp_path / "gone", ignore_errors=True)

@@ -156,7 +156,9 @@ class Pipeline:
         attic = self.state_dir / "attempts" / f"{stage}-{attempt - 1}"
         attic.parent.mkdir(parents=True, exist_ok=True)
         if attic.exists():
-            shutil.rmtree(attic)
+            # A set-aside repo holds an iteration worktree per iteration, each with its own
+            # read-only memory snapshot, so a plain rmtree stops on the first one.
+            mem.rmtree_unlocked(attic)
         repo.rename(attic)
         self.console.print(f"  [dim]previous attempt kept at {attic}[/dim]")
 
@@ -174,7 +176,9 @@ class Pipeline:
             key=lambda p: p.stat().st_mtime,
         )
         for path in existing[: max(len(existing) - keep, 0)]:
-            shutil.rmtree(path, ignore_errors=True)
+            # Unlocked, and not `ignore_errors` alone: a read-only snapshot made this give up
+            # part-way and leave most of the attempt on disk, which is the opposite of pruning.
+            mem.rmtree_unlocked(path, ignore_errors=True)
             self.console.print(f"  [dim]pruned superseded attempt {path.name}[/dim]")
 
     def _read_record(self, name: str) -> dict[str, Any]:
@@ -465,8 +469,9 @@ class Pipeline:
             f"placement for {self.config.module_id} to a single split."
         )
 
-    def submodule(self) -> StageOutcome:
+    def submodule(self, rebuild: bool = False) -> StageOutcome:
         """Cut the module down to one rank, and accept the repo only when the gate agrees."""
+        self._refuse_to_clobber("submodule", rebuild)
         projection = self.projection()
         self._require_expressible_cut(projection)
         repo = self.config.submodule_repo
@@ -646,6 +651,25 @@ class Pipeline:
         for finding in cons.verify_manifest(repo):
             raise StageError(f"a compiled checker has changed since it was written: {finding}")
 
+        # Before anything measures in the main repo, since a measurement rewrites these and the
+        # loop will not start on a dirty tree.
+        untracked = materialize.untrack_regenerated(repo)
+        if untracked:
+            self.console.print(
+                f"  stopped tracking {len(untracked)} regenerated artifact(s) the toolchain "
+                f"rewrites ({', '.join(untracked[:3])}{', …' if len(untracked) > 3 else ''})"
+            )
+
+        if stage == "submodule":
+            lines = self._tighten_submodule_bar(repo)
+            for line in lines:
+                self.console.print(f"  {line}")
+            # The validator only. The manifest beside it lives under `.autohelix/`, which the
+            # repo's own `.gitignore` keeps out of the history.
+            if lines and materialize.git_commit_paths(
+                repo, "Re-pin the numerical bar to what this cut achieved", ["inference.py"],
+            ):
+                self.console.print("  committed the re-pinned bar, so the loop opens clean")
         self._seed_baseline_verdict(repo, stage)
         config_path = self.config.write_loop_config(stage)
         loop = OptimizationLoop(repo, config_file=config_path, stage=stage, verbose=self.verbose)
@@ -857,8 +881,9 @@ class Pipeline:
         self.console.print(f"    {latency:g} ms")
         return latency, achieved
 
-    def assemble(self) -> StageOutcome:
+    def assemble(self, rebuild: bool = False) -> StageOutcome:
         """Rebuild the whole module across all ranks, and accept it only when the gate agrees."""
+        self._refuse_to_clobber("assemble", rebuild)
         projection = self.projection()
         repo = self.config.full_repo
         submodule_repo = self.config.submodule_repo
@@ -1323,22 +1348,40 @@ class Pipeline:
 
         10% of slack, calibrated on the runs that have finished: `00-Attention-B` ended +1.0% from
         its own baseline, `00-Attention-C` -3.5%, `24-Attention` -49.3%, and `02-Attention` +77.0%.
+
+        Called from the submodule stage and again from the start of the loop, and idempotent across
+        both: `tolerance_achieved` in the manifest is the record that it has already happened. Both
+        call sites because reaching the re-pin used to mean running the submodule stage, and running
+        the submodule stage means rebuilding the cut — so "restart the loop under a tighter bar"
+        cost a tuned kernel and an hour of agent time to ask for.
         """
-        verdict = repo / ".autohelix" / "optimization" / "gate.json"
         manifest_path = repo / ".autohelix" / "optimization" / "submodule.json"
         validator = repo / "inference.py"
-        if not (verdict.is_file() and manifest_path.is_file() and validator.is_file()):
+        if not (manifest_path.is_file() and validator.is_file()):
             return []
         try:
-            achieved = json.loads(verdict.read_text()).get(ACCURACY_MARKER)
             manifest = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError):
             return []
         derived = manifest.get("tolerance") or {}
-        if not isinstance(achieved, (int, float)) or not derived:
+        if not derived:
             return []
+        already = manifest.get("tolerance_achieved") or {}
+        if already:
+            return [
+                f"bar already re-pinned: MAX_ABS_ERR {derived.get('MAX_ABS_ERR')} "
+                f"(the cut measured {already.get(ACCURACY_MARKER)})"
+            ]
 
-        tightened = materialize.tighten_bar(derived, {ACCURACY_MARKER: float(achieved)})
+        achieved = self._cut_accuracy(repo)
+        if achieved is None:
+            return [
+                f"[yellow]![/yellow] no {ACCURACY_MARKER} for the cut, so the bar stays as the "
+                f"agent derived it (MAX_ABS_ERR {derived.get('MAX_ABS_ERR')}) — the loop is free "
+                f"to spend accuracy up to it"
+            ]
+
+        tightened = materialize.tighten_bar(derived, {ACCURACY_MARKER: achieved})
         if tightened == derived:
             return []
 
@@ -1352,21 +1395,100 @@ class Pipeline:
         validator.write_text(text)
         manifest["tolerance"] = tightened
         manifest["tolerance_derived"] = derived
-        manifest["tolerance_achieved"] = {ACCURACY_MARKER: float(achieved)}
+        manifest["tolerance_achieved"] = {ACCURACY_MARKER: achieved}
         frozen = manifest.get("frozen")
         if isinstance(frozen, dict) and "inference.py" in frozen:
             frozen["inference.py"] = _validator_sha256(repo)
         manifest_path.write_text(json.dumps(manifest, indent=2))
+        self._refresh_recorded_validator("submodule", _validator_sha256(repo))
         # The two namespaces differ on purpose and are easy to confuse: the bar is keyed by the
         # constant names the validator declares (`MAX_ABS_ERR`), the verdict and the marker by the
         # statistic's own name (`max_abs_err`).
         return [
             f"[green]bar re-pinned[/green] to this cut's own accuracy: MAX_ABS_ERR "
             f"{derived.get('MAX_ABS_ERR')} -> {tightened.get('MAX_ABS_ERR'):g} "
-            f"(the cut measured {float(achieved):g})"
+            f"(the cut measured {achieved:g})"
         ]
 
-    def _prepared(self, stage: str) -> StageOutcome | None:
+    def _refresh_recorded_validator(self, stage: str, digest: str) -> None:
+        """Re-record the frozen validator's hash in the stage's passing records.
+
+        The pipeline is allowed to rewrite `inference.py` — re-pinning the bar is that — but
+        `_prepared` tells a half-replaced stage from a finished one by comparing the repo's
+        validator against the hash the passing record carries. Leave the record behind and the next
+        `optimize all` reads its own edit as a replaced repo and rebuilds the stage, which is the
+        destruction this was meant to prevent.
+        """
+        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json")):
+            try:
+                payload = json.loads(record.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not payload.get("passed") or payload.get("validator_sha256") == digest:
+                continue
+            payload["validator_sha256"] = digest
+            record.write_text(json.dumps(payload, indent=2))
+
+    def _cut_accuracy(self, repo: Path) -> float | None:
+        """What the cut's own frozen validator measured for `ACCURACY_MARKER`, or None.
+
+        `submodule-gate.json` and not `gate.json`. The loop points its per-iteration gate at
+        `gate.json` (`config.write_loop_config`), so one iteration in, that file describes the
+        newest candidate rather than the cut — and a bar re-pinned from it would be pinned to
+        whatever the loop had already drifted to. `submodule-gate.json` is written once, by the
+        submodule stage's own gate, and nothing afterwards touches it.
+
+        A verdict written before that gate published this marker carries a latency and no accuracy.
+        The validator is frozen and the cut is sitting in the repo, so measure it rather than let
+        the loop run unbounded: one validator run against hours of iterations.
+        """
+        verdict = repo / ".autohelix" / "optimization" / "submodule-gate.json"
+        try:
+            recorded = json.loads(verdict.read_text()).get(ACCURACY_MARKER)
+        except (OSError, json.JSONDecodeError):
+            recorded = None
+        if isinstance(recorded, (int, float)):
+            return float(recorded)
+
+        self.console.print(
+            f"  {verdict.name} carries no {ACCURACY_MARKER}; running the frozen validator once to "
+            f"find what the cut achieves"
+        )
+        try:
+            _, measured = self._measure(repo, "the cut's accuracy", "1")
+        except StageError as exc:
+            self.console.print(f"  [yellow]![/yellow] {exc}")
+            return None
+        measured_value = measured.get(ACCURACY_MARKER)
+        return float(measured_value) if isinstance(measured_value, (int, float)) else None
+
+    def _refuse_to_clobber(self, stage: str, rebuild: bool) -> None:
+        """Stop a preparation stage from archiving a repo whose own gate already passed.
+
+        `submodule` and `assemble` both open with `_set_aside`, which moves the finished repo into
+        `.optimization/attempts/` and materializes a fresh one for the agent to fill. On a stage
+        that has not passed that is the whole point. On a stage that has, it costs the tuned kernel,
+        its git history, its notes and reviews, and an hour of agent time to rebuild something
+        nobody asked to change — recoverable only because `_set_aside` archives rather than deletes.
+
+        So rebuilding is opt-in. Neither reason an operator reaches for `optimize submodule` on a
+        passed stage needs it: re-pinning the numerical bar happens at the start of the loop
+        (`_tighten_submodule_bar`), and re-running the loop is `optimize run`.
+        """
+        if rebuild or self._prepared(stage, quiet=True) is None:
+            return
+        repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
+        nxt = "run" if stage == "submodule" else "run-full"
+        raise StageError(
+            f"{stage} already passed its gate and {repo.name} is still there, so this would "
+            f"archive it to {self.state_dir / 'attempts'} and have an agent build another one.\n"
+            f"To re-run the loop over the repo you have: `optimize {nxt}`.\n"
+            f"To change its numerical bar: that happens at the start of the loop now, so "
+            f"`optimize {nxt}` is enough.\n"
+            f"To replace the repo on purpose: `optimize {stage} --rebuild`."
+        )
+
+    def _prepared(self, stage: str, *, quiet: bool = False) -> StageOutcome | None:
         """The recorded outcome of a preparation stage that already passed, or None.
 
         `submodule` and `assemble` both open with `_set_aside`, so calling either one again moves
@@ -1397,23 +1519,26 @@ class Pipeline:
             # half-replaced stage reaches the loop. The frozen validator's hash is what ties the
             # verdict to the repo it was a verdict about.
             recorded = payload.get("validator_sha256")
-            if recorded is None:
+            if recorded is None and not quiet:
                 self.console.print(
                     f"  [yellow]![/yellow] {record.name} records a pass but no validator hash "
                     f"(written before this was recorded); skipping {stage} on the weaker evidence "
                     f"that {repo.name} is present"
                 )
-            elif recorded != current:
-                self.console.print(
-                    f"  [yellow]![/yellow] {record.name} passed against a different "
-                    f"inference.py than {repo.name} now has — rebuilding {stage} rather than "
-                    f"trusting it"
-                )
+            elif recorded is not None and recorded != current:
+                if not quiet:
+                    self.console.print(
+                        f"  [yellow]![/yellow] {record.name} passed against a different "
+                        f"inference.py than {repo.name} now has — rebuilding {stage} rather than "
+                        f"trusting it"
+                    )
                 return None
-            self.console.print(
-                f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
-                f"is present — skipping it. Run `optimize {stage}` to rebuild on purpose."
-            )
+            if not quiet:
+                self.console.print(
+                    f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
+                    f"is present — skipping it. Run `optimize {stage} --rebuild` to replace it "
+                    f"on purpose."
+                )
             return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
         return None
 

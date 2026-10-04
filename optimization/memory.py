@@ -378,6 +378,37 @@ def unlock(worktree_dir: Path) -> None:
         pass
 
 
+def rmtree_unlocked(root: Path, ignore_errors: bool = False) -> None:
+    """`shutil.rmtree`, giving back the write bits a read-only snapshot took away.
+
+    `unlock` restores them for *one* worktree's snapshot, which is enough to tear that worktree
+    down. A set-aside attempt is a whole repo, and every iteration worktree inside it carries its
+    own snapshot — so removing one fails on the first read-only directory with a `PermissionError`
+    naming a file nobody would connect to a memory snapshot. `02-Attention`'s stage 4 died on
+    `REPORT.md`, eight hours into the run and after its loop had already succeeded.
+
+    Driven by the error rather than by a search for snapshots, so it clears any read-only directory
+    in the way and does not have to know where `seed` has been.
+    """
+    def grant(func, path, _exc):  # type: ignore[no-untyped-def]
+        # It is the *containing* directory's write bit that permits unlinking, and a directory's
+        # own bits that permit removing it once empty, so both are candidates. Symlinks are left
+        # alone: `seed` copies directory links as links, and chmod follows them.
+        for candidate in (Path(path), Path(path).parent):
+            try:
+                if candidate.is_dir() and not candidate.is_symlink():
+                    candidate.chmod(candidate.stat().st_mode | 0o700)
+            except OSError:
+                pass
+        func(path)
+
+    try:
+        shutil.rmtree(root, onexc=grant)
+    except (OSError, FileNotFoundError):
+        if not ignore_errors:
+            raise
+
+
 def seed(spec: MemorySpec, worktree_dir: Path) -> int:
     """Copy the memory into a worktree, read-only. Returns files seeded, 0 when there is nothing.
 
