@@ -349,10 +349,15 @@ def untrack_regenerated(repo: Path) -> list[str]:
             ["git", "check-ignore", "-q", "--no-index", "--", path], cwd=repo, check=False,
         ).returncode == 0
     ]
-    if not now_ignored:
+    # Both halves commit, and an appended `.gitignore` with nothing tracked to drop is the common
+    # case: a repo that never compiled in its main tree has the patterns missing and no artifact
+    # matching them. Returning early there left the edit uncommitted, and `run_loop` starts the
+    # harness in the next breath — so a clean pre-existing run could not resume at all.
+    if not (now_ignored or missing):
         return []
-    subprocess.run(["git", "rm", "-r", "--cached", "-q", "--", *now_ignored],
-                   cwd=repo, check=True)
+    if now_ignored:
+        subprocess.run(["git", "rm", "-r", "--cached", "-q", "--", *now_ignored],
+                       cwd=repo, check=True)
     subprocess.run(["git", "add", "--", ".gitignore"], cwd=repo, check=True)
     subprocess.run(
         ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
@@ -576,7 +581,14 @@ def tighten_bar(derived: dict[str, float], achieved: dict[str, float] | None,
         return out
     worst = achieved.get("max_abs_err")
     if worst is not None and "MAX_ABS_ERR" in out:
-        out["MAX_ABS_ERR"] = min(out["MAX_ABS_ERR"], worst * worst_margin)
+        # Floored, and scaled to the derived ceiling rather than absolute, because the ceiling is
+        # the one thing here that knows the output's magnitude (it is `RTOL` times the largest
+        # reference element plus `ATOL`). A kernel that happens to match bit-for-bit reports
+        # `max_abs_err = 0`, and multiplying that by the margin demands every later candidate be
+        # bit-exact too — which refuses legitimate reordering, sharding and any collective whose
+        # summation order differs, none of which the derived bar objects to.
+        allowance = max(worst * worst_margin, out["MAX_ABS_ERR"] * ACHIEVED_FLOOR)
+        out["MAX_ABS_ERR"] = min(out["MAX_ABS_ERR"], allowance)
     for name, key in (("MIN_COSINE", "cosine"), ("MIN_PASS_FRACTION", "pass_fraction")):
         got = achieved.get(key)
         if got is None or name not in out:

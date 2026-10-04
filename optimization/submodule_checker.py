@@ -90,8 +90,10 @@ def find_manifest(repo: Path) -> Path:
     Walking up is what lets the gate's command line be a fixed string with no per-repo path in
     it — so the command never names anything the agent could read to learn what is checked.
     """
-    for candidate in [repo, *repo.parents]:
-        path = candidate / MANIFEST_REL
+    # `directory`, not `candidate`: this module imports `candidate` and the loop variable shadowed
+    # it, so a reader inside this function sees the wrong meaning for the name.
+    for directory in [repo, *repo.parents]:
+        path = directory / MANIFEST_REL
         if path.is_file():
             return path
     raise CheckerError(

@@ -518,10 +518,13 @@ class OptimizationLoop(Harness):
         original = self.sandbox.remove_worktree
 
         def remove(worktree_path: Path) -> None:
+            # The project directory inside the worktree, which is the worktree root itself unless
+            # AutoHelix runs from a subdirectory of a larger repository. Both the capture below and
+            # the unlock after it are relative to it.
+            path = Path(worktree_path)
+            if self.sandbox.repo_prefix:
+                path = path / self.sandbox.repo_prefix
             try:
-                path = Path(worktree_path)
-                if self.sandbox.repo_prefix:
-                    path = path / self.sandbox.repo_prefix
                 source = path / "source.py"
                 iteration = self._current_iteration
                 if iteration is not None and source.is_file():
@@ -531,8 +534,10 @@ class OptimizationLoop(Harness):
             # The seeded memory is read-only down to its directory bits, and both
             # `git worktree remove --force` and the `shutil.rmtree` behind it need those bits back
             # to delete what is inside. Given back here, in the same seam, so a read-only snapshot
-            # never turns into a teardown failure that strands a worktree.
-            mem.unlock(Path(worktree_path))
+            # never turns into a teardown failure that strands a worktree — and given back at
+            # `path`, where `seed` put it, since the worktree root is the wrong place to look under
+            # a nested project and the directories would stay locked.
+            mem.unlock(path)
             original(worktree_path)
 
         self.sandbox.remove_worktree = remove  # type: ignore[method-assign]

@@ -198,11 +198,11 @@ def write_report(config: PipelineConfig, console: Console | None = None) -> Path
             f"this module on {projection.planned_units} logical NeuronCores across "
             f"{projection.planned_devices} devices (`{planned}`); this run projected that onto the "
             f"one device available (`{got}`), so a rank holds "
-            f"{projection.weight_residency_ratio():g}x the planned weight bytes. For `.ffn` that is "
-            f"exactly the trade the floorplan's own report priced and rejected — it chose the wider "
-            f"split because it lowers per-bank weight residency and decode is bank-bandwidth bound. "
-            f"A fast kernel here is a fast single-device kernel, not evidence about the 16-device "
-            f"deployment.",
+            f"{projection.weight_residency_ratio():g}x the planned weight bytes. The floorplan "
+            f"ranked the wider split higher, and this run took the narrower one because it is what "
+            f"fits — so a fast kernel here is a fast single-device kernel, not evidence about the "
+            f"planned deployment. Why the wider split was preferred for this module is in the "
+            f"floorplan's own report; it is a property of the module, not of every module.",
             "",
         ]
     parts += [

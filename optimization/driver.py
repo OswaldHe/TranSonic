@@ -226,8 +226,8 @@ class Pipeline:
                     f"{self.config.scheme.name} no longer projects {self.config.module_id} the way "
                     f"this workspace was initialized:\n  "
                     + "\n  ".join(drift)
-                    + f"\nThe repos already built assume the recorded projection.\n"
-                    f"Either restore the scheme, or start a fresh workspace.root for the new one."
+                    + "\nThe repos already built assume the recorded projection.\n"
+                    "Either restore the scheme, or start a fresh workspace.root for the new one."
                 )
             projection = frozen
 
@@ -606,18 +606,37 @@ class Pipeline:
                     f"({attempt}/{COMPILER_ATTEMPTS - 1})[/yellow]")
 
         if problems:
-            # Out of attempts. Deleting the unusable checkers is what makes the rest of the run
-            # honest: `loop.run_iteration` finds no checker, says so on every affected iteration,
-            # and enforces nothing — which is the author's rule (never enforce an unvalidated
-            # script, never silently claim a constraint) without throwing away the stage. Stopping
-            # here costs the whole stage; this costs one slot's enforcement.
-            for slot in enforceable:
+            # Out of attempts. An unvalidated checker is never enforced, so the unusable ones go --
+            # `loop.run_iteration` then finds no checker, says so on every affected iteration, and
+            # enforces nothing.
+            unusable = [
+                slot for slot in enforceable
+                if not any(c.path == cons.checker_path(repo, slot) for c in compiled)
+            ]
+            for slot in unusable:
                 path = cons.checker_path(repo, slot)
-                if path.is_file() and not any(c.path == path for c in compiled):
+                if path.is_file():
                     path.unlink()
+            # Which slots they were decides whether the stage may continue. Dropping a `soft`
+            # slot's checker costs advice the loop was free to ignore. Dropping a `hard` one's
+            # means the prompt still tells the agent the rule is mandatory while nothing checks it,
+            # and candidates that violate it merge — the stage would report success having
+            # delivered something weaker than the config asked for, which no later stage can
+            # detect. So soft degrades and hard stops.
+            hard = [slot for slot in unusable if slot.enforcement == "hard"]
+            if hard:
+                raise StageError(
+                    f"{len(hard)} checker(s) for `enforcement: hard` slot(s) "
+                    f"({', '.join(s.label for s in hard)}) are still unusable after "
+                    f"{COMPILER_ATTEMPTS} attempt(s), and a hard slot may not run unchecked: the "
+                    f"prompt would call the rule mandatory with nothing enforcing it.\n"
+                    f"The compiler's findings are above. Either rewrite that slot's prose so a "
+                    f"checker can be written against it, or set `enforcement: soft` to accept "
+                    f"advice without a gate."
+                )
             self.console.print(
                 f"  [red]![/red] {len(problems)} checker(s) still unusable after "
-                f"{COMPILER_ATTEMPTS} attempt(s); removed them. Those slots run "
+                f"{COMPILER_ATTEMPTS} attempt(s); removed them. Those slots are soft, so they run "
                 f"**unenforced** and every affected iteration will say so."
             )
         cons.write_manifest(repo, compiled, schedule)

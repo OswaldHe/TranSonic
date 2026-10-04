@@ -565,11 +565,13 @@ def test_iteration_zero_never_reads_the_memory(store):
 # -- what a hostile or merely untidy memory directory must not be able to do -------------
 
 
-def test_a_symlinked_directory_is_copied_as_a_link_and_never_followed(tmp_path, store):
-    """`seed_problem` compares the two root paths, so a link inside the tree slips past it.
+def test_a_memory_containing_a_symlink_is_refused_rather_than_seeded(tmp_path, store):
+    """Neither copy policy for a link is safe, so the link itself is the thing refused.
 
-    Followed, a link to the memory's own parent copies the snapshot into itself, and a link to a
-    large external tree copies far more than the operator pointed at.
+    Followed, a link to the memory's own parent copies the snapshot into itself and a link to a
+    large external tree copies all of it. Preserved, the iteration reaches the operator's original
+    through `.autohelix/memory/<link>` and can write to it, because the read-only chmod cannot
+    apply to a link without re-moding its target.
     """
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -578,28 +580,30 @@ def test_a_symlinked_directory_is_copied_as_a_link_and_never_followed(tmp_path, 
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    seed(MemorySpec(path=store, every=True), worktree)
+    problem = seed_problem(MemorySpec(path=store, every=True), worktree)
 
-    landed = worktree / SEEDED_REL / "link-to-outside"
-    assert landed.is_symlink(), "the link was followed instead of being copied as a link"
-    assert not (worktree / SEEDED_REL / "link-to-outside" / "huge.bin").is_file() or \
-        landed.is_symlink()
+    assert problem is not None and "symlink" in problem
+    assert "link-to-outside" in problem, "the message has to name the link to be actionable"
+    assert seed(MemorySpec(path=store, every=True), worktree) == 0
+    assert not (worktree / SEEDED_REL).exists()
 
 
-def test_locking_the_snapshot_does_not_chmod_through_a_symlink(tmp_path, store):
-    """`Path.chmod` follows links, so locking a copied link would re-mode its target."""
+def test_unlocking_does_not_chmod_through_a_symlink(tmp_path):
+    """`Path.chmod` and `is_dir` both follow links, so teardown would re-mode an outside target.
+
+    Built by hand rather than through `seed`, which refuses a memory containing links: this covers
+    the guard inside `unlock` itself, for a snapshot that holds a link by any other route.
+    """
     outside = tmp_path / "outside"
-    outside.mkdir()
-    victim = outside / "private.txt"
-    victim.write_text("secret\n")
-    victim.chmod(0o600)
-    (store / "link-to-file").symlink_to(victim)
+    outside.mkdir(mode=0o700)
     worktree = tmp_path / "wt"
-    worktree.mkdir()
+    snapshot = worktree / SEEDED_REL
+    snapshot.mkdir(parents=True)
+    (snapshot / "link-to-outside").symlink_to(outside, target_is_directory=True)
 
-    seed(MemorySpec(path=store, every=True), worktree)
+    unlock(worktree)
 
-    assert victim.stat().st_mode & 0o777 == 0o600, "the target's mode was changed through the link"
+    assert outside.stat().st_mode & 0o777 == 0o700, "a private directory was opened up through a link"
 
 
 def test_locking_preserves_a_private_files_own_read_permissions(tmp_path, store):

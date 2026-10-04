@@ -99,17 +99,12 @@ def launch(ranks: int) -> list[str]:
 #: claim, and load imbalance — the thing that makes a fastest-rank number optimistic — is invisible.
 RANK_LATENCY_MARKER = "latency_rank_{rank}_ms"
 
-#: What the collective must come from, and what it must not. The banned forms all work; they just
-#: measure a different machine than the one the floorplan is about.
+#: Where the collective must come from. Any other source works and measures a different machine
+#: than the one the floorplan is about, so the check resolves each of these operation names through
+#: the file's import table and requires the module it came from to be this one — which catches a
+#: host-side or XLA collective under any alias, rather than only the spellings someone listed.
 COLLECTIVE_MODULE = "nki.collectives"
 COLLECTIVE_OPS = ("all_reduce", "all_gather", "all_to_all", "reduce_scatter", "collective_permute")
-BANNED_COLLECTIVES = (
-    "torch.distributed.all_reduce", "torch.distributed.all_gather",
-    "torch.distributed.reduce_scatter", "torch.distributed.all_to_all",
-    "dist.all_reduce", "dist.all_gather", "dist.reduce_scatter", "dist.all_to_all",
-    "xm.all_reduce", "xm.all_gather", "xm.mesh_reduce", "xm.reduce_scatter",
-    "xm.all_to_all",
-)
 
 #: `torch.distributed` calls that are legitimate: they organize processes, they do not reduce data.
 ALLOWED_DIST_CALLS = frozenset({
@@ -134,8 +129,10 @@ OVERHEAD_ALLOWANCE = 1.10
 
 
 def find_manifest(repo: Path) -> Path:
-    for candidate in [repo, *repo.parents]:
-        path = candidate / MANIFEST_REL
+    # `directory`, not `candidate`: this module imports `candidate` and the loop variable shadowed
+    # it, so a reader inside this function sees the wrong meaning for the name.
+    for directory in [repo, *repo.parents]:
+        path = directory / MANIFEST_REL
         if path.is_file():
             return path
     raise CheckerError(

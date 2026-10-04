@@ -37,6 +37,7 @@ or edited on the way through.
 from __future__ import annotations
 
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -219,6 +220,17 @@ class MemorySpec:
         raw = section.get("iterations")
         if isinstance(raw, str):
             word = raw.strip().lower()
+            # One selector form, never two. `iterations: all` with `at: 3` beside it used to take
+            # the word and drop the range silently, so a config asking for memory at one iteration
+            # got it at every one — the opposite of what it said, and 5 of 5 iterations paying for
+            # a seed the operator wanted once. Ordinary selectors already reject conflicts.
+            clash = sorted(k for k in ("at", "from", "to") if k in section)
+            if clash:
+                raise MemoryError_(
+                    f"{where}: 'iterations: {word}' cannot be combined with "
+                    f"{', '.join(repr(k) for k in clash)}. Use one form: the word "
+                    f"'{EVERY}'/'{NONE}', or a list, or 'at', or 'from'/'to'"
+                )
             if word == NONE:
                 # Only useful beside `preparation: true`: let the one-shot agent read the memory
                 # and leave the loop's iterations alone.
@@ -350,7 +362,36 @@ def seed_problem(spec: MemorySpec, worktree_dir: Path) -> str | None:
         )
     if not source.is_dir():
         return f"memory.path {spec.path} is not a readable directory"
-    return None
+    return _symlink_problem(source, spec.path)
+
+
+def _symlink_problem(source: Path, declared: Path) -> str | None:
+    """Why a symlink in the memory tree makes it unseedable, or None when there is none.
+
+    A snapshot has to be a snapshot. Following links copies whatever they point at — a link to the
+    parent recurses to the path-length limit, a link to a large external tree copies all of it —
+    and *preserving* them is worse than it looks: the agent reaches the operator's original through
+    `.autohelix/memory/<link>` and can write to it, since the read-only chmod cannot apply to a
+    link without changing the target's own mode. A tree of only links also reports zero files
+    seeded while every target stays reachable.
+
+    So neither copy policy is safe and the link itself is the problem. Refused with the path, since
+    replacing it with a copy is a one-line fix and no behaviour here could guess which the operator
+    meant.
+    """
+    try:
+        found = [p for p in source.rglob("*") if p.is_symlink()]
+    except OSError as exc:
+        return f"memory.path {declared} could not be walked: {exc}"
+    if not found:
+        return None
+    shown = ", ".join(str(p.relative_to(source)) for p in found[:3])
+    return (
+        f"memory.path {declared} contains {len(found)} symlink(s) ({shown}"
+        f"{', …' if len(found) > 3 else ''}). A seeded memory is a read-only snapshot, and a link "
+        f"cannot be one: following it copies the target, and keeping it lets the iteration write "
+        f"through to the original. Replace each link with a copy of what it points at"
+    )
 
 
 def unlock(worktree_dir: Path) -> None:
@@ -393,7 +434,7 @@ def rmtree_unlocked(root: Path, ignore_errors: bool = False) -> None:
     def grant(func, path, _exc):  # type: ignore[no-untyped-def]
         # It is the *containing* directory's write bit that permits unlinking, and a directory's
         # own bits that permit removing it once empty, so both are candidates. Symlinks are left
-        # alone: `seed` copies directory links as links, and chmod follows them.
+        # alone, since chmod follows them and the target is not ours.
         for candidate in (Path(path), Path(path).parent):
             try:
                 if candidate.is_dir() and not candidate.is_symlink():
@@ -402,9 +443,13 @@ def rmtree_unlocked(root: Path, ignore_errors: bool = False) -> None:
                 pass
         func(path)
 
+    # `onexc` is 3.12; `onerror` takes the same three arguments with `sys.exc_info()` in the third
+    # and is the spelling 3.11 has. The package supports both, so pick by what `rmtree` accepts
+    # rather than by a version comparison.
+    keyword = "onexc" if sys.version_info >= (3, 12) else "onerror"
     try:
-        shutil.rmtree(root, onexc=grant)
-    except (OSError, FileNotFoundError):
+        shutil.rmtree(root, **{keyword: grant})
+    except OSError:
         if not ignore_errors:
             raise
 

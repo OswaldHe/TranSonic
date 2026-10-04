@@ -2166,3 +2166,94 @@ def test_a_fresh_repo_never_tracks_them_in_the_first_place(tmp_path):
     tracked = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
                              capture_output=True, text=True).stdout.split()
     assert tracked == [".gitignore", "source.py"]
+
+
+# ---------------------------------------------------------------------------------------------
+#  A hard slot may not run unchecked
+# ---------------------------------------------------------------------------------------------
+def _with_slots(tmp_path: Path, slots: list[dict]) -> Path:
+    """`_filled`, with the single-rank stage's constraint schedule replaced."""
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["submodule"]["iteration_constraints"] = slots
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    return path
+
+
+def test_an_unusable_hard_checker_stops_the_stage(tmp_path):
+    """Deleting it and carrying on leaves the prompt calling a rule mandatory with nothing
+    enforcing it, so violating candidates merge and the stage still reports success."""
+    from optimization.driver import Pipeline, StageError
+
+    pipeline = Pipeline(PipelineConfig.load(
+        _with_slots(tmp_path, [{"at": 1, "enforcement": "hard", "text": "only NKI"}])))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.config.submodule_repo.mkdir(parents=True, exist_ok=True)
+    pipeline._run_one_shot = lambda *a, **k: True        # the compiler "ran" and wrote nothing
+
+    with pytest.raises(StageError) as raised:
+        pipeline.compile_constraints("submodule")
+
+    assert "hard" in str(raised.value)
+    assert "enforcement: soft" in str(raised.value), "the message has to name the way forward"
+
+
+def test_an_unusable_soft_checker_degrades_instead_of_stopping(tmp_path):
+    """Soft is advice the loop was free to ignore, so losing its checker costs only the advice."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(
+        _with_slots(tmp_path, [{"at": 1, "enforcement": "soft", "text": "prefer NKI"}])))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.config.submodule_repo.mkdir(parents=True, exist_ok=True)
+    pipeline._run_one_shot = lambda *a, **k: True
+
+    outcome = pipeline.compile_constraints("submodule")
+
+    assert outcome.ok
+
+
+def test_an_ignore_only_change_is_committed_so_a_clean_run_can_resume(tmp_path):
+    """A repo that never compiled in its main tree has the patterns missing and nothing tracked
+    matching them. Returning early there left `.gitignore` dirty, and `run_loop` starts the harness
+    in the next breath — so an otherwise clean pre-existing run could not resume at all."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(".autohelix/\n")
+    (repo / "source.py").write_text("# kernel\n")
+    materialize.git_init(repo, "baseline")
+
+    assert materialize.untrack_regenerated(repo) == [], "nothing was tracked to un-stage"
+
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout == ""
+    assert "log-neuron-cc.txt" in (repo / ".gitignore").read_text()
+
+
+def test_a_bit_exact_baseline_does_not_demand_a_bit_exact_loop(tmp_path):
+    """A kernel that happens to match exactly reports max_abs_err 0, and 0 x the margin is 0 --
+    which refuses legitimate reordering, sharding and any collective whose summation order
+    differs, none of which the derived bar objects to."""
+    derived = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+               "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+
+    bar = materialize.tighten_bar(derived, {"max_abs_err": 0.0})
+
+    assert bar["MAX_ABS_ERR"] > 0.0
+    assert bar["MAX_ABS_ERR"] < derived["MAX_ABS_ERR"], "still tighter than the derived ceiling"
+
+
+def test_the_projected_width_is_the_one_configured_not_the_package_default(tmp_path):
+    """`FLOORPLAN.md` is binding on the agent that reads it, and it used to assert a one-device
+    trn2.3xlarge with the package's own default core count whatever the config asked for."""
+    projection = project(
+        module="layers.1.ffn",
+        splits=[{"dim": "expert", "factor": 8}],
+        units=["0.0", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7"],
+        target_units=2,
+    )
+
+    assert projection.target_units == 2
+    text = projection.describe()
+    assert "2 logical NeuronCore(s)" in text
+    assert "trn2.3xlarge" not in text, "the instance type is not this module's to assert"

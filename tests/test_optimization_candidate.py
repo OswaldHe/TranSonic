@@ -1078,3 +1078,22 @@ def test_a_count_computed_from_the_launch_is_allowed():
 def test_visible_cores_is_not_a_widening():
     tree = ast.parse("import os\nos.environ['NEURON_RT_VISIBLE_CORES'] = '2'\n")
     assert candidate.core_allocation_findings(tree, "inference.py", "1") == []
+
+
+def test_a_destructured_entry_point_counts_as_bound():
+    """`kernel, helper = _impl[2], value` makes `source.kernel` callable and runs in the validator.
+    Reading only `ast.Name` targets matched one spelling of binding, not Python's rules, so the
+    gate rejected a working candidate for having no entry point."""
+    tree = ast.parse("kernel, helper = _impl[2], 3\n")
+    assert "kernel" in candidate.top_level_names(tree)
+    assert "helper" in candidate.top_level_names(tree)
+
+
+def test_a_starred_destructured_binding_counts_too():
+    tree = ast.parse("first, *rest = things\n")
+    assert {"first", "rest"} <= candidate.top_level_names(tree)
+
+
+def test_an_attribute_target_binds_no_new_name():
+    tree = ast.parse("obj.kernel = _impl[2]\n")
+    assert "kernel" not in candidate.top_level_names(tree)

@@ -332,10 +332,30 @@ def top_level_names(tree: ast.Module) -> set[str]:
     names = set(top_level_functions(tree))
     for node in tree.body:
         if isinstance(node, ast.Assign):
-            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
+            for target in node.targets:
+                names.update(_bound_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_bound_names(node.target))
     return names
+
+
+def _bound_names(target: ast.expr) -> set[str]:
+    """Every name one assignment target binds.
+
+    Recursive because a target can be a tuple or a list: `kernel, helper = _impl[2], value` binds
+    `kernel` just as plainly as `kernel = _impl[2]` does, and the validator calls `source.kernel`
+    either way. Reading only `ast.Name` matched one spelling rather than Python's binding rules, so
+    the gate rejected a working candidate for having no entry point. Starred targets unpack too
+    (`first, *rest = ...`), and attribute or subscript targets bind no new name, so they contribute
+    nothing.
+    """
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for element in target.elts for name in _bound_names(element)}
+    return set()
 
 
 def called_attributes(tree: ast.Module) -> dict[str, int]:

@@ -5,22 +5,106 @@ module from `bootstrap`, and a decision about what runs where from `floorplan` �
 between them. It cuts the module down to what one NeuronCore runs, makes that fast, then puts the
 ranks back together with a collective and makes *that* fast.
 
+## Run one
+
 ```bash
 autohelix optimize template > optimization.yaml   # then fill in the <FILL IN>s
 autohelix optimize check                          # validate the config, show the projection
-autohelix optimize all                            # all five stages
+autohelix optimize all                            # every stage, in order
 ```
 
-`optimize all` **resumes**. A stage that already recorded a passing gate, and whose repo is still
-there, is skipped with a line saying so — so a run that died in stage 5 is picked up by re-running
-the same command, not started over. To rebuild a finished stage on purpose, name it:
-`optimize submodule` and `optimize assemble` always archive the existing repo into
-`.optimization/attempts/` and build a new one.
+`check` is free and reads no device. Run it after every config edit.
 
-The words this pipeline coins — *projection*, *slot*, *checker*, *advisory*, *custody*, *attic*,
-*drift* — are defined in [`CONTEXT.md`](../CONTEXT.md); reach for it when a term here reads as
-ambiguous, or before coining another. Three decisions are recorded with their rejected alternatives
-in [`docs/adr/`](../docs/adr/), and named below at the point where each one bites.
+`all` takes hours to days: each loop iteration is one agent plus one on-device measurement. Run it
+under `setsid nohup` and watch the log.
+
+### Resuming, and the one flag that destroys work
+
+`optimize all` **resumes**. A stage that recorded a passing gate, and whose repo is still there, is
+skipped with a line saying so — so a run that died in stage 5 is picked up by re-running the same
+command.
+
+`optimize submodule` and `optimize assemble` archive the repo they find into
+`.optimization/attempts/` and have an agent build a new one. On a stage that already passed, that
+throws away a tuned kernel and its whole history, so they **refuse** unless you add `--rebuild`:
+
+```bash
+autohelix optimize run                  # re-run the loop over the kernel you have
+autohelix optimize submodule --rebuild  # throw that kernel away and cut the module again
+```
+
+Reach for `--rebuild` only when you want a different cut or a different assembly. Re-running a loop,
+and changing the numerical bar it is held to, both happen without it.
+
+## Commands and options
+
+Every command takes `-c/--config PATH` (default `./optimization.yaml`). Every command that runs an
+agent also takes `-v/--verbose`, which streams the agent's output to your terminal instead of only
+to its log.
+
+| command | what it does | its own options |
+|---|---|---|
+| `template` | print the config template to stdout | — |
+| `check` | validate the config and show the projection; touches no device | — |
+| `init` | make the workspace and record the projection | — |
+| `submodule` | an agent cuts the module down to one rank | `--rebuild` |
+| `compile-constraints` | turn each constraint slot's prose into a checker | `--stage submodule\|full` |
+| `run` | the optimization loop on the single-rank kernel | — |
+| `assemble` | an agent rejoins the ranks with `nki.collectives` | `--rebuild` |
+| `run-full` | the optimization loop on the whole distributed module | — |
+| `rerun-full` | another round of the whole-module loop, from the last round's best | `--from-commit SHA`, `--note TEXT` |
+| `feedback` | an agent reconciles both loops' notes into `FEEDBACK.md` | — |
+| `report` | write the run's report: what each stage achieved | — |
+| `gate` | run a gate once, by hand, against the repo as it stands | `--stage submodule\|full` |
+| `all` | every stage above, in order, resuming what passed | — |
+
+Two that are useful on their own: **`gate`** tells you whether a repo would pass right now without
+starting a loop, and **`rerun-full`** is how a second round happens once you have read the first
+round's notes — `--from-commit` overrides its default starting point, `--note` records why the round
+exists.
+
+## The config
+
+`optimize template` emits the whole thing with every key present and commented. The parts you will
+actually edit:
+
+| block | key | what it decides |
+|---|---|---|
+| `module` | `id`, `bootstrap_repo`, `artifact` | which module, and where its bootstrapped kernel and recorded tensors are |
+| `floorplan` | `scheme`, `target_units`, `on_oversized` | the placement to project, how many ranks, and what to do when the module does not fit |
+| `workspace` | `root`, `venv` | where the run's repos and state go |
+| `memory` | `path`, `prompt` | a directory of earlier runs that iterations start from |
+| `submodule`, `full` | `goal` | what the loop is asked to achieve |
+| | `budget.iterations`, `budget.iteration_time` | how many iterations and how long each may take |
+| | `acceptance.max_regression_pct` | how much slower than the best an iteration may be and still merge |
+| | `memory.iterations` | which iterations receive the memory |
+| | `iteration_constraints` | the per-iteration **constraint schedule** (below) |
+| | `reviewer` | the per-iteration reviewer's model, timeout and prompt |
+| `agent` | `type` | which agent backend runs the iterations |
+| `preparation` | `retries`, `timeout` | how many attempts the one-shot stages get |
+| `constraint_compiler`, `feedback` | `model`, `timeout` | the two other one-shot agents |
+
+`check` rejects an incomplete block rather than quietly disabling it, so a `memory:` with a selector
+and no `path:`, or a slot with `enforcement: hard` and no text, is an error you see before the device
+is touched.
+
+## When a stage fails
+
+| what you see | what it means | what to do |
+|---|---|---|
+| `submodule did not pass its gate in N attempt(s)` | the cut is wrong or incomplete | read the last report in `.optimization/`; a repeated failure is the prompt or the module, not luck |
+| `checker(s) for 'enforcement: hard' slot(s) … still unusable` | the compiler could not write a check for that prose | rewrite the slot's text, or set `enforcement: soft` to keep it as advice |
+| `the submodule loop recorded no iteration, so it did not start` | the repo is dirty, a scoped file is missing, or the config drifted | the causes print above it; the usual one is uncommitted changes |
+| `already passed its gate and … is still there` | you named a one-shot stage that is done | `optimize run`/`run-full` to re-loop, or `--rebuild` to replace it |
+| `a compiled checker has changed since it was written` | a checker was edited after the manifest recorded its hash | `optimize compile-constraints --stage <stage>` |
+
+---
+
+The rest of this file is how the pipeline works, for when a message or a decision needs explaining.
+The words it coins — *projection*, *slot*, *checker*, *advisory*, *custody*, *attic*, *drift* — are
+defined in [`CONTEXT.md`](../CONTEXT.md); reach for it when a term reads as ambiguous, or before
+coining another. Three decisions are recorded with their rejected alternatives in
+[`docs/adr/`](../docs/adr/), and named below at the point where each one bites.
 
 ## Six stages, and why they are six
 
@@ -488,6 +572,14 @@ optimization/
   not a worse starting point than the last attempt, it is not a starting point. Read the last report
   before raising `preparation.retries`, because a repeated failure is the prompt or the module rather
   than luck.
+- **The loop will not start in a dirty repository, and the toolchain dirties one.** `log-neuron-cc.txt`,
+  `global_metric_store.json` and the per-kernel compile caches are rewritten by every measurement
+  taken in the main repo, so a repo that tracks them stops the loop on a file that has nothing to do
+  with the kernel. They are excluded for new repos and un-staged from existing ones when a loop
+  starts; nothing on disk is deleted, so a cache the next compile wants is still there.
+- **A seeded memory may not contain symlinks.** A snapshot has to be a snapshot: following a link
+  copies whatever it points at, and keeping it lets the iteration write through to the operator's
+  original. `check` names the offending links; replace each with a copy.
 - **Stripping never touches the originals.** The bootstrapped repo keeps its comments; only the
   copies inside an optimization repo lose them. If you want to read the bootstrap agent's reasoning,
   it is still in `bootstrap-runs/<module>/`.
