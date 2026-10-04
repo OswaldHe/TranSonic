@@ -1715,3 +1715,104 @@ def test_an_unreopenable_reviewer_commit_stops_the_merge(tmp_path):
             loop.run_reviewer(worktree, 1)
     finally:
         cls.run_reviewer = original
+
+
+# ---------------------------------------------------------------------------------------------
+#  The bar the reassembly is held to
+# ---------------------------------------------------------------------------------------------
+
+#: What each module's bootstrapped kernel achieved, and what its optimized four-rank module
+#: achieved, as measured. The calibration of `tighten_bar` is only meaningful against real numbers:
+#: a rule that rejects a good assembly is worse than no rule at all.
+_MEASURED = {
+    # module: (bootstrap (max_abs, cosine, pass_fraction), final (same)), expected verdict
+    "00-Attention-B": ((0.0859375, 0.9999554805, 1.0),
+                       (0.0859375, 0.9999444598, 1.0), True),
+    "24-Attention": ((0.2518768311, 0.9998087800, 0.9999944448),
+                     (0.1738281250, 0.9997568207, 0.9999969959), True),
+    "00-Attention-C-iter2": ((0.1093750000, 0.9999013080, 1.0),
+                             (0.1171875000, 0.9998860816, 1.0), True),
+    "00-Attention-C-final": ((0.1093750000, 0.9999013080, 1.0),
+                             (0.1406250000, 0.9995487502, 0.9999990225), False),
+    "02-Attention": ((0.0981445000, 0.9998770000, 1.0),
+                     (0.6093750000, 0.9996998017, 0.9998433352), False),
+}
+
+_DERIVED = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+            "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+
+
+def _clears(bar, result):
+    max_abs, cosine, pass_fraction = result
+    return (max_abs <= bar["MAX_ABS_ERR"] and cosine >= bar["MIN_COSINE"]
+            and pass_fraction >= bar["MIN_PASS_FRACTION"])
+
+
+def test_the_bar_is_tightened_to_what_the_bootstrapped_kernel_achieved():
+    """The derived bar describes the recorded output, not what the module can be computed to.
+
+    `layers.2.attention`'s derived ceiling is 0.7875 and its bootstrapped kernel reaches 0.0981445,
+    so the pipeline had 8x of headroom and used it: the assembly landed at 0.2773438 and stage 5 at
+    0.609375, all of it passing a gate that was never binding.
+    """
+    achieved = {"max_abs_err": 0.0981445, "cosine": 0.9998770, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.0981445 * materialize.WORST_MARGIN)
+    assert bar["MAX_ABS_ERR"] < _DERIVED["MAX_ABS_ERR"]
+    assert bar["MIN_COSINE"] > _DERIVED["MIN_COSINE"]
+    assert bar["MIN_PASS_FRACTION"] > _DERIVED["MIN_PASS_FRACTION"]
+
+
+def test_tightening_never_loosens_any_of_the_five():
+    """The derived bar stays the ceiling; this is a floor under it, never a relaxation."""
+    for bootstrap, _final, _ok in _MEASURED.values():
+        achieved = dict(zip(("max_abs_err", "cosine", "pass_fraction"), bootstrap))
+        bar = materialize.tighten_bar(_DERIVED, achieved)
+        assert bar["MAX_ABS_ERR"] <= _DERIVED["MAX_ABS_ERR"]
+        assert bar["MIN_COSINE"] >= _DERIVED["MIN_COSINE"]
+        assert bar["MIN_PASS_FRACTION"] >= _DERIVED["MIN_PASS_FRACTION"]
+
+
+def test_the_elementwise_test_itself_is_never_moved():
+    """`RTOL`/`ATOL` define what `MIN_PASS_FRACTION` counts, so moving them changes its meaning."""
+    achieved = {"max_abs_err": 0.01, "cosine": 0.99999999, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["RTOL"] == _DERIVED["RTOL"]
+    assert bar["ATOL"] == _DERIVED["ATOL"]
+
+
+def test_the_tightened_bar_admits_the_good_assemblies_and_refuses_the_bad(): 
+    """Calibration, against every module measured so far.
+
+    Two margins because the statistics fail differently: `MAX_ABS_ERR` is one element and moves
+    when something structural changes, while cosine and the pass fraction aggregate over 42 M
+    elements and drift whenever the arithmetic is reordered.
+    """
+    for name, (bootstrap, final, expected) in _MEASURED.items():
+        achieved = dict(zip(("max_abs_err", "cosine", "pass_fraction"), bootstrap))
+        bar = materialize.tighten_bar(_DERIVED, achieved)
+        assert _clears(bar, final) is expected, (
+            f"{name}: expected {'to clear' if expected else 'to be refused by'} the tightened bar, "
+            f"bar={bar}, achieved={final}"
+        )
+
+
+def test_a_bootstrap_that_reaches_one_does_not_produce_an_unreachable_bar():
+    """`pass_fraction = 1.0` would otherwise demand 1.0 of the reassembly: one stray element fails."""
+    achieved = {"max_abs_err": 0.05, "cosine": 1.0, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["MIN_PASS_FRACTION"] < 1.0
+    assert bar["MIN_COSINE"] < 1.0
+
+
+def test_a_baseline_measurement_with_no_numerics_leaves_the_derived_bar_alone():
+    """An older run recorded no numerics beside its latency; it gets the behaviour it had."""
+    assert materialize.tighten_bar(_DERIVED, None) == _DERIVED
+    assert materialize.tighten_bar(_DERIVED, {}) == _DERIVED
+
+
+def test_a_partially_reported_measurement_tightens_only_what_it_reported():
+    bar = materialize.tighten_bar(_DERIVED, {"max_abs_err": 0.05})
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.05 * materialize.WORST_MARGIN)
+    assert bar["MIN_COSINE"] == _DERIVED["MIN_COSINE"]
+    assert bar["MIN_PASS_FRACTION"] == _DERIVED["MIN_PASS_FRACTION"]

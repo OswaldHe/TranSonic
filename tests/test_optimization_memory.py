@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from optimization.config import ConfigError, PipelineConfig
@@ -95,6 +97,14 @@ def test_relative_path_resolves_against_the_config_not_the_cwd(tmp_path, store):
         {"path": "memory"}, max_iterations=5, base_dir=tmp_path,
     )
     assert spec.path == store.resolve()
+
+
+#: UID 0 ignores the permission bits these tests are about: a root process writes into a 0555
+#: directory and reads a 0000 one, so the behavioural half of each check silently passes while
+#: proving nothing. Containerized CI commonly runs as root, so the mode-bit assertions are the
+#: ones that must hold everywhere and the behavioural ones are skipped there.
+_AS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_root_skip = pytest.mark.skipif(_AS_ROOT, reason="UID 0 bypasses the mode bits under test")
 
 
 # -- seeding ---------------------------------------------------------------------------
@@ -369,9 +379,11 @@ def test_seeded_directories_are_read_only_not_just_the_files(tmp_path, store):
         assert not path.stat().st_mode & 0o222, f"{path} is writable"
 
     # The property that matters: a new entry cannot be created beside a read-only file, which is
-    # how an atomic-save editor would otherwise replace one.
-    with pytest.raises(PermissionError):
-        (landed / "submodule" / "sneaked.py").write_text("x")
+    # how an atomic-save editor would otherwise replace one. The mode-bit loop above is what
+    # proves it portably; this is the behaviour that follows, and only off root.
+    if not _AS_ROOT:
+        with pytest.raises(PermissionError):
+            (landed / "submodule" / "sneaked.py").write_text("x")
 
 
 def test_unlock_makes_the_tree_removable_again(tmp_path, store):
@@ -381,8 +393,9 @@ def test_unlock_makes_the_tree_removable_again(tmp_path, store):
     worktree.mkdir()
     seed(MemorySpec(path=store, every=True), worktree)
 
-    with pytest.raises(OSError):
-        sh.rmtree(worktree / SEEDED_REL)
+    if not _AS_ROOT:
+        with pytest.raises(OSError):
+            sh.rmtree(worktree / SEEDED_REL)
 
     unlock(worktree)
     sh.rmtree(worktree / SEEDED_REL)
@@ -607,8 +620,12 @@ def test_locking_preserves_a_private_files_own_read_permissions(tmp_path, store)
     assert ordinary.stat().st_mode & 0o044 != 0, "an ordinary file stopped being group/world readable"
 
 
+@_root_skip
 def test_an_unlistable_memory_directory_is_a_warning_not_a_crash(tmp_path, store):
-    """`warnings()` runs in `_preflight`, before a stage starts: raising there kills the command."""
+    """`warnings()` runs in `_preflight`, before a stage starts: raising there kills the command.
+
+    Skipped as root, which reads a 0000 directory happily and so never reaches the branch.
+    """
     store.chmod(0o000)
     try:
         found = MemorySpec(path=store, every=True).validate()

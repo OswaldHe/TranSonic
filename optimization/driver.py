@@ -23,6 +23,7 @@ of iteration 7 could be written around what iteration 6 already did.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -78,6 +79,20 @@ it has to be written inline instead. Here is the contract again, in full:
 
 {{ contract }}
 """
+
+
+def _validator_sha256(repo: Path) -> str | None:
+    """`inference.py`'s hash, or None if it is not there yet.
+
+    The validator is frozen for the whole of the loop that follows a preparation stage — its hash
+    is already a gate check — which makes it the one thing that identifies "the repo that passed"
+    and stays true until the stage is rebuilt. `source.py` would not do: the loop rewrites it every
+    iteration, so matching on it would refuse to resume exactly when resuming is wanted.
+    """
+    path = repo / "inference.py"
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class StageError(RuntimeError):
@@ -486,7 +501,10 @@ class Pipeline:
                 self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.submodule_checker", "submodule")
-            self._record(f"submodule-attempt-{attempt}", {"passed": ok, "report": report})
+            self._record(f"submodule-attempt-{attempt}", {
+                "passed": ok, "report": report,
+                "validator_sha256": _validator_sha256(repo),
+            })
             if ok:
                 materialize.git_init(repo, f"Submodule baseline: one rank of {self.config.module_id}")
                 latency = _latency_from_gate(
@@ -736,7 +754,7 @@ class Pipeline:
 
     # -- stage: assemble -----------------------------------------------------------
 
-    def measure_baselines(self) -> tuple[float, float]:
+    def measure_baselines(self) -> tuple[float, float, dict[str, float]]:
         """Re-measure the two numbers stage 5 is bounded by, on this host, now.
 
         Not copied from the bootstrap log or from stage 3's history. Both bounds are comparisons
@@ -744,15 +762,20 @@ class Pipeline:
         different toolchain is the kind of number that makes a bound quietly meaningless.
         """
         self.console.print("\n[bold]re-measuring the two baselines on this host[/bold]")
-        bootstrap_ms = self._measure(
+        bootstrap_ms, achieved = self._measure(
             self.config.bootstrap_repo, "the bootstrapped module (1 core)", cores="1",
         )
+        if achieved:
+            self.console.print(
+                "    achieved "
+                + ", ".join(f"{k}={v:g}" for k, v in sorted(achieved.items()))
+            )
         # The submodule is measured at the *commit the assembly is built from*, not at `HEAD`. With
         # 5% of regression slack those differ, and measuring one while assembling the other would
         # make the 1.1x ceiling describe code that is not in the assembly.
         best_commit, _ = _best_from_summary(self.config.submodule_repo)
         with self._at_commit(self.config.submodule_repo, best_commit) as repo:
-            submodule_ms = self._measure(
+            submodule_ms, _ = self._measure(
                 repo, f"the optimized submodule at {(best_commit or 'HEAD')[:12]} (1 core)",
                 cores="1",
             )
@@ -760,9 +783,10 @@ class Pipeline:
             "bootstrap_latency_ms": bootstrap_ms,
             "submodule_latency_ms": submodule_ms,
             "overhead_ceiling_ms": round(submodule_ms * 1.10, 6),
+            "bootstrap_achieved": achieved,
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
-        return bootstrap_ms, submodule_ms
+        return bootstrap_ms, submodule_ms, achieved
 
     @contextmanager
     def _at_commit(self, repo: Path, commit: str | None):
@@ -798,7 +822,13 @@ class Pipeline:
         finally:
             target.write_text(original)
 
-    def _measure(self, repo: Path, label: str, cores: str) -> float:
+    #: The numerics a validator prints beside its latency. Read from the same run, because they
+    #: describe the same kernel on the same host — and because a bar derived from the recorded
+    #: output alone is not a bar the pipeline can be held to. See `materialize.tighten_bar`.
+    ACHIEVED_MARKERS = ("max_abs_err", "cosine", "pass_fraction")
+
+    def _measure(self, repo: Path, label: str, cores: str) -> tuple[float, dict[str, float]]:
+        """The validator's latency, and whatever numerics it printed alongside it."""
         from optimization import candidate
 
         self.console.print(f"  measuring {label} in {repo}")
@@ -813,8 +843,13 @@ class Pipeline:
                 f"could not measure {label}: exit {outcome.return_code}, "
                 f"latency {latency}\n{tail}"
             )
+        achieved = {}
+        for name in self.ACHIEVED_MARKERS:
+            value = candidate.marker_value(outcome.output, name)
+            if value is not None:
+                achieved[name] = value
         self.console.print(f"    {latency:g} ms")
-        return latency
+        return latency, achieved
 
     def assemble(self) -> StageOutcome:
         """Rebuild the whole module across all ranks, and accept it only when the gate agrees."""
@@ -825,7 +860,7 @@ class Pipeline:
             raise StageError(f"{submodule_repo} does not exist — run the submodule stages first")
 
         best_commit, best_ms = _best_from_summary(submodule_repo)
-        bootstrap_ms, submodule_ms = self.measure_baselines()
+        bootstrap_ms, submodule_ms, achieved = self.measure_baselines()
         ranks = projection.projected_units
         prompt_template = presets.assemble_prompt()
 
@@ -837,7 +872,7 @@ class Pipeline:
                 artifact=self.config.artifact, submodule_repo=submodule_repo,
                 projection=projection, module_id=self.config.module_id,
                 bootstrap_latency_ms=bootstrap_ms, submodule_latency_ms=submodule_ms,
-                best_commit=best_commit,
+                best_commit=best_commit, achieved=achieved,
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
@@ -864,7 +899,10 @@ class Pipeline:
                 self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.module_checker", "module")
-            self._record(f"assemble-attempt-{attempt}", {"passed": ok, "report": report})
+            self._record(f"assemble-attempt-{attempt}", {
+                "passed": ok, "report": report,
+                "validator_sha256": _validator_sha256(repo),
+            })
             if ok:
                 materialize.git_init(
                     repo, f"Assembly baseline: {self.config.module_id} on {ranks} ranks",
@@ -1279,16 +1317,38 @@ class Pipeline:
         repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
         if not (repo / "source.py").is_file():
             return None
+        current = _validator_sha256(repo)
         for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json")):
             try:
-                if json.loads(record.read_text()).get("passed"):
-                    self.console.print(
-                        f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
-                        f"is present — skipping it. Run `optimize {stage}` to rebuild on purpose."
-                    )
-                    return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
+                payload = json.loads(record.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
+            if not payload.get("passed"):
+                continue
+            # A pass record alone is not enough. A rebuild interrupted after `_set_aside`
+            # materialized a fresh repo but before its own record was written leaves an older
+            # `passed: true` beside a repo of stubs, and skipping the gate for *that* is how a
+            # half-replaced stage reaches the loop. The frozen validator's hash is what ties the
+            # verdict to the repo it was a verdict about.
+            recorded = payload.get("validator_sha256")
+            if recorded is None:
+                self.console.print(
+                    f"  [yellow]![/yellow] {record.name} records a pass but no validator hash "
+                    f"(written before this was recorded); skipping {stage} on the weaker evidence "
+                    f"that {repo.name} is present"
+                )
+            elif recorded != current:
+                self.console.print(
+                    f"  [yellow]![/yellow] {record.name} passed against a different "
+                    f"inference.py than {repo.name} now has — rebuilding {stage} rather than "
+                    f"trusting it"
+                )
+                return None
+            self.console.print(
+                f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
+                f"is present — skipping it. Run `optimize {stage}` to rebuild on purpose."
+            )
+            return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
         return None
 
     def all(self) -> list[StageOutcome]:

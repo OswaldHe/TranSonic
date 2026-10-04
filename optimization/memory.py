@@ -367,6 +367,11 @@ def unlock(worktree_dir: Path) -> None:
         return
     try:
         for path in [root, *root.rglob("*")]:
+            # `is_dir` and `chmod` both follow symlinks, and `seed` now copies directory links as
+            # links rather than following them — so without this an external target's mode is
+            # changed during teardown, and a private 0700 directory becomes world-traversable.
+            if path.is_symlink():
+                continue
             if path.is_dir():
                 path.chmod(0o755)
     except OSError:
@@ -409,6 +414,15 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
         target.chmod(_locked(target, 0o555))
         return count
     except OSError:
+        # Returning 0 makes the caller omit the memory prompt, so the agent is told nothing about
+        # a tree it can nonetheless read — and a snapshot abandoned mid-chmod is still writable.
+        # Whatever landed has to go with the report of failure.
+        try:
+            if target.exists():
+                unlock(worktree_dir)
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
         return 0
 
 

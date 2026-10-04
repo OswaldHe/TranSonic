@@ -428,6 +428,61 @@ It must exit 0 and print three markers — `##autohelix[latency_ms=...]`,
 # --------------------------------------------------------------------------------------
 
 
+#: How much worse than the bootstrapped kernel a reassembly of the same module may be.
+#:
+#: The derived bar (`read_numerical_bar`) is a property of the *recorded output* — `RTOL` times its
+#: largest element plus `ATOL` — not of what the module can actually be computed to. On
+#: `layers.2.attention` the derived ceiling is 0.7875 and the bootstrapped single-core kernel
+#: reaches 0.0981445, so the pipeline had 8x of headroom and walked into it: stage 4 reassembled at
+#: 0.2773438 and stage 5 finished at 0.609375, with 6,571 of 42 M elements outside the elementwise
+#: tolerance against the assembly's 24 — all of it passing a gate that was never the binding
+#: constraint. The bootstrapped kernel is a working implementation of the same module against the
+#: same golden, so what *it* achieves is the honest reference point.
+#:
+#: Two margins, because the three statistics fail differently. `MAX_ABS_ERR` is one element and
+#: moves only when something structural changes, so it is held tight. Cosine and the pass fraction
+#: aggregate over 42 M elements and drift a little whenever the arithmetic is reordered — a rank
+#: split legitimately costs a few percent there — so they get more room. Checked against all four
+#: attention modules measured so far: this admits `00-Attention-B` (whose assembly cost nothing) and
+#: `24-Attention` (whose rewrite improved on its bootstrap), and refuses `02-Attention`'s assembly
+#: and `00-Attention-C`'s fp8-PV kernel while admitting C's previous iteration.
+WORST_MARGIN = 1.10          # MAX_ABS_ERR
+SPREAD_MARGIN = 2.00         # MIN_COSINE, MIN_PASS_FRACTION
+
+#: A floor on the allowance, so a bootstrapped kernel that happens to reach `pass_fraction = 1.0`
+#: or a cosine of 1.0 does not produce a bar no reassembly can clear. 1e-5 of 42 M elements is
+#: about 420 of them.
+ACHIEVED_FLOOR = 1e-5
+
+
+def tighten_bar(derived: dict[str, float], achieved: dict[str, float] | None,
+                worst_margin: float = WORST_MARGIN,
+                spread_margin: float = SPREAD_MARGIN) -> dict[str, float]:
+    """`derived`, tightened to what the bootstrapped kernel achieved plus a margin.
+
+    Only ever tightens: every value returned is at least as strict as the derived one, so the
+    documented rule stays the ceiling and this is a floor under it. A statistic missing from
+    `achieved` is left at its derived value rather than guessed — an older run whose baseline
+    measurement recorded no numerics gets the old behaviour.
+
+    `RTOL` and `ATOL` are never touched. They define the elementwise test that `MIN_PASS_FRACTION`
+    counts, so moving them would silently change what the pass fraction means.
+    """
+    out = dict(derived)
+    if not achieved:
+        return out
+    worst = achieved.get("max_abs_err")
+    if worst is not None and "MAX_ABS_ERR" in out:
+        out["MAX_ABS_ERR"] = min(out["MAX_ABS_ERR"], worst * worst_margin)
+    for name, key in (("MIN_COSINE", "cosine"), ("MIN_PASS_FRACTION", "pass_fraction")):
+        got = achieved.get(key)
+        if got is None or name not in out:
+            continue
+        allowance = max(1.0 - got, ACHIEVED_FLOOR) * spread_margin
+        out[name] = max(out[name], 1.0 - allowance)
+    return out
+
+
 def materialize_full(
     repo: Path,
     bootstrap_repo: Path,
@@ -439,6 +494,7 @@ def materialize_full(
     submodule_latency_ms: float,
     best_commit: str | None,
     entry_point: str = "kernel",
+    achieved: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Scaffold the repo the stage-4 agent fills in. Returns the partial manifest.
 
@@ -487,7 +543,8 @@ def materialize_full(
         _copy(src, submodule_dst / name)
 
     readme = module_dst / "README.md"
-    bar = read_numerical_bar(readme)
+    derived_bar = read_numerical_bar(readme)
+    bar = tighten_bar(derived_bar, achieved)
     records = read_tensor_table(readme)
     golden = golden_record(records)
 
@@ -537,6 +594,11 @@ def materialize_full(
             "overhead_ceiling_ms": round(submodule_latency_ms * 1.10, 6),
         },
         "submodule_commit": best_commit,
+        # What the bar would have been from the recorded output alone, and what the bootstrapped
+        # kernel actually achieved. `tolerance` above is the two reconciled by `tighten_bar`, and is
+        # the only one the gate enforces; these two are here so a reader can see why it is stricter.
+        "tolerance_derived": derived_bar,
+        "tolerance_achieved": dict(achieved) if achieved else {},
         # Filled by the agent when it freezes the validator it wrote.
         "frozen": {},
     }
