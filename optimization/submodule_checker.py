@@ -66,6 +66,9 @@ CHECK_TITLES: dict[str, str] = {
 #: constraint schedule permits a torch implementation, and a gate that forbade it would contradict
 #: the schedule. Keeping NKI-only is the schedule's job, checked per iteration by a script the
 #: agent cannot see.
+#: The accuracy statistic every validator in this pipeline prints and the gate already checks.
+ACCURACY_MARKER = "max_abs_err"
+
 SOURCE_ALLOWED_IMPORTS = frozenset({"nki", "neuronxcc", "torch", "torch_neuronx", "torch_xla", "numpy"})
 
 #: What `inference.py` may have on top. It loads `.bin` bytes and drives the device.
@@ -387,6 +390,12 @@ def main(argv: list[str] | None = None) -> int:
     if latency is not None:
         extra[LATENCY_MARKER] = latency
 
+    # The accuracy the validator reported, published beside the latency for the same reason: the
+    # verdict is the only thing that outlives the worktree, and `optimization.readback` turns it
+    # into a recorded metric the loop can gate on.
+    worst = candidate.marker_value(run.output, ACCURACY_MARKER)
+    if worst is not None:
+        extra[ACCURACY_MARKER] = worst
     verdict = candidate.write_verdict(
         results, run, "submodule gate", Path(args.json) if args.json else None, extra=extra,
     )

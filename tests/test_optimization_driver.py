@@ -1816,3 +1816,105 @@ def test_a_partially_reported_measurement_tightens_only_what_it_reported():
     assert bar["MAX_ABS_ERR"] == pytest.approx(0.05 * materialize.WORST_MARGIN)
     assert bar["MIN_COSINE"] == _DERIVED["MIN_COSINE"]
     assert bar["MIN_PASS_FRACTION"] == _DERIVED["MIN_PASS_FRACTION"]
+
+
+# ---------------------------------------------------------------------------------------------
+#  The bar the single-rank loop is held to
+# ---------------------------------------------------------------------------------------------
+
+def _cut(tmp_path, measured, bar=None):
+    """A submodule repo as stage 2 leaves it: a frozen validator, a manifest, and a gate verdict."""
+    from optimization.driver import ACCURACY_MARKER
+    bar = bar or {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                  "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+    repo = tmp_path / "rank0"
+    (repo / ".autohelix" / "optimization").mkdir(parents=True)
+    (repo / "inference.py").write_text(
+        "\n".join(f"{k} = {v}" for k, v in bar.items()) + "\n")
+    (repo / ".autohelix" / "optimization" / "submodule.json").write_text(
+        json.dumps({"tolerance": bar, "frozen": {"inference.py": "stale"}}))
+    (repo / ".autohelix" / "optimization" / "gate.json").write_text(
+        json.dumps({"passed": True, ACCURACY_MARKER: measured}))
+    return repo
+
+
+def test_the_submodule_bar_is_re_pinned_to_what_the_cut_achieved(tmp_path):
+    """The agent-derived bar describes the rank's recorded output, not what the cut reached.
+
+    `layers.2.attention`'s cut reached 0.0388967 against a bar of 0.7875, so iteration 1 could buy
+    4x of latency with 2.2x of error and nothing objected — and the assembly and stage 5 then
+    inherited that error unchanged.
+    """
+    from optimization.driver import Pipeline
+    repo = _cut(tmp_path, 0.038896650075912476)
+
+    lines = Pipeline._tighten_submodule_bar(Pipeline.__new__(Pipeline), repo)
+
+    assert lines and "re-pinned" in lines[0]
+    manifest = json.loads((repo / ".autohelix" / "optimization" / "submodule.json").read_text())
+    assert manifest["tolerance"]["MAX_ABS_ERR"] == pytest.approx(0.038896650075912476 * 1.10)
+    assert manifest["tolerance_derived"]["MAX_ABS_ERR"] == 0.7875
+    assert f"MAX_ABS_ERR = {manifest['tolerance']['MAX_ABS_ERR']}" in (
+        repo / "inference.py").read_text()
+
+
+def test_re_pinning_refreshes_the_recorded_validator_hash(tmp_path):
+    """`check_frozen_validator` compares the file against the manifest, so both move together or
+    every iteration of the loop fails a check the candidate had no part in."""
+    import hashlib
+
+    from optimization.driver import Pipeline
+    repo = _cut(tmp_path, 0.02)
+
+    Pipeline._tighten_submodule_bar(Pipeline.__new__(Pipeline), repo)
+
+    manifest = json.loads((repo / ".autohelix" / "optimization" / "submodule.json").read_text())
+    actual = hashlib.sha256((repo / "inference.py").read_bytes()).hexdigest()
+    assert manifest["frozen"]["inference.py"] == actual
+
+
+def test_re_pinning_leaves_an_already_tight_bar_alone(tmp_path):
+    """Nothing to do when the derived bar is already stricter than the cut's own measurement."""
+    from optimization.driver import Pipeline
+    repo = _cut(tmp_path, 0.5, bar={"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                                    "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.2})
+    before = (repo / "inference.py").read_text()
+
+    assert Pipeline._tighten_submodule_bar(Pipeline.__new__(Pipeline), repo) == []
+    assert (repo / "inference.py").read_text() == before
+
+
+def test_re_pinning_is_inert_without_a_measurement(tmp_path):
+    """An older verdict published no accuracy; the cut keeps the bar its agent derived."""
+    from optimization.driver import Pipeline
+    repo = _cut(tmp_path, 0.02)
+    (repo / ".autohelix" / "optimization" / "gate.json").write_text('{"passed": true}')
+    before = (repo / "inference.py").read_text()
+
+    assert Pipeline._tighten_submodule_bar(Pipeline.__new__(Pipeline), repo) == []
+    assert (repo / "inference.py").read_text() == before
+
+
+def test_the_re_pinned_bar_admits_every_loop_that_has_finished(tmp_path):
+    """Calibration against the measured trajectories, as a test rather than a claim.
+
+    Each module's stage-3 iteration 0 is its cut; the worst `max_abs_err` any later iteration
+    reached is what the re-pinned bar has to admit — or refuse, for the one that went wrong.
+    """
+    from optimization.driver import Pipeline
+    # module: (cut's max_abs_err, the worst any accepted iteration reached, should clear)
+    trajectories = {
+        "00-Attention-B": (0.02549302577972412, 0.0257452130317688, True),
+        "00-Attention-C": (0.03719229996204376, 0.03590035438537598, True),
+        "24-Attention": (0.2518768310546875, 0.12760743498802185, True),
+        "02-Attention": (0.038896650075912476, 0.08605745434761047, False),
+    }
+    for name, (cut, worst, expected) in trajectories.items():
+        repo = _cut(tmp_path / name, cut)
+        Pipeline._tighten_submodule_bar(Pipeline.__new__(Pipeline), repo)
+        ceiling = json.loads(
+            (repo / ".autohelix" / "optimization" / "submodule.json").read_text()
+        )["tolerance"]["MAX_ABS_ERR"]
+        assert (worst <= ceiling) is expected, (
+            f"{name}: worst iteration {worst} against a re-pinned ceiling of {ceiling}"
+        )

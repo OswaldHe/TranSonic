@@ -117,6 +117,9 @@ ALLOWED_DIST_CALLS = frozenset({
     "is_initialized", "new_group",
 })
 
+#: The accuracy statistic every validator in this pipeline prints and the gate already checks.
+ACCURACY_MARKER = "max_abs_err"
+
 SOURCE_ALLOWED_IMPORTS = frozenset({
     "nki", "neuronxcc", "torch", "torch_neuronx", "torch_xla", "numpy",
 })
@@ -547,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
             str(r): candidate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
             for r in range(rank_count(manifest))
         }
+    # The accuracy the validator reported, published beside the latency for the same reason: the
+    # verdict is the only thing that outlives the worktree, and `optimization.readback` turns it
+    # into a recorded metric the loop can gate on.
+    worst = candidate.marker_value(run.output, ACCURACY_MARKER)
+    if worst is not None:
+        extra[ACCURACY_MARKER] = worst
     verdict = candidate.write_verdict(
         results, run, "whole-module gate", Path(args.json) if args.json else None, extra=extra,
     )

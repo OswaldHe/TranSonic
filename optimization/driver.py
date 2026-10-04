@@ -81,6 +81,10 @@ it has to be written inline instead. Here is the contract again, in full:
 """
 
 
+#: The accuracy statistic both gates publish into their verdict, and the one the bars are pinned on.
+ACCURACY_MARKER = "max_abs_err"
+
+
 def _validator_sha256(repo: Path) -> str | None:
     """`inference.py`'s hash, or None if it is not there yet.
 
@@ -506,6 +510,8 @@ class Pipeline:
                 "validator_sha256": _validator_sha256(repo),
             })
             if ok:
+                for line in self._tighten_submodule_bar(repo):
+                    self.console.print(f"  {line}")
                 materialize.git_init(repo, f"Submodule baseline: one rank of {self.config.module_id}")
                 latency = _latency_from_gate(
                     repo / ".autohelix" / "optimization" / "submodule-gate.json"
@@ -1299,6 +1305,66 @@ class Pipeline:
         )
 
     # -- the whole thing -----------------------------------------------------------
+
+    def _tighten_submodule_bar(self, repo: Path) -> list[str]:
+        """Re-pin the submodule's numerical bar to what its own cut achieved, before the loop runs.
+
+        The bar the agent derived is a property of the rank's recorded output — `RTOL` times its
+        largest element plus `ATOL` — so on a cut far better than that, the bar never binds and the
+        loop can spend a large multiple of the achievable error with nothing objecting. That is what
+        happened on `layers.2.attention`: the cut reached `max_abs_err = 0.0389` against a bar of
+        0.7875, iteration 1 bought 4x of latency for 2.2x of error, and the assembly and stage 5
+        then inherited it unchanged.
+
+        Done here rather than by the agent because the cut can only be measured after the validator
+        is written, and the validator may not move afterwards without the manifest and the recorded
+        hash moving with it — which is why all three are rewritten together. The pipeline may do
+        that; the agent may not, and `check_frozen_validator` is what keeps the distinction.
+
+        10% of slack, calibrated on the runs that have finished: `00-Attention-B` ended +1.0% from
+        its own baseline, `00-Attention-C` -3.5%, `24-Attention` -49.3%, and `02-Attention` +77.0%.
+        """
+        verdict = repo / ".autohelix" / "optimization" / "gate.json"
+        manifest_path = repo / ".autohelix" / "optimization" / "submodule.json"
+        validator = repo / "inference.py"
+        if not (verdict.is_file() and manifest_path.is_file() and validator.is_file()):
+            return []
+        try:
+            achieved = json.loads(verdict.read_text()).get(ACCURACY_MARKER)
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        derived = manifest.get("tolerance") or {}
+        if not isinstance(achieved, (int, float)) or not derived:
+            return []
+
+        tightened = materialize.tighten_bar(derived, {ACCURACY_MARKER: float(achieved)})
+        if tightened == derived:
+            return []
+
+        text = validator.read_text()
+        for name, value in tightened.items():
+            text, n = re.subn(rf"^{name} = [0-9.eE+-]+$", f"{name} = {value}", text,
+                              count=1, flags=re.M)
+            if n != 1:
+                return [f"[yellow]![/yellow] could not re-pin {name} in inference.py; "
+                        f"leaving the bar as the agent derived it"]
+        validator.write_text(text)
+        manifest["tolerance"] = tightened
+        manifest["tolerance_derived"] = derived
+        manifest["tolerance_achieved"] = {ACCURACY_MARKER: float(achieved)}
+        frozen = manifest.get("frozen")
+        if isinstance(frozen, dict) and "inference.py" in frozen:
+            frozen["inference.py"] = _validator_sha256(repo)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        # The two namespaces differ on purpose and are easy to confuse: the bar is keyed by the
+        # constant names the validator declares (`MAX_ABS_ERR`), the verdict and the marker by the
+        # statistic's own name (`max_abs_err`).
+        return [
+            f"[green]bar re-pinned[/green] to this cut's own accuracy: MAX_ABS_ERR "
+            f"{derived.get('MAX_ABS_ERR')} -> {tightened.get('MAX_ABS_ERR'):g} "
+            f"(the cut measured {float(achieved):g})"
+        ]
 
     def _prepared(self, stage: str) -> StageOutcome | None:
         """The recorded outcome of a preparation stage that already passed, or None.
