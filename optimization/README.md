@@ -86,7 +86,7 @@ the current prose.
 | | `bootstrap_repo` | the bootstrapped kernel and the recorded tensors |
 | | `artifact` | the partition artifact |
 | `floorplan` | `scheme` | the ranked placement to project |
-| | `target_units` | logical NeuronCores on this device (4 on a trn2.3xlarge at LNC=2) |
+| | `target_units` | logical NeuronCores on the target device |
 | | `on_oversized` | `project` or `error` when the module does not fit |
 | `workspace` | `root` | where the repositories and run state go |
 | | `venv` | the Python environment the validator runs in |
@@ -172,7 +172,7 @@ full:
     iterations: [1]
     preparation: false          # keep the stage-4 agent blind to it
     prompt: |                   # replaces the shared prose for this stage
-      module/ is the 4-rank assembly, including where the collective sits.
+      module/ is the whole-module assembly, including where the collective sits.
 ```
 
 `iterations` selects loop iterations. `preparation` (default `true`) selects the one-shot agent that
@@ -237,9 +237,8 @@ re-pins `MAX_ABS_ERR` to the cut's own measured error plus 10%, then rewrites `i
 manifest and the recorded hash together. This only tightens the bar. It is idempotent, so restarting
 stage 3 does not tighten it again.
 
-Without the re-pin the bar describes the recorded output and not the achievable error, and the loop
-can spend accuracy it does not need. On `layers.2.attention` the cut reached `max_abs_err` 0.0389
-against a derived bar of 0.3058.
+Without the re-pin the bar describes the recorded output and not the achievable error. A cut far
+better than its derived bar leaves the loop free to spend accuracy it does not need.
 
 ## Validator and metric
 
@@ -261,7 +260,7 @@ gate is the only thing that runs a candidate.
 
 | path | contents |
 |---|---|
-| `<root>/<module>-rank0/` | the single-rank repository |
+| `<root>/<module>-rank0/` | the single-rank repository, one per run |
 | `<root>/<module>-full/` | the whole-module repository |
 | `<root>/.optimization/` | projection, baselines, per-attempt verdicts, agent logs |
 | `<root>/.optimization/attempts/` | the **attic**: set-aside preparation attempts |
