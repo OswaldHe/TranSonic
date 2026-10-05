@@ -372,4 +372,4 @@ constraint_compiler:
 # profile actually supports is the hardest reading task in the pipeline.
 feedback:
   model: null          # null = the same model as the optimizing agent
-  timeout: 3h
+  timeout: 2h
