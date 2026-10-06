@@ -99,6 +99,12 @@ def _validator_sha256(repo: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _attempt_number(record: Path) -> int:
+    """`3` from `submodule-attempt-3.json`, so attempts sort by age rather than lexically."""
+    digits = record.stem.rsplit("-", 1)[-1]
+    return int(digits) if digits.isdigit() else 0
+
+
 class StageError(RuntimeError):
     """A stage could not complete, and the next one must not start."""
 
@@ -127,6 +133,9 @@ class Pipeline:
         self.verbose = verbose
         self.state_dir = config.workspace_root / STATE_DIR
         self._projection: Projection | None = None
+        #: Repos this pipeline seeded a memory snapshot into, so `_drop_preparation_memory` removes
+        #: only its own copies. See the warning there.
+        self._seeded_memory: set[Path] = set()
 
     # -- shared --------------------------------------------------------------------
 
@@ -305,18 +314,29 @@ class Pipeline:
             return ""
         seeded = mem.seed(spec, repo)
         if seeded:
+            self._seeded_memory.add(repo.resolve())
             self.console.print(f"  memory: {seeded} file(s) from {spec.path} at {mem.SEEDED_REL}")
         else:
             self.console.print(f"  [yellow]![/yellow] memory: nothing seeded from {spec.path}")
         return mem.describe_for_preparation(spec, seeded)
 
     def _drop_preparation_memory(self, repo: Path) -> None:
-        """Remove a seeded copy from a repo once its preparation agent has finished."""
-        target = repo / mem.SEEDED_REL
-        if not target.exists():
+        """Remove a seeded copy from a repo once its preparation agent has finished.
+
+        Only a copy *this* pipeline made. The path is derived — `<repo>/.autohelix/memory` — and an
+        operator is free to keep the configured source at that path under the workspace root, which
+        is also where the feedback stage runs its agent and seeds nothing. Removing by path alone
+        therefore recursively deleted the operator's own memory directory, as the last act of a
+        stage that never read it.
+        """
+        here = repo.resolve()
+        if here not in self._seeded_memory:
             return
-        mem.unlock(repo)
-        shutil.rmtree(target, ignore_errors=True)
+        target = repo / mem.SEEDED_REL
+        if target.exists():
+            mem.unlock(repo)
+            shutil.rmtree(target, ignore_errors=True)
+        self._seeded_memory.discard(here)
 
     def _run_one_shot(
         self, repo: Path, prompt: str, label: str, timeout: str, model: str | None = None,
@@ -354,9 +374,8 @@ class Pipeline:
                 log_path=log_path, event_callback=on_event, project_path=repo,
             )
         finally:
-            # Unconditional and a no-op when nothing was seeded, so every way out of a preparation
-            # attempt — finished, failed, raised, retried — leaves the repo without a stale
-            # read-only copy in it. A retry re-seeds from `_seed_preparation_memory`.
+            # Every way out of a preparation attempt — finished, failed, raised, retried — leaves
+            # the repo without a stale read-only copy. A retry re-seeds.
             self._drop_preparation_memory(repo)
         elapsed = time.monotonic() - started
         if not result.success:
@@ -1386,6 +1405,8 @@ class Pipeline:
         the submodule stage means rebuilding the cut — so "restart the loop under a tighter bar"
         cost a tuned kernel and an hour of agent time to ask for.
         """
+        from optimization import candidate
+
         manifest_path = repo / ".autohelix" / "optimization" / "submodule.json"
         validator = repo / "inference.py"
         if not (manifest_path.is_file() and validator.is_file()):
@@ -1416,13 +1437,10 @@ class Pipeline:
         if tightened == derived:
             return []
 
-        text = validator.read_text()
-        for name, value in tightened.items():
-            text, n = re.subn(rf"^{name} = [0-9.eE+-]+$", f"{name} = {value}", text,
-                              count=1, flags=re.M)
-            if n != 1:
-                return [f"[yellow]![/yellow] could not re-pin {name} in inference.py; "
-                        f"leaving the bar as the agent derived it"]
+        text, unreachable = candidate.rewrite_pinned_constants(validator.read_text(), tightened)
+        if unreachable:
+            return [f"[yellow]![/yellow] could not re-pin {', '.join(unreachable)} in "
+                    f"inference.py; leaving the bar as the agent derived it"]
         validator.write_text(text)
         manifest["tolerance"] = tightened
         manifest["tolerance_derived"] = derived
@@ -1532,46 +1550,56 @@ class Pipeline:
 
         Both halves have to hold. A record says the gate passed once; the repo being present says
         the thing it passed on is still there to run.
+
+        Every passing record is considered, not the first one found. A stage rebuilt after it had
+        already passed keeps the earlier attempt's record — a rebuild that fails before writing one
+        of its own leaves no failure beside it — so the oldest `passed: true` can describe a repo
+        that is gone while a later one describes the repo in front of us. Stopping at the first
+        mismatch rebuilt the good repo it had not got to yet.
         """
         repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
         if not (repo / "source.py").is_file():
             return None
         current = _validator_sha256(repo)
-        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json")):
+        passes: list[tuple[Path, dict[str, Any]]] = []
+        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json"), key=_attempt_number):
             try:
                 payload = json.loads(record.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            if not payload.get("passed"):
-                continue
-            # A pass record alone is not enough. A rebuild interrupted after `_set_aside`
-            # materialized a fresh repo but before its own record was written leaves an older
-            # `passed: true` beside a repo of stubs, and skipping the gate for *that* is how a
-            # half-replaced stage reaches the loop. The frozen validator's hash is what ties the
-            # verdict to the repo it was a verdict about.
-            recorded = payload.get("validator_sha256")
-            if recorded is None and not quiet:
+            if payload.get("passed"):
+                passes.append((record, payload))
+        if not passes:
+            return None
+
+        # A pass record alone is not enough. A rebuild interrupted after `_set_aside` materialized
+        # a fresh repo but before its own record was written leaves an older `passed: true` beside
+        # a repo of stubs, and skipping the gate for *that* is how a half-replaced stage reaches
+        # the loop. The frozen validator's hash is what ties a verdict to the repo it was about.
+        matched = [(r, p) for r, p in passes if p.get("validator_sha256") == current]
+        unhashed = [(r, p) for r, p in passes if p.get("validator_sha256") is None]
+        if not (matched or unhashed):
+            if not quiet:
+                names = ", ".join(r.name for r, _ in passes)
+                self.console.print(
+                    f"  [yellow]![/yellow] {names} passed against a different inference.py than "
+                    f"{repo.name} now has — rebuilding {stage} rather than trusting it"
+                )
+            return None
+        record, _ = (matched or unhashed)[-1]
+        if not quiet:
+            if not matched:
                 self.console.print(
                     f"  [yellow]![/yellow] {record.name} records a pass but no validator hash "
                     f"(written before this was recorded); skipping {stage} on the weaker evidence "
                     f"that {repo.name} is present"
                 )
-            elif recorded is not None and recorded != current:
-                if not quiet:
-                    self.console.print(
-                        f"  [yellow]![/yellow] {record.name} passed against a different "
-                        f"inference.py than {repo.name} now has — rebuilding {stage} rather than "
-                        f"trusting it"
-                    )
-                return None
-            if not quiet:
-                self.console.print(
-                    f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
-                    f"is present — skipping it. Run `optimize {stage} --rebuild` to replace it "
-                    f"on purpose."
-                )
-            return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
-        return None
+            self.console.print(
+                f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
+                f"is present — skipping it. Run `optimize {stage} --rebuild` to replace it "
+                f"on purpose."
+            )
+        return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
 
     def all(self) -> list[StageOutcome]:
         """Every stage in order, stopping at the first that did not succeed.

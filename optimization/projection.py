@@ -154,6 +154,9 @@ class Projection:
             "projected": {
                 "units": self.projected_units,
                 "devices": 1,
+                # The width this projection was asked to fit, not the width it reached. Omitting it
+                # restored the package default, so `FLOORPLAN.md` told the agent the wrong target.
+                "target_units": self.target_units,
                 "splits": [
                     {"dim": f.dim, "factor": f.factor, "collective": f.collective}
                     for f in self.projected
@@ -193,6 +196,7 @@ class Projection:
             dropped=[Factor.parse(d) for d in (data.get("dropped") or [])],
             scaled=scaled,
             target=str(data.get("target") or ""),
+            target_units=int(projected.get("target_units") or PROJECTION_TARGET_UNITS),
         )
 
     def differences(self, other: Projection) -> list[str]:

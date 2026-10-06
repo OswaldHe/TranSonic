@@ -338,6 +338,16 @@ _REGENERATED_NOTE = (
 )
 
 
+#: Run state, profile artifacts and the validator's scratch directory — the rest of what
+#: `write_gitignore` manages. Named as data so `untrack_regenerated` can tell a pattern this
+#: module put in `.gitignore` from one an operator did.
+_RUN_STATE = (".autohelix/", "__pycache__/", "*.pyc")
+_PROFILES = ("*.neff", "*.ntff", "profile*.json")
+_SCRATCH = ("build/",)
+
+MANAGED_IGNORES = (*_RUN_STATE, *_PROFILES, *_SCRATCH, *REGENERATED)
+
+
 def write_gitignore(repo: Path) -> None:
     """Keep run state and regenerated artifacts out of the history.
 
@@ -346,23 +356,41 @@ def write_gitignore(repo: Path) -> None:
     """
     (repo / ".gitignore").write_text(
         "\n".join([
-            ".autohelix/",
-            "__pycache__/",
-            "*.pyc",
+            *_RUN_STATE,
             "# Profile artifacts: produced fresh every iteration and checked for freshness, so a",
             "# committed one would be a stale measurement waiting to be believed.",
-            "*.neff",
-            "*.ntff",
-            "profile*.json",
+            *_PROFILES,
             "# A validator's scratch directory: compile caches, per-rank logs, the device output it",
             "# compares. Regenerated every run, and tracking it means every gate run leaves the",
             "# tree dirty — which the loop refuses to start on.",
-            "build/",
+            *_SCRATCH,
             _REGENERATED_NOTE,
             *REGENERATED,
             "",
         ])
     )
+
+
+def _ignored_by_managed_patterns(repo: Path, tracked: list[str]) -> list[str]:
+    """Which of `tracked` an artifact pattern from `MANAGED_IGNORES` matches.
+
+    Asking `check-ignore` whether a path is ignored *at all* answers a wider question than the one
+    being fixed: it consults every rule in effect, including `.git/info/exclude`, the operator's
+    global excludes, and any line a previous version of this file wrote. A repo that deliberately
+    tracks something matching one of those had it dropped from the index as a side effect of
+    un-staging a compiler log. `-v` names the pattern that matched, which narrows it to ours while
+    still leaving the matching itself to git.
+    """
+    if not tracked:
+        return []
+    shown = subprocess.run(
+        ["git", "check-ignore", "-v", "-z", "--no-index", "--stdin"],
+        cwd=repo, input="\0".join(tracked), capture_output=True, text=True, check=False,
+    ).stdout
+    # `<source> NUL <line> NUL <pattern> NUL <path> NUL` per match, under `-z`.
+    fields = shown.split("\0")
+    managed = set(MANAGED_IGNORES)
+    return [fields[i + 3] for i in range(0, len(fields) - 3, 4) if fields[i + 2] in managed]
 
 
 def untrack_regenerated(repo: Path) -> list[str]:
@@ -387,17 +415,10 @@ def untrack_regenerated(repo: Path) -> list[str]:
         body = existing if existing.endswith("\n") or not existing else existing + "\n"
         ignore.write_text(body + _REGENERATED_NOTE + "\n" + "\n".join(missing) + "\n")
 
-    tracked = subprocess.run(
+    tracked = [p for p in subprocess.run(
         ["git", "ls-files", "-z"], cwd=repo, capture_output=True, text=True, check=True,
-    ).stdout.split("\0")
-    # `--no-index` because by default `check-ignore` says nothing about a tracked path, and every
-    # path here is tracked — that is the whole problem being fixed.
-    now_ignored = [
-        path for path in tracked
-        if path and subprocess.run(
-            ["git", "check-ignore", "-q", "--no-index", "--", path], cwd=repo, check=False,
-        ).returncode == 0
-    ]
+    ).stdout.split("\0") if p]
+    now_ignored = _ignored_by_managed_patterns(repo, tracked)
     # Both halves commit, and an appended `.gitignore` with nothing tracked to drop is the common
     # case: a repo that never compiled in its main tree has the patterns missing and no artifact
     # matching them. Returning early there left the edit uncommitted, and `run_loop` starts the

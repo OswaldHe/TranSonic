@@ -712,6 +712,58 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def rewrite_pinned_constants(text: str, values: dict[str, float]) -> tuple[str, list[str]]:
+    """`text` with each named constant's literal replaced, plus the names it could not reach.
+
+    The pipeline re-pins the bar to what a kernel achieved, which means editing the validator it
+    just gated. Driven by the same walk `pinned_constants` judges with, so every spelling the gate
+    accepts can be re-pinned: a line-anchored regex matched only `NAME = 1.0` with single spaces
+    and nothing after it, so `RTOL=0.1`, extra spacing or a trailing comment left the loop running
+    under the loose bar with a warning nobody was watching for.
+
+    Written at `repr` precision, the same as the README publishes, so the validator, the manifest
+    and the README state one value rather than three roundings of it.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, sorted(values)
+
+    # Several names can share one literal (`A = B = 0.1`), so the literal is the unit, keyed by
+    # where it sits. Names not found at all, and names that would need one literal to hold two
+    # different values, come back as unreachable.
+    spots: dict[tuple[int, int, int, int], set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, (int, float)) or isinstance(node.value.value, bool):
+            continue
+        where = (node.value.lineno, node.value.col_offset,
+                 node.value.end_lineno or node.value.lineno, node.value.end_col_offset or 0)
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in values:
+                spots.setdefault(where, set()).add(target.id)
+
+    reached = {name for names in spots.values() for name in names}
+    unreachable = [name for name in values if name not in reached]
+    replacements: dict[tuple[int, int, int, int], str] = {}
+    for where, names in spots.items():
+        wanted = {values[name] for name in names}
+        if len(wanted) > 1 or where[0] != where[2]:
+            unreachable.extend(names)
+            continue
+        replacements[where] = repr(wanted.pop())
+
+    # Bottom-up, so an earlier edit cannot move a later one's offsets. `col_offset` counts UTF-8
+    # bytes, which is why the splice happens on encoded lines.
+    lines = text.splitlines(keepends=True)
+    for where in sorted(replacements, reverse=True):
+        lineno, col, _, end_col = where
+        raw = lines[lineno - 1].encode()
+        lines[lineno - 1] = (raw[:col] + replacements[where].encode() + raw[end_col:]).decode()
+    return "".join(lines), sorted(set(unreachable))
+
+
 def pinned_constants(tree: ast.Module, expected: dict[str, float],
                      filename: str) -> list[str]:
     """Findings if the five tolerance constants are absent, computed, or altered.

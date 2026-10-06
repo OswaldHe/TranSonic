@@ -1097,3 +1097,62 @@ def test_a_starred_destructured_binding_counts_too():
 def test_an_attribute_target_binds_no_new_name():
     tree = ast.parse("obj.kernel = _impl[2]\n")
     assert "kernel" not in candidate.top_level_names(tree)
+
+
+def test_both_gates_accept_a_grid_bound_entry_point(tmp_path):
+    """`kernel = _impl[CORES]` is how a kernel reaches both physical cores of an LNC=2 pair while
+    the frozen validator still calls `kernel(*args)`. A launch grid cannot be a `FunctionDef`, so
+    requiring one rejected the only shape that works — and the module gate still required it after
+    the submodule gate stopped, which cost a four-rank assembly that passed its other eight
+    checks."""
+    source = "import nki\n@nki.jit\ndef _impl(x):\n    return x\nCORES = 2\nkernel = _impl[CORES]\n"
+    tree = ast.parse(source)
+
+    assert "kernel" in candidate.top_level_names(tree)
+    assert "kernel" not in candidate.top_level_functions(tree), (
+        "the point of the test is that a `def` check cannot see it"
+    )
+
+
+def test_re_pinning_reaches_every_spelling_the_gate_accepts():
+    """The bar is re-pinned by rewriting the validator, so the rewrite has to match the gate.
+
+    A line-anchored regex matched only `NAME = 1.0`; the gate accepts any module-level numeric
+    literal. A validator written with no spaces, extra spaces or a trailing comment therefore kept
+    its loose bar while the manifest recorded the tight one.
+    """
+    text = textwrap.dedent('''
+        """A validator."""
+        RTOL=0.1
+        ATOL  =  0.1
+        MIN_COSINE = 0.99  # what the cut reached
+        MIN_PASS_FRACTION = 0.9
+        MAX_ABS_ERR = 2.65
+    ''')
+    want = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999432399999999,
+            "MIN_PASS_FRACTION": 0.999766, "MAX_ABS_ERR": 0.20625}
+
+    rewritten, unreachable = candidate.rewrite_pinned_constants(text, want)
+
+    assert unreachable == []
+    assert candidate.pinned_constants(ast.parse(rewritten), want, "inference.py") == []
+    assert "# what the cut reached" in rewritten, "a trailing comment was eaten"
+
+
+def test_re_pinning_reports_a_constant_it_cannot_reach():
+    """A computed constant is already absent from the gate's view; the rewrite must agree."""
+    text = "RTOL = 0.1\nMAX_ABS_ERR = 2.65 * 1.0\n"
+
+    rewritten, unreachable = candidate.rewrite_pinned_constants(
+        text, {"RTOL": 0.1, "MAX_ABS_ERR": 0.2})
+
+    assert unreachable == ["MAX_ABS_ERR"]
+    assert rewritten == text, "a partial rewrite leaves the bar stated two ways"
+
+
+def test_re_pinning_writes_full_precision():
+    """The validator, the manifest and the README have to state one value, not three roundings."""
+    rewritten, _ = candidate.rewrite_pinned_constants(
+        "MIN_COSINE = 0.99\n", {"MIN_COSINE": 0.9999432399999999})
+
+    assert rewritten == "MIN_COSINE = 0.9999432399999999\n"

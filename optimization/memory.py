@@ -380,7 +380,7 @@ def _symlink_problem(source: Path, declared: Path) -> str | None:
     meant.
     """
     try:
-        found = [p for p in source.rglob("*") if p.is_symlink()]
+        found = [p for p in source.rglob("*") if p.is_symlink() and not _hidden(p, source)]
     except OSError as exc:
         return f"memory.path {declared} could not be walked: {exc}"
     if not found:
@@ -392,6 +392,24 @@ def _symlink_problem(source: Path, declared: Path) -> str | None:
         f"cannot be one: following it copies the target, and keeping it lets the iteration write "
         f"through to the original. Replace each link with a copy of what it points at"
     )
+
+
+def _hidden(path: Path, root: Path) -> bool:
+    """Whether `path` sits under a dot-prefixed name, and so is not copied into a snapshot."""
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
+def skip_hidden(directory: str, names: list[str]) -> set[str]:
+    """`copytree`'s ignore callback: leave the operator's dotfiles out of the snapshot.
+
+    `entry_names` already treats a dot-prefixed entry as the operator's rather than as memory
+    material and keeps it out of the prompt's listing. Copying it anyway is worse than
+    inconsistent: a `memory.path` pointed at an earlier repo or a working directory carries `.git`,
+    `.env` and whatever else lives there into a tree the agent can read, so a credential the
+    operator never meant to share is seeded beside the notes and never mentioned.
+    """
+    del directory  # the signature `shutil.copytree` calls this with
+    return {name for name in names if name.startswith(".")}
 
 
 def unlock(worktree_dir: Path) -> None:
@@ -472,7 +490,7 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
         # memory holding a link to its own parent, or to a large external tree, both escapes
         # `seed_problem` — which compares only the two root paths — and copies far more than the
         # operator pointed at.
-        shutil.copytree(spec.path, target, symlinks=True)
+        shutil.copytree(spec.path, target, symlinks=True, ignore=skip_hidden)
         count = 0
         # Depth-first, so a directory's contents are chmodded before the directory itself. chmod
         # on an existing entry needs only ownership, but doing it in this order keeps the tree

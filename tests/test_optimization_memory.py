@@ -653,8 +653,11 @@ def test_a_read_only_snapshot_does_not_block_removing_the_tree_that_holds_it(tmp
     for directory in (snapshot, snapshot.parent, snapshot.parent.parent):
         directory.chmod(0o555)
 
-    with pytest.raises(PermissionError):
-        shutil.rmtree(attempt)
+    # The premise, and only off root: UID 0 removes a 0555 directory's contents happily, so there
+    # is nothing for `rmtree_unlocked` to rescue and the assertion below proves nothing either way.
+    if not _AS_ROOT:
+        with pytest.raises(PermissionError):
+            shutil.rmtree(attempt)
 
     rmtree_unlocked(attempt)
     assert not attempt.exists()
@@ -663,3 +666,29 @@ def test_a_read_only_snapshot_does_not_block_removing_the_tree_that_holds_it(tmp
 def test_removing_a_tree_that_is_not_there_is_not_an_error_when_asked_to_ignore(tmp_path):
     """`_prune_attempts` runs on whatever it finds and must not raise on a race."""
     rmtree_unlocked(tmp_path / "gone", ignore_errors=True)
+
+
+def test_hidden_entries_are_left_out_of_the_snapshot(tmp_path, store):
+    """A `memory.path` pointed at an old repo carries `.git` and `.env`; neither is memory."""
+    (store / ".env").write_text("AWS_SECRET_ACCESS_KEY=hunter2")
+    (store / ".git").mkdir()
+    (store / ".git" / "config").write_text("[core]")
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    seeded = seed(MemorySpec(path=store, every=True), worktree)
+
+    landed = worktree / SEEDED_REL
+    assert not (landed / ".env").exists(), "a credential file reached the agent-visible snapshot"
+    assert not (landed / ".git").exists()
+    assert seeded == len([p for p in landed.rglob("*") if p.is_file()])
+    # The entries that are memory still arrive, so hiding dotfiles did not hide the directory.
+    assert (landed / "README.md").is_file()
+
+
+def test_a_symlink_inside_a_hidden_entry_does_not_block_seeding(tmp_path, store):
+    """`.git` is full of links on some checkouts, and nothing under it is copied."""
+    (store / ".git").mkdir()
+    (store / ".git" / "link").symlink_to(tmp_path)
+
+    assert seed_problem(MemorySpec(path=store, every=True), tmp_path / "wt") is None

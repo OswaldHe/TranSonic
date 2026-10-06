@@ -2291,3 +2291,110 @@ def test_a_published_bar_round_trips_exactly_to_the_gate_s_bar():
     assert published == bar
     for name in materialize.TOLERANCE_NAMES:
         assert abs(published[name] - bar[name]) <= 1e-12, name
+
+
+def test_a_later_attempt_s_pass_is_found_behind_an_older_one(tmp_path):
+    """Every passing record is weighed, not the first one on disk.
+
+    A stage rebuilt after it had already passed keeps the earlier attempt's record, and a rebuild
+    that fails before writing one of its own leaves no failure beside it. So the oldest
+    `passed: true` can describe a repo that is gone while a later one describes the repo in front
+    of us. Stopping at the first hash mismatch archived the good repo it had not reached yet.
+    """
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text(json.dumps(
+        {"passed": True, "report": "", "validator_sha256": "a" * 64}))
+    (pipeline.state_dir / "submodule-attempt-2.json").write_text(json.dumps(
+        {"passed": True, "report": "",
+         "validator_sha256": _sha256_of(repo / "inference.py")}))
+
+    outcome = pipeline._prepared("submodule", quiet=True)
+
+    assert outcome is not None and outcome.ok
+
+
+def test_attempts_are_weighed_in_numeric_order(tmp_path):
+    """`attempt-10` sorts before `attempt-2` lexically, and the newest record is the one to cite."""
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    for n in (2, 10):
+        (pipeline.state_dir / f"submodule-attempt-{n}.json").write_text(json.dumps(
+            {"passed": True, "report": "", "validator_sha256": None}))
+
+    assert pipeline._prepared("submodule", quiet=True) is not None
+
+
+def test_no_passing_record_matches_the_repo_so_the_stage_is_rebuilt(tmp_path):
+    """The guard still has to fire: every pass describing another repo is no evidence for this one."""
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    for n in (1, 2):
+        (pipeline.state_dir / f"submodule-attempt-{n}.json").write_text(json.dumps(
+            {"passed": True, "report": "", "validator_sha256": f"{n}" * 64}))
+
+    assert pipeline._prepared("submodule", quiet=True) is None
+
+
+def test_a_one_shot_does_not_delete_a_memory_it_did_not_seed(tmp_path):
+    """The seed path is derived, so an operator may keep the source exactly there.
+
+    `<repo>/.autohelix/memory` is where `seed` puts its copy, and the feedback stage runs its agent
+    in the workspace root and seeds nothing. Removing by path alone recursively deleted the
+    operator's own memory directory as the last act of a stage that never read it.
+    """
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    store = pipeline.config.workspace_root / ".autohelix" / "memory"
+    store.mkdir(parents=True)
+    (store / "FEEDBACK.md").write_text("what the first round found")
+
+    pipeline._drop_preparation_memory(pipeline.config.workspace_root)
+
+    assert (store / "FEEDBACK.md").is_file(), "the operator's own memory was deleted"
+
+
+def test_a_one_shot_removes_the_copy_it_did_seed(tmp_path):
+    """The other half: a snapshot left behind is a read-only subtree in the delivered repo."""
+    from optimization.driver import Pipeline
+
+    from optimization import memory as mem
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    landed = repo / mem.SEEDED_REL
+    landed.mkdir(parents=True)
+    (landed / "NOTES.md").write_text("read-only")
+    (landed / "NOTES.md").chmod(0o444)
+    landed.chmod(0o555)
+    pipeline._seeded_memory.add(repo.resolve())
+
+    pipeline._drop_preparation_memory(repo)
+
+    assert not landed.exists()
+
+
+def test_untracking_leaves_a_file_tracked_on_purpose_alone(tmp_path):
+    """Scoped to the patterns this module manages, not to every rule in effect.
+
+    `check-ignore` consults `.git/info/exclude`, the operator's global excludes and any line an
+    older version of `write_gitignore` wrote. A repo that deliberately tracks something matching
+    one of those had it dropped from the index as a side effect of un-staging a compiler log.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # An older `.gitignore`: no artifact patterns yet, and one rule of the operator's own.
+    (repo / ".gitignore").write_text(".autohelix/\ntensors/*.bin\n")
+    (repo / "tensors").mkdir()
+    (repo / "tensors" / "weights.bin").write_bytes(b"\x00" * 8)
+    (repo / "log-neuron-cc.txt").write_text("compiler chatter")
+    (repo / "source.py").write_text("# kernel\n")
+    materialize.git_init(repo, "baseline")
+    subprocess.run(["git", "add", "-f", "--", "tensors/weights.bin"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tensors"],
+                   cwd=repo, check=True)
+
+    untracked = materialize.untrack_regenerated(repo)
+
+    assert untracked == ["log-neuron-cc.txt"]
+    tracked = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
+                             capture_output=True, text=True).stdout.split()
+    assert "tensors/weights.bin" in tracked, "a file tracked on purpose was un-staged"
