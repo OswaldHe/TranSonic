@@ -2398,3 +2398,51 @@ def test_untracking_leaves_a_file_tracked_on_purpose_alone(tmp_path):
     tracked = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
                              capture_output=True, text=True).stdout.split()
     assert "tensors/weights.bin" in tracked, "a file tracked on purpose was un-staged"
+
+
+def test_a_superseded_bar_is_marked_outside_the_code_fence(tmp_path):
+    """The marker goes next to the stale number but not inside its fence.
+
+    A blockquote inside a ```python block is not a blockquote: it renders as source, and it makes
+    the fence invalid Python for anything that reads it as code. The first version inserted between
+    two constants of the live `mtp.0.attention` repo.
+    """
+    repo = tmp_path / "full"
+    (repo / "module").mkdir(parents=True)
+    (repo / "module" / "README.md").write_text(textwrap.dedent("""
+        # The bootstrapped module
+
+        Its numerical bar is:
+
+        ```python
+        RTOL = 0.1
+        ATOL = 0.1
+        MIN_COSINE = 0.9995
+        MIN_PASS_FRACTION = 0.999
+        MAX_ABS_ERR = 2.65
+        ```
+    """))
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999432399999999,
+           "MIN_PASS_FRACTION": 0.9997659999999999, "MAX_ABS_ERR": 0.20625000000000002}
+
+    assert materialize.mark_superseded_bars(repo, bar) == ["module/README.md"]
+
+    lines = (repo / "module" / "README.md").read_text().splitlines()
+    marker = next(i for i, line in enumerate(lines) if "not the bar this repo" in line)
+    fence = next(i for i, line in enumerate(lines) if line.startswith("```python"))
+    assert marker < fence, "the marker landed inside the fenced block"
+    assert str(bar["MAX_ABS_ERR"]) in "\n".join(lines), "the marker rounded the authoritative bar"
+    # Still the stale file's own bar where something parses it, and marking twice changes nothing.
+    assert materialize.read_numerical_bar(repo / "module" / "README.md")["MAX_ABS_ERR"] == 2.65
+    assert materialize.mark_superseded_bars(repo, bar) == []
+
+
+def test_a_file_that_states_this_repo_s_own_bar_is_not_marked(tmp_path):
+    """Only a *different* bar is stale. Marking an agreeing file would be noise."""
+    repo = tmp_path / "full"
+    (repo / "submodule").mkdir(parents=True)
+    (repo / "submodule" / "README.md").write_text("MAX_ABS_ERR = 0.20625000000000002\n")
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+           "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.20625000000000002}
+
+    assert materialize.mark_superseded_bars(repo, bar) == []

@@ -116,18 +116,31 @@ def mark_superseded_bars(repo: Path, bar: dict[str, float]) -> list[str]:
         stale = [float(v) for name, v in _BAR.findall(text) if name == CEILING_NAME]
         if not stale or all(abs(s - want) <= 1e-12 for s in stale):
             continue
-        # Immediately above the first line that states the ceiling, so the marker cannot be read
-        # separately from the number it is about.
         lines = text.splitlines(keepends=True)
-        for i, line in enumerate(lines):
-            if CEILING_NAME in line and any(ch.isdigit() for ch in line):
-                lines.insert(i, note)
-                break
-        else:
-            lines.insert(0, note)
+        lines.insert(_marker_line(lines), note)
         path.write_text("".join(lines))
         marked.append(rel)
     return marked
+
+
+def _marker_line(lines: list[str]) -> int:
+    """Where to insert the note: as close to the stale number as markdown allows.
+
+    Next to it, so the marker cannot be read apart from the number it is about — but not *inside*
+    the fenced block the number usually sits in, where a blockquote is no longer a blockquote and
+    the fence stops being valid Python. So the opening fence is the insertion point when the
+    statement is fenced, and the line itself when it is prose.
+    """
+    fences = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fences += 1
+        if CEILING_NAME in line and any(ch.isdigit() for ch in line):
+            if fences % 2 == 0:
+                return i
+            opening = max(j for j in range(i) if lines[j].lstrip().startswith("```"))
+            return opening
+    return 0
 
 
 def read_numerical_bar(readme: Path) -> dict[str, float]:
