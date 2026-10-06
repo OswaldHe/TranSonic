@@ -35,6 +35,12 @@ Also available, and worth reading:
 - `{{ full_repo }}/inference.py` — the frozen validator, including how latency is measured.
 - `{{ workspace_root }}/REPORT.md` — what the run achieved, and the two caveats on its numbers.
 
+{% if archive %}
+## What is already filed
+
+{{ archive }}
+
+{% endif %}
 ## The run, for context
 
 - bootstrapped module, one core: **{{ bootstrap_latency }}**
@@ -112,8 +118,9 @@ argument; the sections are the evidence.
 - **Every row traces to the corpus.** Cite the note or review it came from, by repository and
   iteration. A row you cannot trace is one you invented, and it will waste the reader's time and
   spend this report's credibility.
-- **Merge duplicates.** The same obstacle shows up in several iterations under different names. One
-  row, citing all of them.
+- **Merge duplicates, within this run and across runs.** The same obstacle shows up in several
+  iterations under different names: one row, citing all of them. And if an *earlier run* already
+  filed it, do not file it again — rule on it in the previously-filed table instead.
 - **Leave out what you fixed.** If the run found a workaround and the workaround works, that is not
   a blocker — unless the workaround costs something, in which case the cost is the finding and you
   should say what it cost.
@@ -128,6 +135,12 @@ argument; the sections are the evidence.
 Run `python -m optimization.feedback --check --root {{ workspace_root }}` and fix anything it
 reports. It checks the shape of the report, never whether a finding is true: that every row has a
 level in range, a reproduction file that exists, a link, and cells long enough to be read.
+{% if archive %}
+
+The stage also checks your previously-filed table the same way: every `Filed` cell has to name a
+12-character finding id that is actually in the archive, and every `Ruling` has to be one of
+{{ rulings }}. Take the ids from the archive's `README.md` rather than retyping them.
+{% endif %}
 
 Then write, at the top of the report, how many findings there are at each level and the one sentence
 you would say to the Neuron team if they read nothing else.

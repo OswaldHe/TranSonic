@@ -41,6 +41,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
+from optimization import archive
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
 from optimization import memory as mem
@@ -332,11 +333,81 @@ class Pipeline:
         here = repo.resolve()
         if here not in self._seeded_memory:
             return
-        target = repo / mem.SEEDED_REL
-        if target.exists():
-            mem.unlock(repo)
-            shutil.rmtree(target, ignore_errors=True)
+        for rel in (mem.SEEDED_REL, archive.SEEDED_REL):
+            target = repo / rel
+            if target.exists():
+                mem.unlock(repo, rel)
+                shutil.rmtree(target, ignore_errors=True)
         self._seeded_memory.discard(here)
+
+    def _archive_spec(self) -> "mem.MemorySpec":
+        """The feedback archive as something `memory.seed` can copy: every reader, always."""
+        return mem.MemorySpec(
+            path=self.config.feedback_archive, every=True, preparation=True,
+            dest=archive.SEEDED_REL,
+        )
+
+    def _seed_archive(self, repo: Path, feedback: bool = False) -> str:
+        """Seed the cross-run feedback archive into a repo, and return its prompt block.
+
+        Separate from the operator's memory and not a substitute for it: that directory is this
+        module's own earlier work, this one is every other module's unresolved obstacles. A run
+        wants both, and merging them would lose which is which.
+        """
+        if self.config.feedback_archive is None:
+            return ""
+        entries = archive.read_entries(self.config.feedback_archive)
+        if not entries:
+            return ""
+        spec = self._archive_spec()
+        problem = mem.seed_problem(spec, repo)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] feedback archive: {problem}")
+            return ""
+        seeded = mem.seed(spec, repo)
+        if not seeded:
+            self.console.print(
+                f"  [yellow]![/yellow] feedback archive: nothing seeded from "
+                f"{self.config.feedback_archive}"
+            )
+            return ""
+        self._seeded_memory.add(repo.resolve())
+        self.console.print(
+            f"  feedback archive: {sum(len(e.findings) for e in entries)} finding(s) from "
+            f"{len(entries)} run(s), {seeded} file(s) at {archive.SEEDED_REL}"
+        )
+        return (archive.describe_for_feedback(entries, seeded) if feedback
+                else archive.describe_for_optimizer(entries, seeded))
+
+    def _deposit_feedback(self) -> None:
+        """Put this run's finished report into the archive, so the next run reads it.
+
+        Best-effort on purpose. The report is written, validated and on disk by the time this runs;
+        failing the stage because a shared directory is unwritable would throw away the thing that
+        took three hours to produce for the sake of the copy of it.
+        """
+        if self.config.feedback_archive is None:
+            return
+        baselines = self._read_record("baselines")
+        try:
+            entry = archive.deposit(
+                self.config.feedback_archive, self.config.workspace_root, self.config.module_id,
+                latencies={
+                    "bootstrap_ms": baselines.get("bootstrap_latency_ms"),
+                    "submodule_ms": _read_summary(self.config.submodule_repo,
+                                                  "submodule").get("best_ms"),
+                    "module_ms": _read_summary(self.config.full_repo, "full").get("best_ms"),
+                },
+            )
+        except (archive.ArchiveError, OSError) as exc:
+            self.console.print(f"  [yellow]![/yellow] could not deposit into the archive: {exc}")
+            return
+        ruled = len(entry.rulings)
+        self.console.print(
+            f"  [green]deposited[/green] {len(entry.findings)} finding(s) as "
+            f"`{entry.name}` in {self.config.feedback_archive}"
+            + (f", ruling on {ruled} already-filed finding(s)" if ruled else "")
+        )
 
     def _run_one_shot(
         self, repo: Path, prompt: str, label: str, timeout: str, model: str | None = None,
@@ -514,6 +585,7 @@ class Pipeline:
                 "factor": projection.projected_units,
                 "splits": " * ".join(f.label() for f in projection.projected) or "no split",
                 "memory": memory_block,
+                "archive": self._seed_archive(repo),
             })
             held = custody.take_custody(
                 prepared, custody.SUBMODULE_OWNED,
@@ -965,6 +1037,7 @@ class Pipeline:
                 "submodule_latency": f"{submodule_ms:g}",
                 "overhead_ceiling": f"{submodule_ms * 1.10:g}",
                 "memory": memory_block,
+                "archive": self._seed_archive(repo),
             })
             held = custody.take_custody(
                 prepared, custody.MODULE_OWNED,
@@ -1321,6 +1394,7 @@ class Pipeline:
 
         deliverables = fb.snapshot_deliverables(sub, full)
         fb.repro_dir(self.config.workspace_root).mkdir(parents=True, exist_ok=True)
+        filed = archive.read_entries(self.config.feedback_archive)
         prompt = _render(presets.feedback_prompt(), {
             "module": self.config.module_id,
             "corpus": listing,
@@ -1336,6 +1410,8 @@ class Pipeline:
             "bootstrap_latency": _ms(baselines.get("bootstrap_latency_ms")),
             "submodule_latency": _ms(sub_summary.get("best_ms")),
             "full_latency": _ms(full_summary.get("best_ms")),
+            "archive": self._seed_archive(self.config.workspace_root, feedback=True),
+            "rulings": ", ".join(archive.RULINGS),
         })
 
         self.console.print(
@@ -1343,6 +1419,10 @@ class Pipeline:
             f"~{words:,} words"
         )
         for attempt in range(1, self.config.preparation_retries + 1):
+            # `_run_one_shot` drops the seeded copy when it returns, and this prompt was rendered
+            # once, so a retry has to put the archive back or it points at a directory not there.
+            if attempt > 1:
+                self._seed_archive(self.config.workspace_root, feedback=True)
             ok = self._run_one_shot(
                 self.config.workspace_root, prompt, f"feedback-{attempt}",
                 self.config.feedback_timeout, model=self.config.feedback_model,
@@ -1354,6 +1434,9 @@ class Pipeline:
             # `build/`, which is harmless, but nothing was stopping it editing `source.py`.
             touched = fb.restore_deliverables(deliverables)
             problems = fb.validate_report(self.config.workspace_root)
+            # Rulings on already-filed findings are checked the same way and for the same reason:
+            # a verdict naming an id that is in no entry is one nobody can act on.
+            problems += archive.validate_rulings(self.config.workspace_root, filed)
             self._record(f"feedback-attempt-{attempt}",
                          {"agent_ok": ok, "problems": problems, "restored": touched})
             for name in touched:
@@ -1368,6 +1451,9 @@ class Pipeline:
                     f"  [green]feedback written[/green] — {counts['findings']} finding(s) "
                     f"({levels}) in {fb.REPORT_NAME}"
                 )
+                # After the structural check, never before: the archive is read by every later
+                # run, so only a report that passed its own gate belongs in it.
+                self._deposit_feedback()
                 return StageOutcome("feedback", True,
                                     f"{counts['findings']} finding(s)", counts)
             for problem in problems:

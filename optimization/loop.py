@@ -35,6 +35,7 @@ from rich.text import Text
 from autohelix.dashboard import generate_dashboard
 from autohelix.harness import AutoHelixRunError, Harness
 from autohelix.history import IterationResult
+from optimization import archive
 from optimization import constraints as cons
 from optimization import memory as mem
 from optimization import feedback
@@ -129,6 +130,7 @@ class OptimizationLoop(Harness):
         # read the memory and others do not. An iteration that does not read it never sees the
         # directory at all, so it cannot be tempted into it by a path in its tree.
         variables["memory"] = self._seed_memory(iteration, worktree_dir)
+        variables["archive"] = self._seed_archive(worktree_dir)
         variables["constraint_schedule"] = self.schedule.summary_table()
         variables["stage"] = self.stage
         variables["metric"] = METRIC
@@ -168,6 +170,35 @@ class OptimizationLoop(Harness):
                 f"  [yellow]![/yellow] memory: nothing seeded from {self.memory.path}"
             )
         return mem.describe_for_prompt(self.memory, iteration, seeded)
+
+    def _seed_archive(self, worktree_dir: Path) -> str:
+        """Copy the cross-run feedback archive in, and return its prompt block.
+
+        Every iteration, with no selector, which is what separates it from the operator's memory:
+        that directory is this module's own earlier work and some iterations are deliberately kept
+        from it, while this one is other modules' unresolved toolchain obstacles and there is no
+        iteration those would be wrong for.
+        """
+        path = (self._raw_config or {}).get("feedback_archive")
+        if not path:
+            return ""
+        entries = archive.read_entries(Path(str(path)))
+        if not entries:
+            return ""
+        spec = mem.MemorySpec(path=Path(str(path)), every=True, dest=archive.SEEDED_REL)
+        problem = mem.seed_problem(spec, worktree_dir)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] feedback archive: {problem}")
+            return ""
+        seeded = mem.seed(spec, worktree_dir)
+        if not seeded:
+            self.console.print(f"  [yellow]![/yellow] feedback archive: nothing seeded from {path}")
+            return ""
+        self.console.print(
+            f"  feedback archive: {sum(len(e.findings) for e in entries)} finding(s) from "
+            f"{len(entries)} run(s) at {archive.SEEDED_REL}"
+        )
+        return archive.describe_for_optimizer(entries, seeded)
 
     def _print_header(self, max_iter: int, start_iter: int = 1) -> None:
         """The stock header with the goal escaped, since the goal quotes `##autohelix[...]`.
@@ -552,7 +583,7 @@ class OptimizationLoop(Harness):
             # never turns into a teardown failure that strands a worktree — and given back at
             # `path`, where `seed` put it, since the worktree root is the wrong place to look under
             # a nested project and the directories would stay locked.
-            mem.unlock(path)
+            mem.unlock(path, mem.SEEDED_REL, archive.SEEDED_REL)
             original(worktree_path)
 
         self.sandbox.remove_worktree = remove  # type: ignore[method-assign]

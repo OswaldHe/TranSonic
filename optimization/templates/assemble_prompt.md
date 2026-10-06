@@ -24,6 +24,10 @@ The numbers you have to beat, measured on this host rather than copied from a lo
 {{ memory }}
 {% endif %}
 
+{% if archive %}
+{{ archive }}
+{% endif %}
+
 ## What you must produce
 
 **`source.py`** — the whole module on {{ ranks }} ranks. Each rank runs the submodule's work for its

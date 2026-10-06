@@ -219,6 +219,18 @@ Every note and review both loops wrote, read as one body of evidence. Self-contr
 construction, because each file was written before the run ended.
 _Avoid_: logs, history, transcript
 
+**Feedback archive**:
+Every finished run's `FEEDBACK.md`, pooled across modules, so a later run neither rediscovers a
+filed blocker nor files it twice. Distinct from the **attic**, which keeps failed preparation
+attempts, and from the **candidate archive**, which keeps one run's own kernels.
+_Avoid_: feedback memory, blocker database, knowledge base
+
+**Ruling**:
+What a later run says about a filed blocker: `agrees`, `disagrees`, `extends`, `not-applicable`. A
+`disagrees` marks the blocker **disputed** for every run after it. Distinct from a **verdict**,
+which is what a gate or a checker says about a candidate.
+_Avoid_: verdict, vote, review, judgement
+
 **Blocker**:
 Something that stopped a kernel getting faster and that this project cannot fix for itself, named by
 who would have to: a toolchain **bug** (L0), a missing **software feature** (L1), or missing

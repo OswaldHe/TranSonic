@@ -16,6 +16,10 @@ The whole schedule, so you know what this iteration is for and what the next one
 {{ memory }}
 {% endif %}
 
+{% if archive %}
+{{ archive }}
+{% endif %}
+
 {% if best_so_far %}
 Best {{ metric }} so far: **{{ best_so_far }}**.{% if regression_allowance %} An iteration more than
 {{ regression_allowance }}% above it is rejected and discarded — so a change you are unsure about
@@ -56,6 +60,11 @@ Read before starting:
 {% endif %}
 {% if memory %}
 - .autohelix/memory/ — earlier work on this module, read-only. Start here.
+{% endif %}
+{% if archive %}
+- .autohelix/feedback-archive/ — what earlier runs on *other* modules found blocking on this
+  toolchain, read-only. A lookup, not reading to do: its README.md is one table, worth a look when
+  you are about to conclude something is impossible here.
 {% endif %}
 
 The `neuron-nki-*` agents and skills available to you know the NKI API, the compiler's errors and

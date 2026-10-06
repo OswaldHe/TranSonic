@@ -91,6 +91,10 @@ class PipelineConfig:
     #: and searches for documentation links, so it gets longer than the constraint compiler.
     feedback_model: str | None = None
     feedback_timeout: str = "3h"
+    #: The cross-run feedback archive: every finished run's `FEEDBACK.md`, deposited here when its
+    #: report passes and seeded read-only into every later run. Unset disables the mechanism
+    #: entirely, because it is the one path this pipeline writes to outside its own workspace.
+    feedback_archive: Path | None = None
     source: Path | None = None
 
     # -- derived paths -------------------------------------------------------------
@@ -195,6 +199,7 @@ class PipelineConfig:
             compiler_timeout=str(compiler.get("timeout", "1h")),
             feedback_model=feedback_section.get("model"),
             feedback_timeout=str(feedback_section.get("timeout", "3h")),
+            feedback_archive=_archive_path(feedback_section.get("archive"), base_dir),
         )
 
     # -- validation ----------------------------------------------------------------
@@ -340,6 +345,10 @@ class PipelineConfig:
             # same way the schedule does. Absolute path: the derived config lives beside the repos,
             # not beside the operator's config, so a relative path would resolve somewhere else.
             payload["memory"] = spec.memory.to_payload()
+        if self.feedback_archive is not None:
+            # Every iteration of every stage, with no selector. Unlike the operator's memory this
+            # is not about *this* module, so there is no iteration it would be wrong for.
+            payload["feedback_archive"] = str(self.feedback_archive)
         if spec.has_reviewer:
             payload["reviewer"] = {
                 "prompt": spec.reviewer_prompt,
@@ -391,6 +400,21 @@ def _required_str(section: dict[str, Any], key: str, where: str) -> str:
 
 def _required_path(section: dict[str, Any], key: str, where: str) -> Path:
     return Path(_required_str(section, key, where)).expanduser()
+
+
+def _archive_path(raw: Any, base_dir: Path | None) -> Path | None:
+    """`feedback.archive`, resolved against the operator's config file like `memory.path` is.
+
+    Absent, blank or still the placeholder all mean off. Relative resolves against the config's
+    own directory, because the archive is shared by every module's config in a project and those
+    configs sit together.
+    """
+    if raw is None or not str(raw).strip() or str(raw).strip() == PLACEHOLDER:
+        return None
+    path = Path(str(raw).strip()).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    return path
 
 
 def _stage(

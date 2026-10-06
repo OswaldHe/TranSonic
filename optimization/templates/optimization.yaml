@@ -373,3 +373,12 @@ constraint_compiler:
 feedback:
   model: null          # null = the same model as the optimizing agent
   timeout: 2h
+
+  # Where every finished run's FEEDBACK.md is collected. Point several modules' configs at one
+  # directory and each run reads what the others found blocking, so an iteration is not spent
+  # rediscovering a toolchain limit and a finding is not filed twice. Omit to disable.
+  #
+  # Written at the end of a run, once its report passes the structural check; read, read-only, by
+  # every iteration and every preparation agent at `.autohelix/feedback-archive/`. Backfill runs
+  # that finished earlier with `autohelix optimize archive --add <workspace> --module <id>`.
+  archive: null

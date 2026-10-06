@@ -70,6 +70,7 @@ agent accept `-v, --verbose`, which streams agent output to the terminal as well
 | `feedback` | Write `FEEDBACK.md` from both loops' notes. | |
 | `report` | Write `REPORT.md`. | |
 | `gate` | Run a gate once against the repository as it is. | `--stage submodule\|full` |
+| `archive` | Show or extend the **feedback archive**. | `--add WORKSPACE`, `--module ID`, `--reindex` |
 | `all` | Run stages 1 to 6 in order. | |
 
 `gate` reports whether a repository would pass now, without starting a loop. `rerun-full` keeps the
@@ -91,6 +92,7 @@ the current prose.
 | `workspace` | `root` | where the repositories and run state go |
 | | `venv` | the Python environment the validator runs in |
 | `memory` | `path`, `prompt` | a directory of earlier work, shared by both stages |
+| `feedback` | `archive` | where finished runs' `FEEDBACK.md` is pooled across modules |
 | `submodule`, `full` | `goal` | what the loop must achieve |
 | | `budget.iterations` | iteration count for the stage |
 | | `budget.iteration_time` | wall-clock limit per iteration |
@@ -192,6 +194,63 @@ Constraints on the directory:
 - It must not contain symlinks. A snapshot cannot hold a live pointer.
 - It must not contain the worktree. Point `path:` beside the workspace root, not above it.
 - A missing directory is a warning. The loop reports how many files it seeded.
+
+## Feedback archive
+
+`feedback.archive:` points several modules' configs at one directory. When a run's `FEEDBACK.md`
+passes its structural check, that report is deposited there; every later run gets the directory
+copied into its worktrees at `.autohelix/feedback-archive/`, read-only, beside `.autohelix/memory/`.
+
+```yaml
+feedback:
+  archive: ../feedback-archive  # absolute, or relative to the config file. Omit to disable.
+```
+
+The two directories hold different things and are not substitutes. `memory:` is **this** module's
+own earlier work, curated by you, read by the iterations you select. The archive is **other**
+modules' unresolved toolchain obstacles, collected automatically, available to every iteration.
+
+It solves one problem in each direction:
+
+- **Forward.** The obstacles are the toolchain's, not any one module's, so a finding filed against
+  one module usually applies to the next. An iteration is a device slot and an hour of agent time;
+  rediscovering a filed dead end spends one.
+- **Backward.** A finding filed twice is a finding triaged once. The feedback agent rules on an
+  already-filed finding instead of re-filing it, in a table with the columns `Filed`, `Ruling`,
+  `Evidence`. The rulings are `agrees`, `disagrees`, `extends` and `not-applicable`, and the stage
+  checks that each `Filed` cell names a finding id that exists.
+
+Agents are told what is in the archive and where, not told to read it. It is a lookup, worth one
+when a run is about to conclude something is impossible or about to file a row of its own.
+
+What it holds:
+
+| | |
+|---|---|
+| `README.md` | the index: one row per finding, keyed by a 12-character id, regenerated on every deposit |
+| `<module>-<date>/FEEDBACK.md` | the report, byte for byte |
+| `<module>-<date>/entry.json` | module, date, latencies, findings, verdicts, origin |
+| `manifest.json` | every entry, for tooling |
+
+**Markdown only.** The whole store is copied into every iteration worktree, so it carries prose and
+nothing else — the reproduction scripts, NEFFs, profiles and compiler logs stay in the run that
+produced them, at the `origin` path the index records. Collecting a reproduction directory whole
+pulled 48 MB of `.ntff` out of one run before this rule existed.
+
+A finding is evidence, not settled fact. A later run that tests a filed claim and disagrees marks
+it **disputed** and the index says so beside the row, because a wrong finding read by every
+subsequent run is worse than no archive at all.
+
+Runs that finished before the archive existed are collected with `--add`:
+
+```bash
+autohelix optimize archive --add ../optimization-runs-40-MoE --module mtp.0.ffn
+autohelix optimize archive            # print what is filed
+```
+
+`--add` reads the run's own `baselines.json` and stage summaries, so a backfilled entry carries the
+same latencies the pipeline would have filed. The index also flags pairs of findings from different
+runs whose lead sentences mostly agree, since those are usually one obstacle described twice.
 
 ## Gates
 

@@ -102,6 +102,10 @@ class MemorySpec:
     preparation: bool = True
     #: Kept so warnings can name the file the operator wrote, not the derived config.
     source: Path | None = field(default=None, compare=False)
+    #: Where the seeded copy lands in a worktree. Not operator-configurable — the prompts name it
+    #: literally — but carried as a field so the pipeline's own stores, the feedback archive in
+    #: particular, are seeded by this same read-only machinery into a destination of their own.
+    dest: Path = SEEDED_REL
 
     @property
     def enabled(self) -> bool:
@@ -344,7 +348,7 @@ def seed_problem(spec: MemorySpec, worktree_dir: Path) -> str | None:
         return None
     try:
         source = spec.path.resolve()
-        target = (Path(worktree_dir) / SEEDED_REL).resolve()
+        target = (Path(worktree_dir) / spec.dest).resolve()
     except OSError as exc:  # pragma: no cover - a path that cannot be resolved at all
         return f"memory.path {spec.path} could not be resolved: {exc}"
     if source == target:
@@ -357,7 +361,7 @@ def seed_problem(spec: MemorySpec, worktree_dir: Path) -> str | None:
         )
     if source.is_relative_to(target):
         return (
-            f"memory.path {spec.path} is inside the seed destination {SEEDED_REL}, which is "
+            f"memory.path {spec.path} is inside the seed destination {spec.dest}, which is "
             f"replaced on every seed"
         )
     if not source.is_dir():
@@ -412,8 +416,8 @@ def skip_hidden(directory: str, names: list[str]) -> set[str]:
     return {name for name in names if name.startswith(".")}
 
 
-def unlock(worktree_dir: Path) -> None:
-    """Give the write bits back to a seeded tree, so it can be removed.
+def unlock(worktree_dir: Path, *rels: Path) -> None:
+    """Give the write bits back to one or more seeded trees, so they can be removed.
 
     `seed` takes the directory bits away as well as the files' — on Unix, write permission on the
     containing directory is enough to replace a `0444` file, so files alone do not make a snapshot
@@ -421,7 +425,11 @@ def unlock(worktree_dir: Path) -> None:
     `git worktree remove --force`, `shutil.rmtree`, and `seed`'s own replacement of a previous
     copy. Called from all three, so read-only never turns into a teardown failure.
     """
-    root = Path(worktree_dir) / SEEDED_REL
+    for rel in (rels or (SEEDED_REL,)):
+        _unlock_one(Path(worktree_dir) / rel)
+
+
+def _unlock_one(root: Path) -> None:
     if not root.exists():
         return
     try:
@@ -482,9 +490,9 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
     if seed_problem(spec, worktree_dir) is not None:
         return 0
     try:
-        target = Path(worktree_dir) / SEEDED_REL
+        target = Path(worktree_dir) / spec.dest
         if target.exists():
-            unlock(worktree_dir)
+            unlock(worktree_dir, spec.dest)
             shutil.rmtree(target)
         # `symlinks=True` copies a link as a link instead of following it. Following is how a
         # memory holding a link to its own parent, or to a large external tree, both escapes
@@ -513,7 +521,7 @@ def seed(spec: MemorySpec, worktree_dir: Path) -> int:
         # Whatever landed has to go with the report of failure.
         try:
             if target.exists():
-                unlock(worktree_dir)
+                unlock(worktree_dir, spec.dest)
                 shutil.rmtree(target, ignore_errors=True)
         except OSError:
             pass
@@ -546,7 +554,7 @@ def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
     if not spec.reads_at_preparation or seeded <= 0:
         return ""
     lines = [
-        f"**Earlier work on this module is in `{SEEDED_REL}/`.** {seeded} file(s), read-only. "
+        f"**Earlier work on this module is in `{spec.dest}/`.** {seeded} file(s), read-only. "
         f"Read it before you design: the run recorded there already settled questions you are "
         f"about to answer, and the ones it could *not* settle are written down too.",
         "",
@@ -565,7 +573,7 @@ def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
         "from. Say in your write-up which you took, which you re-derived, and which you left, "
         "with the reason.",
         "",
-        TRANSIENCE.format(rel=SEEDED_REL),
+        TRANSIENCE.format(rel=spec.dest),
     ]
     return "\n".join(lines)
 
@@ -586,7 +594,7 @@ def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:
         return ""
     names = entry_names(spec.path)
     lines = [
-        f"**Start from the memory in `{SEEDED_REL}/`.** {seeded} file(s) from earlier work on this "
+        f"**Start from the memory in `{spec.dest}/`.** {seeded} file(s) from earlier work on this "
         f"module, copied in read-only before you started. It is outside your editable scope, so "
         f"you cannot commit it and nothing you do to it reaches the candidate.",
         "",
@@ -603,6 +611,6 @@ def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:
         "profile are the only things that decide. Where it records something that *did not* work, "
         "that is the most valuable part: do not spend an iteration rediscovering it.",
         "",
-        TRANSIENCE.format(rel=SEEDED_REL),
+        TRANSIENCE.format(rel=spec.dest),
     ]
     return "\n".join(lines)
