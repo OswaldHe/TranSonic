@@ -207,18 +207,8 @@ class OptimizationLoop(Harness):
             else:
                 result = self._run_governed_iteration(iteration)
         except AutoHelixRunError as exc:
-            # An agent that ran out of its time budget is a **rejected iteration, not a failed
-            # run**. Upstream raises here, which aborts `optimize all` and takes stages 4, 5,
-            # feedback and report with it -- on `40-DSparkAttention` that discarded a finished
-            # 12x improvement (0.89305 -> 0.447916 ms over four merged iterations) because the
-            # fifth agent overran by minutes. The iteration itself has nothing to contribute: its
-            # candidate was never measured, and `Harness.run_iteration`'s own `finally` has
-            # already saved its notes, so the only thing propagating buys is losing the stages
-            # that come after.
-            #
-            # Scoped to timeouts on purpose. Any other agent failure -- a crash, a non-zero exit
-            # -- still propagates, because those can mean the worktree or the repo is in a state
-            # the next iteration should not build on, and that is a different judgement.
+            # A timed-out agent is a rejected iteration, not a failed run: its candidate was never
+            # measured, its notes are already saved, and propagating only loses the later stages.
             if "timed out" not in str(exc):
                 raise
             self.console.print(f"  [yellow]![/yellow] iteration {iteration} {exc}"

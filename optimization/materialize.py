@@ -51,6 +51,10 @@ REFERENCE_TREES = ("vendor", "compat")
 #: The five constants, as `bootstrap init` publishes them under "The numerical bar".
 TOLERANCE_NAMES = ("RTOL", "ATOL", "MIN_COSINE", "MIN_PASS_FRACTION", "MAX_ABS_ERR")
 
+#: The one of those five that `tighten_bar` moves most and that a stale copy misstates most
+#: visibly, so it is what `mark_superseded_bars` keys on. Same name the gates use for it.
+CEILING_NAME = "MAX_ABS_ERR"
+
 _BAR = re.compile(r"^\s*(RTOL|ATOL|MIN_COSINE|MIN_PASS_FRACTION|MAX_ABS_ERR)\s*=\s*([0-9.eE+-]+)",
                   re.M)
 
@@ -79,6 +83,51 @@ class TensorRecord:
     def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "role": self.role, "file": self.file,
                 "dtype": self.dtype, "shape": self.shape}
+
+
+def mark_superseded_bars(repo: Path, bar: dict[str, float]) -> list[str]:
+    """Annotate every carried-in file that states a bar other than this repo's.
+
+    A materialized repo states `MAX_ABS_ERR` in several files and only one is the bar the gate
+    enforces: everything under `module/` and `submodule/` describes the stage it was copied from,
+    and `tighten_bar` has since re-pinned this repo's. Being outnumbered is not a problem prose can
+    fix -- an agent told to copy the bar from `module/README.md` does so and fails the gate's bar
+    check -- so each stale statement is marked in place, naming the authoritative file.
+
+    Only markdown is touched: a carried-in `inference.py` is another stage's frozen artifact, and
+    markdown is what the prompts send agents to read, which is where the mistake happens.
+    """
+    marked: list[str] = []
+    want = bar.get(CEILING_NAME)
+    if want is None:
+        return marked
+    note = (f"> **This is not the bar this repo is held to.** It belongs to the stage this file was\n"
+            f"> copied from. What this repo must hit is in its own `README.md` under \"What it has\n"
+            f"> to hit\" -- `{CEILING_NAME} = {want!r}` -- which is written from the same value the\n"
+            f"> gate reads out of `.autohelix/optimization/module.json`. Declaring anything else in\n"
+            f"> `inference.py` fails the gate's bar check.\n\n")
+    for rel in ("module/README.md", "submodule/README.md", "submodule/SUBMODULE.md"):
+        path = repo / rel
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        if note in text:
+            continue
+        stale = [float(v) for name, v in _BAR.findall(text) if name == CEILING_NAME]
+        if not stale or all(abs(s - want) <= 1e-12 for s in stale):
+            continue
+        # Immediately above the first line that states the ceiling, so the marker cannot be read
+        # separately from the number it is about.
+        lines = text.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if CEILING_NAME in line and any(ch.isdigit() for ch in line):
+                lines.insert(i, note)
+                break
+        else:
+            lines.insert(0, note)
+        path.write_text("".join(lines))
+        marked.append(rel)
+    return marked
 
 
 def read_numerical_bar(readme: Path) -> dict[str, float]:
@@ -513,7 +562,7 @@ Its recorded output is `{MODULE_DIR}/{golden.file}` — `{golden.dtype}`, shape
 `{tuple(golden.shape)}` — and its numerical bar is:
 
 ```python
-{chr(10).join(f'{name} = {bar[name]:g}' for name in TOLERANCE_NAMES)}
+{chr(10).join(f'{name} = {bar[name]!r}' for name in TOLERANCE_NAMES)}
 ```
 
 That is the bar the **assembly** is held to, since the assembly reproduces this tensor. This
@@ -686,6 +735,17 @@ def materialize_full(
         module_id, projection, bar, golden,
         bootstrap_latency_ms, submodule_latency_ms,
     ))
+    # The README the prompt sends the agent to and the manifest the gate enforces are both written
+    # from `bar`, so reading it back is what stops a `_full_readme` edit silently splitting them.
+    published = read_numerical_bar(repo / "README.md")
+    drift = {n: (published[n], bar[n]) for n in TOLERANCE_NAMES
+             if abs(published[n] - bar[n]) > 1e-12}
+    if drift:
+        raise MaterializeError(
+            f"{repo / 'README.md'} publishes a bar that differs from the one going into the "
+            f"manifest: " + ", ".join(f"{n} {p:g} vs {b:g}" for n, (p, b) in sorted(drift.items()))
+        )
+    bar_marked = mark_superseded_bars(repo, bar)
     write_gitignore(repo)
     (repo / "source.py").write_text(_source_stub(entry_point))
     (repo / "inference.py").write_text(_inference_stub(entry_point))
@@ -695,6 +755,9 @@ def materialize_full(
         "entry_point": entry_point,
         "ranks": projection.projected_units,
         "stripped": [s.describe() for s in stripped],
+        # Carried-in files that state a bar other than this repo's and were marked in place, so a
+        # change that stops marking one shows up as a missing entry rather than as silence.
+        "bar_marked": bar_marked,
         "projection": projection.to_dict(),
         "tolerance": bar,
         "tensors": tensors,
@@ -755,7 +818,7 @@ The golden is `tensors/{Path(golden.file).name}` — `{golden.dtype}`, shape
 `{tuple(golden.shape)}` — compared against **rank 0's post-collective output**, once, at:
 
 ```python
-{chr(10).join(f'{name} = {bar[name]:g}' for name in TOLERANCE_NAMES)}
+{chr(10).join(f'{name} = {bar[name]!r}' for name in TOLERANCE_NAMES)}
 ```
 
 Unchanged from the bootstrapped module. Two standing bounds, both measured on this host:

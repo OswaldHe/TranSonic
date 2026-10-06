@@ -736,8 +736,14 @@ def pinned_constants(tree: ast.Module, expected: dict[str, float],
             findings.append(f"{filename}:{line} declares {name} as {value!r}, not a number")
             continue
         if abs(got - want) > 1e-12:
+            # Name the authoritative file: a repo states a bar in several places, and an agent that
+            # copied a stale one cannot tell from "not yours to change" which to open on a retry.
             findings.append(
                 f"{filename}:{line} declares {name} = {got:g}, but this repo's bar is {want:g}. "
-                f"The bar is not the agent's to change, in either direction"
+                f"Take all five constants from this repo's own README.md under 'What it has to "
+                f"hit', which is written from the same value the gate reads out of "
+                f"`.autohelix/optimization/module.json`. A bar stated anywhere else in the repo -- "
+                f"`module/README.md` in particular -- describes the bootstrapped module and may be "
+                f"looser. The bar itself is not yours to change, in either direction"
             )
     return findings

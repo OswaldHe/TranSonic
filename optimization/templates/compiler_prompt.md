@@ -24,7 +24,7 @@ Write one script per slot, to the exact path named above. Nothing else.
 ## How to write a good one
 
 **Check the prose, not more than the prose.** A slot saying "must use NKI, no torch" is about which
-library the arithmetic goes through. It is not a licence to also require a particular tiling, ban a
+library the arithmetic goes through. It is not a license to also require a particular tiling, ban a
 helper function, or demand the kernel be fast. Every extra requirement you add is a trap: the agent
 is told the sentence, so anything you enforce beyond it fails work that did exactly as it was asked.
 

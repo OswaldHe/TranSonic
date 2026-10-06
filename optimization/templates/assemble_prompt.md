@@ -62,11 +62,20 @@ the above.
     against the golden. One comparison against the whole module, not {{ ranks }} partial ones;
   - prints `##autohelix[passed=1]` and exits 0 on a match, non-zero otherwise;
   - prints `##autohelix[max_abs_err=<number>]` and fails when it exceeds `MAX_ABS_ERR`;
-  - declares the five constants with exactly the values in `module/README.md` under "The numerical
-    bar". **Unchanged.** The golden is the same tensor the bootstrap loop matched, so the bar that
-    admitted that kernel admits this one. The {{ ranks }}-rank reduction order differs from the
-    reference's single all-reduce, so accumulation order shifts a little — absorbing that is what a
-    pass fraction and a cosine are for, not a reason to loosen anything;
+  - declares the five constants with exactly the values in **this repo's own `README.md`** under
+    "What it has to hit". **Unchanged.** Take them from there and from nowhere else: the gate reads
+    the bar out of `.autohelix/optimization/module.json`, and that README is written from the same
+    value, so those two always agree.
+
+    `module/README.md` also states a bar and it is **not** this one: that is the bootstrapped
+    module's, derived from the recorded output alone, and on some modules it is an order of
+    magnitude looser than this repo's, which is re-pinned to what that kernel achieved plus 10%.
+    Copying it fails check (e) with "declares MAX_ABS_ERR = ..., but this repo's bar is ...", which
+    is why this paragraph names the file.
+
+    The {{ ranks }}-rank reduction order differs from the reference's single all-reduce, so
+    accumulation order shifts a little — absorbing that is what a pass fraction and a cosine are
+    for, not a reason to loosen anything;
   - profiles the collective run and reports the latency:
 
         neuron-explorer capture -n <neff> --io-from=runtime \

@@ -2257,3 +2257,37 @@ def test_the_projected_width_is_the_one_configured_not_the_package_default(tmp_p
     text = projection.describe()
     assert "2 logical NeuronCore(s)" in text
     assert "trn2.3xlarge" not in text, "the instance type is not this module's to assert"
+
+
+def test_a_published_bar_round_trips_exactly_to_the_gate_s_bar():
+    """A README that rounds the bar cannot be copied into a validator that passes.
+
+    `pinned_constants` compares the declared constants to the manifest at 1e-12, so a README
+    formatted with `:g` publishes six significant digits of a bar the gate holds to seventeen --
+    0.999943 against 0.9999432399999999 -- and an agent that copies it faithfully fails a check it
+    had no part in. The two are written from the same dict, so the only thing that can separate
+    them is the formatting, and that is what this pins.
+    """
+    bar = materialize.tighten_bar(
+        {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+         "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 2.65},
+        {"max_abs_err": 0.1875, "cosine": 0.99997162, "pass_fraction": 0.999883},
+    )
+    assert bar["MIN_COSINE"] != round(bar["MIN_COSINE"], 6), "pick a bar that rounding would break"
+
+    readme = f"""# r
+
+## What it has to hit
+
+```python
+{chr(10).join(f'{name} = {bar[name]!r}' for name in materialize.TOLERANCE_NAMES)}
+```
+"""
+    import pathlib, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "README.md"
+        path.write_text(readme)
+        published = materialize.read_numerical_bar(path)
+    assert published == bar
+    for name in materialize.TOLERANCE_NAMES:
+        assert abs(published[name] - bar[name]) <= 1e-12, name
