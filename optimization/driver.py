@@ -729,9 +729,29 @@ class Pipeline:
         # the `source.py` a reader opens described different code.
         if stage == "full" and best_commit:
             self._materialize_best(repo, best_commit, best_value)
+
+        # **A timed-out loop is not a failed stage.** `step` in `all` turns `ok=False` into a
+        # `StageError` and abandons every later stage, which is right when the loop produced nothing
+        # usable — and wrong when the only thing that went wrong is that an agent ran over its
+        # clock. The loop already behaves correctly in that case: a timeout is recorded as a
+        # rejected iteration, nothing is merged, and the repo stays at the last accepted commit, so
+        # there is always a kernel to hand on. With no accepted iteration at all that kernel is the
+        # baseline cut, which `materialize_full` picks up anyway when `best_commit` is None.
+        #
+        # So an all-timeout loop reports ok and says so, rather than taking stages 4, 5, feedback
+        # and report down with it. Any other reason for an empty loop still fails the stage.
+        timed_out = sum(1 for r in loop.history.load()
+                        if not r.accepted and "timed out" in (r.reason or ""))
+        ok = best_value is not None or timed_out > 0
+        if best_value is not None:
+            detail = f"best {best_value} ms"
+        elif timed_out:
+            detail = (f"no accepted iteration; {timed_out} agent timeout(s) — carrying the "
+                      f"baseline cut forward")
+        else:
+            detail = "no accepted iteration"
         return StageOutcome(
-            stage=f"run-{stage}", ok=best_value is not None,
-            detail=f"best {best_value} ms" if best_value else "no accepted iteration",
+            stage=f"run-{stage}", ok=ok, detail=detail,
             payload={"best_commit": best_commit, "best_ms": best_value},
         )
 

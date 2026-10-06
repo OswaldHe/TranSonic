@@ -33,7 +33,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from autohelix.dashboard import generate_dashboard
-from autohelix.harness import Harness
+from autohelix.harness import AutoHelixRunError, Harness
 from autohelix.history import IterationResult
 from optimization import constraints as cons
 from optimization import memory as mem
@@ -201,10 +201,35 @@ class OptimizationLoop(Harness):
         self._current_iteration = iteration
 
         slot = self.schedule.slot_for(iteration)
-        if slot is None or not (slot.has_text and slot.enforce):
-            result = super().run_iteration(iteration)
-        else:
-            result = self._run_governed_iteration(iteration)
+        try:
+            if slot is None or not (slot.has_text and slot.enforce):
+                result = super().run_iteration(iteration)
+            else:
+                result = self._run_governed_iteration(iteration)
+        except AutoHelixRunError as exc:
+            # An agent that ran out of its time budget is a **rejected iteration, not a failed
+            # run**. Upstream raises here, which aborts `optimize all` and takes stages 4, 5,
+            # feedback and report with it -- on `40-DSparkAttention` that discarded a finished
+            # 12x improvement (0.89305 -> 0.447916 ms over four merged iterations) because the
+            # fifth agent overran by minutes. The iteration itself has nothing to contribute: its
+            # candidate was never measured, and `Harness.run_iteration`'s own `finally` has
+            # already saved its notes, so the only thing propagating buys is losing the stages
+            # that come after.
+            #
+            # Scoped to timeouts on purpose. Any other agent failure -- a crash, a non-zero exit
+            # -- still propagates, because those can mean the worktree or the repo is in a state
+            # the next iteration should not build on, and that is a different judgement.
+            if "timed out" not in str(exc):
+                raise
+            self.console.print(f"  [yellow]![/yellow] iteration {iteration} {exc}"
+                               f" — recorded as rejected; the loop continues")
+            self.log.warning(f"iter {iteration} agent timed out; recorded as rejected")
+            result = IterationResult(
+                iteration=iteration, accepted=False, metrics={},
+                reason=f"agent timed out: {exc}",
+            )
+            self.history.append(result)
+            return result
         archived = self.archive_candidate(iteration, result)
         if archived is not None and not result.accepted:
             self.console.print(f"  [dim]candidate kept at {archived}[/dim]")
