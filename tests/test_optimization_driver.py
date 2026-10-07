@@ -2339,6 +2339,35 @@ def test_the_loop_gate_skips_the_admission_only_checks():
     assert set(mc.CHECK_TITLES) - set(mc.ADMISSION_ONLY) >= {"a", "b", "c", "d", "e", "f", "g"}
 
 
+def test_the_loop_filter_reads_the_field_the_dataclass_actually_has(tmp_path, monkeypatch):
+    """The first version read `r.check`, which only exists on `to_dict()`'s output.
+
+    Every stage-5 iteration raised `AttributeError: 'CheckResult' object has no attribute
+    'check'` before it measured anything, and the test above did not catch it because it
+    asserted properties of the tuple instead of running the filter. Three iterations of
+    42-DSparkMarkovHead were spent on it.
+    """
+    from optimization import candidate, module_checker as mc
+
+    monkeypatch.setattr(candidate, "run_candidate",
+                        lambda *a, **k: candidate.RunOutcome(ran=True, return_code=1))
+    # Empty is enough: every check may fail, the question is only which ones ran.
+    (tmp_path / "source.py").write_text("")
+    (tmp_path / "inference.py").write_text("")
+    manifest = {
+        "ranks": 4,
+        "tolerance": {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                      "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 1.0},
+        "baselines": {"submodule_latency_ms": 1.0},
+    }
+
+    every, _ = mc.evaluate(tmp_path, manifest, timeout=1)
+    looped, _ = mc.evaluate(tmp_path, manifest, timeout=1, loop=True)
+
+    assert {r.key for r in every} - {r.key for r in looped} == set(mc.ADMISSION_ONLY)
+    assert all(hasattr(r, "key") for r in every)
+
+
 def test_only_the_full_stage_s_gate_gets_the_loop_flag(tmp_path):
     config = PipelineConfig.load(_filled(tmp_path))
 

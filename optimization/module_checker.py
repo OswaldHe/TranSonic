@@ -552,7 +552,10 @@ def evaluate(repo: Path, manifest: dict[str, Any], timeout: int,
         check_overhead(run, manifest),
     ]
     if loop:
-        results = [r for r in results if r.check not in ADMISSION_ONLY]
+        # `.key`, not `.check`: only `CheckResult.to_dict` renames the field to "check", and
+        # reading that name off the dataclass is an AttributeError that failed three paid
+        # iterations of 42-DSparkMarkovHead before anything measured them.
+        results = [r for r in results if r.key not in ADMISSION_ONLY]
     return results, run
 
 
