@@ -501,6 +501,10 @@ def measured_latencies(workspace_root: Path) -> dict[str, float | None]:
     try:
         baselines = json.loads((root / ".optimization" / "baselines.json").read_text())
         found["bootstrap_ms"] = baselines.get("bootstrap_latency_ms")
+        # Fallback only. Stage 4 measures the accepted submodule to set its own ceiling, so this
+        # holds the right number whenever stage 3's summary is missing -- a run whose stage 3
+        # finished under an earlier invocation never wrote one. The summary wins below.
+        found["submodule_ms"] = baselines.get("submodule_latency_ms")
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
     for stage, key in (("submodule", "submodule_ms"), ("full", "module_ms")):

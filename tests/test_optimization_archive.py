@@ -402,6 +402,35 @@ def test_a_backfilled_run_files_the_numbers_it_achieved(tmp_path, run):
         (tmp_path / "archive" / archive.INDEX_NAME).read_text()
 
 
+def test_the_submodule_number_falls_back_to_the_baselines_record(tmp_path, run):
+    """40-DSparkAttention filed `submodule_ms: None` with the number sitting in `baselines.json`.
+
+    Its stage 3 finished under an earlier invocation that never wrote `submodule-summary.json`,
+    which is the only place this used to look.
+    """
+    (run / ".optimization").mkdir()
+    (run / ".optimization" / "baselines.json").write_text(json.dumps(
+        {"bootstrap_latency_ms": 17.617743, "submodule_latency_ms": 0.445173}))
+    summary = run / "mod-full" / ".autohelix" / "optimization" / "full-summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(json.dumps({"stage": "full", "best_ms": 0.487923748}))
+
+    assert archive.measured_latencies(run) == {
+        "bootstrap_ms": 17.617743, "submodule_ms": 0.445173, "module_ms": 0.487923748}
+
+
+def test_stage_threes_own_summary_wins_over_the_baseline(tmp_path, run):
+    """The baseline is what stage 4 measured once; the summary is what stage 3 settled on."""
+    (run / ".optimization").mkdir()
+    (run / ".optimization" / "baselines.json").write_text(json.dumps(
+        {"submodule_latency_ms": 0.445173}))
+    summary = run / "mod-rank0" / ".autohelix" / "optimization" / "submodule-summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(json.dumps({"stage": "submodule", "best_ms": 0.441002}))
+
+    assert archive.measured_latencies(run)["submodule_ms"] == 0.441002
+
+
 def test_a_run_with_no_records_files_no_numbers(tmp_path, run):
     """A hand-assembled entry is still a legal entry; the chain just reads as unknown."""
     entry = archive.deposit(tmp_path / "archive", run, "mtp.0.ffn", recorded="2026-10-06")
