@@ -104,7 +104,23 @@ RANK_LATENCY_MARKER = "latency_rank_{rank}_ms"
 #: the file's import table and requires the module it came from to be this one — which catches a
 #: host-side or XLA collective under any alias, rather than only the spellings someone listed.
 COLLECTIVE_MODULE = "nki.collectives"
-COLLECTIVE_OPS = ("all_reduce", "all_gather", "all_to_all", "reduce_scatter", "collective_permute")
+#: Every data-moving collective `nki.collectives` exposes. No particular one is required: the rule
+#: is that the ranks rejoin through this module inside the traced graph, and which call does it is
+#: the assembler's choice. The four `_v` and `_implicit` forms were missing, so a kernel rejoining
+#: with `all_gather_v` was told it "calls no collective at all".
+#: `test_the_collective_allowlist_matches_the_installed_api` fails when this drifts from the module.
+COLLECTIVE_OPS = (
+    "all_reduce",
+    "all_gather", "all_gather_v",
+    "all_to_all", "all_to_all_v",
+    "reduce_scatter",
+    "collective_permute", "collective_permute_implicit", "collective_permute_implicit_reduce",
+)
+#: Exposed by the same module but not data movement, so their presence does not satisfy check (c):
+#: `ReplicaGroup` is a class, and the other two report a rank rather than moving a tensor.
+COLLECTIVE_NON_OPS = frozenset({
+    "ReplicaGroup", "rank_id", "collective_permute_implicit_current_processing_rank_id",
+})
 
 #: `torch.distributed` calls that are legitimate: they organize processes, they do not reduce data.
 ALLOWED_DIST_CALLS = frozenset({
@@ -285,7 +301,7 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
                     findings.append(
                         f"{where}:{line} calls '{dotted}'"
                         + (f", which resolves to '{resolved}'" if resolved != dotted else "")
-                        + f". The reduction has to come from {COLLECTIVE_MODULE} and happen inside "
+                        + f". The collective has to come from {COLLECTIVE_MODULE} and happen inside "
                         f"the traced graph — a host-side or XLA collective works and measures a "
                         f"different machine"
                     )
@@ -312,7 +328,7 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
                f"on device" if resolved_from_nki else "")
         )
     return CheckResult("c", CHECK_TITLES["c"], not findings,
-                       f"reduction via {', '.join(sorted(resolved_from_nki))}" if not findings
+                       f"ranks rejoin via {', '.join(sorted(resolved_from_nki))}" if not findings
                        else f"{len(findings)} problem(s)", findings)
 
 

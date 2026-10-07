@@ -1198,3 +1198,25 @@ def test_a_non_positive_latency_fails_both_latency_checks(reported):
         result = check(run, manifest)
         assert not result.passed, check.__name__
         assert "not a measurement" in result.summary
+
+
+def test_the_collective_allowlist_matches_the_installed_api():
+    """Check (c) is satisfied by any `nki.collectives` call in `COLLECTIVE_OPS`, so a collective
+    the module exposes but this tuple omits reads as "calls no collective at all".
+
+    Four were omitted -- `all_gather_v`, `all_to_all_v`, `collective_permute_implicit` and
+    `collective_permute_implicit_reduce` -- which would have failed an assembly that rejoined with
+    any of them. No particular collective is required; `all_reduce` is one option among nine.
+    """
+    ncc = pytest.importorskip("nki.collectives")
+
+    exposed = {n for n in dir(ncc) if not n.startswith("_")}
+    accounted = set(module_checker.COLLECTIVE_OPS) | module_checker.COLLECTIVE_NON_OPS
+
+    assert exposed - accounted == set(), (
+        f"nki.collectives exposes {sorted(exposed - accounted)}, which check (c) would neither "
+        f"accept as a rejoin nor knowingly ignore"
+    )
+    assert set(module_checker.COLLECTIVE_OPS) - exposed == set(), "the allowlist names a dead API"
+    assert "all_reduce" in module_checker.COLLECTIVE_OPS
+    assert "all_gather_v" in module_checker.COLLECTIVE_OPS
