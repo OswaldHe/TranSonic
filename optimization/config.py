@@ -269,12 +269,16 @@ class PipelineConfig:
         from optimization import candidate, module_checker
 
         if stage == "submodule":
-            spec, checker, timeout = (
-                self.submodule, "optimization.submodule_checker", candidate.DEFAULT_RUN_TIMEOUT,
+            spec, checker, timeout, extra = (
+                self.submodule, "optimization.submodule_checker",
+                candidate.DEFAULT_RUN_TIMEOUT, "",
             )
         elif stage == "full":
-            spec, checker, timeout = (
-                self.full, "optimization.module_checker", module_checker.DEFAULT_RUN_TIMEOUT,
+            # `--loop` drops the admission-only checks: re-asking check (i) every iteration
+            # rejects candidates for measurement noise. See `module_checker.evaluate`.
+            spec, checker, timeout, extra = (
+                self.full, "optimization.module_checker",
+                module_checker.DEFAULT_RUN_TIMEOUT, " --loop",
             )
         else:
             raise ConfigError(f"unknown stage '{stage}' (expected 'submodule' or 'full')")
@@ -286,7 +290,7 @@ class PipelineConfig:
                 # interpreter. The preflight proves it can import what the gate needs.
                 "command": (
                     f"{GATE_PYTHON} -m {checker} --repo . "
-                    f"--json .autohelix/optimization/gate.json --timeout {timeout}"
+                    f"--json .autohelix/optimization/gate.json --timeout {timeout}{extra}"
                 ),
                 "timeout": timeout + 300,
             }],

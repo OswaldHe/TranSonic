@@ -1808,7 +1808,7 @@ def _repinner(tmp_path, measures=None):
     pipeline.state_dir.mkdir(parents=True, exist_ok=True)
     pipeline.console = _SilentConsole()
     if measures is not None:
-        pipeline._measure = lambda repo, label, cores: measures
+        pipeline._measure = lambda repo, label, cores, draws=1: (*measures, 0.0)
     return pipeline
 
 
@@ -2321,3 +2321,52 @@ def test_a_file_that_states_this_repo_s_own_bar_is_not_marked(tmp_path):
            "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.20625000000000002}
 
     assert materialize.mark_superseded_bars(repo, bar) == []
+
+
+def test_the_loop_gate_skips_the_admission_only_checks():
+    """Check (i) bounds the collective against a submodule latency measured once, before the loop.
+
+    Re-asking it every iteration turns measurement noise into rejections: on `mtp.0.attention` the
+    ceiling was 0.48969 ms and twelve later draws of the module kernel it had admitted spanned
+    0.4924 to 0.4998, so three of five iterations were rejected for nothing they did.
+    """
+    from optimization import module_checker as mc
+
+    assert mc.ADMISSION_ONLY, "the subset has to name at least one check"
+    for check in mc.ADMISSION_ONLY:
+        assert check in mc.CHECK_TITLES, check
+    # Everything about the candidate itself still runs every iteration.
+    assert set(mc.CHECK_TITLES) - set(mc.ADMISSION_ONLY) >= {"a", "b", "c", "d", "e", "f", "g"}
+
+
+def test_only_the_full_stage_s_gate_gets_the_loop_flag(tmp_path):
+    config = PipelineConfig.load(_filled(tmp_path))
+
+    assert " --loop" in config.derive_loop_config("full")["constraints"][0]["command"]
+    assert "--loop" not in config.derive_loop_config("submodule")["constraints"][0]["command"]
+
+
+def test_a_baseline_is_the_median_of_several_draws(tmp_path, monkeypatch):
+    """One draw is not a latency. The median of three drops the outlier that set a ceiling the
+    code which produced it could not reproduce."""
+    from optimization import candidate
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    draws = iter([0.445173, 0.496, 0.4998])   # a low outlier, then two honest draws
+
+    def fake_run(_repo, _cmd, **_kw):
+        value = next(draws)
+        return candidate.RunOutcome(
+            ran=True, return_code=0, duration_s=1.0,
+            output=f"##autohelix[latency_ms={value}]\n##autohelix[max_abs_err=0.1875]\n",
+        )
+
+    monkeypatch.setattr(candidate, "run_candidate", fake_run)
+    median, numerics, spread = pipeline._measure(repo, "x", cores="1", draws=3)
+
+    assert median == 0.496, "the outlier must not set the bound"
+    assert numerics == {"max_abs_err": 0.1875}, "numerics come from the median run"
+    assert abs(spread - (0.4998 - 0.445173)) < 1e-9

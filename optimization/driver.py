@@ -917,7 +917,7 @@ class Pipeline:
         different toolchain is the kind of number that makes a bound quietly meaningless.
         """
         self.console.print("\n[bold]re-measuring the two baselines on this host[/bold]")
-        bootstrap_ms, achieved = self._measure(
+        bootstrap_ms, achieved, _ = self._measure(
             self.config.bootstrap_repo, "the bootstrapped module (1 core)", cores="1",
         )
         if achieved:
@@ -930,13 +930,15 @@ class Pipeline:
         # make the 1.1x ceiling describe code that is not in the assembly.
         best_commit, _ = _best_from_summary(self.config.submodule_repo)
         with self._at_commit(self.config.submodule_repo, best_commit) as repo:
-            submodule_ms, _ = self._measure(
+            # Several draws, because this one number sets check (i)'s ceiling. See `_measure`.
+            submodule_ms, _, spread = self._measure(
                 repo, f"the optimized submodule at {(best_commit or 'HEAD')[:12]} (1 core)",
-                cores="1",
+                cores="1", draws=self.BASELINE_DRAWS,
             )
         self._record("baselines", {
             "bootstrap_latency_ms": bootstrap_ms,
             "submodule_latency_ms": submodule_ms,
+            "submodule_spread_ms": round(spread, 6),
             "overhead_ceiling_ms": round(submodule_ms * 1.10, 6),
             "bootstrap_achieved": achieved,
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -982,29 +984,57 @@ class Pipeline:
     #: output alone is not a bar the pipeline can be held to. See `materialize.tighten_bar`.
     ACHIEVED_MARKERS = ("max_abs_err", "cosine", "pass_fraction")
 
-    def _measure(self, repo: Path, label: str, cores: str) -> tuple[float, dict[str, float]]:
-        """The validator's latency, and whatever numerics it printed alongside it."""
+    #: Draws behind the submodule baseline, whose median sets check (i)'s ceiling. Three is enough
+    #: to drop a single outlier and cheap: the validator run is seconds, and this happens once.
+    BASELINE_DRAWS = 3
+
+    def _measure(self, repo: Path, label: str, cores: str,
+                 draws: int = 1) -> tuple[float, dict[str, float], float]:
+        """The validator's median latency over `draws` runs, with the median run's numerics.
+
+        The median, because one draw is not a latency. `latency_ms` on this host carries a few
+        percent of run-to-run spread, and a bound built from a single draw is a bound that the code
+        which set it cannot reproduce: `mtp.0.attention`'s submodule drew 0.445173 ms once, which
+        put check (i)'s ceiling at 0.48969 ms, below every one of twelve later draws of the module
+        kernel that ceiling admitted. Three of its five stage-5 iterations died on that.
+
+        The numerics come from the median run rather than from any run, so the recorded accuracy and
+        the recorded latency describe the same execution.
+        """
         from optimization import candidate
 
-        self.console.print(f"  measuring {label} in {repo}")
-        outcome = candidate.run_candidate(
-            repo, [sys.executable, "inference.py"],
-            env_overrides={"NEURON_RT_NUM_CORES": cores},
-        )
-        latency = candidate.marker_value(outcome.output, METRIC)
-        if outcome.return_code != 0 or latency is None:
-            tail = "\n".join(outcome.output.strip().splitlines()[-15:])
-            raise StageError(
-                f"could not measure {label}: exit {outcome.return_code}, "
-                f"latency {latency}\n{tail}"
+        self.console.print(f"  measuring {label} in {repo}"
+                           + (f" ({draws} draws, median)" if draws > 1 else ""))
+        taken: list[tuple[float, dict[str, float]]] = []
+        for draw in range(1, max(1, draws) + 1):
+            outcome = candidate.run_candidate(
+                repo, [sys.executable, "inference.py"],
+                env_overrides={"NEURON_RT_NUM_CORES": cores},
             )
-        achieved = {}
-        for name in self.ACHIEVED_MARKERS:
-            value = candidate.marker_value(outcome.output, name)
-            if value is not None:
-                achieved[name] = value
-        self.console.print(f"    {latency:g} ms")
-        return latency, achieved
+            latency = candidate.marker_value(outcome.output, METRIC)
+            if outcome.return_code != 0 or latency is None:
+                tail = "\n".join(outcome.output.strip().splitlines()[-15:])
+                raise StageError(
+                    f"could not measure {label}: exit {outcome.return_code}, "
+                    f"latency {latency}\n{tail}"
+                )
+            achieved = {name: value for name in self.ACHIEVED_MARKERS
+                        if (value := candidate.marker_value(outcome.output, name)) is not None}
+            taken.append((latency, achieved))
+            if draws > 1:
+                self.console.print(f"    draw {draw}: {latency:g} ms")
+
+        taken.sort(key=lambda pair: pair[0])
+        median, numerics = taken[len(taken) // 2]
+        spread = taken[-1][0] - taken[0][0]
+        if draws > 1:
+            self.console.print(
+                f"    [bold]{median:g} ms[/bold] median, spread {spread:g} ms "
+                f"({spread / median * 100:.1f}%)"
+            )
+        else:
+            self.console.print(f"    {median:g} ms")
+        return median, numerics, spread
 
     def assemble(self, rebuild: bool = False) -> StageOutcome:
         """Rebuild the whole module across all ranks, and accept it only when the gate agrees."""
@@ -1593,7 +1623,7 @@ class Pipeline:
             f"find what the cut achieves"
         )
         try:
-            _, measured = self._measure(repo, "the cut's accuracy", "1")
+            _, measured, _ = self._measure(repo, "the cut's accuracy", "1")
         except StageError as exc:
             self.console.print(f"  [yellow]![/yellow] {exc}")
             return None

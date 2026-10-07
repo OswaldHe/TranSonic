@@ -199,8 +199,18 @@ def check_frozen_validator(repo: Path, manifest: dict[str, Any],
 
     entry = str(manifest.get("entry_point") or "kernel")
     source = candidate._parse(repo / SOURCE_FILE)
-    if entry not in candidate.top_level_functions(source):
-        findings.append(f"{SOURCE_FILE} defines no top-level '{entry}'")
+    # Any top-level binding, not only a `def` — the same rule the submodule gate applies, and for
+    # the same reason: `kernel = _impl[CORES]` binds the NKI launch grid at module scope, which is
+    # how a kernel reaches both physical cores of an LNC=2 pair while the frozen validator still
+    # calls `kernel(*args)` with no subscript. A grid cannot be expressed as a `FunctionDef` at
+    # all, so requiring one rejected the only shape that works. The two gates disagreeing cost a
+    # four-rank assembly that had already passed the other eight checks.
+    names = candidate.top_level_names(source)
+    if entry not in names:
+        findings.append(
+            f"{SOURCE_FILE} defines no top-level '{entry}'. "
+            f"Found: {', '.join(sorted(names)) or 'nothing'}"
+        )
     inference = candidate._parse(path)
     if "source" not in candidate._import_roots(inference):
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
@@ -498,16 +508,39 @@ def _sha256(path: Path) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def evaluate(repo: Path, manifest: dict[str, Any],
-             timeout: int) -> tuple[list[CheckResult], RunOutcome]:
-    """One `torchrun` of the frozen validator, then all nine checks off that execution."""
+#: Checks about whether the *assembly* was worth optimizing rather than whether this candidate is
+#: sound. Stage 4 asks them once; `--loop` skips them. See `evaluate`.
+ADMISSION_ONLY = ("i",)
+
+
+def evaluate(repo: Path, manifest: dict[str, Any], timeout: int,
+             loop: bool = False) -> tuple[list[CheckResult], RunOutcome]:
+    """One `torchrun` of the frozen validator, then the checks, off that single execution.
+
+    `loop` drops `ADMISSION_ONLY`, which is what every stage-5 iteration wants. Check (i) bounds
+    the collective's overhead against the submodule's latency, and that is a question about the
+    assembly: stage 4 asks it once, to decide whether a loop is worth running at all. Asked again
+    every iteration it stops being a bound and becomes a lottery.
+
+    `mtp.0.attention` is the case. Its ceiling was 0.48969 ms, from one draw of the submodule;
+    twelve later draws of the accepted module kernel — byte-identical, nothing changed — spanned
+    0.4924 to 0.4998 ms. The whole distribution of the code that set the bound sits above the
+    bound, so three of five iterations were rejected for measurement noise, having each spent an
+    agent-hour and a device slot. One of them had reverted to the accepted commit exactly.
+
+    What still holds every iteration is everything about the candidate: the validator is the frozen
+    one, the reduction is a real collective, every rank ran, the output matches the module at its
+    bar, the profile is fresh, the tensors are the recorded bytes, and it beats the bootstrap. A
+    regression past that is the metric gate's job, and the metric gate is relative to the best
+    accepted iteration rather than to a number measured once before the loop began.
+    """
     bar = expected_tolerance(manifest)
     ranks = rank_count(manifest)
     run = candidate.run_candidate(
         repo, launch(ranks), timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
-    return [
+    results = [
         check_frozen_validator(repo, manifest, ranks),
         check_self_contained(repo),
         check_nki_collectives(repo, ranks),
@@ -517,7 +550,10 @@ def evaluate(repo: Path, manifest: dict[str, Any],
         check_provenance(repo, manifest),
         check_faster(run, manifest),
         check_overhead(run, manifest),
-    ], run
+    ]
+    if loop:
+        results = [r for r in results if r.check not in ADMISSION_ONLY]
+    return results, run
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -525,12 +561,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="the candidate repository")
     parser.add_argument("--json", default=None, help="where to write the machine-readable verdict")
     parser.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
+    parser.add_argument("--loop", action="store_true",
+                        help="per-iteration subset: skip the admission-only checks "
+                             f"({', '.join(ADMISSION_ONLY)}), which stage 4 already asked")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
     try:
         manifest = load_manifest(find_manifest(repo))
-        results, run = evaluate(repo, manifest, args.timeout)
+        results, run = evaluate(repo, manifest, args.timeout, loop=args.loop)
     except CheckerError as exc:
         report = f"\nwhole-module gate\n\n  [FAIL] the repo is unusable — {exc}\n"
         print(report)

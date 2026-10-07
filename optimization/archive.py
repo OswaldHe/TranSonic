@@ -75,10 +75,8 @@ PRIOR_COLUMNS: tuple[str, ...] = ("Filed", "Ruling", "Evidence")
 #: 50 rows stay scannable.
 SCENARIO_WIDTH = 150
 
-#: Markdown only. The whole store is copied into every iteration worktree, so what belongs in it
-#: is what an agent reads: prose. A reproduction directory also holds the scripts the feedback
-#: agent wrote, the NEFFs and profiles it compiled, and the compiler's logs — and those stay in
-#: the run's own workspace, which `Entry.origin` records so they can still be found.
+#: Markdown only: every iteration worktree gets a copy of the whole store, so it carries what an
+#: agent reads. The scripts, NEFFs, profiles and logs stay at `Entry.origin`.
 REPRO_SUFFIXES = frozenset({".md"})
 
 #: A per-file ceiling, so one generated file cannot undo the extension filter.
@@ -249,9 +247,8 @@ def findings_table(entries: list[Entry]) -> str:
     return "\n".join(lines)
 
 
-#: Shared-word fraction above which two scenarios are shown as possibly the same finding. Tuned on
-#: the first backfill: 0.45 pairs "Four things the profile reports mean something other than what
-#: they say" with "Four fields the profile reports mean..." and leaves unrelated L0s alone.
+#: Shared-word fraction above which two scenarios read as the same finding. 0.45 found four real
+#: pairs in the first backfill of seven runs and no false ones, stably from 0.35 to 0.55.
 SIMILAR_THRESHOLD = 0.45
 
 #: How much of a lead sentence is compared, for a scenario that runs on without one.
