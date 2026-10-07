@@ -452,6 +452,14 @@ def check_faster(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
         return CheckResult("h", CHECK_TITLES["h"], False, "no latency reported",
                            [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
     baseline = float(baseline)
+    # Before dividing by it. Exactly 0 raised ZeroDivisionError here and killed the whole gate,
+    # and a negative latency passed both this check and (i) -- "-1.5 ms vs 10 ms (-6.67x)".
+    if reported <= 0:
+        return CheckResult(
+            "h", CHECK_TITLES["h"], False, f"{reported:g} ms is not a measurement",
+            [f"the run reported {LATENCY_MARKER}={reported:g}, which cannot be compared against "
+             f"the bootstrapped module's {baseline:g} ms"],
+        )
     if reported >= baseline:
         speedup = baseline / reported if reported else 0.0
         return CheckResult(
@@ -480,6 +488,14 @@ def check_overhead(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
         return CheckResult("i", CHECK_TITLES["i"], False, "no latency reported",
                            [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
     submodule = float(submodule)
+    # A negative latency is below any ceiling, so without this it reported "-250.0% over the
+    # submodule's 1 ms" and passed. See the same guard in `check_faster`.
+    if reported <= 0:
+        return CheckResult(
+            "i", CHECK_TITLES["i"], False, f"{reported:g} ms is not a measurement",
+            [f"the run reported {LATENCY_MARKER}={reported:g}, which cannot be compared against "
+             f"the submodule's {submodule:g} ms"],
+        )
     ceiling = submodule * OVERHEAD_ALLOWANCE
     if reported > ceiling:
         excess = (reported / submodule - 1.0) * 100 if submodule else float("inf")
@@ -540,16 +556,19 @@ def evaluate(repo: Path, manifest: dict[str, Any], timeout: int,
         repo, launch(ranks), timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
+    # Every check behind `guarded`: a defect in one fails that check and leaves the other eight
+    # answered, rather than escaping as a traceback the harness books against the candidate.
+    g = candidate.guarded
     results = [
-        check_frozen_validator(repo, manifest, ranks),
-        check_self_contained(repo),
-        check_nki_collectives(repo, ranks),
-        check_all_ranks(run, ranks),
-        check_matches(run, bar, repo),
-        check_measurement(run, ranks),
-        check_provenance(repo, manifest),
-        check_faster(run, manifest),
-        check_overhead(run, manifest),
+        g("a", CHECK_TITLES["a"], check_frozen_validator, repo, manifest, ranks),
+        g("b", CHECK_TITLES["b"], check_self_contained, repo),
+        g("c", CHECK_TITLES["c"], check_nki_collectives, repo, ranks),
+        g("d", CHECK_TITLES["d"], check_all_ranks, run, ranks),
+        g("e", CHECK_TITLES["e"], check_matches, run, bar, repo),
+        g("f", CHECK_TITLES["f"], check_measurement, run, ranks),
+        g("g", CHECK_TITLES["g"], check_provenance, repo, manifest),
+        g("h", CHECK_TITLES["h"], check_faster, run, manifest),
+        g("i", CHECK_TITLES["i"], check_overhead, run, manifest),
     ]
     if loop:
         # `.key`, not `.check`: only `CheckResult.to_dict` renames the field to "check", and

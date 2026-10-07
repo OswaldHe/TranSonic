@@ -1156,3 +1156,45 @@ def test_re_pinning_writes_full_precision():
         "MIN_COSINE = 0.99\n", {"MIN_COSINE": 0.9999432399999999})
 
     assert rewritten == "MIN_COSINE = 0.9999432399999999\n"
+
+
+def test_a_defect_in_one_check_does_not_kill_the_gate():
+    """Both `evaluate`s answer their checks as one list, and `main` catches only `CheckerError`.
+
+    So any other exception escaped as a traceback, the harness recorded `constraint failed`, and
+    the iteration was rejected with nothing said about the candidate.
+    """
+    def boom():
+        raise ZeroDivisionError("float division by zero")
+
+    result = candidate.guarded("h", "faster than the bootstrap", boom)
+
+    assert result.key == "h"
+    assert not result.passed, "a gate that cannot evaluate must not admit a kernel"
+    assert result.summary == candidate.GATE_DEFECT
+    assert "not a verdict on the candidate" in result.findings[0]
+    assert "ZeroDivisionError" in result.findings[1]
+
+
+def test_the_repo_is_unusable_path_still_propagates():
+    """`CheckerError` is the deliberate signal that there is nothing to judge; `main` reports it."""
+    def unusable():
+        raise candidate.CheckerError("source.py is missing")
+
+    with pytest.raises(candidate.CheckerError):
+        candidate.guarded("a", "shape", unusable)
+
+
+@pytest.mark.parametrize("reported", [0.0, -1.5])
+def test_a_non_positive_latency_fails_both_latency_checks(reported):
+    """0 raised ZeroDivisionError and killed the gate; negative passed as "-1.5 ms vs 10 ms"."""
+    from optimization import module_checker as mc
+
+    run = candidate.RunOutcome(ran=True, return_code=0,
+                               output=f"##autohelix[latency_ms={reported}]")
+    manifest = {"baselines": {"bootstrap_latency_ms": 10.0, "submodule_latency_ms": 1.0}}
+
+    for check in (mc.check_faster, mc.check_overhead):
+        result = check(run, manifest)
+        assert not result.passed, check.__name__
+        assert "not a measurement" in result.summary

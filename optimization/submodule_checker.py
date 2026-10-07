@@ -353,14 +353,17 @@ def evaluate(repo: Path, manifest: dict[str, Any],
         repo, [sys.executable, INFERENCE_FILE], timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": SUBMODULE_CORES},
     )
+    # Every check behind `guarded`, for the reason given there: a defect in one of them used to
+    # escape as a traceback the harness books against the candidate.
+    g = candidate.guarded
     results = [
-        check_shape(repo, manifest),
-        check_self_contained(repo),
-        check_measurement(run),
-        check_baseline(run, bar, repo),
-        check_provenance(repo, manifest),
-        check_declaration(repo, manifest),
-        check_single_core(repo),
+        g("a", CHECK_TITLES["a"], check_shape, repo, manifest),
+        g("b", CHECK_TITLES["b"], check_self_contained, repo),
+        g("c", CHECK_TITLES["c"], check_measurement, run),
+        g("d", CHECK_TITLES["d"], check_baseline, run, bar, repo),
+        g("e", CHECK_TITLES["e"], check_provenance, repo, manifest),
+        g("f", CHECK_TITLES["f"], check_declaration, repo, manifest),
+        g("g", CHECK_TITLES["g"], check_single_core, repo),
     ]
     return results, run
 

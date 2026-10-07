@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -263,6 +264,35 @@ def format_report(title: str, results: list[CheckResult], run: RunOutcome | None
         lines.append(f"  the validator ran for {run.duration_s:.1f}s, exit {run.return_code}")
     lines.append("")
     return "\n".join(lines)
+
+
+#: Prefix on the summary of a check that could not be answered because the gate itself broke.
+#: The loop reads the report, so the wording has to say whose fault it is.
+GATE_DEFECT = "the gate itself raised"
+
+
+def guarded(key: str, title: str, check, *args: Any, **kwargs: Any) -> CheckResult:
+    """Answer one check so a defect in it fails that check instead of killing the gate.
+
+    Both `evaluate` functions build their results as one list of calls, and `main` catches only
+    `CheckerError`. So any other exception escaped as a traceback, the harness recorded
+    `constraint failed`, and the iteration was rejected with nothing said about the candidate.
+    `42-DSparkMarkovHead` lost three iterations and 69 minutes that way to one `AttributeError`.
+
+    Failing rather than passing is deliberate: a gate that cannot evaluate must not admit a
+    kernel. What changes is that the verdict names the gate, carries the traceback, and leaves
+    the other checks' answers intact instead of discarding them.
+    """
+    try:
+        return check(*args, **kwargs)
+    except CheckerError:
+        raise  # the deliberate "this repo is unusable" path, which `main` reports on its own
+    except Exception:
+        return CheckResult(key, title, False, GATE_DEFECT, [
+            f"This is a defect in check ({key}), not a verdict on the candidate. The kernel was "
+            f"not judged on this point; do not change it in response to this message.",
+            traceback.format_exc(limit=8).strip(),
+        ])
 
 
 def write_verdict(results: list[CheckResult], run: RunOutcome | None, title: str,
