@@ -67,6 +67,9 @@ KNOWN_TOP_LEVEL_KEYS = {
     # Same reasoning: a directory of earlier work that named iterations start from, seeded
     # read-only into the worktree. `optimization/memory.py` owns it.
     "memory",
+    # Same reasoning: the path to the cross-run feedback archive that every iteration reads.
+    # `optimization/archive.py` owns it and `optimization/loop.py` reads it from the raw config.
+    "feedback_archive",
 }
 
 
