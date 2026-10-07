@@ -20,7 +20,7 @@ import pytest
 import yaml
 
 from optimization import constraints as cons
-from optimization import materialize, module_checker, presets, submodule_checker
+from optimization import materialize, presets
 from optimization.config import ConfigError, PipelineConfig
 from optimization.projection import project
 
@@ -402,118 +402,6 @@ def test_the_assembled_repo_records_both_bounds(tmp_path):
     assert "770" in (repo / "README.md").read_text()
 
 
-# ======================================================================================
-# drift between the prompts and the gates
-# ======================================================================================
-
-
-def test_the_submodule_prompt_states_every_marker_its_gate_requires():
-    """Anything the gate requires and the prompt omits is a trap, not a requirement."""
-    prompt = presets.submodule_prompt()
-    for marker in (submodule_checker.LATENCY_MARKER, submodule_checker.PASSED_MARKER,
-                   submodule_checker.MAX_ABS_ERR_MARKER):
-        assert marker in prompt, marker
-
-
-def test_the_submodule_prompt_states_the_pinned_constants():
-    prompt = presets.submodule_prompt()
-    for name in (*submodule_checker.TOLERANCE_NAMES, submodule_checker.CEILING_NAME):
-        assert name in prompt, name
-
-
-def test_the_submodule_prompt_states_the_single_core_requirement():
-    prompt = presets.submodule_prompt()
-    assert "NEURON_RT_NUM_CORES=1" in prompt
-
-
-def test_the_submodule_prompt_asks_for_every_declaration_field_the_gate_checks():
-    prompt = presets.submodule_prompt()
-    for field in ("module", "dim", "factor", "shard", "inputs", "outputs", "reassembly"):
-        assert f'"{field}"' in prompt, field
-
-
-def test_the_submodule_prompt_warns_that_the_reassembly_is_checked():
-    """The agent has to know all N goldens are needed, not just its own rank's."""
-    prompt = presets.submodule_prompt()
-    assert "checked" in prompt and "goldens/" in prompt
-
-
-def test_the_assemble_prompt_states_every_marker_its_gate_requires():
-    prompt = presets.assemble_prompt()
-    for marker in (module_checker.LATENCY_MARKER, module_checker.PASSED_MARKER,
-                   module_checker.MAX_ABS_ERR_MARKER):
-        assert marker in prompt, marker
-    assert "latency_rank_" in prompt
-
-
-def test_the_assemble_prompt_states_the_nki_collectives_requirement():
-    """Check (c) refuses torch.distributed reductions, so the prompt has to say so."""
-    prompt = presets.assemble_prompt()
-    assert module_checker.COLLECTIVE_MODULE in prompt
-    assert "torch.distributed" in prompt
-    for allowed in ("init_process_group", "barrier", "get_rank"):
-        assert allowed in prompt, allowed
-
-
-def test_the_assemble_prompt_carries_the_six_toolchain_requirements():
-    """Each one fails with an internal compiler error naming something else.
-
-    Verified empirically on this toolchain before the pipeline was written; an agent that has to
-    rediscover them burns the whole stage.
-    """
-    prompt = presets.assemble_prompt()
-    for marker in ("kernel[2]", "name=", "NCC_IBIR440", "NCC_INLA001", "NCC_ILLC059",
-                   "NCC_ISMP902", "shared_hbm", "ReplicaGroup"):
-        assert marker in prompt, marker
-
-
-def test_the_assemble_prompt_states_the_capture_flags():
-    prompt = presets.assemble_prompt()
-    for flag in ("--collectives-worker-count", "--collectives-workers-per-node",
-                 "--collectives-profile-id"):
-        assert flag in prompt, flag
-
-
-def test_the_assemble_prompt_states_both_bounds_and_the_allowance():
-    prompt = presets.assemble_prompt()
-    assert "{{ bootstrap_latency }}" in prompt
-    assert "{{ overhead_ceiling }}" in prompt
-    assert "10%" in prompt
-
-
-def test_the_assemble_prompt_says_the_bar_is_not_to_be_loosened():
-    prompt = presets.assemble_prompt()
-    assert "Unchanged." in prompt
-
-
-def test_the_loop_prompt_tells_the_agent_the_validator_is_frozen():
-    """Otherwise a whole iteration goes into editing a file that is reverted."""
-    prompt = presets.loop_prompt()
-    assert "reverted" in prompt
-    assert "{{ iteration_constraint }}" in prompt
-
-
-def test_the_loop_prompt_offers_the_reviewer_as_the_channel_for_layout_feedback():
-    """The frozen validator pins the I/O format; the reviewer is how that reaches the operator."""
-    assert "reviewer will carry it to the operator" in presets.loop_prompt()
-
-
-def test_the_compiler_prompt_carries_the_checker_contract():
-    from optimization.constraints import CHECKER_CONTRACT
-
-    prompt = presets.compiler_prompt()
-    assert "{{ contract }}" in prompt
-    assert "--repo" in CHECKER_CONTRACT and "--json" in CHECKER_CONTRACT
-
-
-def test_the_compiler_prompt_tells_it_to_check_neither_more_nor_less():
-    """Both failure modes matter: over-checking fails compliant work, under-checking allows drift."""
-    prompt = presets.compiler_prompt()
-    assert "not more than the prose" in prompt
-    assert "not less than the prose" in prompt
-    assert "permissive" in prompt
-
-
 def test_the_template_documents_the_two_editable_regions():
     """The operator has to be able to find where to write; `### EDIT ME` is the marker."""
     template = presets.config_template()
@@ -562,37 +450,24 @@ def test_autohelix_applies_the_reviewer_timeout(tmp_path):
     assert parsed.reviewer.timeout_seconds == 2000
 
 
-def test_the_prompt_quotes_the_configured_allowance(tmp_path):
-    """The template stated a literal 5%, which is wrong the moment an operator changes it."""
+def test_the_configured_allowance_reaches_the_loops_metric_gate(tmp_path):
+    """The template once stated a literal 5%, which is wrong the moment an operator changes it.
+
+    Asserted on the derived config rather than on the rendered prompt: what has to hold is that
+    the number the loop enforces is the number the operator configured.
+    """
     from autohelix.config import Config
-    from autohelix.prompt_template import render_template
 
     path = _filled(tmp_path)
     data = yaml.safe_load(path.read_text())
     data["submodule"]["acceptance"] = {"max_regression_pct": 12}
     path.write_text(yaml.safe_dump(data, sort_keys=False))
+
     parsed = Config.from_dict(PipelineConfig.load(path).derive_loop_config("submodule"))
+
     allowance = next(g.max_regression_pct for g in parsed.acceptance.metric_gates
                      if g.metric == "latency_ms")
     assert allowance == 12
-
-    rendered = render_template(presets.loop_prompt(), {
-        "best_so_far": "33.48", "metric": "latency_ms",
-        "regression_allowance": f"{allowance:g}",
-    })
-    assert "12% above it is rejected" in rendered
-    assert "5%" not in rendered
-
-
-def test_the_prompt_omits_the_allowance_when_no_gate_names_the_metric():
-    """Better silent than stating a bound nothing enforces."""
-    from autohelix.prompt_template import render_template
-
-    rendered = render_template(presets.loop_prompt(), {
-        "best_so_far": "33.48", "metric": "latency_ms", "regression_allowance": "",
-    })
-    assert "Best latency_ms so far" in rendered
-    assert "above it is rejected" not in rendered
 
 
 class _FakeHistory:

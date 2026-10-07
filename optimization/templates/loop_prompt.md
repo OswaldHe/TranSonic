@@ -7,7 +7,7 @@ This is iteration {{ iteration }} of the **{{ stage }}** stage. Baseline is iter
 {{ iteration_constraint }}
 
 {% if constraint_schedule %}
-The whole schedule, so you know what this iteration is for and what the next ones allow:
+The whole schedule, so you know what this iteration is for and what later ones allow:
 
 {{ constraint_schedule }}
 {% endif %}
@@ -22,8 +22,8 @@ The whole schedule, so you know what this iteration is for and what the next one
 
 {% if best_so_far %}
 Best {{ metric }} so far: **{{ best_so_far }}**.{% if regression_allowance %} An iteration more than
-{{ regression_allowance }}% above it is rejected and discarded — so a change you are unsure about
-belongs behind a measurement, not in the commit.{% endif %}
+{{ regression_allowance }}% above it is rejected and discarded, so a change you are unsure about
+belongs behind a measurement rather than in the commit.{% endif %}
 {% endif %}
 
 {% if history_summary %}
@@ -39,11 +39,11 @@ Measured after you finish:
 {% endif %}
 
 {% if editable %}
-**You may edit only: {{ editable | join(', ') }}.** Everything else is reverted before your work is
-judged — including the validator. That is deliberate: the validator defines what correct means and
-how latency is measured, so freezing it is what makes one iteration's number comparable to
-another's. If you believe the validator's input format is holding the kernel back, do not change
-it — say so in your notes, and the reviewer will carry it to the operator.
+**You may edit only: {{ editable | join(', ') }}.** Everything else reverts before anything judges
+your work, the validator included. That is deliberate: the validator defines what correct means and
+how latency is measured, so freezing it is what makes one iteration's number comparable to the
+next's. If you think its input format holds the kernel back, say so in your notes rather than
+changing it, and the reviewer will carry that to the operator.
 {% endif %}
 
 Read before starting:
@@ -58,18 +58,10 @@ Read before starting:
 {% if has_hints %}
 - .autohelix/hints.md — notes from the operator
 {% endif %}
-{% if memory %}
-- .autohelix/memory/ — earlier work on this module, read-only. Start here.
-{% endif %}
-{% if archive %}
-- .autohelix/feedback-archive/ — what earlier runs on *other* modules found blocking on this
-  toolchain, read-only. A lookup, not reading to do: its README.md is one table, worth a look when
-  you are about to conclude something is impossible here.
-{% endif %}
 
-The `neuron-nki-*` agents and skills available to you know the NKI API, the compiler's errors and
-the profiler. Use them rather than guessing at syntax — a wasted iteration on a compile error is
-the most common way this loop loses ground.
+The `neuron-nki-*` agents and skills know the NKI API, the compiler's errors and the profiler. Use
+them rather than guessing at syntax: losing an iteration to a compile error is the most common way
+this loop gives up ground.
 
 {% if iteration_time %}
 Time budget: {{ iteration_time }}. The process will be killed at the deadline.
@@ -77,10 +69,10 @@ To check remaining time: bash "$AUTOHELIX_TIME_LEFT_SCRIPT"
 Stop new experiments before the deadline, write notes, and exit cleanly.
 {% endif %}
 
-You MUST write notes when done — write to {{ worktree }}/.autohelix/notes/iter-{{ iteration }}.md.
-Record what you tried, what the profile said, which NKI idioms compiled and which did not, and
-what to try next. Notes persist even when your changes are rejected, so they are the only way an
-experiment that did not land still moves the run forward.
+You MUST write notes when done, to {{ worktree }}/.autohelix/notes/iter-{{ iteration }}.md: what you
+tried, what the profile said, which NKI idioms compiled and which did not, and what to try next.
+Notes survive a rejection, so they are the only way an experiment that did not land still moves the
+run forward.
 
 Make it faster without making it wrong.
 Do not create git commits; AutoHelix commits accepted changes for you.

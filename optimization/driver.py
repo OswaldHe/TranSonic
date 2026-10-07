@@ -402,11 +402,14 @@ class Pipeline:
         except (archive.ArchiveError, OSError) as exc:
             self.console.print(f"  [yellow]![/yellow] could not deposit into the archive: {exc}")
             return
-        ruled = len(entry.rulings)
         self.console.print(
             f"  [green]deposited[/green] {len(entry.findings)} finding(s) as "
             f"`{entry.name}` in {self.config.feedback_archive}"
-            + (f", ruling on {ruled} already-filed finding(s)" if ruled else "")
+            + (f", ruling on {len(entry.rulings)} already-filed finding(s)" if entry.rulings else "")
+            # The archive carries markdown only, so say how much of the reproduction directory
+            # stayed behind. An over-tight filter should read as a number, not as a missing file.
+            + (f". {entry.skipped} non-markdown file(s) left in {fb.REPRO_DIR}/"
+               if entry.skipped else "")
         )
 
     def _run_one_shot(

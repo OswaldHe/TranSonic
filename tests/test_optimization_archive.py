@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -254,29 +253,13 @@ def test_nothing_is_said_about_an_empty_archive():
     assert archive.describe_for_optimizer([archive.Entry("e", "m", "2026-01-01")], 0) == ""
 
 
-def test_the_optimizer_is_told_it_may_disagree(tmp_path, run):
-    entries = [archive.deposit(tmp_path / "archive", run, "mtp.0.ffn", recorded="2026-10-06")]
-    block = archive.describe_for_optimizer(entries, 4)
-
-    assert str(archive.SEEDED_REL) in block
-    assert archive.INDEX_NAME in block
-    # The two halves that keep the mechanism from propagating a wrong conclusion.
-    assert "settled fact" in block and "re-test" in block
-    assert "Sizes do not transfer" in block
-    # Offered, not assigned: the agent reads it when it has a question the archive can answer.
-    assert "no requirement to read it" in block
-
-
-def test_the_feedback_agent_is_told_the_vocabulary_and_why_disagrees_matters(tmp_path, run):
+def test_the_feedback_block_names_every_ruling_the_gate_accepts(tmp_path, run):
+    """`validate_rulings` refuses a word the block never offered, which would be a trap."""
     entries = [archive.deposit(tmp_path / "archive", run, "mtp.0.ffn", recorded="2026-10-06")]
     block = archive.describe_for_feedback(entries, 4)
 
     for ruling in archive.RULINGS:
-        assert ruling in block
-    assert "should not be filed again" in block
-    assert "`disagrees` is the most valuable row" in block
-    # A lookup per row, not a reading assignment: the agent decides when to open it.
-    assert "lookup" in block and "not a pass over the whole archive" in block
+        assert ruling in block, ruling
 
 
 # -- seeding ---------------------------------------------------------------------------

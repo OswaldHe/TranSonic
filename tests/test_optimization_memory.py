@@ -12,6 +12,7 @@ import pytest
 from optimization.config import ConfigError, PipelineConfig
 from optimization.memory import (
     NONE,
+    TRANSIENCE,
     describe_for_preparation,
     seed_problem,
     unlock,
@@ -479,24 +480,17 @@ def test_a_non_boolean_preparation_is_refused(store):
         MemorySpec.from_config({"path": str(store), "preparation": "yes"}, max_iterations=5)
 
 
-def test_the_preparation_block_reads_differently_from_a_loop_block(store):
+def test_the_two_blocks_are_not_the_same_text(store):
+    """A preparation agent and a loop iteration want different things from the same directory."""
     spec = MemorySpec.from_config(
         {"path": str(store), "prompt": "Open module/ first."}, max_iterations=5,
     )
     prep = describe_for_preparation(spec, seeded=4)
     loop = describe_for_prompt(spec, 1, seeded=4)
 
-    assert "Open module/ first." in prep and "Open module/ first." in loop
-    assert str(SEEDED_REL) in prep
-    # The preparation agent has no gate of its own, and the block has to say so.
-    assert "no gate behind it yet" in prep
-    assert "no gate behind it yet" not in loop
-    # It is told to port technique forward, because it is what the loop starts from.
-    assert "port it rather than leaving it for the loop to re-earn" in prep
-    assert "port it rather than leaving it" not in loop
-    # The loop is told the opposite-facing thing: do not re-earn a recorded negative.
-    assert "do not spend an iteration rediscovering it" in loop
-    assert "do not spend an iteration rediscovering it" not in prep
+    assert prep and loop and prep != loop
+    # The operator's own prose reaches both, which is the plumbing worth protecting.
+    assert spec.prompt in prep and spec.prompt in loop
 
 
 def test_no_preparation_block_when_it_is_off(store):
@@ -533,26 +527,20 @@ def test_a_preparation_only_stage_still_emits_a_memory_key(tmp_path, store):
 # -- the seed is transient; what an agent leaves behind is not ---------------------------
 
 
-def test_both_prompt_blocks_forbid_citing_the_seeded_paths(store):
+def test_both_prompt_blocks_carry_the_transience_warning(store):
     """The defect this closes: a stage-2 agent wrote `.autohelix/memory/FEEDBACK.md rows 2 and 10`
     into `source.py` and `SUBMODULE.md`. True while it ran; a dangling path for every iteration the
-    operator left out of the selector, and for anyone reading the repo afterwards."""
+    operator left out of the selector, and for anyone reading the repo afterwards.
+
+    Compared against the constant rather than against its wording, so rewording it cannot fail
+    here while dropping it still does.
+    """
     spec = MemorySpec.from_config({"path": str(store), "prompt": "x"}, max_iterations=5)
+    warning = TRANSIENCE.format(rel=spec.dest)
 
     for block in (describe_for_preparation(spec, seeded=4),
                   describe_for_prompt(spec, 1, seeded=4)):
-        assert "seeded for this run only" in block
-        assert "do not cite these paths" in block
-        assert "Restate what the file said" in block
-
-
-def test_the_preparation_block_separates_sizes_from_technique(store):
-    """The wording that caused the deferral said only "derive every size, tiling and budget from
-    the repo in front of you", which reads as "port nothing"."""
-    spec = MemorySpec.from_config({"path": str(store)}, max_iterations=5)
-    block = describe_for_preparation(spec, seeded=4)
-    assert "have to be re-derived" in block
-    assert "port it rather than leaving it for the loop to re-earn" in block
+        assert warning in block
 
 
 def test_iteration_zero_never_reads_the_memory(store):

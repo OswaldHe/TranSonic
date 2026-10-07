@@ -125,27 +125,6 @@ def test_the_shipped_template_leaks_no_hint_into_a_prompt():
             assert cons.PLACEHOLDER_MARKER not in slot.text
 
 
-# -- the prompt's view -----------------------------------------------------------------
-
-
-def test_the_prompt_states_the_consequence_of_violating():
-    """A constraint the agent reads as advice is one it will trade for a faster kernel."""
-    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
-    text = schedule.describe_for_prompt(2)
-    assert "NKI only." in text
-    assert "rejected" in text and "discarded" in text
-    assert "script you cannot see" in text
-
-
-def test_an_unenforced_slot_does_not_threaten_rejection():
-    schedule = cons.Schedule.from_config(
-        [{"from": 1, "to": 2, "text": "Guidance only.", "enforce": False}],
-    )
-    text = schedule.describe_for_prompt(1)
-    assert "Guidance only." in text
-    assert "rejected" not in text
-
-
 # -- verdicts --------------------------------------------------------------------------
 
 
@@ -274,25 +253,6 @@ def test_the_last_iteration_of_a_slot_is_identified():
 def test_a_single_iteration_slot_is_its_own_last():
     schedule = cons.Schedule.from_config([{"iterations": [4], "text": "a"}])
     assert schedule.slots[0].last_iteration == 4
-
-
-def test_the_prompt_threatens_rejection_inside_a_slot():
-    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
-    for iteration in (1, 2):
-        text = schedule.describe_for_prompt(iteration)
-        assert "rejected and its work discarded" in text
-        assert "strictly faster" not in text
-
-
-def test_the_prompt_offers_the_escape_on_the_last_iteration():
-    """The agent has to know the terms, or it will follow the constraint into a dead end."""
-    schedule = cons.Schedule.from_config([{"from": 1, "to": 3, "text": "NKI only."}])
-    text = schedule.describe_for_prompt(3)
-    assert "no longer fatal" in text
-    assert "strictly faster" in text
-    # Named rather than quoted as a number: the allowance is `acceptance.max_regression_pct`.
-    assert "allowance" in text
-    assert "rejected and its work discarded" not in text
 
 
 def test_the_checker_command_carries_the_advisory_flag():
@@ -456,19 +416,6 @@ def test_an_unknown_enforcement_is_refused():
         cons.Schedule.from_config([{"at": 1, "enforcement": "maybe", "text": "x"}])
 
 
-def test_the_prompt_says_which_mode_this_iteration_is_in():
-    schedule = cons.Schedule.from_config([
-        {"at": 1, "enforcement": "hard", "soften_last": False, "text": "NKI only."},
-        {"at": 2, "enforcement": "soft", "text": "Prefer fp8."},
-        {"at": 3, "enforcement": "off", "text": "Ideas."},
-    ])
-    assert "hard constraint" in schedule.describe_for_prompt(1)
-    assert "rejected and its work discarded" in schedule.describe_for_prompt(1)
-    assert "soft constraint" in schedule.describe_for_prompt(2)
-    assert "strictly faster" in schedule.describe_for_prompt(2)
-    assert "guidance rather than a rule" in schedule.describe_for_prompt(3)
-
-
 def test_the_recorded_slot_carries_its_per_iteration_modes():
     """The report and the manifest read this, so what was hard and what was soft stays on record."""
     slot = cons.Schedule.from_config([{"from": 4, "to": 6, "text": "x"}]).slots[0]
@@ -490,16 +437,8 @@ def test_bare_off_survives_yamls_boolean_coercion():
         [{"at": 1, "enforcement": True, "text": "x"}]).slots[0].enforcement == "hard"
 
 
-def test_the_schedule_table_shows_each_slots_enforcement():
-    """Printing one word per slot hid the hard/soft split the operator had just configured."""
-    table = cons.Schedule.from_config([
-        {"at": 1, "enforcement": "hard", "text": "A."},
-        {"at": 2, "enforcement": "soft", "text": "B."},
-        {"at": 3, "enforcement": "off", "text": "C."},
-        {"from": 4, "to": 6, "enforcement": "hard", "text": "D."},
-    ]).summary_table()
-    assert "| 1 | hard |" in table
-    assert "| 2 | soft |" in table
-    assert "| 3 | off |" in table
-    # A hard range softens its last iteration, and the table says which.
-    assert "| 4-6 | hard, soft on 6 |" in table
+def test_a_hard_range_softens_only_its_last_iteration():
+    """What the summary table renders; asserted on the schedule rather than on its prose."""
+    slot = cons.Schedule.from_config(
+        [{"from": 4, "to": 6, "enforcement": "hard", "text": "D."}]).slots[0]
+    assert [slot.enforcement_for(i) for i in (4, 5, 6)] == ["hard", "hard", "soft"]

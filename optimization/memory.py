@@ -73,11 +73,10 @@ _SELECTOR_KEYS = ("iterations", "at", "from", "to")
 #: operator left out of the selector and for anyone reading the repo afterwards. Nothing had told it
 #: the directory was temporary, so the citation looked like an ordinary cross-reference.
 TRANSIENCE = (
-    "`{rel}/` is seeded for this run only and is gone afterwards; iterations the operator left out "
-    "of the schedule never receive it at all. So do not cite these paths in anything you leave "
-    "behind — not in a comment, not in the repo's docs, not in your notes. Restate what the file "
-    "said, in enough detail to act on, and name the finding rather than where it lives. Someone "
-    "reading without the seed has to be able to follow you."
+    "The pipeline copies `{rel}/` in for this run only and removes it afterwards, and iterations "
+    "outside the schedule never receive it at all. Do not cite these paths in anything you leave "
+    "behind, in a comment or in your notes. Restate what the file said in enough detail to act "
+    "on, so that someone who never had this copy can follow you."
 )
 
 
@@ -554,9 +553,9 @@ def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
     if not spec.reads_at_preparation or seeded <= 0:
         return ""
     lines = [
-        f"**Earlier work on this module is in `{spec.dest}/`.** {seeded} file(s), read-only. "
-        f"Read it before you design: the run recorded there already settled questions you are "
-        f"about to answer, and the ones it could *not* settle are written down too.",
+        f"**Earlier work on this module is in `{spec.dest}/`.** It holds {seeded} read-only "
+        f"file(s). That run already settled questions you are about to answer, and it also says "
+        f"which ones it could not settle.",
         "",
         _listing(spec),
     ]
@@ -564,14 +563,12 @@ def describe_for_preparation(spec: MemorySpec, seeded: int) -> str:
         lines += [spec.prompt.strip(), ""]
     lines += [
         "What you are building has no gate behind it yet, so nothing downstream will catch a "
-        "number or a layout you took from there on faith. Separate the two kinds of thing in "
-        "there. **Sizes** — tile widths, buffer depths, SBUF budgets, loop bounds — were fitted to "
-        "that run's shapes and have to be re-derived from the repo in front of you. **Technique** "
-        "— how a value is decoded, how an axis is laid out, which engine does which pass — is "
-        "usually independent of those shapes, and where it is, port it rather than leaving it for "
-        "the loop to re-earn: the loop has a handful of iterations and you are what it starts "
-        "from. Say in your write-up which you took, which you re-derived, and which you left, "
-        "with the reason.",
+        "number you took on faith. Separate two kinds of thing. That run fitted its tile widths, "
+        "buffer depths and loop bounds to its own shapes, so re-derive those from the repository "
+        "in front of you. Technique — how it decodes a value, which engine runs which pass — "
+        "usually survives a change of shape, so port it rather than leaving the loop to re-earn "
+        "it. Say in your write-up which you took, which you re-derived and which you left, and "
+        "why.",
         "",
         TRANSIENCE.format(rel=spec.dest),
     ]
@@ -594,9 +591,9 @@ def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:
         return ""
     names = entry_names(spec.path)
     lines = [
-        f"**Start from the memory in `{spec.dest}/`.** {seeded} file(s) from earlier work on this "
-        f"module, copied in read-only before you started. It is outside your editable scope, so "
-        f"you cannot commit it and nothing you do to it reaches the candidate.",
+        f"**Earlier work on this module is in `{spec.dest}/`.** The pipeline copied {seeded} "
+        f"read-only file(s) there before you started, outside your editable scope, so nothing you "
+        f"do to them reaches the candidate.",
         "",
     ]
     if names:
@@ -606,10 +603,10 @@ def describe_for_prompt(spec: MemorySpec, iteration: int, seeded: int) -> str:
     if spec.prompt.strip():
         lines += [spec.prompt.strip(), ""]
     lines += [
-        "Read it as evidence, not as an answer. A measurement in there was taken on a different "
-        "kernel, and a number that was true then can be false now — your own gate and your own "
-        "profile are the only things that decide. Where it records something that *did not* work, "
-        "that is the most valuable part: do not spend an iteration rediscovering it.",
+        "Read it as evidence rather than as an answer. An earlier kernel produced every "
+        "measurement in there, so a number that held then can be false now, and only your own "
+        "gate and your own profile decide. Where it records something that did not work, that is "
+        "the most valuable part of it: rediscovering a dead end costs you an iteration.",
         "",
         TRANSIENCE.format(rel=spec.dest),
     ]

@@ -62,7 +62,7 @@ ENTRY_NAME = "entry.json"
 #: paragraph belongs in the evidence cell, and a vocabulary nobody can remember goes unused.
 RULINGS: dict[str, str] = {
     "agrees": "reproduced here, independently",
-    "disagrees": "tested here and it does not hold — the filed finding is wrong or has been fixed",
+    "disagrees": "tested here and it does not hold, so the filed finding is wrong or has been fixed",
     "extends": "holds, and this run adds evidence that changes the scope or the suggested fix",
     "not-applicable": "could not arise in this module, so this run is no evidence either way",
 }
@@ -112,7 +112,6 @@ class Finding:
     id: str
     level: str
     scenario: str
-    repro: str = ""
     #: Set when a later run ruled on this finding: `(ruling, module, evidence)` each.
     rulings: list[tuple[str, str, str]] = field(default_factory=list)
 
@@ -121,8 +120,7 @@ class Finding:
         return any(ruling == "disagrees" for ruling, _, _ in self.rulings)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "level": self.level, "scenario": self.scenario,
-                "repro": self.repro}
+        return {"id": self.id, "level": self.level, "scenario": self.scenario}
 
 
 @dataclass
@@ -157,7 +155,7 @@ class Entry:
     def from_dict(cls, data: dict[str, Any]) -> Entry:
         findings = [
             Finding(id=str(f.get("id") or ""), level=str(f.get("level") or ""),
-                    scenario=str(f.get("scenario") or ""), repro=str(f.get("repro") or ""))
+                    scenario=str(f.get("scenario") or ""))
             for f in (data.get("findings") or [])
         ]
         rulings = {
@@ -416,7 +414,6 @@ def findings_of(workspace_root: Path) -> list[Finding]:
             id=finding_id(scenario),
             level=next((k for k in fb.LEVELS if k in level), level or "?"),
             scenario=scenario,
-            repro=fb._column(row, "Minimum reproduction"),
         ))
     return found
 
@@ -609,28 +606,20 @@ def describe_for_optimizer(entries: list[Entry], seeded: int) -> str:
     if not entries or seeded <= 0:
         return ""
     return "\n".join([
-        f"**Available to you: `{SEEDED_REL}/`** — what {len(entries)} finished run(s) on other "
-        f"modules found blocking on this toolchain, {sum(len(e.findings) for e in entries)} "
-        f"finding(s), read-only. Its `{INDEX_NAME}` is a single table keyed by finding id; the "
-        f"full row and a runnable reproduction are one directory away.",
+        f"**`{SEEDED_REL}/` holds what blocked earlier runs on this toolchain.** It carries "
+        f"{sum(len(e.findings) for e in entries)} read-only finding(s) from {len(entries)} "
+        f"finished run(s) on other modules. Its `{INDEX_NAME}` is a single table keyed by finding "
+        f"id, and each row's full text and runnable reproduction sit one directory away.",
         "",
-        "There is no requirement to read it, and no value in reading it through. It is a lookup, "
-        "and it is worth one when you are about to conclude that something is impossible here, or "
-        "about to spend an iteration establishing that it is. These findings are about the "
-        "**device and the toolchain**, not about those modules, so one of them may already answer "
-        "the question — and you have a handful of iterations, so a filed dead end you rediscover "
-        "costs one of them.",
+        "Treat it as a lookup rather than as reading to do. Consult it before you conclude that "
+        "something is impossible on this part, or before you spend an iteration establishing that "
+        "it is, because these findings describe the toolchain rather than the modules that met it.",
         "",
-        "If you do look, two things to keep straight. **Sizes do not transfer** — a tile width or "
-        "an SBUF budget was fitted to another kernel's shapes — while **technique usually does**: "
-        "how a value is decoded, which engine reaches which performance mode, what the compiler "
-        "refuses to express.",
-        "",
-        "And nothing in there is settled fact. A row marked **disputed** is one a later run tested "
-        "and refuted, which is the opposite of a reason to stop. If a filed finding is "
-        "load-bearing for a decision you are making and re-testing it is cheap, re-test it and "
-        "write down what you saw: one run declined its largest available optimization for twelve "
-        "iterations on an inherited claim that turned out to be wrong.",
+        "Two cautions if you do. Each run fitted its tile widths and SBUF budgets to its own "
+        "shapes, so sizes do not transfer, though technique usually does. A row marked "
+        "**disputed** is one that a later run tested and refuted, so treat none of this as "
+        "settled: when a finding carries a decision you are making and re-testing it is cheap, "
+        "re-test it and record what you saw.",
     ])
 
 
@@ -639,32 +628,27 @@ def describe_for_feedback(entries: list[Entry], seeded: int) -> str:
     if not entries or seeded <= 0:
         return ""
     return "\n".join([
-        f"**{sum(len(e.findings) for e in entries)} finding(s) from {len(entries)} earlier run(s) "
-        f"are already filed, in `{SEEDED_REL}/`.** Its `{INDEX_NAME}` is one table keyed by "
-        f"finding id — a lookup, for the rows you are about to write.",
+        f"**`{SEEDED_REL}/` already holds {sum(len(e.findings) for e in entries)} finding(s) from "
+        f"{len(entries)} earlier run(s).** Its `{INDEX_NAME}` is one table keyed by finding id. "
+        f"Consult it per row as you write, rather than reading it through first.",
         "",
-        "**A finding that is already there should not be filed again.** A finding filed twice is a "
-        "finding triaged once: the same four or five toolchain obstacles are in every report on "
-        "this host, worded differently enough that nobody downstream can tell they are one thing. "
-        "Your report is more useful short and additive than long and duplicated. So the check "
-        "worth making is per row, as you write it — not a pass over the whole archive first.",
+        "**Do not file a finding that is already there.** Filing one twice means the Neuron team "
+        "triages it once: the same few toolchain obstacles appear in every report on this host, "
+        "worded differently enough that nobody downstream can tell they are one thing. Where this "
+        "run met an obstacle that is already there, rule on it instead, in one table placed "
+        "anywhere in your report:",
         "",
-        f"When this run met an obstacle that is already filed, rule on it instead. One table, "
-        f"anywhere in your report, with the columns `{'` | `'.join(PRIOR_COLUMNS)}`:",
-        "",
-        "| Filed | Ruling | Evidence |",
+        f"| {' | '.join(PRIOR_COLUMNS)} |",
         "|---|---|---|",
         "| `a1b2c3d4e5f6` | agrees | what you measured, and where the reproduction is |",
         "",
-        "The rulings, and they are the whole vocabulary:",
+        "Those are the only rulings:",
         "",
         *(f"- **{name}** — {text}" for name, text in RULINGS.items()),
         "",
-        "**`disagrees` is the most valuable row you can write.** A wrong finding in that archive "
-        "is read by every run after this one, and one of them will decline a real optimization on "
-        "it — that has already happened here, and it cost a 9x. If you tested a filed claim and it "
-        "did not hold, say so, with the measurement.",
-        "",
-        "File a new row only for what is **not** in there: a new obstacle, or a filed one whose "
-        "scope or fix your evidence genuinely changes (`extends`, and then say what is new).",
+        "**A `disagrees` is the most valuable row you can write.** Every run after this one reads "
+        "that archive, so a wrong finding in it will eventually make one of them decline a real "
+        "optimization — that has already happened here, and it cost a 9x. File a new row only for "
+        "an obstacle the archive does not have, or for one whose scope or fix your evidence "
+        "genuinely changes: rule that one `extends` and say what is new.",
     ])
