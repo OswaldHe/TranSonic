@@ -97,9 +97,14 @@ twice for one copy of the answer.
 _Avoid_: core on its own (which reads as the rank), thread, worker
 
 **Engine**:
-One functional unit inside a physical core — Tensor, Vector, Scalar, Activation, GpSimd, Pool, DMA.
-Every instruction is issued to exactly one engine, and a kernel cannot be faster than its busiest one.
-_Avoid_: core, unit, pipeline, pipe
+One functional unit inside a physical core. There are six, and `nki.isa.engine` is the list that
+settles how many: **Tensor**, **Vector**, **Scalar**, **GpSimd**, **DMA**, **Sync**. Every
+instruction is issued to exactly one engine, and a kernel cannot be faster than its busiest one.
+_Avoid_: core, unit, pipeline, pipe — and **Activation** and **Pool**, which are the compiler's and
+profiler's second names for Scalar and GpSimd respectively, not engines of their own. (`nisa.activation`
+documents itself as running on the Scalar engine; `engine=nisa.engine.gpsimd` fails with "cannot run
+on engine Pool".) Counting the aliases gives eight engines and invents idle capacity that is not
+there.
 
 **Free width**:
 The width of the axis an instruction moves along, and what its duration follows. The partition axis
