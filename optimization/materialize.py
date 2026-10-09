@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,10 @@ REFERENCE_TREES = ("vendor", "compat")
 #: The five constants, as `bootstrap init` publishes them under "The numerical bar".
 TOLERANCE_NAMES = ("RTOL", "ATOL", "MIN_COSINE", "MIN_PASS_FRACTION", "MAX_ABS_ERR")
 
+#: The one of those five that `tighten_bar` moves most and that a stale copy misstates most
+#: visibly, so it is what `mark_superseded_bars` keys on. Same name the gates use for it.
+CEILING_NAME = "MAX_ABS_ERR"
+
 _BAR = re.compile(r"^\s*(RTOL|ATOL|MIN_COSINE|MIN_PASS_FRACTION|MAX_ABS_ERR)\s*=\s*([0-9.eE+-]+)",
                   re.M)
 
@@ -78,6 +83,64 @@ class TensorRecord:
     def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "role": self.role, "file": self.file,
                 "dtype": self.dtype, "shape": self.shape}
+
+
+def mark_superseded_bars(repo: Path, bar: dict[str, float]) -> list[str]:
+    """Annotate every carried-in file that states a bar other than this repo's.
+
+    A materialized repo states `MAX_ABS_ERR` in several files and only one is the bar the gate
+    enforces: everything under `module/` and `submodule/` describes the stage it was copied from,
+    and `tighten_bar` has since re-pinned this repo's. Being outnumbered is not a problem prose can
+    fix -- an agent told to copy the bar from `module/README.md` does so and fails the gate's bar
+    check -- so each stale statement is marked in place, naming the authoritative file.
+
+    Only markdown is touched: a carried-in `inference.py` is another stage's frozen artifact, and
+    markdown is what the prompts send agents to read, which is where the mistake happens.
+    """
+    marked: list[str] = []
+    want = bar.get(CEILING_NAME)
+    if want is None:
+        return marked
+    note = (f"> **This is not the bar this repo is held to.** It belongs to the stage this file was\n"
+            f"> copied from. What this repo must hit is in its own `README.md` under \"What it has\n"
+            f"> to hit\" -- `{CEILING_NAME} = {want!r}` -- which is written from the same value the\n"
+            f"> gate reads out of `.autohelix/optimization/module.json`. Declaring anything else in\n"
+            f"> `inference.py` fails the gate's bar check.\n\n")
+    for rel in ("module/README.md", "submodule/README.md", "submodule/SUBMODULE.md"):
+        path = repo / rel
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        if note in text:
+            continue
+        stale = [float(v) for name, v in _BAR.findall(text) if name == CEILING_NAME]
+        if not stale or all(abs(s - want) <= 1e-12 for s in stale):
+            continue
+        lines = text.splitlines(keepends=True)
+        lines.insert(_marker_line(lines), note)
+        path.write_text("".join(lines))
+        marked.append(rel)
+    return marked
+
+
+def _marker_line(lines: list[str]) -> int:
+    """Where to insert the note: as close to the stale number as markdown allows.
+
+    Next to it, so the marker cannot be read apart from the number it is about — but not *inside*
+    the fenced block the number usually sits in, where a blockquote is no longer a blockquote and
+    the fence stops being valid Python. So the opening fence is the insertion point when the
+    statement is fenced, and the line itself when it is prose.
+    """
+    fences = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fences += 1
+        if CEILING_NAME in line and any(ch.isdigit() for ch in line):
+            if fences % 2 == 0:
+                return i
+            opening = max(j for j in range(i) if lines[j].lstrip().startswith("```"))
+            return opening
+    return 0
 
 
 def read_numerical_bar(readme: Path) -> dict[str, float]:
@@ -237,29 +300,157 @@ def git_init(repo: Path, message: str) -> None:
     )
 
 
+def _git_ignored(repo: Path, path: str) -> bool:
+    """Whether the repo's own `.gitignore` excludes this path.
+
+    `git add` on an explicitly named ignored path is an error, not a no-op, so an ignored path has
+    to be dropped before staging rather than discovered during it.
+    """
+    return subprocess.run(
+        ["git", "check-ignore", "-q", "--", path], cwd=repo, check=False,
+    ).returncode == 0
+
+
+def git_commit_paths(repo: Path, message: str, paths: Sequence[str]) -> bool:
+    """Commit named paths, if the repo is a git repo and any of them actually moved.
+
+    For edits the pipeline makes to an already-initialized repo. The loop refuses to start in a
+    dirty repository, so a pipeline-side rewrite of a tracked file has to land in a commit of its
+    own or it reads as the agent having left work behind.
+    """
+    if not (repo / ".git").is_dir():
+        return False
+    present = [p for p in paths if (repo / p).exists() and not _git_ignored(repo, p)]
+    if not present:
+        return False
+    subprocess.run(["git", "add", "--", *present], cwd=repo, check=True)
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--quiet", "--", *present], cwd=repo, check=False)
+    if staged.returncode == 0:
+        return False
+    subprocess.run(
+        ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
+         "commit", "-q", "-m", message, "--", *present],
+        cwd=repo, check=True,
+    )
+    return True
+
+
+#: What the Neuron toolchain regenerates beside the repo root rather than under `build/`: the
+#: compiler's own log, the metric store it appends to, and the per-kernel compile caches it names by
+#: content hash (a `.colz` and a `.done` in a directory whose name is the hash). Kept in one place
+#: because `untrack_regenerated` has to recognize what `write_gitignore` excluded.
+REGENERATED = ("log-neuron-cc.txt", "global_metric_store.json", "*.colz", "**/.done")
+
+_REGENERATED_NOTE = (
+    "# What the Neuron toolchain writes beside the repo root rather than under build/: the\n"
+    "# compiler's own log, the metric store it appends to, and the per-kernel compile caches it\n"
+    "# names by content hash. A tracked one of these turns any measurement taken in the main repo\n"
+    "# — a gate run, the bar's own re-pin — into uncommitted changes, and the loop then refuses to\n"
+    "# start for a reason that has nothing to do with the kernel."
+)
+
+
+#: Run state, profile artifacts and the validator's scratch directory — the rest of what
+#: `write_gitignore` manages. Named as data so `untrack_regenerated` can tell a pattern this
+#: module put in `.gitignore` from one an operator did.
+_RUN_STATE = (".autohelix/", "__pycache__/", "*.pyc")
+_PROFILES = ("*.neff", "*.ntff", "profile*.json")
+_SCRATCH = ("build/",)
+
+MANAGED_IGNORES = (*_RUN_STATE, *_PROFILES, *_SCRATCH, *REGENERATED)
+
+
 def write_gitignore(repo: Path) -> None:
-    """Keep run state and profile artifacts out of the history.
+    """Keep run state and regenerated artifacts out of the history.
 
     Profiles especially: an iteration leaves a `.neff` and one `.ntff` per rank, and committing them
     would put tens of megabytes of binary into every iteration's diff.
     """
     (repo / ".gitignore").write_text(
         "\n".join([
-            ".autohelix/",
-            "__pycache__/",
-            "*.pyc",
+            *_RUN_STATE,
             "# Profile artifacts: produced fresh every iteration and checked for freshness, so a",
             "# committed one would be a stale measurement waiting to be believed.",
-            "*.neff",
-            "*.ntff",
-            "profile*.json",
+            *_PROFILES,
             "# A validator's scratch directory: compile caches, per-rank logs, the device output it",
             "# compares. Regenerated every run, and tracking it means every gate run leaves the",
             "# tree dirty — which the loop refuses to start on.",
-            "build/",
+            *_SCRATCH,
+            _REGENERATED_NOTE,
+            *REGENERATED,
             "",
         ])
     )
+
+
+def _ignored_by_managed_patterns(repo: Path, tracked: list[str]) -> list[str]:
+    """Which of `tracked` an artifact pattern from `MANAGED_IGNORES` matches.
+
+    Asking `check-ignore` whether a path is ignored *at all* answers a wider question than the one
+    being fixed: it consults every rule in effect, including `.git/info/exclude`, the operator's
+    global excludes, and any line a previous version of this file wrote. A repo that deliberately
+    tracks something matching one of those had it dropped from the index as a side effect of
+    un-staging a compiler log. `-v` names the pattern that matched, which narrows it to ours while
+    still leaving the matching itself to git.
+    """
+    if not tracked:
+        return []
+    shown = subprocess.run(
+        ["git", "check-ignore", "-v", "-z", "--no-index", "--stdin"],
+        cwd=repo, input="\0".join(tracked), capture_output=True, text=True, check=False,
+    ).stdout
+    # `<source> NUL <line> NUL <pattern> NUL <path> NUL` per match, under `-z`.
+    fields = shown.split("\0")
+    managed = set(MANAGED_IGNORES)
+    return [fields[i + 3] for i in range(0, len(fields) - 3, 4) if fields[i + 2] in managed]
+
+
+def untrack_regenerated(repo: Path) -> list[str]:
+    """Ignore and un-stage the artifacts the toolchain rewrites. Returns what it un-staged.
+
+    For repos materialized before `REGENERATED` was excluded, where `git_init`'s `git add -A` took
+    the compiler log and the compile cache into the first commit. Every later measurement in the
+    main repo then rewrites a tracked file, and the loop — which refuses to start in a dirty
+    repository — stops on `M log-neuron-cc.txt`, naming a file that has nothing to do with the
+    kernel. `02-Attention`'s stage 3 stopped on exactly that, four minutes in.
+
+    Appends rather than rewriting `.gitignore`, and un-stages with `git rm --cached`, so nothing on
+    disk is touched and a cache the next compile wants is still there to be found. Idempotent: on a
+    repo already clean of them it appends nothing and un-stages nothing.
+    """
+    if not (repo / ".git").is_dir():
+        return []
+    ignore = repo / ".gitignore"
+    existing = ignore.read_text() if ignore.is_file() else ""
+    missing = [p for p in REGENERATED if p not in existing.splitlines()]
+    if missing:
+        body = existing if existing.endswith("\n") or not existing else existing + "\n"
+        ignore.write_text(body + _REGENERATED_NOTE + "\n" + "\n".join(missing) + "\n")
+
+    tracked = [p for p in subprocess.run(
+        ["git", "ls-files", "-z"], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.split("\0") if p]
+    now_ignored = _ignored_by_managed_patterns(repo, tracked)
+    # Both halves commit, and an appended `.gitignore` with nothing tracked to drop is the common
+    # case: a repo that never compiled in its main tree has the patterns missing and no artifact
+    # matching them. Returning early there left the edit uncommitted, and `run_loop` starts the
+    # harness in the next breath — so a clean pre-existing run could not resume at all.
+    if not (now_ignored or missing):
+        return []
+    if now_ignored:
+        subprocess.run(["git", "rm", "-r", "--cached", "-q", "--", *now_ignored],
+                       cwd=repo, check=True)
+    subprocess.run(["git", "add", "--", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=autohelix", "-c", "user.email=autohelix@localhost",
+         "commit", "-q", "-m",
+         "Stop tracking what the toolchain regenerates\n\n"
+         "A tracked compiler log or compile cache makes every measurement taken in the main "
+         "repo leave the tree dirty, and the loop refuses to start on a dirty tree."],
+        cwd=repo, check=True,
+    )
+    return now_ignored
 
 
 # --------------------------------------------------------------------------------------
@@ -405,7 +596,7 @@ Its recorded output is `{MODULE_DIR}/{golden.file}` — `{golden.dtype}`, shape
 `{tuple(golden.shape)}` — and its numerical bar is:
 
 ```python
-{chr(10).join(f'{name} = {bar[name]:g}' for name in TOLERANCE_NAMES)}
+{chr(10).join(f'{name} = {bar[name]!r}' for name in TOLERANCE_NAMES)}
 ```
 
 That is the bar the **assembly** is held to, since the assembly reproduces this tensor. This
@@ -428,6 +619,68 @@ It must exit 0 and print three markers — `##autohelix[latency_ms=...]`,
 # --------------------------------------------------------------------------------------
 
 
+#: How much worse than the bootstrapped kernel a reassembly of the same module may be.
+#:
+#: The derived bar (`read_numerical_bar`) is a property of the *recorded output* — `RTOL` times its
+#: largest element plus `ATOL` — not of what the module can actually be computed to. On
+#: `layers.2.attention` the derived ceiling is 0.7875 and the bootstrapped single-core kernel
+#: reaches 0.0981445, so the pipeline had 8x of headroom and walked into it: stage 4 reassembled at
+#: 0.2773438 and stage 5 finished at 0.609375, with 6,571 of 42 M elements outside the elementwise
+#: tolerance against the assembly's 24 — all of it passing a gate that was never the binding
+#: constraint. The bootstrapped kernel is a working implementation of the same module against the
+#: same golden, so what *it* achieves is the honest reference point.
+#:
+#: Two margins, because the three statistics fail differently. `MAX_ABS_ERR` is one element and
+#: moves only when something structural changes, so it is held tight. Cosine and the pass fraction
+#: aggregate over 42 M elements and drift a little whenever the arithmetic is reordered — a rank
+#: split legitimately costs a few percent there — so they get more room. Checked against all four
+#: attention modules measured so far: this admits `00-Attention-B` (whose assembly cost nothing) and
+#: `24-Attention` (whose rewrite improved on its bootstrap), and refuses `02-Attention`'s assembly
+#: and `00-Attention-C`'s fp8-PV kernel while admitting C's previous iteration.
+WORST_MARGIN = 1.10          # MAX_ABS_ERR
+SPREAD_MARGIN = 2.00         # MIN_COSINE, MIN_PASS_FRACTION
+
+#: A floor on the allowance, so a bootstrapped kernel that happens to reach `pass_fraction = 1.0`
+#: or a cosine of 1.0 does not produce a bar no reassembly can clear. 1e-5 of 42 M elements is
+#: about 420 of them.
+ACHIEVED_FLOOR = 1e-5
+
+
+def tighten_bar(derived: dict[str, float], achieved: dict[str, float] | None,
+                worst_margin: float = WORST_MARGIN,
+                spread_margin: float = SPREAD_MARGIN) -> dict[str, float]:
+    """`derived`, tightened to what the bootstrapped kernel achieved plus a margin.
+
+    Only ever tightens: every value returned is at least as strict as the derived one, so the
+    documented rule stays the ceiling and this is a floor under it. A statistic missing from
+    `achieved` is left at its derived value rather than guessed — an older run whose baseline
+    measurement recorded no numerics gets the old behaviour.
+
+    `RTOL` and `ATOL` are never touched. They define the elementwise test that `MIN_PASS_FRACTION`
+    counts, so moving them would silently change what the pass fraction means.
+    """
+    out = dict(derived)
+    if not achieved:
+        return out
+    worst = achieved.get("max_abs_err")
+    if worst is not None and "MAX_ABS_ERR" in out:
+        # Floored, and scaled to the derived ceiling rather than absolute, because the ceiling is
+        # the one thing here that knows the output's magnitude (it is `RTOL` times the largest
+        # reference element plus `ATOL`). A kernel that happens to match bit-for-bit reports
+        # `max_abs_err = 0`, and multiplying that by the margin demands every later candidate be
+        # bit-exact too — which refuses legitimate reordering, sharding and any collective whose
+        # summation order differs, none of which the derived bar objects to.
+        allowance = max(worst * worst_margin, out["MAX_ABS_ERR"] * ACHIEVED_FLOOR)
+        out["MAX_ABS_ERR"] = min(out["MAX_ABS_ERR"], allowance)
+    for name, key in (("MIN_COSINE", "cosine"), ("MIN_PASS_FRACTION", "pass_fraction")):
+        got = achieved.get(key)
+        if got is None or name not in out:
+            continue
+        allowance = max(1.0 - got, ACHIEVED_FLOOR) * spread_margin
+        out[name] = max(out[name], 1.0 - allowance)
+    return out
+
+
 def materialize_full(
     repo: Path,
     bootstrap_repo: Path,
@@ -439,6 +692,7 @@ def materialize_full(
     submodule_latency_ms: float,
     best_commit: str | None,
     entry_point: str = "kernel",
+    achieved: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Scaffold the repo the stage-4 agent fills in. Returns the partial manifest.
 
@@ -487,7 +741,8 @@ def materialize_full(
         _copy(src, submodule_dst / name)
 
     readme = module_dst / "README.md"
-    bar = read_numerical_bar(readme)
+    derived_bar = read_numerical_bar(readme)
+    bar = tighten_bar(derived_bar, achieved)
     records = read_tensor_table(readme)
     golden = golden_record(records)
 
@@ -514,6 +769,17 @@ def materialize_full(
         module_id, projection, bar, golden,
         bootstrap_latency_ms, submodule_latency_ms,
     ))
+    # The README the prompt sends the agent to and the manifest the gate enforces are both written
+    # from `bar`, so reading it back is what stops a `_full_readme` edit silently splitting them.
+    published = read_numerical_bar(repo / "README.md")
+    drift = {n: (published[n], bar[n]) for n in TOLERANCE_NAMES
+             if abs(published[n] - bar[n]) > 1e-12}
+    if drift:
+        raise MaterializeError(
+            f"{repo / 'README.md'} publishes a bar that differs from the one going into the "
+            f"manifest: " + ", ".join(f"{n} {p:g} vs {b:g}" for n, (p, b) in sorted(drift.items()))
+        )
+    bar_marked = mark_superseded_bars(repo, bar)
     write_gitignore(repo)
     (repo / "source.py").write_text(_source_stub(entry_point))
     (repo / "inference.py").write_text(_inference_stub(entry_point))
@@ -523,6 +789,9 @@ def materialize_full(
         "entry_point": entry_point,
         "ranks": projection.projected_units,
         "stripped": [s.describe() for s in stripped],
+        # Carried-in files that state a bar other than this repo's and were marked in place, so a
+        # change that stops marking one shows up as a missing entry rather than as silence.
+        "bar_marked": bar_marked,
         "projection": projection.to_dict(),
         "tolerance": bar,
         "tensors": tensors,
@@ -537,6 +806,11 @@ def materialize_full(
             "overhead_ceiling_ms": round(submodule_latency_ms * 1.10, 6),
         },
         "submodule_commit": best_commit,
+        # What the bar would have been from the recorded output alone, and what the bootstrapped
+        # kernel actually achieved. `tolerance` above is the two reconciled by `tighten_bar`, and is
+        # the only one the gate enforces; these two are here so a reader can see why it is stricter.
+        "tolerance_derived": derived_bar,
+        "tolerance_achieved": dict(achieved) if achieved else {},
         # Filled by the agent when it freezes the validator it wrote.
         "frozen": {},
     }
@@ -578,7 +852,7 @@ The golden is `tensors/{Path(golden.file).name}` — `{golden.dtype}`, shape
 `{tuple(golden.shape)}` — compared against **rank 0's post-collective output**, once, at:
 
 ```python
-{chr(10).join(f'{name} = {bar[name]:g}' for name in TOLERANCE_NAMES)}
+{chr(10).join(f'{name} = {bar[name]!r}' for name in TOLERANCE_NAMES)}
 ```
 
 Unchanged from the bootstrapped module. Two standing bounds, both measured on this host:

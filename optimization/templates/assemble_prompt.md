@@ -3,7 +3,7 @@ You are putting an optimized per-rank kernel back together into the **whole modu
 
 This is the stage where the pipeline's looseness gets paid for. Everything before it was judged
 against goldens an agent chose; from here the target is the bootstrapped module's own recorded
-output, and the bar is the bar that admitted the bootstrapped kernel.
+output, at the bar that admitted the bootstrapped kernel.
 
 ## What you are given
 
@@ -20,50 +20,58 @@ The numbers you have to beat, measured on this host rather than copied from a lo
 - the bootstrapped module, one core: **{{ bootstrap_latency }} ms**
 - the optimized submodule, one core: **{{ submodule_latency }} ms**
 
+{% if memory %}
+{{ memory }}
+{% endif %}
+
+{% if archive %}
+{{ archive }}
+{% endif %}
+
 ## What you must produce
 
 **`source.py`** — the whole module on {{ ranks }} ranks. Each rank runs the submodule's work for its
-own shard and the ranks rejoin with a collective **from `nki.collectives`**, inside the traced graph.
-`torch.distributed` may set the process group up (`init_process_group`, `barrier`, `get_rank`,
-`destroy_process_group`) but may not move tensor data: a host-side or XLA reduction would work and
-would measure a different machine than the one the floorplan is about.
+own shard, and the ranks rejoin with a collective **from `nki.collectives`**, inside the traced
+graph. `torch.distributed` may set the process group up (`init_process_group`, `barrier`,
+`get_rank`, `destroy_process_group`) but may not move tensor data: a host-side or XLA reduction
+would work and would measure a different machine than the one the floorplan is about.
 
-Six things about `nki.collectives` on this toolchain, each of which fails with an internal compiler
-error that names something else. They are not optional and they are not discoverable cheaply:
+Six things about `nki.collectives` on this toolchain. Each one fails with an internal compiler error
+that names something else, so none of them is cheap to rediscover.
+`aws-neuron/nki-library`, at `src/nkilib_src/nkilib/experimental/collectives/collectives.py`, is the
+reference pattern for all six.
 
-1. **Invoke the kernel as `kernel[2](...)`.** NKI defaults to `lnc=1`; this host runs LNC=2, and a
-   LNC=1 NEFF leaves the collective's buffer unallocated on the logical core's second physical core
-   (`NCC_ILLC059 Could not find MemoryLocation ... on core 1`).
+1. **Invoke the kernel as `kernel[2](...)`.** NKI defaults to `lnc=1`, this host runs LNC=2, and a
+   LNC=1 NEFF leaves the collective's buffer unallocated on the second physical core
+   (`NCC_ILLC059`).
 2. **Pass `name=` to the collective's `src`/`dst` `nl.ndarray`s**, or DRAM allocation fails
    (`NCC_IBIR440`).
 3. **A collective may not read or write IO tensors** (`NCC_INLA001`). `nisa.dma_copy` the input into
-   a named scratch buffer, collective into a second named scratch, `nisa.dma_copy` that into the
-   returned buffer.
-4. **Every `src` and `dst` must be `nl.shared_hbm`** — buffer kinds may not be mixed.
-5. **Build `ReplicaGroup` outside the kernel and pass it in.** The tracer rejects `range` in a traced
-   body; `ReplicaGroup([[0, 1, ..., {{ last_rank }}]])`.
+   a named scratch buffer, collective into a second named scratch, then `nisa.dma_copy` that into
+   the returned buffer.
+4. **Every `src` and `dst` must be `nl.shared_hbm`.** Buffer kinds may not be mixed.
+5. **Build `ReplicaGroup` outside the kernel and pass it in**, as
+   `ReplicaGroup([[0, 1, ..., {{ last_rank }}]])`. The tracer rejects `range` in a traced body.
 6. **Build input tensors on CPU and `.to(device)` them.** `torch.full(..., device=xla)` emits a
-   broadcast HLO that hits `NCC_ISMP902`, and that error is the broadcast, not the collective.
+   broadcast HLO that hits `NCC_ISMP902`, and that error names the broadcast, not the collective.
 
-`aws-neuron/nki-library`, at
-`src/nkilib_src/nkilib/experimental/collectives/collectives.py`, is the reference pattern for all of
-the above.
+**`inference.py`** — the validator, then **frozen for the whole loop that follows**.
+`module/inference.py` is a working one for this module on a single core; write yours to the same
+contract, across {{ ranks }} ranks, and keep these properties:
 
-**`inference.py`** — the validator, then **frozen for the whole optimization loop that follows**:
-
-  - runs under `torchrun --nproc_per_node={{ ranks }}`, every rank exiting 0;
-  - loads the input, weights and golden from `tensors/` in this repo — the module's recorded bytes;
-  - traces `{{ entry_point }}` from `source.py`, runs it on all {{ ranks }} ranks, and compares
-    **rank 0's post-collective output** — the whole module's output, after the ranks have rejoined —
-    against the golden. One comparison against the whole module, not {{ ranks }} partial ones;
-  - prints `##autohelix[passed=1]` and exits 0 on a match, non-zero otherwise;
-  - prints `##autohelix[max_abs_err=<number>]` and fails when it exceeds `MAX_ABS_ERR`;
-  - declares the five constants with exactly the values in `module/README.md` under "The numerical
-    bar". **Unchanged.** The golden is the same tensor the bootstrap loop matched, so the bar that
-    admitted that kernel admits this one. The {{ ranks }}-rank reduction order differs from the
-    reference's single all-reduce, so accumulation order shifts a little — absorbing that is what a
-    pass fraction and a cosine are for, not a reason to loosen anything;
-  - profiles the collective run and reports the latency:
+  - it runs under `torchrun --nproc_per_node={{ ranks }}`, every rank exiting 0;
+  - it loads the input, weights and golden from `tensors/` in this repo, the module's recorded bytes;
+  - it traces `{{ entry_point }}` from `source.py`, runs it on all {{ ranks }} ranks, and compares
+    **rank 0's post-collective output** against the golden. One comparison against the whole
+    module, not {{ ranks }} partial ones;
+  - it prints `##autohelix[passed=1]` and exits 0 on a match, non-zero otherwise, and prints
+    `##autohelix[max_abs_err=<number>]`, failing when that exceeds `MAX_ABS_ERR`;
+  - it declares the five constants at exactly the values **this repo's own `README.md`** states
+    under "What it has to hit", **unchanged**. Take them from there and nowhere else. Other files
+    here state a different bar and carry a note saying so, because they belong to the stage they
+    were copied from. The {{ ranks }}-rank reduction order shifts accumulation a little, which is
+    what a pass fraction and a cosine absorb, not a reason to loosen anything;
+  - it profiles the collective run and reports the latency:
 
         neuron-explorer capture -n <neff> --io-from=runtime \
           --collectives-worker-count {{ ranks }} --collectives-workers-per-node {{ ranks }} \
@@ -71,30 +79,25 @@ the above.
         neuron-explorer view -n <neff> -s profile_rank_<N>.ntff \
           --output-format=summary-json --disable-ui
 
-    That writes one `profile_rank_<N>.ntff` per rank. `total_exec_time` in the summary is in
+    That writes one `profile_rank_<N>.ntff` per rank, and `total_exec_time` in the summary is in
     **seconds**. Print every rank as `##autohelix[latency_rank_<N>_ms=<number>]` and the **fastest**
-    of them as `##autohelix[latency_ms=<number>]`. All {{ ranks }} per-rank lines are required: without
-    them "the fastest rank" is a claim nobody can check. The summary also carries `cc_op_time`, which
-    isolates the collective — worth printing into your notes, since it is the number stage 5 has to
-    shrink.
+    of them as `##autohelix[latency_ms=<number>]`. All {{ ranks }} per-rank lines are required, or
+    "the fastest rank" is a claim nobody can check. The summary also carries `cc_op_time`, which
+    isolates the collective; print it into your notes, since stage 5 has to shrink it.
 
-**`tensors/`** — the module's input, weights and golden, copied byte-for-byte from `module/tensors/`.
-Not regenerated and not re-sliced: this stage's whole purpose is to be judged against the recorded
-module, so its inputs are the recorded inputs.
+**`tensors/`** — the module's input, weights and golden, copied byte-for-byte from
+`module/tensors/`. Not regenerated and not re-sliced: this stage exists to be judged against the
+recorded module, so its inputs are the recorded inputs.
 
-**`.autohelix/optimization/module.json`** — the manifest. **Edit the file that is already there**;
-do not rewrite it. It arrives carrying `module`, `entry_point`, `ranks`, `projection`, `tolerance`,
-`module_output` and `baselines` — the pipeline owns all of those and restores them after you finish,
-so an edit there is put back rather than honoured. One field is yours:
+**`.autohelix/optimization/module.json`** — the manifest. **Edit the file already there**; the
+pipeline owns every field but one and restores the rest after you finish, `tensors` included. Yours
+is the hash that lets the gate tell that the validator judging iteration 5 is the one gated here:
 
 ```json
 {
   "frozen": { "inference.py": "<sha256 of the validator you just froze>" }
 }
 ```
-
-`tensors` is already filled in from the module's recorded bytes; leave it alone. The hash in `frozen`
-is what lets the gate tell that the validator judging iteration 5 is the one that was gated here.
 
 **`ASSEMBLY.md`** — for a human: how the ranks divide the work, which collective rejoins them and
 where in the graph it sits, what is replicated, and what the first measurement showed — total, per
@@ -104,11 +107,11 @@ rank, and `cc_op_time`.
 
 Your baseline has to be green *and* already satisfy both bounds:
 
-- faster than **{{ bootstrap_latency }} ms** — {{ ranks }} ranks that cannot beat one core have spent
-  their parallelism on overhead;
+- faster than **{{ bootstrap_latency }} ms**, since {{ ranks }} ranks that cannot beat one core have
+  spent their parallelism on overhead;
 - no slower than **{{ overhead_ceiling }} ms**, which is 1.1x the submodule. Each rank does one
   rank's work, so anything past this is the collective plus imbalance, and 10% is what they get.
 
-If you cannot clear both, say so plainly in `ASSEMBLY.md` with the measurements — an honest failure
-here is worth far more than a validator bent until it passes. The loop that follows optimizes from
-this baseline, so a baseline that does not hold gives it nothing to stand on.
+If you cannot clear both, say so plainly in `ASSEMBLY.md` with the measurements. An honest failure
+here is worth far more than a validator bent until it passes: the loop optimizes from this baseline,
+so a baseline that does not hold gives it nothing to stand on.

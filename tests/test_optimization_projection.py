@@ -288,3 +288,40 @@ def test_a_placement_that_already_fit_is_not_divergent():
         projected=[Factor("expert", 4)], projected_units=4,
     )
     assert not projection.diverges
+
+
+def _scheme(tmp_path):
+    path = tmp_path / "rank1.yaml"
+    path.write_text(textwrap.dedent("""
+        version: 1
+        target: trn2-16device
+        placements:
+          - module: layers.1.ffn
+            units: [d0.l0, d1.l0, d0.l1, d1.l1]
+            splits:
+              - {dim: expert, factor: 4, collective: all_to_all}
+    """))
+    return path
+
+
+def test_the_configured_target_width_survives_the_round_trip(tmp_path):
+    """`init` writes the projection; later stages read it back rather than re-deriving it.
+
+    `FLOORPLAN.md` states the width the run targets and the preparation agent takes that as
+    binding, so a target dropped on the way through tells it to cut for the package default.
+    """
+    projection = project_module(_scheme(tmp_path), "layers.1.ffn", 2)
+    assert projection.target_units == 2
+
+    restored = Projection.from_dict(projection.to_dict())
+
+    assert restored.target_units == 2
+    assert "2 logical NeuronCore(s)" in restored.describe()
+
+
+def test_a_projection_recorded_before_the_target_was_written_still_loads(tmp_path):
+    """Old `init` payloads have no `target_units`; they fall back rather than failing."""
+    payload = project_module(_scheme(tmp_path), "layers.1.ffn", 4).to_dict()
+    del payload["projected"]["target_units"]
+
+    assert Projection.from_dict(payload).target_units == PROJECTION_TARGET_UNITS

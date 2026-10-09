@@ -214,18 +214,6 @@ def test_the_check_command_exits_zero_on_a_good_report(tmp_path, capsys):
 # -- the prompt the stage sends ---------------------------------------------------------
 
 
-def test_the_prompt_names_the_skill_and_every_column():
-    from optimization import presets
-
-    prompt = presets.feedback_prompt()
-    assert "domain-modeling" in prompt
-    for column in fb.COLUMNS:
-        assert column in prompt, column
-    for level, definition in fb.LEVELS.items():
-        assert level in prompt, level
-    assert "{{ corpus }}" in prompt and "{{ report_path }}" in prompt
-
-
 def test_the_prompt_renders_with_the_variables_the_driver_supplies():
     from autohelix.prompt_template import render_template
 

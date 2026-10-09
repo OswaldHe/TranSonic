@@ -61,6 +61,12 @@ _config_option = click.option(
     help=f"the pipeline config (default: ./{DEFAULT_CONFIG})",
 )
 _verbose_option = click.option("--verbose", "-v", is_flag=True, help="stream agent output")
+#: `submodule` and `assemble` archive the repo they find and have an agent build another. Opt-in,
+#: because on a stage that already passed its gate that throws away a tuned kernel and its history.
+_rebuild_option = click.option(
+    "--rebuild", is_flag=True,
+    help="replace the repo even if this stage already passed (archives it to .optimization/attempts)",
+)
 
 
 @click.group(name="optimize")
@@ -132,13 +138,14 @@ def init(config: str | None, verbose: bool) -> None:
 @optimize.command()
 @_config_option
 @_verbose_option
-def submodule(config: str | None, verbose: bool) -> None:
+@_rebuild_option
+def submodule(config: str | None, verbose: bool, rebuild: bool) -> None:
     """Have an agent cut the module down to the part one NeuronCore runs."""
     pipeline = _pipeline(config, verbose)
 
     def go() -> None:
         pipeline.init()
-        pipeline.submodule()
+        pipeline.submodule(rebuild=rebuild)
 
     raise SystemExit(_run("submodule", go))
 
@@ -165,10 +172,11 @@ def run(config: str | None, verbose: bool) -> None:
 @optimize.command()
 @_config_option
 @_verbose_option
-def assemble(config: str | None, verbose: bool) -> None:
+@_rebuild_option
+def assemble(config: str | None, verbose: bool, rebuild: bool) -> None:
     """Have an agent rebuild the whole module across all ranks, rejoined with nki.collectives."""
     pipeline = _pipeline(config, verbose)
-    raise SystemExit(_run("assemble", pipeline.assemble))
+    raise SystemExit(_run("assemble", lambda: pipeline.assemble(rebuild=rebuild)))
 
 
 @optimize.command(name="run-full")
@@ -263,6 +271,58 @@ def report(config: str | None) -> None:
     pipeline = _pipeline(config, verbose=False)
     path = write_report(pipeline.config, console=console)
     console.print(f"\n[green]Wrote[/green] {path}")
+
+
+@optimize.command(name="archive")
+@_config_option
+@click.option("--add", "add", multiple=True, metavar="WORKSPACE",
+              help="deposit a finished run's FEEDBACK.md; repeatable. Use for runs that "
+                   "finished before the archive existed.")
+@click.option("--module", "module", default=None,
+              help="the module id to file --add under. Defaults to the config's.")
+@click.option("--reindex", is_flag=True,
+              help="regenerate README.md and manifest.json from the entries on disk.")
+def archive_cmd(config: str | None, add: tuple[str, ...], module: str | None,
+                reindex: bool) -> None:
+    """Show or extend the cross-run feedback archive.
+
+    With no options it prints what is filed, which is also what every later run's agents read.
+    """
+    from optimization import archive as arch
+
+    pipeline_config = _load(config)
+    store = pipeline_config.feedback_archive
+    if store is None:
+        raise click.ClickException(
+            "this config sets no `feedback.archive:`, so nothing is collected. Point it at a "
+            "directory shared by the modules you want to pool feedback across."
+        )
+
+    for workspace in add:
+        root = Path(workspace).expanduser()
+        try:
+            entry = arch.deposit(store, root, module or pipeline_config.module_id)
+        except arch.ArchiveError as exc:
+            raise click.ClickException(str(exc)) from exc
+        console.print(f"[green]deposited[/green] `{entry.name}` — {len(entry.findings)} finding(s)")
+    if reindex and not add:
+        arch.write_index(store)
+        console.print(f"[green]reindexed[/green] {store / arch.INDEX_NAME}")
+
+    entries = arch.read_entries(store)
+    if not entries:
+        console.print(f"{store} holds no entries yet.")
+        return
+    disputed = [f for _, f in arch.all_findings(entries) if f.disputed]
+    console.print(
+        f"\n[bold]{store}[/bold]\n{len(entries)} run(s), "
+        f"{sum(len(e.findings) for e in entries)} finding(s), {len(disputed)} disputed\n"
+    )
+    for entry in entries:
+        console.print(f"  [cyan]{entry.name}[/cyan]  {entry.module}  {len(entry.findings)} finding(s)")
+    for entry, finding in arch.all_findings(entries):
+        mark = " [yellow](disputed)[/yellow]" if finding.disputed else ""
+        console.print(f"  {finding.id}  {finding.level}  {finding.scenario[:90]}{mark}")
 
 
 if __name__ == "__main__":

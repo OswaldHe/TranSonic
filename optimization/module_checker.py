@@ -99,23 +99,37 @@ def launch(ranks: int) -> list[str]:
 #: claim, and load imbalance — the thing that makes a fastest-rank number optimistic — is invisible.
 RANK_LATENCY_MARKER = "latency_rank_{rank}_ms"
 
-#: What the collective must come from, and what it must not. The banned forms all work; they just
-#: measure a different machine than the one the floorplan is about.
+#: Where the collective must come from. Any other source works and measures a different machine
+#: than the one the floorplan is about, so the check resolves each of these operation names through
+#: the file's import table and requires the module it came from to be this one — which catches a
+#: host-side or XLA collective under any alias, rather than only the spellings someone listed.
 COLLECTIVE_MODULE = "nki.collectives"
-COLLECTIVE_OPS = ("all_reduce", "all_gather", "all_to_all", "reduce_scatter", "collective_permute")
-BANNED_COLLECTIVES = (
-    "torch.distributed.all_reduce", "torch.distributed.all_gather",
-    "torch.distributed.reduce_scatter", "torch.distributed.all_to_all",
-    "dist.all_reduce", "dist.all_gather", "dist.reduce_scatter", "dist.all_to_all",
-    "xm.all_reduce", "xm.all_gather", "xm.mesh_reduce", "xm.reduce_scatter",
-    "xm.all_to_all",
+#: Every data-moving collective `nki.collectives` exposes. No particular one is required: the rule
+#: is that the ranks rejoin through this module inside the traced graph, and which call does it is
+#: the assembler's choice. The four `_v` and `_implicit` forms were missing, so a kernel rejoining
+#: with `all_gather_v` was told it "calls no collective at all".
+#: `test_the_collective_allowlist_matches_the_installed_api` fails when this drifts from the module.
+COLLECTIVE_OPS = (
+    "all_reduce",
+    "all_gather", "all_gather_v",
+    "all_to_all", "all_to_all_v",
+    "reduce_scatter",
+    "collective_permute", "collective_permute_implicit", "collective_permute_implicit_reduce",
 )
+#: Exposed by the same module but not data movement, so their presence does not satisfy check (c):
+#: `ReplicaGroup` is a class, and the other two report a rank rather than moving a tensor.
+COLLECTIVE_NON_OPS = frozenset({
+    "ReplicaGroup", "rank_id", "collective_permute_implicit_current_processing_rank_id",
+})
 
 #: `torch.distributed` calls that are legitimate: they organize processes, they do not reduce data.
 ALLOWED_DIST_CALLS = frozenset({
     "init_process_group", "destroy_process_group", "barrier", "get_rank", "get_world_size",
     "is_initialized", "new_group",
 })
+
+#: The accuracy statistic every validator in this pipeline prints and the gate already checks.
+ACCURACY_MARKER = "max_abs_err"
 
 SOURCE_ALLOWED_IMPORTS = frozenset({
     "nki", "neuronxcc", "torch", "torch_neuronx", "torch_xla", "numpy",
@@ -131,8 +145,10 @@ OVERHEAD_ALLOWANCE = 1.10
 
 
 def find_manifest(repo: Path) -> Path:
-    for candidate in [repo, *repo.parents]:
-        path = candidate / MANIFEST_REL
+    # `directory`, not `candidate`: this module imports `candidate` and the loop variable shadowed
+    # it, so a reader inside this function sees the wrong meaning for the name.
+    for directory in [repo, *repo.parents]:
+        path = directory / MANIFEST_REL
         if path.is_file():
             return path
     raise CheckerError(
@@ -199,8 +215,18 @@ def check_frozen_validator(repo: Path, manifest: dict[str, Any],
 
     entry = str(manifest.get("entry_point") or "kernel")
     source = candidate._parse(repo / SOURCE_FILE)
-    if entry not in candidate.top_level_functions(source):
-        findings.append(f"{SOURCE_FILE} defines no top-level '{entry}'")
+    # Any top-level binding, not only a `def` — the same rule the submodule gate applies, and for
+    # the same reason: `kernel = _impl[CORES]` binds the NKI launch grid at module scope, which is
+    # how a kernel reaches both physical cores of an LNC=2 pair while the frozen validator still
+    # calls `kernel(*args)` with no subscript. A grid cannot be expressed as a `FunctionDef` at
+    # all, so requiring one rejected the only shape that works. The two gates disagreeing cost a
+    # four-rank assembly that had already passed the other eight checks.
+    names = candidate.top_level_names(source)
+    if entry not in names:
+        findings.append(
+            f"{SOURCE_FILE} defines no top-level '{entry}'. "
+            f"Found: {', '.join(sorted(names)) or 'nothing'}"
+        )
     inference = candidate._parse(path)
     if "source" not in candidate._import_roots(inference):
         findings.append(f"{INFERENCE_FILE} never imports {SOURCE_FILE}")
@@ -275,7 +301,7 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
                     findings.append(
                         f"{where}:{line} calls '{dotted}'"
                         + (f", which resolves to '{resolved}'" if resolved != dotted else "")
-                        + f". The reduction has to come from {COLLECTIVE_MODULE} and happen inside "
+                        + f". The collective has to come from {COLLECTIVE_MODULE} and happen inside "
                         f"the traced graph — a host-side or XLA collective works and measures a "
                         f"different machine"
                     )
@@ -302,7 +328,7 @@ def check_nki_collectives(repo: Path, ranks: int = DEFAULT_RANKS) -> CheckResult
                f"on device" if resolved_from_nki else "")
         )
     return CheckResult("c", CHECK_TITLES["c"], not findings,
-                       f"reduction via {', '.join(sorted(resolved_from_nki))}" if not findings
+                       f"ranks rejoin via {', '.join(sorted(resolved_from_nki))}" if not findings
                        else f"{len(findings)} problem(s)", findings)
 
 
@@ -442,6 +468,14 @@ def check_faster(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
         return CheckResult("h", CHECK_TITLES["h"], False, "no latency reported",
                            [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
     baseline = float(baseline)
+    # Before dividing by it. Exactly 0 raised ZeroDivisionError here and killed the whole gate,
+    # and a negative latency passed both this check and (i) -- "-1.5 ms vs 10 ms (-6.67x)".
+    if reported <= 0:
+        return CheckResult(
+            "h", CHECK_TITLES["h"], False, f"{reported:g} ms is not a measurement",
+            [f"the run reported {LATENCY_MARKER}={reported:g}, which cannot be compared against "
+             f"the bootstrapped module's {baseline:g} ms"],
+        )
     if reported >= baseline:
         speedup = baseline / reported if reported else 0.0
         return CheckResult(
@@ -470,6 +504,14 @@ def check_overhead(run: RunOutcome, manifest: dict[str, Any]) -> CheckResult:
         return CheckResult("i", CHECK_TITLES["i"], False, "no latency reported",
                            [f"no ##autohelix[{LATENCY_MARKER}=...] line to compare"])
     submodule = float(submodule)
+    # A negative latency is below any ceiling, so without this it reported "-250.0% over the
+    # submodule's 1 ms" and passed. See the same guard in `check_faster`.
+    if reported <= 0:
+        return CheckResult(
+            "i", CHECK_TITLES["i"], False, f"{reported:g} ms is not a measurement",
+            [f"the run reported {LATENCY_MARKER}={reported:g}, which cannot be compared against "
+             f"the submodule's {submodule:g} ms"],
+        )
     ceiling = submodule * OVERHEAD_ALLOWANCE
     if reported > ceiling:
         excess = (reported / submodule - 1.0) * 100 if submodule else float("inf")
@@ -498,26 +540,58 @@ def _sha256(path: Path) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def evaluate(repo: Path, manifest: dict[str, Any],
-             timeout: int) -> tuple[list[CheckResult], RunOutcome]:
-    """One `torchrun` of the frozen validator, then all nine checks off that execution."""
+#: Checks about whether the *assembly* was worth optimizing rather than whether this candidate is
+#: sound. Stage 4 asks them once; `--loop` skips them. See `evaluate`.
+ADMISSION_ONLY = ("i",)
+
+
+def evaluate(repo: Path, manifest: dict[str, Any], timeout: int,
+             loop: bool = False) -> tuple[list[CheckResult], RunOutcome]:
+    """One `torchrun` of the frozen validator, then the checks, off that single execution.
+
+    `loop` drops `ADMISSION_ONLY`, which is what every stage-5 iteration wants. Check (i) bounds
+    the collective's overhead against the submodule's latency, and that is a question about the
+    assembly: stage 4 asks it once, to decide whether a loop is worth running at all. Asked again
+    every iteration it stops being a bound and becomes a lottery.
+
+    `mtp.0.attention` is the case. Its ceiling was 0.48969 ms, from one draw of the submodule;
+    twelve later draws of the accepted module kernel — byte-identical, nothing changed — spanned
+    0.4924 to 0.4998 ms. The whole distribution of the code that set the bound sits above the
+    bound, so three of five iterations were rejected for measurement noise, having each spent an
+    agent-hour and a device slot. One of them had reverted to the accepted commit exactly.
+
+    What still holds every iteration is everything about the candidate: the validator is the frozen
+    one, the reduction is a real collective, every rank ran, the output matches the module at its
+    bar, the profile is fresh, the tensors are the recorded bytes, and it beats the bootstrap. A
+    regression past that is the metric gate's job, and the metric gate is relative to the best
+    accepted iteration rather than to a number measured once before the loop began.
+    """
     bar = expected_tolerance(manifest)
     ranks = rank_count(manifest)
     run = candidate.run_candidate(
         repo, launch(ranks), timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": str(ranks)},
     )
-    return [
-        check_frozen_validator(repo, manifest, ranks),
-        check_self_contained(repo),
-        check_nki_collectives(repo, ranks),
-        check_all_ranks(run, ranks),
-        check_matches(run, bar, repo),
-        check_measurement(run, ranks),
-        check_provenance(repo, manifest),
-        check_faster(run, manifest),
-        check_overhead(run, manifest),
-    ], run
+    # Every check behind `guarded`: a defect in one fails that check and leaves the other eight
+    # answered, rather than escaping as a traceback the harness books against the candidate.
+    g = candidate.guarded
+    results = [
+        g("a", CHECK_TITLES["a"], check_frozen_validator, repo, manifest, ranks),
+        g("b", CHECK_TITLES["b"], check_self_contained, repo),
+        g("c", CHECK_TITLES["c"], check_nki_collectives, repo, ranks),
+        g("d", CHECK_TITLES["d"], check_all_ranks, run, ranks),
+        g("e", CHECK_TITLES["e"], check_matches, run, bar, repo),
+        g("f", CHECK_TITLES["f"], check_measurement, run, ranks),
+        g("g", CHECK_TITLES["g"], check_provenance, repo, manifest),
+        g("h", CHECK_TITLES["h"], check_faster, run, manifest),
+        g("i", CHECK_TITLES["i"], check_overhead, run, manifest),
+    ]
+    if loop:
+        # `.key`, not `.check`: only `CheckResult.to_dict` renames the field to "check", and
+        # reading that name off the dataclass is an AttributeError that failed three paid
+        # iterations of 42-DSparkMarkovHead before anything measured them.
+        results = [r for r in results if r.key not in ADMISSION_ONLY]
+    return results, run
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -525,12 +599,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="the candidate repository")
     parser.add_argument("--json", default=None, help="where to write the machine-readable verdict")
     parser.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
+    parser.add_argument("--loop", action="store_true",
+                        help="per-iteration subset: skip the admission-only checks "
+                             f"({', '.join(ADMISSION_ONLY)}), which stage 4 already asked")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
     try:
         manifest = load_manifest(find_manifest(repo))
-        results, run = evaluate(repo, manifest, args.timeout)
+        results, run = evaluate(repo, manifest, args.timeout, loop=args.loop)
     except CheckerError as exc:
         report = f"\nwhole-module gate\n\n  [FAIL] the repo is unusable — {exc}\n"
         print(report)
@@ -547,6 +624,12 @@ def main(argv: list[str] | None = None) -> int:
             str(r): candidate.marker_value(run.output, RANK_LATENCY_MARKER.format(rank=r))
             for r in range(rank_count(manifest))
         }
+    # The accuracy the validator reported, published beside the latency for the same reason: the
+    # verdict is the only thing that outlives the worktree, and `optimization.readback` turns it
+    # into a recorded metric the loop can gate on.
+    worst = candidate.marker_value(run.output, ACCURACY_MARKER)
+    if worst is not None:
+        extra[ACCURACY_MARKER] = worst
     verdict = candidate.write_verdict(
         results, run, "whole-module gate", Path(args.json) if args.json else None, extra=extra,
     )

@@ -104,6 +104,11 @@ class Projection:
     dropped: list[Factor] = field(default_factory=list)
     scaled: list[tuple[Factor, Factor]] = field(default_factory=list)
     target: str = ""
+    #: The unit count this projection was asked to fit, which `floorplan.target_units` sets. Carried
+    #: so `FLOORPLAN.md` can state the width it actually projected onto rather than the package
+    #: default — they differ whenever an operator configures a different device or core count, and
+    #: the agent reading that file takes the width as binding.
+    target_units: int = PROJECTION_TARGET_UNITS
 
     @property
     def diverges(self) -> bool:
@@ -149,6 +154,9 @@ class Projection:
             "projected": {
                 "units": self.projected_units,
                 "devices": 1,
+                # The width this projection was asked to fit, not the width it reached. Omitting it
+                # restored the package default, so `FLOORPLAN.md` told the agent the wrong target.
+                "target_units": self.target_units,
                 "splits": [
                     {"dim": f.dim, "factor": f.factor, "collective": f.collective}
                     for f in self.projected
@@ -188,6 +196,7 @@ class Projection:
             dropped=[Factor.parse(d) for d in (data.get("dropped") or [])],
             scaled=scaled,
             target=str(data.get("target") or ""),
+            target_units=int(projected.get("target_units") or PROJECTION_TARGET_UNITS),
         )
 
     def differences(self, other: Projection) -> list[str]:
@@ -229,8 +238,8 @@ class Projection:
             "",
             "## Projected onto one device",
             "",
-            f"This host is a one-device trn2.3xlarge with {PROJECTION_TARGET_UNITS} logical"
-            f" NeuronCores, so the placement is projected to"
+            f"This run targets {self.target_units} logical NeuronCore(s) on one device, so the"
+            f" placement is projected to"
             f" **{self.projected_units} unit(s) on one device**:",
             "",
             f"    {projected}",
@@ -312,7 +321,7 @@ def project(
 
     common = dict(
         module=module, planned=planned, planned_units=planned_units,
-        planned_devices=planned_devices, target=target,
+        planned_devices=planned_devices, target=target, target_units=target_units,
     )
 
     # Already single-device-sized: pass it through untouched. Projecting *up* to fill the device

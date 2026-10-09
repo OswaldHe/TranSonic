@@ -4,8 +4,8 @@ AutoHelix puts an AI agent in a verified improvement loop: each iteration is iso
 kept only when it passes. Four pipelines build on that loop to take a model from a checkpoint to fast
 kernels on AWS Trainium.
 
-**Coverage.** This glossary currently covers the loop's shared vocabulary and the `optimization/`
-pipeline. The `partition/`, `bootstrap/` and `floorplan/` pipelines have their own coined terms that
+**Coverage.** This glossary currently covers the loop's shared vocabulary, the `optimization/`
+pipeline, and the few machine terms that every kernel write-up otherwise re-defines for itself. The `partition/`, `bootstrap/` and `floorplan/` pipelines have their own coined terms that
 are not yet resolved here; add them as they come up, or split to a `CONTEXT-MAP.md` if the four
 vocabularies stop overlapping.
 
@@ -51,6 +51,13 @@ _Avoid_: layer, block, component, subgraph
 The part of a module that one rank computes. Structurally identical across ranks.
 _Avoid_: fragment, piece, partial module, sub-kernel
 
+**Archetype**:
+A class of modules that compute the same thing from the same shape of inputs, so one optimized kernel
+serves every member. What sets a module's archetype is which shared state it builds and which it only
+reads — not where it sits in the model.
+_Avoid_: signature group (the partitioner's own grouping, which is coarser and splits on layer
+composition instead), variant, family, kind
+
 **Rank**:
 One participant in a distributed execution of a module, and the work it holds. On this dev host a
 rank is one logical NeuronCore.
@@ -79,6 +86,38 @@ _Avoid_: harness, runner, test, benchmark
 The five pinned constants a validator judges a result by. Derived from a module's own recorded
 output, never chosen by an agent.
 _Avoid_: tolerance, threshold, accuracy target
+
+### The machine
+
+**Physical core**:
+One of the two execution units that make up one logical NeuronCore on a host configured
+`logical-neuroncore-config: 2`. The two run independent instruction streams, so work has to be divided
+between them explicitly; given the same program they each do all of it, and a rank reads every input
+twice for one copy of the answer.
+_Avoid_: core on its own (which reads as the rank), thread, worker
+
+**Engine**:
+One functional unit inside a physical core. There are six, and `nki.isa.engine` is the list that
+settles how many: **Tensor**, **Vector**, **Scalar**, **GpSimd**, **DMA**, **Sync**. Every
+instruction is issued to exactly one engine, and a kernel cannot be faster than its busiest one.
+_Avoid_: core, unit, pipeline, pipe — and **Activation** and **Pool**, which are the compiler's and
+profiler's second names for Scalar and GpSimd respectively, not engines of their own. (`nisa.activation`
+documents itself as running on the Scalar engine; `engine=nisa.engine.gpsimd` fails with "cannot run
+on engine Pool".) Counting the aliases gives eight engines and invents idle capacity that is not
+there.
+
+**Free width**:
+The width of the axis an instruction moves along, and what its duration follows. The partition axis
+holds up to 128 lanes and does not enter the cost, so one instruction spanning all 128 partitions
+costs what one spanning a single partition costs. The rule that follows: fewer instructions on wider
+tiles.
+_Avoid_: tile size, vector length, batch (none of which carry the "does not count the partitions"
+half, which is the whole point)
+
+**DMA trigger**:
+The fixed start cost of one DMA transfer, independent of how many bytes it moves. Many small
+transfers therefore cost more than one large transfer of the same bytes.
+_Avoid_: DMA overhead, latency, descriptor (which is the separate per-row cost an *indirect* DMA pays)
 
 ### Gates
 
@@ -184,6 +223,18 @@ _Avoid_: history, attic
 Every note and review both loops wrote, read as one body of evidence. Self-contradictory by
 construction, because each file was written before the run ended.
 _Avoid_: logs, history, transcript
+
+**Feedback archive**:
+Every finished run's `FEEDBACK.md`, pooled across modules, so a later run neither rediscovers a
+filed blocker nor files it twice. Distinct from the **attic**, which keeps failed preparation
+attempts, and from the **candidate archive**, which keeps one run's own kernels.
+_Avoid_: feedback memory, blocker database, knowledge base
+
+**Ruling**:
+What a later run says about a filed blocker: `agrees`, `disagrees`, `extends`, `not-applicable`. A
+`disagrees` marks the blocker **disputed** for every run after it. Distinct from a **verdict**,
+which is what a gate or a checker says about a candidate.
+_Avoid_: verdict, vote, review, judgement
 
 **Blocker**:
 Something that stopped a kernel getting faster and that this project cannot fix for itself, named by

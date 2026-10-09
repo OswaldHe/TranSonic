@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -265,6 +266,35 @@ def format_report(title: str, results: list[CheckResult], run: RunOutcome | None
     return "\n".join(lines)
 
 
+#: Prefix on the summary of a check that could not be answered because the gate itself broke.
+#: The loop reads the report, so the wording has to say whose fault it is.
+GATE_DEFECT = "the gate itself raised"
+
+
+def guarded(key: str, title: str, check, *args: Any, **kwargs: Any) -> CheckResult:
+    """Answer one check so a defect in it fails that check instead of killing the gate.
+
+    Both `evaluate` functions build their results as one list of calls, and `main` catches only
+    `CheckerError`. So any other exception escaped as a traceback, the harness recorded
+    `constraint failed`, and the iteration was rejected with nothing said about the candidate.
+    `42-DSparkMarkovHead` lost three iterations and 69 minutes that way to one `AttributeError`.
+
+    Failing rather than passing is deliberate: a gate that cannot evaluate must not admit a
+    kernel. What changes is that the verdict names the gate, carries the traceback, and leaves
+    the other checks' answers intact instead of discarding them.
+    """
+    try:
+        return check(*args, **kwargs)
+    except CheckerError:
+        raise  # the deliberate "this repo is unusable" path, which `main` reports on its own
+    except Exception:
+        return CheckResult(key, title, False, GATE_DEFECT, [
+            f"This is a defect in check ({key}), not a verdict on the candidate. The kernel was "
+            f"not judged on this point; do not change it in response to this message.",
+            traceback.format_exc(limit=8).strip(),
+        ])
+
+
 def write_verdict(results: list[CheckResult], run: RunOutcome | None, title: str,
                   path: Path | None, extra: dict[str, Any] | None = None) -> Verdict:
     """Assemble a verdict and, when asked, write the machine-readable copy the reviewer reads."""
@@ -311,6 +341,51 @@ def top_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.Asy
         node.name: node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def top_level_names(tree: ast.Module) -> set[str]:
+    """Every name `import source` then `source.<name>` can reach, however it was bound.
+
+    A `def`, but also a plain assignment — because binding the NKI launch grid at module scope is
+    an assignment, and it is the only way a kernel reaches both physical cores of an LNC=2 pair
+    under a validator that calls `kernel(*args)` with no subscript:
+
+        @nki.jit
+        def _impl(...): ...
+        kernel = _impl[2]          # a 2-wide grid, bound where the caller needs no grammar for it
+
+    Verified end to end: that form traces through `torch_neuronx.trace` on a `torch.nn.Module`
+    wrapper and the compiler builds the 2-wide NEFF. Judging the entry point by `FunctionDef`
+    alone rejected it, which would have cost the run the 2x that splitting across the two physical
+    cores is worth — the largest single gain the MoE pipeline found.
+    """
+    names = set(top_level_functions(tree))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_bound_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_bound_names(node.target))
+    return names
+
+
+def _bound_names(target: ast.expr) -> set[str]:
+    """Every name one assignment target binds.
+
+    Recursive because a target can be a tuple or a list: `kernel, helper = _impl[2], value` binds
+    `kernel` just as plainly as `kernel = _impl[2]` does, and the validator calls `source.kernel`
+    either way. Reading only `ast.Name` matched one spelling rather than Python's binding rules, so
+    the gate rejected a working candidate for having no entry point. Starred targets unpack too
+    (`first, *rest = ...`), and attribute or subscript targets bind no new name, so they contribute
+    nothing.
+    """
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for element in target.elts for name in _bound_names(element)}
+    return set()
 
 
 def called_attributes(tree: ast.Module) -> dict[str, int]:
@@ -667,6 +742,58 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def rewrite_pinned_constants(text: str, values: dict[str, float]) -> tuple[str, list[str]]:
+    """`text` with each named constant's literal replaced, plus the names it could not reach.
+
+    The pipeline re-pins the bar to what a kernel achieved, which means editing the validator it
+    just gated. Driven by the same walk `pinned_constants` judges with, so every spelling the gate
+    accepts can be re-pinned: a line-anchored regex matched only `NAME = 1.0` with single spaces
+    and nothing after it, so `RTOL=0.1`, extra spacing or a trailing comment left the loop running
+    under the loose bar with a warning nobody was watching for.
+
+    Written at `repr` precision, the same as the README publishes, so the validator, the manifest
+    and the README state one value rather than three roundings of it.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, sorted(values)
+
+    # Several names can share one literal (`A = B = 0.1`), so the literal is the unit, keyed by
+    # where it sits. Names not found at all, and names that would need one literal to hold two
+    # different values, come back as unreachable.
+    spots: dict[tuple[int, int, int, int], set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, (int, float)) or isinstance(node.value.value, bool):
+            continue
+        where = (node.value.lineno, node.value.col_offset,
+                 node.value.end_lineno or node.value.lineno, node.value.end_col_offset or 0)
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in values:
+                spots.setdefault(where, set()).add(target.id)
+
+    reached = {name for names in spots.values() for name in names}
+    unreachable = [name for name in values if name not in reached]
+    replacements: dict[tuple[int, int, int, int], str] = {}
+    for where, names in spots.items():
+        wanted = {values[name] for name in names}
+        if len(wanted) > 1 or where[0] != where[2]:
+            unreachable.extend(names)
+            continue
+        replacements[where] = repr(wanted.pop())
+
+    # Bottom-up, so an earlier edit cannot move a later one's offsets. `col_offset` counts UTF-8
+    # bytes, which is why the splice happens on encoded lines.
+    lines = text.splitlines(keepends=True)
+    for where in sorted(replacements, reverse=True):
+        lineno, col, _, end_col = where
+        raw = lines[lineno - 1].encode()
+        lines[lineno - 1] = (raw[:col] + replacements[where].encode() + raw[end_col:]).decode()
+    return "".join(lines), sorted(set(unreachable))
+
+
 def pinned_constants(tree: ast.Module, expected: dict[str, float],
                      filename: str) -> list[str]:
     """Findings if the five tolerance constants are absent, computed, or altered.
@@ -691,8 +818,14 @@ def pinned_constants(tree: ast.Module, expected: dict[str, float],
             findings.append(f"{filename}:{line} declares {name} as {value!r}, not a number")
             continue
         if abs(got - want) > 1e-12:
+            # Name the authoritative file: a repo states a bar in several places, and an agent that
+            # copied a stale one cannot tell from "not yours to change" which to open on a retry.
             findings.append(
                 f"{filename}:{line} declares {name} = {got:g}, but this repo's bar is {want:g}. "
-                f"The bar is not the agent's to change, in either direction"
+                f"Take all five constants from this repo's own README.md under 'What it has to "
+                f"hit', which is written from the same value the gate reads out of "
+                f"`.autohelix/optimization/module.json`. A bar stated anywhere else in the repo -- "
+                f"`module/README.md` in particular -- describes the bootstrapped module and may be "
+                f"looser. The bar itself is not yours to change, in either direction"
             )
     return findings

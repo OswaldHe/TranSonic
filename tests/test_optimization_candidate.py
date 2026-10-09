@@ -446,6 +446,82 @@ def test_the_single_core_check_applies_the_shared_core_rule(tmp_path):
     assert any("not the validator's to choose" in f for f in result.findings)
 
 
+def _entry_repo(tmp_path: Path, source: str) -> Path:
+    repo = tmp_path / "sub"
+    repo.mkdir(exist_ok=True)
+    (repo / "source.py").write_text(textwrap.dedent(source))
+    (repo / "inference.py").write_text(textwrap.dedent("""
+        import source
+        from source import kernel
+        RTOL = 0.1
+        def run(x):
+            return kernel(x)
+    """))
+    return repo
+
+
+def test_a_grid_bound_entry_point_is_a_definition(tmp_path):
+    """`kernel = _impl[2]` binds the NKI launch grid at module scope.
+
+    It is how a kernel reaches both physical cores of an LNC=2 pair while the frozen validator
+    still calls `kernel(*args)` with no subscript — verified end to end: the form traces through
+    `torch_neuronx.trace` on a `torch.nn.Module` wrapper and the compiler builds the 2-wide NEFF.
+    Judging the entry point by `FunctionDef` alone rejected it on every iteration, which would have
+    cost the run the 2x that splitting across the two physical cores is worth.
+    """
+    repo = _entry_repo(tmp_path, """
+        import nki
+        import nki.language as nl
+
+        @nki.jit
+        def _impl(x):
+            return x
+
+        kernel = _impl[2]
+    """)
+    result = submodule_checker.check_shape(repo, {"entry_point": "kernel"})
+    assert result.passed, result.findings
+
+
+def test_a_plain_def_entry_point_still_passes(tmp_path):
+    repo = _entry_repo(tmp_path, """
+        import nki
+
+        @nki.jit
+        def kernel(x):
+            return x
+    """)
+    assert submodule_checker.check_shape(repo, {"entry_point": "kernel"}).passed
+
+
+def test_an_annotated_grid_binding_is_also_a_definition(tmp_path):
+    repo = _entry_repo(tmp_path, """
+        import nki
+        from typing import Any
+
+        @nki.jit
+        def _impl(x):
+            return x
+
+        kernel: Any = _impl[2]
+    """)
+    assert submodule_checker.check_shape(repo, {"entry_point": "kernel"}).passed
+
+
+def test_an_entry_point_bound_nowhere_is_still_refused(tmp_path):
+    """The check still has to catch the thing it exists for."""
+    repo = _entry_repo(tmp_path, """
+        import nki
+
+        @nki.jit
+        def _impl(x):
+            return x
+    """)
+    result = submodule_checker.check_shape(repo, {"entry_point": "kernel"})
+    assert not result.passed
+    assert any("defines no top-level 'kernel'" in f for f in result.findings)
+
+
 def test_a_missing_declaration_blocks_the_next_stage(tmp_path):
     repo = tmp_path / "sub"
     repo.mkdir()
@@ -1002,3 +1078,145 @@ def test_a_count_computed_from_the_launch_is_allowed():
 def test_visible_cores_is_not_a_widening():
     tree = ast.parse("import os\nos.environ['NEURON_RT_VISIBLE_CORES'] = '2'\n")
     assert candidate.core_allocation_findings(tree, "inference.py", "1") == []
+
+
+def test_a_destructured_entry_point_counts_as_bound():
+    """`kernel, helper = _impl[2], value` makes `source.kernel` callable and runs in the validator.
+    Reading only `ast.Name` targets matched one spelling of binding, not Python's rules, so the
+    gate rejected a working candidate for having no entry point."""
+    tree = ast.parse("kernel, helper = _impl[2], 3\n")
+    assert "kernel" in candidate.top_level_names(tree)
+    assert "helper" in candidate.top_level_names(tree)
+
+
+def test_a_starred_destructured_binding_counts_too():
+    tree = ast.parse("first, *rest = things\n")
+    assert {"first", "rest"} <= candidate.top_level_names(tree)
+
+
+def test_an_attribute_target_binds_no_new_name():
+    tree = ast.parse("obj.kernel = _impl[2]\n")
+    assert "kernel" not in candidate.top_level_names(tree)
+
+
+def test_both_gates_accept_a_grid_bound_entry_point(tmp_path):
+    """`kernel = _impl[CORES]` is how a kernel reaches both physical cores of an LNC=2 pair while
+    the frozen validator still calls `kernel(*args)`. A launch grid cannot be a `FunctionDef`, so
+    requiring one rejected the only shape that works — and the module gate still required it after
+    the submodule gate stopped, which cost a four-rank assembly that passed its other eight
+    checks."""
+    source = "import nki\n@nki.jit\ndef _impl(x):\n    return x\nCORES = 2\nkernel = _impl[CORES]\n"
+    tree = ast.parse(source)
+
+    assert "kernel" in candidate.top_level_names(tree)
+    assert "kernel" not in candidate.top_level_functions(tree), (
+        "the point of the test is that a `def` check cannot see it"
+    )
+
+
+def test_re_pinning_reaches_every_spelling_the_gate_accepts():
+    """The bar is re-pinned by rewriting the validator, so the rewrite has to match the gate.
+
+    A line-anchored regex matched only `NAME = 1.0`; the gate accepts any module-level numeric
+    literal. A validator written with no spaces, extra spaces or a trailing comment therefore kept
+    its loose bar while the manifest recorded the tight one.
+    """
+    text = textwrap.dedent('''
+        """A validator."""
+        RTOL=0.1
+        ATOL  =  0.1
+        MIN_COSINE = 0.99  # what the cut reached
+        MIN_PASS_FRACTION = 0.9
+        MAX_ABS_ERR = 2.65
+    ''')
+    want = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999432399999999,
+            "MIN_PASS_FRACTION": 0.999766, "MAX_ABS_ERR": 0.20625}
+
+    rewritten, unreachable = candidate.rewrite_pinned_constants(text, want)
+
+    assert unreachable == []
+    assert candidate.pinned_constants(ast.parse(rewritten), want, "inference.py") == []
+    assert "# what the cut reached" in rewritten, "a trailing comment was eaten"
+
+
+def test_re_pinning_reports_a_constant_it_cannot_reach():
+    """A computed constant is already absent from the gate's view; the rewrite must agree."""
+    text = "RTOL = 0.1\nMAX_ABS_ERR = 2.65 * 1.0\n"
+
+    rewritten, unreachable = candidate.rewrite_pinned_constants(
+        text, {"RTOL": 0.1, "MAX_ABS_ERR": 0.2})
+
+    assert unreachable == ["MAX_ABS_ERR"]
+    assert rewritten == text, "a partial rewrite leaves the bar stated two ways"
+
+
+def test_re_pinning_writes_full_precision():
+    """The validator, the manifest and the README have to state one value, not three roundings."""
+    rewritten, _ = candidate.rewrite_pinned_constants(
+        "MIN_COSINE = 0.99\n", {"MIN_COSINE": 0.9999432399999999})
+
+    assert rewritten == "MIN_COSINE = 0.9999432399999999\n"
+
+
+def test_a_defect_in_one_check_does_not_kill_the_gate():
+    """Both `evaluate`s answer their checks as one list, and `main` catches only `CheckerError`.
+
+    So any other exception escaped as a traceback, the harness recorded `constraint failed`, and
+    the iteration was rejected with nothing said about the candidate.
+    """
+    def boom():
+        raise ZeroDivisionError("float division by zero")
+
+    result = candidate.guarded("h", "faster than the bootstrap", boom)
+
+    assert result.key == "h"
+    assert not result.passed, "a gate that cannot evaluate must not admit a kernel"
+    assert result.summary == candidate.GATE_DEFECT
+    assert "not a verdict on the candidate" in result.findings[0]
+    assert "ZeroDivisionError" in result.findings[1]
+
+
+def test_the_repo_is_unusable_path_still_propagates():
+    """`CheckerError` is the deliberate signal that there is nothing to judge; `main` reports it."""
+    def unusable():
+        raise candidate.CheckerError("source.py is missing")
+
+    with pytest.raises(candidate.CheckerError):
+        candidate.guarded("a", "shape", unusable)
+
+
+@pytest.mark.parametrize("reported", [0.0, -1.5])
+def test_a_non_positive_latency_fails_both_latency_checks(reported):
+    """0 raised ZeroDivisionError and killed the gate; negative passed as "-1.5 ms vs 10 ms"."""
+    from optimization import module_checker as mc
+
+    run = candidate.RunOutcome(ran=True, return_code=0,
+                               output=f"##autohelix[latency_ms={reported}]")
+    manifest = {"baselines": {"bootstrap_latency_ms": 10.0, "submodule_latency_ms": 1.0}}
+
+    for check in (mc.check_faster, mc.check_overhead):
+        result = check(run, manifest)
+        assert not result.passed, check.__name__
+        assert "not a measurement" in result.summary
+
+
+def test_the_collective_allowlist_matches_the_installed_api():
+    """Check (c) is satisfied by any `nki.collectives` call in `COLLECTIVE_OPS`, so a collective
+    the module exposes but this tuple omits reads as "calls no collective at all".
+
+    Four were omitted -- `all_gather_v`, `all_to_all_v`, `collective_permute_implicit` and
+    `collective_permute_implicit_reduce` -- which would have failed an assembly that rejoined with
+    any of them. No particular collective is required; `all_reduce` is one option among nine.
+    """
+    ncc = pytest.importorskip("nki.collectives")
+
+    exposed = {n for n in dir(ncc) if not n.startswith("_")}
+    accounted = set(module_checker.COLLECTIVE_OPS) | module_checker.COLLECTIVE_NON_OPS
+
+    assert exposed - accounted == set(), (
+        f"nki.collectives exposes {sorted(exposed - accounted)}, which check (c) would neither "
+        f"accept as a rejoin nor knowingly ignore"
+    )
+    assert set(module_checker.COLLECTIVE_OPS) - exposed == set(), "the allowlist names a dead API"
+    assert "all_reduce" in module_checker.COLLECTIVE_OPS
+    assert "all_gather_v" in module_checker.COLLECTIVE_OPS

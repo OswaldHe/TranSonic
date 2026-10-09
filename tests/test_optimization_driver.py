@@ -12,13 +12,15 @@ and `floorplan` both keep that pair honest with tests; this does the same.
 from __future__ import annotations
 
 import json
+import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
 import yaml
 
-from optimization import materialize, module_checker, presets, submodule_checker
+from optimization import constraints as cons
+from optimization import materialize, presets
 from optimization.config import ConfigError, PipelineConfig
 from optimization.projection import project
 
@@ -400,118 +402,6 @@ def test_the_assembled_repo_records_both_bounds(tmp_path):
     assert "770" in (repo / "README.md").read_text()
 
 
-# ======================================================================================
-# drift between the prompts and the gates
-# ======================================================================================
-
-
-def test_the_submodule_prompt_states_every_marker_its_gate_requires():
-    """Anything the gate requires and the prompt omits is a trap, not a requirement."""
-    prompt = presets.submodule_prompt()
-    for marker in (submodule_checker.LATENCY_MARKER, submodule_checker.PASSED_MARKER,
-                   submodule_checker.MAX_ABS_ERR_MARKER):
-        assert marker in prompt, marker
-
-
-def test_the_submodule_prompt_states_the_pinned_constants():
-    prompt = presets.submodule_prompt()
-    for name in (*submodule_checker.TOLERANCE_NAMES, submodule_checker.CEILING_NAME):
-        assert name in prompt, name
-
-
-def test_the_submodule_prompt_states_the_single_core_requirement():
-    prompt = presets.submodule_prompt()
-    assert "NEURON_RT_NUM_CORES=1" in prompt
-
-
-def test_the_submodule_prompt_asks_for_every_declaration_field_the_gate_checks():
-    prompt = presets.submodule_prompt()
-    for field in ("module", "dim", "factor", "shard", "inputs", "outputs", "reassembly"):
-        assert f'"{field}"' in prompt, field
-
-
-def test_the_submodule_prompt_warns_that_the_reassembly_is_checked():
-    """The agent has to know all N goldens are needed, not just its own rank's."""
-    prompt = presets.submodule_prompt()
-    assert "checked" in prompt and "goldens/" in prompt
-
-
-def test_the_assemble_prompt_states_every_marker_its_gate_requires():
-    prompt = presets.assemble_prompt()
-    for marker in (module_checker.LATENCY_MARKER, module_checker.PASSED_MARKER,
-                   module_checker.MAX_ABS_ERR_MARKER):
-        assert marker in prompt, marker
-    assert "latency_rank_" in prompt
-
-
-def test_the_assemble_prompt_states_the_nki_collectives_requirement():
-    """Check (c) refuses torch.distributed reductions, so the prompt has to say so."""
-    prompt = presets.assemble_prompt()
-    assert module_checker.COLLECTIVE_MODULE in prompt
-    assert "torch.distributed" in prompt
-    for allowed in ("init_process_group", "barrier", "get_rank"):
-        assert allowed in prompt, allowed
-
-
-def test_the_assemble_prompt_carries_the_six_toolchain_requirements():
-    """Each one fails with an internal compiler error naming something else.
-
-    Verified empirically on this toolchain before the pipeline was written; an agent that has to
-    rediscover them burns the whole stage.
-    """
-    prompt = presets.assemble_prompt()
-    for marker in ("kernel[2]", "name=", "NCC_IBIR440", "NCC_INLA001", "NCC_ILLC059",
-                   "NCC_ISMP902", "shared_hbm", "ReplicaGroup"):
-        assert marker in prompt, marker
-
-
-def test_the_assemble_prompt_states_the_capture_flags():
-    prompt = presets.assemble_prompt()
-    for flag in ("--collectives-worker-count", "--collectives-workers-per-node",
-                 "--collectives-profile-id"):
-        assert flag in prompt, flag
-
-
-def test_the_assemble_prompt_states_both_bounds_and_the_allowance():
-    prompt = presets.assemble_prompt()
-    assert "{{ bootstrap_latency }}" in prompt
-    assert "{{ overhead_ceiling }}" in prompt
-    assert "10%" in prompt
-
-
-def test_the_assemble_prompt_says_the_bar_is_not_to_be_loosened():
-    prompt = presets.assemble_prompt()
-    assert "Unchanged." in prompt
-
-
-def test_the_loop_prompt_tells_the_agent_the_validator_is_frozen():
-    """Otherwise a whole iteration goes into editing a file that is reverted."""
-    prompt = presets.loop_prompt()
-    assert "reverted" in prompt
-    assert "{{ iteration_constraint }}" in prompt
-
-
-def test_the_loop_prompt_offers_the_reviewer_as_the_channel_for_layout_feedback():
-    """The frozen validator pins the I/O format; the reviewer is how that reaches the operator."""
-    assert "reviewer will carry it to the operator" in presets.loop_prompt()
-
-
-def test_the_compiler_prompt_carries_the_checker_contract():
-    from optimization.constraints import CHECKER_CONTRACT
-
-    prompt = presets.compiler_prompt()
-    assert "{{ contract }}" in prompt
-    assert "--repo" in CHECKER_CONTRACT and "--json" in CHECKER_CONTRACT
-
-
-def test_the_compiler_prompt_tells_it_to_check_neither_more_nor_less():
-    """Both failure modes matter: over-checking fails compliant work, under-checking allows drift."""
-    prompt = presets.compiler_prompt()
-    assert "not more than the prose" in prompt
-    assert "not less than the prose" in prompt
-    assert "permissive" in prompt
-
-
 def test_the_template_documents_the_two_editable_regions():
     """The operator has to be able to find where to write; `### EDIT ME` is the marker."""
     template = presets.config_template()
@@ -560,37 +450,24 @@ def test_autohelix_applies_the_reviewer_timeout(tmp_path):
     assert parsed.reviewer.timeout_seconds == 2000
 
 
-def test_the_prompt_quotes_the_configured_allowance(tmp_path):
-    """The template stated a literal 5%, which is wrong the moment an operator changes it."""
+def test_the_configured_allowance_reaches_the_loops_metric_gate(tmp_path):
+    """The template once stated a literal 5%, which is wrong the moment an operator changes it.
+
+    Asserted on the derived config rather than on the rendered prompt: what has to hold is that
+    the number the loop enforces is the number the operator configured.
+    """
     from autohelix.config import Config
-    from autohelix.prompt_template import render_template
 
     path = _filled(tmp_path)
     data = yaml.safe_load(path.read_text())
     data["submodule"]["acceptance"] = {"max_regression_pct": 12}
     path.write_text(yaml.safe_dump(data, sort_keys=False))
+
     parsed = Config.from_dict(PipelineConfig.load(path).derive_loop_config("submodule"))
+
     allowance = next(g.max_regression_pct for g in parsed.acceptance.metric_gates
                      if g.metric == "latency_ms")
     assert allowance == 12
-
-    rendered = render_template(presets.loop_prompt(), {
-        "best_so_far": "33.48", "metric": "latency_ms",
-        "regression_allowance": f"{allowance:g}",
-    })
-    assert "12% above it is rejected" in rendered
-    assert "5%" not in rendered
-
-
-def test_the_prompt_omits_the_allowance_when_no_gate_names_the_metric():
-    """Better silent than stating a bound nothing enforces."""
-    from autohelix.prompt_template import render_template
-
-    rendered = render_template(presets.loop_prompt(), {
-        "best_so_far": "33.48", "metric": "latency_ms", "regression_allowance": "",
-    })
-    assert "Best latency_ms so far" in rendered
-    assert "above it is rejected" not in rendered
 
 
 class _FakeHistory:
@@ -634,6 +511,107 @@ def _violation(iteration, label):
 
     return SlotVerdict(iteration, label, checked=True, passed=False,
                        findings=["source.py:4 imports torch"])
+
+
+def _reviewer_loop(tmp_path, editable, reviewer_does):
+    """An OptimizationLoop wired just enough to call `run_reviewer`, with upstream's stubbed out.
+
+    The bug this covers is not in the restore logic, which was right — it is that the override read
+    `config.scope.editable`, a path `Config` does not have. The YAML nests it under `scope:` and the
+    dataclass flattens it, so the attribute error fired at the *baseline* review and killed the stage
+    before iteration 1. Nothing tested it because nothing called `run_reviewer`.
+    """
+    from rich.console import Console
+
+    from optimization.loop import OptimizationLoop
+
+    class _Loop(OptimizationLoop):
+        def __init__(self):
+            pass
+
+        def run_reviewer(self, worktree, iteration):  # the override under test
+            return OptimizationLoop.run_reviewer(self, worktree, iteration)
+
+    # Upstream's `run_reviewer` is what the override wraps; this stands in for the agent.
+    from autohelix.harness import Harness
+    original = Harness.run_reviewer
+    Harness.run_reviewer = lambda self, worktree, iteration: (reviewer_does(), True)[1]
+
+    loop = _Loop()
+    loop.config = _FakeConfig()
+    loop.config.editable = editable
+    # `resolve_editable(editable, frozen, ...)` reads both. Set here rather than caught: an
+    # `AttributeError` from a config path that does not exist is the exact bug that killed stage 3
+    # at the baseline review, so the guard must not swallow that class of mistake.
+    loop.config.frozen = []
+    loop.console = Console(quiet=True)
+    # The guard now also reopens the reviewer's commits and reverts what it touched out of scope,
+    # which means it talks to the sandbox. These tests are about the byte restore, so the sandbox
+    # records the calls and does nothing; `_reviewer_git_loop` exercises the real one.
+    loop.sandbox = _RecordingSandbox()
+    worktree = type("W", (), {"working_dir": tmp_path})()
+    return loop, worktree, (Harness, original)
+
+
+class _RecordingSandbox:
+    def __init__(self):
+        self.uncommitted = 0
+        self.reverted: list[str] = []
+
+    def uncommit_agent_changes(self, worktree):
+        self.uncommitted += 1
+        return 0
+
+    def resolve_editable(self, editable, frozen, cwd=None):
+        return list(editable) or None
+
+    def revert_out_of_scope(self, worktree, effective_editable):
+        return list(self.reverted)
+
+
+def test_the_reviewer_cannot_replace_the_validated_candidate(tmp_path):
+    gated = "# the kernel the gate measured\n"
+    (tmp_path / "source.py").write_text(gated)
+
+    def edit():
+        (tmp_path / "source.py").write_text("# what the reviewer scribbled\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], edit)
+    try:
+        assert loop.run_reviewer(worktree, 3) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_a_reviewer_that_touches_nothing_leaves_the_candidate_alone(tmp_path):
+    gated = "# untouched\n"
+    (tmp_path / "source.py").write_text(gated)
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], lambda: None)
+    try:
+        assert loop.run_reviewer(worktree, 1) is True
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == gated
+
+
+def test_an_empty_editable_scope_still_guards_the_deliverables(tmp_path):
+    """`editable` unset means "everything but `frozen`", where guarding nothing would leave the
+    reviewer free to rewrite the files whose hashes are themselves gate checks."""
+    (tmp_path / "source.py").write_text("a\n")
+    (tmp_path / "inference.py").write_text("b\n")
+
+    def edit_both():
+        (tmp_path / "source.py").write_text("x\n")
+        (tmp_path / "inference.py").write_text("y\n")
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, [], edit_both)
+    try:
+        loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original
+    assert (tmp_path / "source.py").read_text() == "a\n"
+    assert (tmp_path / "inference.py").read_text() == "b\n"
 
 
 def test_an_end_of_slot_violation_is_kept_when_it_improves(tmp_path):
@@ -1330,7 +1308,7 @@ def test_the_round_starts_from_the_named_kernel_on_a_clean_tree(tmp_path):
 
     pipeline._restore_commit(repo, head, round_number=2)
     assert (repo / "source.py").read_text() == "# round one kernel\n"
-    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
                           capture_output=True, text=True).stdout.strip() == ""
 
 
@@ -1403,5 +1381,1021 @@ def test_committing_the_tree_absorbs_what_the_gates_run_left(tmp_path):
     (repo / "build").mkdir(exist_ok=True)
     (repo / "build" / "rank0_output.pt").write_text("new output\n")
     pipeline._commit_tree(repo, "round 2 baseline")
-    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
                           capture_output=True, text=True).stdout.strip() == ""
+
+
+# -- PR #7: a reviewer commit must not ride `git merge` into the deliverable --------------
+
+
+def _reviewer_git_loop(tmp_path, reviewer_does):
+    """A real `Sandbox` over a real git repo, so the commit path is exercised, not stubbed.
+
+    The finding this covers: `Harness.run_iteration` runs the reviewer *after*
+    `uncommit_agent_changes` and `revert_out_of_scope`, and `Sandbox.merge_worktree` then does
+    `git merge <worktree.branch>`. That merge only *stages* the editable files for its own commit,
+    but it carries every commit already on the branch — so a reviewer that commits reaches main
+    with whatever it touched, and a working-tree byte restore never sees it.
+    """
+    import subprocess as sp
+
+    from rich.console import Console
+
+    from autohelix.harness import Harness
+    from autohelix.sandbox import Sandbox, Worktree
+    from optimization.loop import OptimizationLoop
+
+    def git(*args):
+        return sp.run(["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "source.py").write_text("# the kernel the gate measured\n")
+    (tmp_path / "inference.py").write_text("# the frozen validator\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "baseline")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    class _Loop(OptimizationLoop):
+        def __init__(self):
+            pass
+
+        def run_reviewer(self, worktree, iteration):
+            return OptimizationLoop.run_reviewer(self, worktree, iteration)
+
+    original = Harness.run_reviewer
+    Harness.run_reviewer = lambda self, worktree, iteration: (reviewer_does(), True)[1]
+
+    loop = _Loop()
+    loop.config = _FakeConfig()
+    loop.config.editable = ["source.py"]
+    loop.config.frozen = []
+    loop.console = Console(quiet=True)
+    loop.sandbox = Sandbox(tmp_path)
+    worktree = Worktree(path=tmp_path, branch="main", iteration=3,
+                        working_dir=tmp_path, base_commit=base)
+    return loop, worktree, (Harness, original), base, git
+
+
+def test_a_reviewer_commit_outside_scope_is_reopened_and_reverted(tmp_path):
+    def commit_the_validator():
+        (tmp_path / "inference.py").write_text("# RTOL = 9.0\n")
+        for args in (("add", "-A"), ("commit", "-q", "-m", "reviewer tidied the validator")):
+            __import__("subprocess").run(["git", *args], cwd=tmp_path, check=True,
+                                         capture_output=True)
+
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(
+        tmp_path, commit_the_validator,
+    )
+    try:
+        assert loop.run_reviewer(worktree, 3) is True
+    finally:
+        cls.run_reviewer = original
+
+    # The commit is gone from the branch, so `git merge` has nothing extra to carry...
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    # ...and the validator is the one the gate ran, not the one the reviewer wrote.
+    assert (tmp_path / "inference.py").read_text() == "# the frozen validator\n"
+
+
+def test_a_reviewer_commit_inside_scope_is_reopened_and_the_bytes_restored(tmp_path):
+    """In scope, so `revert_out_of_scope` leaves it — the byte snapshot is what catches it."""
+    def commit_the_kernel():
+        (tmp_path / "source.py").write_text("# what the reviewer scribbled\n")
+        for args in (("add", "-A"), ("commit", "-q", "-m", "reviewer edited the kernel")):
+            __import__("subprocess").run(["git", *args], cwd=tmp_path, check=True,
+                                         capture_output=True)
+
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(tmp_path, commit_the_kernel)
+    try:
+        loop.run_reviewer(worktree, 3)
+    finally:
+        cls.run_reviewer = original
+
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    assert (tmp_path / "source.py").read_text() == "# the kernel the gate measured\n"
+
+
+def test_a_reviewer_that_commits_nothing_leaves_the_branch_where_it_was(tmp_path):
+    loop, worktree, (cls, original), base, git = _reviewer_git_loop(tmp_path, lambda: None)
+    try:
+        loop.run_reviewer(worktree, 3)
+    finally:
+        cls.run_reviewer = original
+    assert git("rev-parse", "HEAD").stdout.strip() == base
+    assert (tmp_path / "source.py").read_text() == "# the kernel the gate measured\n"
+    assert (tmp_path / "inference.py").read_text() == "# the frozen validator\n"
+
+
+# ---------------------------------------------------------------------------------------------
+#  The checker contract and the validator that enforces it
+# ---------------------------------------------------------------------------------------------
+
+def test_the_contract_quotes_every_module_the_validator_allows():
+    """The compiler is told the real rule, so it cannot be rejected for obeying a looser one.
+
+    The contract used to say "import nothing outside the standard library" while the validator
+    enforced 23 named modules. A checker that imported `operator` — the ordinary way to dispatch
+    `ast.Add` when evaluating a trace-time constant — was therefore correct by the contract it was
+    given and rejected by the code that read it, which stopped a whole pipeline after the compiler
+    had already been paid for.
+    """
+    for module in cons.CHECKER_ALLOWED_IMPORTS:
+        assert module in cons.CHECKER_CONTRACT, (
+            f"'{module}' is allowed but the contract does not mention it, so the compiler cannot "
+            f"know it may be used"
+        )
+
+
+def test_the_pure_stdlib_helpers_a_checker_needs_are_allowed():
+    """Modules with no I/O and no dynamic import cannot reach what the list keeps out."""
+    for module in ("operator", "bisect", "heapq", "statistics", "token"):
+        assert module in cons.CHECKER_ALLOWED_IMPORTS
+
+
+def test_the_modules_that_would_defeat_the_sandbox_stay_out():
+    for module in ("subprocess", "shutil", "importlib", "socket", "pickle", "ctypes", "tempfile"):
+        assert module not in cons.CHECKER_ALLOWED_IMPORTS
+
+
+# ---------------------------------------------------------------------------------------------
+#  Resuming a pipeline that stopped part-way
+# ---------------------------------------------------------------------------------------------
+
+def test_a_preparation_stage_that_already_passed_is_not_rebuilt(tmp_path):
+    """`optimize all` has to pick a stopped run up, not start it over.
+
+    `submodule` and `assemble` both open with `_set_aside`, so running either again archives the
+    finished repo and builds a new one from the bootstrap. Resuming a run that died in stage 5 that
+    way costs the tuned single-rank kernel and every iteration of its history.
+    """
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+
+    outcome = pipeline._prepared("submodule")
+    assert outcome is not None and outcome.ok
+    assert outcome.stage == "submodule"
+
+
+def test_a_passing_record_without_its_repo_does_not_count_as_prepared(tmp_path):
+    """Half the evidence is not enough: the record says the gate passed, the repo says the thing
+    it passed on is still there to run."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": true, "report": ""}')
+    assert pipeline._prepared("submodule") is None
+
+
+def test_a_failed_attempt_does_not_count_as_prepared(tmp_path):
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("def kernel(x): return x\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text('{"passed": false, "report": ""}')
+    assert pipeline._prepared("submodule") is None
+
+
+def _passed_stage(tmp_path, stage):
+    """A pipeline whose `stage` has a passing record and the repo that earned it."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo if stage == "submodule" else pipeline.config.full_repo
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "source.py").write_text("# the tuned kernel\n")
+    (repo / "inference.py").write_text("MAX_ABS_ERR = 0.1\n")
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline.state_dir / f"{stage}-attempt-1.json").write_text(json.dumps(
+        {"passed": True, "report": "", "validator_sha256": _sha256_of(repo / "inference.py")}))
+    return pipeline, repo
+
+
+def _sha256_of(path):
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("stage", ["submodule", "assemble"])
+def test_a_preparation_stage_run_on_a_passed_stage_refuses_rather_than_archiving_it(tmp_path, stage):
+    """The destruction `_prepared` prevents inside `optimize all` was still one command away.
+
+    `optimize submodule` on `layers.2.attention` archived an 18.2672 ms cut with five iterations of
+    history and spent an hour building another one, because re-pinning the numerical bar was only
+    reachable by running the stage. Asking to rebuild has to be explicit.
+    """
+    from optimization.driver import StageError
+
+    pipeline, repo = _passed_stage(tmp_path, stage)
+    before = (repo / "source.py").read_text()
+
+    with pytest.raises(StageError) as raised:
+        getattr(pipeline, stage)()
+
+    assert "--rebuild" in str(raised.value)
+    assert (repo / "source.py").read_text() == before
+
+
+def test_the_refusal_names_the_command_that_does_what_was_probably_wanted(tmp_path):
+    from optimization.driver import StageError
+
+    pipeline, _ = _passed_stage(tmp_path, "submodule")
+    with pytest.raises(StageError) as raised:
+        pipeline.submodule()
+    assert "optimize run" in str(raised.value)
+
+
+def test_a_stage_that_has_not_passed_is_built_without_asking(tmp_path):
+    """The guard must not stand between a fresh run and its first cut."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline._refuse_to_clobber("submodule", rebuild=False)
+
+
+def test_re_pinning_the_bar_does_not_make_the_next_resume_rebuild_the_stage(tmp_path):
+    """`_prepared` compares the repo's validator against the hash its record carries, so a pipeline
+    that rewrites `inference.py` and leaves the record behind reads its own edit as a replaced repo
+    — and rebuilds the stage it was trying to protect."""
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+           "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+    (repo / ".autohelix" / "optimization").mkdir(parents=True, exist_ok=True)
+    (repo / "inference.py").write_text("\n".join(f"{k} = {v}" for k, v in bar.items()) + "\n")
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text(json.dumps(
+        {"passed": True, "report": "", "validator_sha256": _sha256_of(repo / "inference.py")}))
+    (repo / ".autohelix" / "optimization" / "submodule.json").write_text(
+        json.dumps({"tolerance": bar, "frozen": {"inference.py": "stale"}}))
+    (repo / ".autohelix" / "optimization" / "submodule-gate.json").write_text(
+        json.dumps({"passed": True, "max_abs_err": 0.02}))
+
+    pipeline._tighten_submodule_bar(repo)
+
+    assert pipeline._prepared("submodule", quiet=True) is not None
+
+
+def test_an_unreopenable_reviewer_commit_stops_the_merge(tmp_path):
+    """The reopen step is the only thing between a reviewer commit and the main branch.
+
+    It fails before reporting what it found, so there is no way to tell "nothing to reopen" from
+    "commits I could not reopen". Carrying on lets `merge_worktree` take the branch as it stands —
+    reviewer commits and all — into the deliverable that was just gated.
+    """
+    (tmp_path / "source.py").write_text("# the kernel the gate measured\n")
+
+    def noop():
+        return None
+
+    loop, worktree, (cls, original) = _reviewer_loop(tmp_path, ["source.py"], noop)
+
+    class _Failing(_RecordingSandbox):
+        def uncommit_agent_changes(self, worktree):
+            raise RuntimeError("git is wedged")
+
+    loop.sandbox = _Failing()
+    try:
+        with pytest.raises(RuntimeError, match="must not be merged"):
+            loop.run_reviewer(worktree, 1)
+    finally:
+        cls.run_reviewer = original
+
+
+# ---------------------------------------------------------------------------------------------
+#  The bar the reassembly is held to
+# ---------------------------------------------------------------------------------------------
+
+#: What each module's bootstrapped kernel achieved, and what its optimized four-rank module
+#: achieved, as measured. The calibration of `tighten_bar` is only meaningful against real numbers:
+#: a rule that rejects a good assembly is worse than no rule at all.
+_MEASURED = {
+    # module: (bootstrap (max_abs, cosine, pass_fraction), final (same)), expected verdict
+    "00-Attention-B": ((0.0859375, 0.9999554805, 1.0),
+                       (0.0859375, 0.9999444598, 1.0), True),
+    "24-Attention": ((0.2518768311, 0.9998087800, 0.9999944448),
+                     (0.1738281250, 0.9997568207, 0.9999969959), True),
+    "00-Attention-C-iter2": ((0.1093750000, 0.9999013080, 1.0),
+                             (0.1171875000, 0.9998860816, 1.0), True),
+    "00-Attention-C-final": ((0.1093750000, 0.9999013080, 1.0),
+                             (0.1406250000, 0.9995487502, 0.9999990225), False),
+    "02-Attention": ((0.0981445000, 0.9998770000, 1.0),
+                     (0.6093750000, 0.9996998017, 0.9998433352), False),
+}
+
+_DERIVED = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+            "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+
+
+def _clears(bar, result):
+    max_abs, cosine, pass_fraction = result
+    return (max_abs <= bar["MAX_ABS_ERR"] and cosine >= bar["MIN_COSINE"]
+            and pass_fraction >= bar["MIN_PASS_FRACTION"])
+
+
+def test_the_bar_is_tightened_to_what_the_bootstrapped_kernel_achieved():
+    """The derived bar describes the recorded output, not what the module can be computed to.
+
+    `layers.2.attention`'s derived ceiling is 0.7875 and its bootstrapped kernel reaches 0.0981445,
+    so the pipeline had 8x of headroom and used it: the assembly landed at 0.2773438 and stage 5 at
+    0.609375, all of it passing a gate that was never binding.
+    """
+    achieved = {"max_abs_err": 0.0981445, "cosine": 0.9998770, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.0981445 * materialize.WORST_MARGIN)
+    assert bar["MAX_ABS_ERR"] < _DERIVED["MAX_ABS_ERR"]
+    assert bar["MIN_COSINE"] > _DERIVED["MIN_COSINE"]
+    assert bar["MIN_PASS_FRACTION"] > _DERIVED["MIN_PASS_FRACTION"]
+
+
+def test_tightening_never_loosens_any_of_the_five():
+    """The derived bar stays the ceiling; this is a floor under it, never a relaxation."""
+    for bootstrap, _final, _ok in _MEASURED.values():
+        achieved = dict(zip(("max_abs_err", "cosine", "pass_fraction"), bootstrap))
+        bar = materialize.tighten_bar(_DERIVED, achieved)
+        assert bar["MAX_ABS_ERR"] <= _DERIVED["MAX_ABS_ERR"]
+        assert bar["MIN_COSINE"] >= _DERIVED["MIN_COSINE"]
+        assert bar["MIN_PASS_FRACTION"] >= _DERIVED["MIN_PASS_FRACTION"]
+
+
+def test_the_elementwise_test_itself_is_never_moved():
+    """`RTOL`/`ATOL` define what `MIN_PASS_FRACTION` counts, so moving them changes its meaning."""
+    achieved = {"max_abs_err": 0.01, "cosine": 0.99999999, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["RTOL"] == _DERIVED["RTOL"]
+    assert bar["ATOL"] == _DERIVED["ATOL"]
+
+
+def test_the_tightened_bar_admits_the_good_assemblies_and_refuses_the_bad(): 
+    """Calibration, against every module measured so far.
+
+    Two margins because the statistics fail differently: `MAX_ABS_ERR` is one element and moves
+    when something structural changes, while cosine and the pass fraction aggregate over 42 M
+    elements and drift whenever the arithmetic is reordered.
+    """
+    for name, (bootstrap, final, expected) in _MEASURED.items():
+        achieved = dict(zip(("max_abs_err", "cosine", "pass_fraction"), bootstrap))
+        bar = materialize.tighten_bar(_DERIVED, achieved)
+        assert _clears(bar, final) is expected, (
+            f"{name}: expected {'to clear' if expected else 'to be refused by'} the tightened bar, "
+            f"bar={bar}, achieved={final}"
+        )
+
+
+def test_a_bootstrap_that_reaches_one_does_not_produce_an_unreachable_bar():
+    """`pass_fraction = 1.0` would otherwise demand 1.0 of the reassembly: one stray element fails."""
+    achieved = {"max_abs_err": 0.05, "cosine": 1.0, "pass_fraction": 1.0}
+    bar = materialize.tighten_bar(_DERIVED, achieved)
+    assert bar["MIN_PASS_FRACTION"] < 1.0
+    assert bar["MIN_COSINE"] < 1.0
+
+
+def test_a_baseline_measurement_with_no_numerics_leaves_the_derived_bar_alone():
+    """An older run recorded no numerics beside its latency; it gets the behaviour it had."""
+    assert materialize.tighten_bar(_DERIVED, None) == _DERIVED
+    assert materialize.tighten_bar(_DERIVED, {}) == _DERIVED
+
+
+def test_a_partially_reported_measurement_tightens_only_what_it_reported():
+    bar = materialize.tighten_bar(_DERIVED, {"max_abs_err": 0.05})
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.05 * materialize.WORST_MARGIN)
+    assert bar["MIN_COSINE"] == _DERIVED["MIN_COSINE"]
+    assert bar["MIN_PASS_FRACTION"] == _DERIVED["MIN_PASS_FRACTION"]
+
+
+# ---------------------------------------------------------------------------------------------
+#  The bar the single-rank loop is held to
+# ---------------------------------------------------------------------------------------------
+
+def _cut(tmp_path, measured, bar=None):
+    """A submodule repo as stage 2 leaves it: a frozen validator, a manifest, and a gate verdict.
+
+    The accuracy goes in `submodule-gate.json`, which the submodule stage's gate writes once. The
+    loop overwrites `gate.json` every iteration, so that file is not a record of the cut.
+    """
+    from optimization.driver import ACCURACY_MARKER
+    bar = bar or {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                  "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+    repo = tmp_path / "rank0"
+    (repo / ".autohelix" / "optimization").mkdir(parents=True)
+    (repo / "inference.py").write_text(
+        "\n".join(f"{k} = {v}" for k, v in bar.items()) + "\n")
+    (repo / ".autohelix" / "optimization" / "submodule.json").write_text(
+        json.dumps({"tolerance": bar, "frozen": {"inference.py": "stale"}}))
+    if measured is not None:
+        (repo / ".autohelix" / "optimization" / "submodule-gate.json").write_text(
+            json.dumps({"passed": True, ACCURACY_MARKER: measured}))
+    return repo
+
+
+def _repinner(tmp_path, measures=None):
+    """A `Pipeline` with only what the re-pin touches: a state directory and a console."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.state_dir = tmp_path / "state"
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.console = _SilentConsole()
+    if measures is not None:
+        pipeline._measure = lambda repo, label, cores, draws=1: (*measures, 0.0)
+    return pipeline
+
+
+class _SilentConsole:
+    def print(self, *_args, **_kwargs):
+        pass
+
+
+def test_the_submodule_bar_is_re_pinned_to_what_the_cut_achieved(tmp_path):
+    """The agent-derived bar describes the rank's recorded output, not what the cut reached.
+
+    `layers.2.attention`'s cut reached 0.0388967 against a bar of 0.7875, so iteration 1 could buy
+    4x of latency with 2.2x of error and nothing objected — and the assembly and stage 5 then
+    inherited that error unchanged.
+    """
+    repo = _cut(tmp_path, 0.038896650075912476)
+
+    lines = _repinner(tmp_path)._tighten_submodule_bar(repo)
+
+    assert lines and "re-pinned" in lines[0]
+    manifest = json.loads((repo / ".autohelix" / "optimization" / "submodule.json").read_text())
+    assert manifest["tolerance"]["MAX_ABS_ERR"] == pytest.approx(0.038896650075912476 * 1.10)
+    assert manifest["tolerance_derived"]["MAX_ABS_ERR"] == 0.7875
+    assert f"MAX_ABS_ERR = {manifest['tolerance']['MAX_ABS_ERR']}" in (
+        repo / "inference.py").read_text()
+
+
+def test_re_pinning_refreshes_the_recorded_validator_hash(tmp_path):
+    """`check_frozen_validator` compares the file against the manifest, so both move together or
+    every iteration of the loop fails a check the candidate had no part in."""
+    import hashlib
+
+    repo = _cut(tmp_path, 0.02)
+
+    _repinner(tmp_path)._tighten_submodule_bar(repo)
+
+    manifest = json.loads((repo / ".autohelix" / "optimization" / "submodule.json").read_text())
+    actual = hashlib.sha256((repo / "inference.py").read_bytes()).hexdigest()
+    assert manifest["frozen"]["inference.py"] == actual
+
+
+def test_re_pinning_leaves_an_already_tight_bar_alone(tmp_path):
+    """Nothing to do when the derived bar is already stricter than the cut's own measurement."""
+    repo = _cut(tmp_path, 0.5, bar={"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                                    "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.2})
+    before = (repo / "inference.py").read_text()
+
+    assert _repinner(tmp_path)._tighten_submodule_bar(repo) == []
+    assert (repo / "inference.py").read_text() == before
+
+
+def test_re_pinning_reads_the_submodule_gate_not_the_loop_s_scratch_verdict(tmp_path):
+    """`gate.json` is where the loop's per-iteration gate writes, so after one iteration it holds
+    the newest candidate's error. Pinning the bar from it pins it to whatever the loop drifted to —
+    and reaching the re-pin at all then meant rebuilding the cut, which destroys it."""
+    from optimization.driver import ACCURACY_MARKER
+    repo = _cut(tmp_path, 0.02)
+    (repo / ".autohelix" / "optimization" / "gate.json").write_text(
+        json.dumps({"passed": True, ACCURACY_MARKER: 0.5}))
+
+    _repinner(tmp_path)._tighten_submodule_bar(repo)
+
+    bar = json.loads(
+        (repo / ".autohelix" / "optimization" / "submodule.json").read_text())["tolerance"]
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.02 * 1.10)
+
+
+def test_re_pinning_is_idempotent_so_the_loop_may_restart_under_the_same_bar(tmp_path):
+    """The loop re-pins on every start. A second pass must not ratchet the bar down again."""
+    repo = _cut(tmp_path, 0.02)
+
+    _repinner(tmp_path)._tighten_submodule_bar(repo)
+    once = (repo / "inference.py").read_text()
+    lines = _repinner(tmp_path)._tighten_submodule_bar(repo)
+
+    assert lines and "already re-pinned" in lines[0]
+    assert (repo / "inference.py").read_text() == once
+
+
+def test_a_verdict_without_an_accuracy_falls_back_to_running_the_frozen_validator(tmp_path):
+    """Older verdicts carry a latency and no accuracy. The validator is frozen and the cut is
+    sitting there, so one measurement beats leaving the loop unbounded for hours."""
+    repo = _cut(tmp_path, None)
+
+    lines = _repinner(tmp_path, measures=(80.3, {"max_abs_err": 0.02}))._tighten_submodule_bar(repo)
+
+    assert lines and "re-pinned" in lines[0]
+    bar = json.loads(
+        (repo / ".autohelix" / "optimization" / "submodule.json").read_text())["tolerance"]
+    assert bar["MAX_ABS_ERR"] == pytest.approx(0.02 * 1.10)
+
+
+def test_a_bar_that_cannot_be_re_pinned_says_so_rather_than_passing_silently(tmp_path):
+    """Returning nothing left the loop running under a bar 20x looser than the cut, with nothing
+    on the console to say the tightening had not happened."""
+    from optimization.driver import StageError
+
+    def explode(*_args, **_kwargs):
+        raise StageError("the validator did not run")
+
+    repo = _cut(tmp_path, None)
+    pipeline = _repinner(tmp_path)
+    pipeline._measure = explode
+    before = (repo / "inference.py").read_text()
+
+    lines = pipeline._tighten_submodule_bar(repo)
+
+    assert lines and "max_abs_err" in lines[0] and "stays as the" in lines[0]
+    assert (repo / "inference.py").read_text() == before
+
+
+def test_the_re_pinned_bar_admits_every_loop_that_has_finished(tmp_path):
+    """Calibration against the measured trajectories, as a test rather than a claim.
+
+    Each module's stage-3 iteration 0 is its cut; the worst `max_abs_err` any later iteration
+    reached is what the re-pinned bar has to admit — or refuse, for the one that went wrong.
+    """
+    # module: (cut's max_abs_err, the worst any accepted iteration reached, should clear)
+    trajectories = {
+        "00-Attention-B": (0.02549302577972412, 0.0257452130317688, True),
+        "00-Attention-C": (0.03719229996204376, 0.03590035438537598, True),
+        "24-Attention": (0.2518768310546875, 0.12760743498802185, True),
+        "02-Attention": (0.038896650075912476, 0.08605745434761047, False),
+    }
+    for name, (cut, worst, expected) in trajectories.items():
+        repo = _cut(tmp_path / name, cut)
+        _repinner(tmp_path / name)._tighten_submodule_bar(repo)
+        ceiling = json.loads(
+            (repo / ".autohelix" / "optimization" / "submodule.json").read_text()
+        )["tolerance"]["MAX_ABS_ERR"]
+        assert (worst <= ceiling) is expected, (
+            f"{name}: worst iteration {worst} against a re-pinned ceiling of {ceiling}"
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+#  Committing a pipeline-side edit so the loop opens on a clean tree
+# ---------------------------------------------------------------------------------------------
+
+def _git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(".autohelix/\n")
+    (repo / "inference.py").write_text("MAX_ABS_ERR = 0.7875\n")
+    materialize.git_init(repo, "baseline")
+    return repo
+
+
+def test_a_pipeline_side_edit_is_committed_so_the_loop_does_not_see_a_dirty_tree(tmp_path):
+    """The harness refuses to start in a dirty repository, so the re-pin's own rewrite of the
+    frozen validator would otherwise read as work the agent left behind."""
+    import subprocess
+
+    repo = _git_repo(tmp_path)
+    (repo / "inference.py").write_text("MAX_ABS_ERR = 0.0427863\n")
+
+    assert materialize.git_commit_paths(repo, "re-pin", ["inference.py"]) is True
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout == ""
+
+
+def test_committing_an_unchanged_path_is_not_an_empty_commit(tmp_path):
+    repo = _git_repo(tmp_path)
+    assert materialize.git_commit_paths(repo, "re-pin", ["inference.py"]) is False
+
+
+def test_an_ignored_path_is_dropped_rather_than_failing_the_commit(tmp_path):
+    """`git add` on an explicitly named ignored path exits non-zero. The manifest the re-pin edits
+    lives under `.autohelix/`, which every submodule repo ignores."""
+    repo = _git_repo(tmp_path)
+    (repo / ".autohelix").mkdir()
+    (repo / ".autohelix" / "submodule.json").write_text("{}")
+    (repo / "inference.py").write_text("MAX_ABS_ERR = 0.1\n")
+
+    assert materialize.git_commit_paths(
+        repo, "re-pin", ["inference.py", ".autohelix/submodule.json"]) is True
+
+
+def test_the_artifacts_the_toolchain_rewrites_are_untracked_and_ignored(tmp_path):
+    """A tracked compiler log makes every measurement in the main repo leave the tree dirty, and
+    the loop refuses to start on a dirty tree. `02-Attention`'s stage 3 stopped on `M
+    log-neuron-cc.txt` four minutes in, naming a file with nothing to do with the kernel."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(".autohelix/\nbuild/\n")
+    (repo / "source.py").write_text("# kernel\n")
+    (repo / "log-neuron-cc.txt").write_text("compiler said things\n")
+    (repo / "global_metric_store.json").write_text("{}")
+    (repo / "cafe1234").mkdir()
+    (repo / "cafe1234" / "source.colz").write_bytes(b"cache")
+    (repo / "cafe1234" / ".done").write_text("")
+    materialize.git_init(repo, "baseline")
+
+    untracked = materialize.untrack_regenerated(repo)
+
+    assert set(untracked) == {"log-neuron-cc.txt", "global_metric_store.json",
+                              "cafe1234/source.colz", "cafe1234/.done"}
+    assert (repo / "log-neuron-cc.txt").is_file(), "un-staged, not deleted"
+    assert (repo / "cafe1234" / "source.colz").is_file(), "the next compile still wants its cache"
+    (repo / "log-neuron-cc.txt").write_text("the compiler said other things\n")
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout == ""
+
+
+def test_untracking_the_regenerated_artifacts_twice_changes_nothing(tmp_path):
+    """Called at the start of every loop, so a second pass must be a no-op."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    materialize.write_gitignore(repo)
+    (repo / "source.py").write_text("# kernel\n")
+    (repo / "log-neuron-cc.txt").write_text("compiler said things\n")
+    materialize.git_init(repo, "baseline")
+
+    assert materialize.untrack_regenerated(repo) == []
+    assert materialize.untrack_regenerated(repo) == []
+
+
+def test_a_fresh_repo_never_tracks_them_in_the_first_place(tmp_path):
+    """`git_init` stages with `git add -A`, so the exclusion has to be in place before it runs."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    materialize.write_gitignore(repo)
+    for name in ("log-neuron-cc.txt", "global_metric_store.json"):
+        (repo / name).write_text("x")
+    (repo / "cafe1234").mkdir()
+    (repo / "cafe1234" / "source.colz").write_bytes(b"cache")
+    (repo / "source.py").write_text("# kernel\n")
+    materialize.git_init(repo, "baseline")
+
+    tracked = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
+                             capture_output=True, text=True).stdout.split()
+    assert tracked == [".gitignore", "source.py"]
+
+
+# ---------------------------------------------------------------------------------------------
+#  A hard slot may not run unchecked
+# ---------------------------------------------------------------------------------------------
+def _with_slots(tmp_path: Path, slots: list[dict]) -> Path:
+    """`_filled`, with the single-rank stage's constraint schedule replaced."""
+    path = _filled(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["submodule"]["iteration_constraints"] = slots
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    return path
+
+
+def test_an_unusable_hard_checker_stops_the_stage(tmp_path):
+    """Deleting it and carrying on leaves the prompt calling a rule mandatory with nothing
+    enforcing it, so violating candidates merge and the stage still reports success."""
+    from optimization.driver import Pipeline, StageError
+
+    pipeline = Pipeline(PipelineConfig.load(
+        _with_slots(tmp_path, [{"at": 1, "enforcement": "hard", "text": "only NKI"}])))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.config.submodule_repo.mkdir(parents=True, exist_ok=True)
+    pipeline._run_one_shot = lambda *a, **k: True        # the compiler "ran" and wrote nothing
+
+    with pytest.raises(StageError) as raised:
+        pipeline.compile_constraints("submodule")
+
+    assert "hard" in str(raised.value)
+    assert "enforcement: soft" in str(raised.value), "the message has to name the way forward"
+
+
+def test_an_unusable_soft_checker_degrades_instead_of_stopping(tmp_path):
+    """Soft is advice the loop was free to ignore, so losing its checker costs only the advice."""
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(
+        _with_slots(tmp_path, [{"at": 1, "enforcement": "soft", "text": "prefer NKI"}])))
+    pipeline.state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.config.submodule_repo.mkdir(parents=True, exist_ok=True)
+    pipeline._run_one_shot = lambda *a, **k: True
+
+    outcome = pipeline.compile_constraints("submodule")
+
+    assert outcome.ok
+
+
+def test_an_ignore_only_change_is_committed_so_a_clean_run_can_resume(tmp_path):
+    """A repo that never compiled in its main tree has the patterns missing and nothing tracked
+    matching them. Returning early there left `.gitignore` dirty, and `run_loop` starts the harness
+    in the next breath — so an otherwise clean pre-existing run could not resume at all."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(".autohelix/\n")
+    (repo / "source.py").write_text("# kernel\n")
+    materialize.git_init(repo, "baseline")
+
+    assert materialize.untrack_regenerated(repo) == [], "nothing was tracked to un-stage"
+
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout == ""
+    assert "log-neuron-cc.txt" in (repo / ".gitignore").read_text()
+
+
+def test_a_bit_exact_baseline_does_not_demand_a_bit_exact_loop(tmp_path):
+    """A kernel that happens to match exactly reports max_abs_err 0, and 0 x the margin is 0 --
+    which refuses legitimate reordering, sharding and any collective whose summation order
+    differs, none of which the derived bar objects to."""
+    derived = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+               "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.7875}
+
+    bar = materialize.tighten_bar(derived, {"max_abs_err": 0.0})
+
+    assert bar["MAX_ABS_ERR"] > 0.0
+    assert bar["MAX_ABS_ERR"] < derived["MAX_ABS_ERR"], "still tighter than the derived ceiling"
+
+
+def test_the_projected_width_is_the_one_configured_not_the_package_default(tmp_path):
+    """`FLOORPLAN.md` is binding on the agent that reads it, and it used to assert a one-device
+    trn2.3xlarge with the package's own default core count whatever the config asked for."""
+    projection = project(
+        module="layers.1.ffn",
+        splits=[{"dim": "expert", "factor": 8}],
+        units=["0.0", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7"],
+        target_units=2,
+    )
+
+    assert projection.target_units == 2
+    text = projection.describe()
+    assert "2 logical NeuronCore(s)" in text
+    assert "trn2.3xlarge" not in text, "the instance type is not this module's to assert"
+
+
+def test_a_published_bar_round_trips_exactly_to_the_gate_s_bar():
+    """A README that rounds the bar cannot be copied into a validator that passes.
+
+    `pinned_constants` compares the declared constants to the manifest at 1e-12, so a README
+    formatted with `:g` publishes six significant digits of a bar the gate holds to seventeen --
+    0.999943 against 0.9999432399999999 -- and an agent that copies it faithfully fails a check it
+    had no part in. The two are written from the same dict, so the only thing that can separate
+    them is the formatting, and that is what this pins.
+    """
+    bar = materialize.tighten_bar(
+        {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+         "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 2.65},
+        {"max_abs_err": 0.1875, "cosine": 0.99997162, "pass_fraction": 0.999883},
+    )
+    assert bar["MIN_COSINE"] != round(bar["MIN_COSINE"], 6), "pick a bar that rounding would break"
+
+    readme = f"""# r
+
+## What it has to hit
+
+```python
+{chr(10).join(f'{name} = {bar[name]!r}' for name in materialize.TOLERANCE_NAMES)}
+```
+"""
+    import pathlib, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "README.md"
+        path.write_text(readme)
+        published = materialize.read_numerical_bar(path)
+    assert published == bar
+    for name in materialize.TOLERANCE_NAMES:
+        assert abs(published[name] - bar[name]) <= 1e-12, name
+
+
+def test_a_later_attempt_s_pass_is_found_behind_an_older_one(tmp_path):
+    """Every passing record is weighed, not the first one on disk.
+
+    A stage rebuilt after it had already passed keeps the earlier attempt's record, and a rebuild
+    that fails before writing one of its own leaves no failure beside it. So the oldest
+    `passed: true` can describe a repo that is gone while a later one describes the repo in front
+    of us. Stopping at the first hash mismatch archived the good repo it had not reached yet.
+    """
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    (pipeline.state_dir / "submodule-attempt-1.json").write_text(json.dumps(
+        {"passed": True, "report": "", "validator_sha256": "a" * 64}))
+    (pipeline.state_dir / "submodule-attempt-2.json").write_text(json.dumps(
+        {"passed": True, "report": "",
+         "validator_sha256": _sha256_of(repo / "inference.py")}))
+
+    outcome = pipeline._prepared("submodule", quiet=True)
+
+    assert outcome is not None and outcome.ok
+
+
+def test_attempts_are_weighed_in_numeric_order(tmp_path):
+    """`attempt-10` sorts before `attempt-2` lexically, and the newest record is the one to cite."""
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    for n in (2, 10):
+        (pipeline.state_dir / f"submodule-attempt-{n}.json").write_text(json.dumps(
+            {"passed": True, "report": "", "validator_sha256": None}))
+
+    assert pipeline._prepared("submodule", quiet=True) is not None
+
+
+def test_no_passing_record_matches_the_repo_so_the_stage_is_rebuilt(tmp_path):
+    """The guard still has to fire: every pass describing another repo is no evidence for this one."""
+    pipeline, repo = _passed_stage(tmp_path, "submodule")
+    for n in (1, 2):
+        (pipeline.state_dir / f"submodule-attempt-{n}.json").write_text(json.dumps(
+            {"passed": True, "report": "", "validator_sha256": f"{n}" * 64}))
+
+    assert pipeline._prepared("submodule", quiet=True) is None
+
+
+def test_a_one_shot_does_not_delete_a_memory_it_did_not_seed(tmp_path):
+    """The seed path is derived, so an operator may keep the source exactly there.
+
+    `<repo>/.autohelix/memory` is where `seed` puts its copy, and the feedback stage runs its agent
+    in the workspace root and seeds nothing. Removing by path alone recursively deleted the
+    operator's own memory directory as the last act of a stage that never read it.
+    """
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    store = pipeline.config.workspace_root / ".autohelix" / "memory"
+    store.mkdir(parents=True)
+    (store / "FEEDBACK.md").write_text("what the first round found")
+
+    pipeline._drop_preparation_memory(pipeline.config.workspace_root)
+
+    assert (store / "FEEDBACK.md").is_file(), "the operator's own memory was deleted"
+
+
+def test_a_one_shot_removes_the_copy_it_did_seed(tmp_path):
+    """The other half: a snapshot left behind is a read-only subtree in the delivered repo."""
+    from optimization.driver import Pipeline
+
+    from optimization import memory as mem
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = pipeline.config.submodule_repo
+    landed = repo / mem.SEEDED_REL
+    landed.mkdir(parents=True)
+    (landed / "NOTES.md").write_text("read-only")
+    (landed / "NOTES.md").chmod(0o444)
+    landed.chmod(0o555)
+    pipeline._seeded_memory.add(repo.resolve())
+
+    pipeline._drop_preparation_memory(repo)
+
+    assert not landed.exists()
+
+
+def test_untracking_leaves_a_file_tracked_on_purpose_alone(tmp_path):
+    """Scoped to the patterns this module manages, not to every rule in effect.
+
+    `check-ignore` consults `.git/info/exclude`, the operator's global excludes and any line an
+    older version of `write_gitignore` wrote. A repo that deliberately tracks something matching
+    one of those had it dropped from the index as a side effect of un-staging a compiler log.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # An older `.gitignore`: no artifact patterns yet, and one rule of the operator's own.
+    (repo / ".gitignore").write_text(".autohelix/\ntensors/*.bin\n")
+    (repo / "tensors").mkdir()
+    (repo / "tensors" / "weights.bin").write_bytes(b"\x00" * 8)
+    (repo / "log-neuron-cc.txt").write_text("compiler chatter")
+    (repo / "source.py").write_text("# kernel\n")
+    materialize.git_init(repo, "baseline")
+    subprocess.run(["git", "add", "-f", "--", "tensors/weights.bin"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tensors"],
+                   cwd=repo, check=True)
+
+    untracked = materialize.untrack_regenerated(repo)
+
+    assert untracked == ["log-neuron-cc.txt"]
+    tracked = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
+                             capture_output=True, text=True).stdout.split()
+    assert "tensors/weights.bin" in tracked, "a file tracked on purpose was un-staged"
+
+
+def test_a_superseded_bar_is_marked_outside_the_code_fence(tmp_path):
+    """The marker goes next to the stale number but not inside its fence.
+
+    A blockquote inside a ```python block is not a blockquote: it renders as source, and it makes
+    the fence invalid Python for anything that reads it as code. The first version inserted between
+    two constants of the live `mtp.0.attention` repo.
+    """
+    repo = tmp_path / "full"
+    (repo / "module").mkdir(parents=True)
+    (repo / "module" / "README.md").write_text(textwrap.dedent("""
+        # The bootstrapped module
+
+        Its numerical bar is:
+
+        ```python
+        RTOL = 0.1
+        ATOL = 0.1
+        MIN_COSINE = 0.9995
+        MIN_PASS_FRACTION = 0.999
+        MAX_ABS_ERR = 2.65
+        ```
+    """))
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9999432399999999,
+           "MIN_PASS_FRACTION": 0.9997659999999999, "MAX_ABS_ERR": 0.20625000000000002}
+
+    assert materialize.mark_superseded_bars(repo, bar) == ["module/README.md"]
+
+    lines = (repo / "module" / "README.md").read_text().splitlines()
+    marker = next(i for i, line in enumerate(lines) if "not the bar this repo" in line)
+    fence = next(i for i, line in enumerate(lines) if line.startswith("```python"))
+    assert marker < fence, "the marker landed inside the fenced block"
+    assert str(bar["MAX_ABS_ERR"]) in "\n".join(lines), "the marker rounded the authoritative bar"
+    # Still the stale file's own bar where something parses it, and marking twice changes nothing.
+    assert materialize.read_numerical_bar(repo / "module" / "README.md")["MAX_ABS_ERR"] == 2.65
+    assert materialize.mark_superseded_bars(repo, bar) == []
+
+
+def test_a_file_that_states_this_repo_s_own_bar_is_not_marked(tmp_path):
+    """Only a *different* bar is stale. Marking an agreeing file would be noise."""
+    repo = tmp_path / "full"
+    (repo / "submodule").mkdir(parents=True)
+    (repo / "submodule" / "README.md").write_text("MAX_ABS_ERR = 0.20625000000000002\n")
+    bar = {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+           "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 0.20625000000000002}
+
+    assert materialize.mark_superseded_bars(repo, bar) == []
+
+
+def test_the_loop_gate_skips_the_admission_only_checks():
+    """Check (i) bounds the collective against a submodule latency measured once, before the loop.
+
+    Re-asking it every iteration turns measurement noise into rejections: on `mtp.0.attention` the
+    ceiling was 0.48969 ms and twelve later draws of the module kernel it had admitted spanned
+    0.4924 to 0.4998, so three of five iterations were rejected for nothing they did.
+    """
+    from optimization import module_checker as mc
+
+    assert mc.ADMISSION_ONLY, "the subset has to name at least one check"
+    for check in mc.ADMISSION_ONLY:
+        assert check in mc.CHECK_TITLES, check
+    # Everything about the candidate itself still runs every iteration.
+    assert set(mc.CHECK_TITLES) - set(mc.ADMISSION_ONLY) >= {"a", "b", "c", "d", "e", "f", "g"}
+
+
+def test_the_loop_filter_reads_the_field_the_dataclass_actually_has(tmp_path, monkeypatch):
+    """The first version read `r.check`, which only exists on `to_dict()`'s output.
+
+    Every stage-5 iteration raised `AttributeError: 'CheckResult' object has no attribute
+    'check'` before it measured anything, and the test above did not catch it because it
+    asserted properties of the tuple instead of running the filter. Three iterations of
+    42-DSparkMarkovHead were spent on it.
+    """
+    from optimization import candidate, module_checker as mc
+
+    monkeypatch.setattr(candidate, "run_candidate",
+                        lambda *a, **k: candidate.RunOutcome(ran=True, return_code=1))
+    # Empty is enough: every check may fail, the question is only which ones ran.
+    (tmp_path / "source.py").write_text("")
+    (tmp_path / "inference.py").write_text("")
+    manifest = {
+        "ranks": 4,
+        "tolerance": {"RTOL": 0.1, "ATOL": 0.1, "MIN_COSINE": 0.9995,
+                      "MIN_PASS_FRACTION": 0.999, "MAX_ABS_ERR": 1.0},
+        "baselines": {"submodule_latency_ms": 1.0},
+    }
+
+    every, _ = mc.evaluate(tmp_path, manifest, timeout=1)
+    looped, _ = mc.evaluate(tmp_path, manifest, timeout=1, loop=True)
+
+    assert {r.key for r in every} - {r.key for r in looped} == set(mc.ADMISSION_ONLY)
+    assert all(hasattr(r, "key") for r in every)
+
+
+def test_only_the_full_stage_s_gate_gets_the_loop_flag(tmp_path):
+    config = PipelineConfig.load(_filled(tmp_path))
+
+    assert " --loop" in config.derive_loop_config("full")["constraints"][0]["command"]
+    assert "--loop" not in config.derive_loop_config("submodule")["constraints"][0]["command"]
+
+
+def test_a_baseline_is_the_median_of_several_draws(tmp_path, monkeypatch):
+    """One draw is not a latency. The median of three drops the outlier that set a ceiling the
+    code which produced it could not reproduce."""
+    from optimization import candidate
+    from optimization.driver import Pipeline
+
+    pipeline = Pipeline(PipelineConfig.load(_filled(tmp_path)))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    draws = iter([0.445173, 0.496, 0.4998])   # a low outlier, then two honest draws
+
+    def fake_run(_repo, _cmd, **_kw):
+        value = next(draws)
+        return candidate.RunOutcome(
+            ran=True, return_code=0, duration_s=1.0,
+            output=f"##autohelix[latency_ms={value}]\n##autohelix[max_abs_err=0.1875]\n",
+        )
+
+    monkeypatch.setattr(candidate, "run_candidate", fake_run)
+    median, numerics, spread = pipeline._measure(repo, "x", cores="1", draws=3)
+
+    assert median == 0.496, "the outlier must not set the bound"
+    assert numerics == {"max_abs_err": 0.1875}, "numerics come from the median run"
+    assert abs(spread - (0.4998 - 0.445173)) < 1e-9

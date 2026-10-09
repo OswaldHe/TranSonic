@@ -23,6 +23,7 @@ of iteration 7 could be written around what iteration 6 already did.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -40,8 +41,10 @@ from rich.panel import Panel
 from rich.text import Text
 
 from autohelix.agents import AgentConfig, AgentEvent, create_agent
+from optimization import archive
 from optimization import constraints as cons
 from optimization import custody, materialize, presets
+from optimization import memory as mem
 from optimization import feedback as fb
 from optimization.config import GATE_PYTHON, PipelineConfig
 from optimization.loop import METRIC, OptimizationLoop
@@ -50,6 +53,57 @@ from optimization.projection import Projection, ProjectionError, project_module
 #: Where the pipeline's own records go, under the workspace root: the projection, each preparation
 #: attempt's log and verdict, and the final report.
 STATE_DIR = ".optimization"
+
+#: How many times the constraint compiler may be asked for a slot's checker. Attempt 1 is the
+#: plain request; the rest carry the validator's findings back. Three is enough for the failures
+#: seen in practice, which are a single contract violation the findings name exactly.
+COMPILER_ATTEMPTS = 3
+
+#: Appended to the compiler's prompt on a retry. It names the files it has to fix and quotes the
+#: contract again, because the violation is always a clause of the contract it did not apply.
+COMPILER_RETRY = """
+
+---
+
+## Your previous attempt is on disk and it does not satisfy the contract
+
+The checkers you wrote were validated and rejected for these reasons:
+
+{{ problems }}
+
+Rewrite the offending checker(s) in place, at the same paths, fixing exactly these findings and
+changing nothing else about what they check. The constraint prose has not changed, and a checker
+that now passes validation but stops judging the mechanism is worse than the one you wrote.
+
+The most common cause is an import: the allowed list is short and deliberate, and anything outside
+it has to be written inline instead. Here is the contract again, in full:
+
+{{ contract }}
+"""
+
+
+#: The accuracy statistic both gates publish into their verdict, and the one the bars are pinned on.
+ACCURACY_MARKER = "max_abs_err"
+
+
+def _validator_sha256(repo: Path) -> str | None:
+    """`inference.py`'s hash, or None if it is not there yet.
+
+    The validator is frozen for the whole of the loop that follows a preparation stage — its hash
+    is already a gate check — which makes it the one thing that identifies "the repo that passed"
+    and stays true until the stage is rebuilt. `source.py` would not do: the loop rewrites it every
+    iteration, so matching on it would refuse to resume exactly when resuming is wanted.
+    """
+    path = repo / "inference.py"
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _attempt_number(record: Path) -> int:
+    """`3` from `submodule-attempt-3.json`, so attempts sort by age rather than lexically."""
+    digits = record.stem.rsplit("-", 1)[-1]
+    return int(digits) if digits.isdigit() else 0
 
 
 class StageError(RuntimeError):
@@ -80,6 +134,9 @@ class Pipeline:
         self.verbose = verbose
         self.state_dir = config.workspace_root / STATE_DIR
         self._projection: Projection | None = None
+        #: Repos this pipeline seeded a memory snapshot into, so `_drop_preparation_memory` removes
+        #: only its own copies. See the warning there.
+        self._seeded_memory: set[Path] = set()
 
     # -- shared --------------------------------------------------------------------
 
@@ -109,7 +166,9 @@ class Pipeline:
         attic = self.state_dir / "attempts" / f"{stage}-{attempt - 1}"
         attic.parent.mkdir(parents=True, exist_ok=True)
         if attic.exists():
-            shutil.rmtree(attic)
+            # A set-aside repo holds an iteration worktree per iteration, each with its own
+            # read-only memory snapshot, so a plain rmtree stops on the first one.
+            mem.rmtree_unlocked(attic)
         repo.rename(attic)
         self.console.print(f"  [dim]previous attempt kept at {attic}[/dim]")
 
@@ -127,7 +186,9 @@ class Pipeline:
             key=lambda p: p.stat().st_mtime,
         )
         for path in existing[: max(len(existing) - keep, 0)]:
-            shutil.rmtree(path, ignore_errors=True)
+            # Unlocked, and not `ignore_errors` alone: a read-only snapshot made this give up
+            # part-way and leave most of the attempt on disk, which is the opposite of pruning.
+            mem.rmtree_unlocked(path, ignore_errors=True)
             self.console.print(f"  [dim]pruned superseded attempt {path.name}[/dim]")
 
     def _read_record(self, name: str) -> dict[str, Any]:
@@ -175,8 +236,8 @@ class Pipeline:
                     f"{self.config.scheme.name} no longer projects {self.config.module_id} the way "
                     f"this workspace was initialized:\n  "
                     + "\n  ".join(drift)
-                    + f"\nThe repos already built assume the recorded projection.\n"
-                    f"Either restore the scheme, or start a fresh workspace.root for the new one."
+                    + "\nThe repos already built assume the recorded projection.\n"
+                    "Either restore the scheme, or start a fresh workspace.root for the new one."
                 )
             projection = frozen
 
@@ -236,6 +297,121 @@ class Pipeline:
 
     # -- the one-shot preparation agents -------------------------------------------
 
+    def _seed_preparation_memory(self, repo: Path, spec: "mem.MemorySpec") -> str:
+        """Seed the memory for a one-shot preparation agent, and return its prompt block.
+
+        Seeded into the repo itself, because `_run_one_shot` runs the agent there rather than in a
+        worktree. Safe to land under `.autohelix/`: it is gitignored, and `Sandbox.prepare_worktree`
+        copies an explicit allowlist out of it (`notes`, `observations`, `logs`, `peer_notes`) that
+        does not include `memory` — so a copy left here could not leak into a later iteration that
+        opted out. `_drop_preparation_memory` removes it anyway once the agent is done, so the repo
+        the next stage consumes does not carry a second copy or a read-only subtree.
+        """
+        if not spec.reads_at_preparation:
+            return ""
+        problem = mem.seed_problem(spec, repo)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] memory: {problem}")
+            return ""
+        seeded = mem.seed(spec, repo)
+        if seeded:
+            self._seeded_memory.add(repo.resolve())
+            self.console.print(f"  memory: {seeded} file(s) from {spec.path} at {mem.SEEDED_REL}")
+        else:
+            self.console.print(f"  [yellow]![/yellow] memory: nothing seeded from {spec.path}")
+        return mem.describe_for_preparation(spec, seeded)
+
+    def _drop_preparation_memory(self, repo: Path) -> None:
+        """Remove a seeded copy from a repo once its preparation agent has finished.
+
+        Only a copy *this* pipeline made. The path is derived — `<repo>/.autohelix/memory` — and an
+        operator is free to keep the configured source at that path under the workspace root, which
+        is also where the feedback stage runs its agent and seeds nothing. Removing by path alone
+        therefore recursively deleted the operator's own memory directory, as the last act of a
+        stage that never read it.
+        """
+        here = repo.resolve()
+        if here not in self._seeded_memory:
+            return
+        for rel in (mem.SEEDED_REL, archive.SEEDED_REL):
+            target = repo / rel
+            if target.exists():
+                mem.unlock(repo, rel)
+                shutil.rmtree(target, ignore_errors=True)
+        self._seeded_memory.discard(here)
+
+    def _archive_spec(self) -> "mem.MemorySpec":
+        """The feedback archive as something `memory.seed` can copy: every reader, always."""
+        return mem.MemorySpec(
+            path=self.config.feedback_archive, every=True, preparation=True,
+            dest=archive.SEEDED_REL,
+        )
+
+    def _seed_archive(self, repo: Path, feedback: bool = False) -> str:
+        """Seed the cross-run feedback archive into a repo, and return its prompt block.
+
+        Separate from the operator's memory and not a substitute for it: that directory is this
+        module's own earlier work, this one is every other module's unresolved obstacles. A run
+        wants both, and merging them would lose which is which.
+        """
+        if self.config.feedback_archive is None:
+            return ""
+        entries = archive.read_entries(self.config.feedback_archive)
+        if not entries:
+            return ""
+        spec = self._archive_spec()
+        problem = mem.seed_problem(spec, repo)
+        if problem:
+            self.console.print(f"  [yellow]![/yellow] feedback archive: {problem}")
+            return ""
+        seeded = mem.seed(spec, repo)
+        if not seeded:
+            self.console.print(
+                f"  [yellow]![/yellow] feedback archive: nothing seeded from "
+                f"{self.config.feedback_archive}"
+            )
+            return ""
+        self._seeded_memory.add(repo.resolve())
+        self.console.print(
+            f"  feedback archive: {sum(len(e.findings) for e in entries)} finding(s) from "
+            f"{len(entries)} run(s), {seeded} file(s) at {archive.SEEDED_REL}"
+        )
+        return (archive.describe_for_feedback(entries, seeded) if feedback
+                else archive.describe_for_optimizer(entries, seeded))
+
+    def _deposit_feedback(self) -> None:
+        """Put this run's finished report into the archive, so the next run reads it.
+
+        Best-effort on purpose. The report is written, validated and on disk by the time this runs;
+        failing the stage because a shared directory is unwritable would throw away the thing that
+        took three hours to produce for the sake of the copy of it.
+        """
+        if self.config.feedback_archive is None:
+            return
+        baselines = self._read_record("baselines")
+        try:
+            entry = archive.deposit(
+                self.config.feedback_archive, self.config.workspace_root, self.config.module_id,
+                latencies={
+                    "bootstrap_ms": baselines.get("bootstrap_latency_ms"),
+                    "submodule_ms": _read_summary(self.config.submodule_repo,
+                                                  "submodule").get("best_ms"),
+                    "module_ms": _read_summary(self.config.full_repo, "full").get("best_ms"),
+                },
+            )
+        except (archive.ArchiveError, OSError) as exc:
+            self.console.print(f"  [yellow]![/yellow] could not deposit into the archive: {exc}")
+            return
+        self.console.print(
+            f"  [green]deposited[/green] {len(entry.findings)} finding(s) as "
+            f"`{entry.name}` in {self.config.feedback_archive}"
+            + (f", ruling on {len(entry.rulings)} already-filed finding(s)" if entry.rulings else "")
+            # The archive carries markdown only, so say how much of the reproduction directory
+            # stayed behind. An over-tight filter should read as a number, not as a missing file.
+            + (f". {entry.skipped} non-markdown file(s) left in {fb.REPRO_DIR}/"
+               if entry.skipped else "")
+        )
+
     def _run_one_shot(
         self, repo: Path, prompt: str, label: str, timeout: str, model: str | None = None,
     ) -> bool:
@@ -266,10 +442,15 @@ class Pipeline:
 
         self.console.print(f"  running the {label} agent (log: {log_path})")
         started = time.monotonic()
-        result = agent.run(
-            worktree_path=repo, prompt=prompt, iteration=0,
-            log_path=log_path, event_callback=on_event, project_path=repo,
-        )
+        try:
+            result = agent.run(
+                worktree_path=repo, prompt=prompt, iteration=0,
+                log_path=log_path, event_callback=on_event, project_path=repo,
+            )
+        finally:
+            # Every way out of a preparation attempt — finished, failed, raised, retried — leaves
+            # the repo without a stale read-only copy. A retry re-seeds.
+            self._drop_preparation_memory(repo)
         elapsed = time.monotonic() - started
         if not result.success:
             self.console.print(
@@ -381,8 +562,9 @@ class Pipeline:
             f"placement for {self.config.module_id} to a single split."
         )
 
-    def submodule(self) -> StageOutcome:
+    def submodule(self, rebuild: bool = False) -> StageOutcome:
         """Cut the module down to one rank, and accept the repo only when the gate agrees."""
+        self._refuse_to_clobber("submodule", rebuild)
         projection = self.projection()
         self._require_expressible_cut(projection)
         repo = self.config.submodule_repo
@@ -398,12 +580,15 @@ class Pipeline:
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.submodule.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id,
                 "entry_point": "kernel",
                 "dim": (projection.projected[0].dim if projection.projected else "none"),
                 "factor": projection.projected_units,
                 "splits": " * ".join(f.label() for f in projection.projected) or "no split",
+                "memory": memory_block,
+                "archive": self._seed_archive(repo),
             })
             held = custody.take_custody(
                 prepared, custody.SUBMODULE_OWNED,
@@ -419,8 +604,13 @@ class Pipeline:
                 self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.submodule_checker", "submodule")
-            self._record(f"submodule-attempt-{attempt}", {"passed": ok, "report": report})
+            self._record(f"submodule-attempt-{attempt}", {
+                "passed": ok, "report": report,
+                "validator_sha256": _validator_sha256(repo),
+            })
             if ok:
+                for line in self._tighten_submodule_bar(repo):
+                    self.console.print(f"  {line}")
                 materialize.git_init(repo, f"Submodule baseline: one rank of {self.config.module_id}")
                 latency = _latency_from_gate(
                     repo / ".autohelix" / "optimization" / "submodule-gate.json"
@@ -473,29 +663,75 @@ class Pipeline:
             "max_iterations": spec.iterations,
         })
 
-        if not self._run_one_shot(repo, prompt, f"compiler-{stage}",
-                                  self.config.compiler_timeout, self.config.compiler_model):
-            raise StageError("the constraint compiler failed; the schedule would go unenforced")
-
+        # The compiler is an agent, so a checker that breaks its contract is a normal outcome, not
+        # an exceptional one — and the findings say exactly what to change. Hand them back and let
+        # it fix its own work. This used to raise on the first attempt, which stopped a whole
+        # pipeline over one `import operator` after the agent had already been paid for.
         compiled: list[cons.CompiledSlot] = []
         problems: list[str] = []
-        for slot in enforceable:
-            path = cons.checker_path(repo, slot)
-            findings = cons.validate_checker_source(path)
-            if findings:
-                problems += [f"slot {slot.label}: {f}" for f in findings]
-                continue
-            compiled.append(cons.CompiledSlot(
-                label=slot.label, iterations=slot.iterations, path=path,
-                sha256=cons.sha256_file(path),
-            ))
-        if problems:
+        for attempt in range(1, COMPILER_ATTEMPTS + 1):
+            label = f"compiler-{stage}" if attempt == 1 else f"compiler-{stage}-retry-{attempt - 1}"
+            this_prompt = prompt if not problems else prompt + _render(COMPILER_RETRY, {
+                "problems": "\n".join(f"  - {p}" for p in problems),
+                "contract": cons.CHECKER_CONTRACT,
+            })
+            if not self._run_one_shot(repo, this_prompt, label,
+                                      self.config.compiler_timeout, self.config.compiler_model):
+                raise StageError("the constraint compiler failed; the schedule would go unenforced")
+
+            compiled, problems = [], []
+            for slot in enforceable:
+                path = cons.checker_path(repo, slot)
+                findings = cons.validate_checker_source(path)
+                if findings:
+                    problems += [f"slot {slot.label}: {f}" for f in findings]
+                    continue
+                compiled.append(cons.CompiledSlot(
+                    label=slot.label, iterations=slot.iterations, path=path,
+                    sha256=cons.sha256_file(path),
+                ))
+            if not problems:
+                break
             for problem in problems:
                 self.console.print(f"  [red]FAIL[/red] {problem}")
-            raise StageError(
-                f"{len(problems)} compiled checker(s) are unusable. A schedule that cannot be "
-                f"enforced is worse than no schedule: the prompts would claim a constraint the "
-                f"loop does not apply."
+            if attempt < COMPILER_ATTEMPTS:
+                self.console.print(
+                    f"  [yellow]retrying the constraint compiler with those findings "
+                    f"({attempt}/{COMPILER_ATTEMPTS - 1})[/yellow]")
+
+        if problems:
+            # Out of attempts. An unvalidated checker is never enforced, so the unusable ones go --
+            # `loop.run_iteration` then finds no checker, says so on every affected iteration, and
+            # enforces nothing.
+            unusable = [
+                slot for slot in enforceable
+                if not any(c.path == cons.checker_path(repo, slot) for c in compiled)
+            ]
+            for slot in unusable:
+                path = cons.checker_path(repo, slot)
+                if path.is_file():
+                    path.unlink()
+            # Which slots they were decides whether the stage may continue. Dropping a `soft`
+            # slot's checker costs advice the loop was free to ignore. Dropping a `hard` one's
+            # means the prompt still tells the agent the rule is mandatory while nothing checks it,
+            # and candidates that violate it merge — the stage would report success having
+            # delivered something weaker than the config asked for, which no later stage can
+            # detect. So soft degrades and hard stops.
+            hard = [slot for slot in unusable if slot.enforcement == "hard"]
+            if hard:
+                raise StageError(
+                    f"{len(hard)} checker(s) for `enforcement: hard` slot(s) "
+                    f"({', '.join(s.label for s in hard)}) are still unusable after "
+                    f"{COMPILER_ATTEMPTS} attempt(s), and a hard slot may not run unchecked: the "
+                    f"prompt would call the rule mandatory with nothing enforcing it.\n"
+                    f"The compiler's findings are above. Either rewrite that slot's prose so a "
+                    f"checker can be written against it, or set `enforcement: soft` to accept "
+                    f"advice without a gate."
+                )
+            self.console.print(
+                f"  [red]![/red] {len(problems)} checker(s) still unusable after "
+                f"{COMPILER_ATTEMPTS} attempt(s); removed them. Those slots are soft, so they run "
+                f"**unenforced** and every affected iteration will say so."
             )
         cons.write_manifest(repo, compiled, schedule)
         self.console.print(
@@ -528,6 +764,25 @@ class Pipeline:
         for finding in cons.verify_manifest(repo):
             raise StageError(f"a compiled checker has changed since it was written: {finding}")
 
+        # Before anything measures in the main repo, since a measurement rewrites these and the
+        # loop will not start on a dirty tree.
+        untracked = materialize.untrack_regenerated(repo)
+        if untracked:
+            self.console.print(
+                f"  stopped tracking {len(untracked)} regenerated artifact(s) the toolchain "
+                f"rewrites ({', '.join(untracked[:3])}{', …' if len(untracked) > 3 else ''})"
+            )
+
+        if stage == "submodule":
+            lines = self._tighten_submodule_bar(repo)
+            for line in lines:
+                self.console.print(f"  {line}")
+            # The validator only. The manifest beside it lives under `.autohelix/`, which the
+            # repo's own `.gitignore` keeps out of the history.
+            if lines and materialize.git_commit_paths(
+                repo, "Re-pin the numerical bar to what this cut achieved", ["inference.py"],
+            ):
+                self.console.print("  committed the re-pinned bar, so the loop opens clean")
         self._seed_baseline_verdict(repo, stage)
         config_path = self.config.write_loop_config(stage)
         loop = OptimizationLoop(repo, config_file=config_path, stage=stage, verbose=self.verbose)
@@ -568,9 +823,21 @@ class Pipeline:
         # the `source.py` a reader opens described different code.
         if stage == "full" and best_commit:
             self._materialize_best(repo, best_commit, best_value)
+
+        # A loop whose iterations all timed out still has a kernel to hand on -- the baseline cut,
+        # which `materialize_full` takes when `best_commit` is None -- so it reports ok, not failure.
+        timed_out = sum(1 for r in loop.history.load()
+                        if not r.accepted and "timed out" in (r.reason or ""))
+        ok = best_value is not None or timed_out > 0
+        if best_value is not None:
+            detail = f"best {best_value} ms"
+        elif timed_out:
+            detail = (f"no accepted iteration; {timed_out} agent timeout(s) — carrying the "
+                      f"baseline cut forward")
+        else:
+            detail = "no accepted iteration"
         return StageOutcome(
-            stage=f"run-{stage}", ok=best_value is not None,
-            detail=f"best {best_value} ms" if best_value else "no accepted iteration",
+            stage=f"run-{stage}", ok=ok, detail=detail,
             payload={"best_commit": best_commit, "best_ms": best_value},
         )
 
@@ -642,7 +909,7 @@ class Pipeline:
 
     # -- stage: assemble -----------------------------------------------------------
 
-    def measure_baselines(self) -> tuple[float, float]:
+    def measure_baselines(self) -> tuple[float, float, dict[str, float]]:
         """Re-measure the two numbers stage 5 is bounded by, on this host, now.
 
         Not copied from the bootstrap log or from stage 3's history. Both bounds are comparisons
@@ -650,25 +917,33 @@ class Pipeline:
         different toolchain is the kind of number that makes a bound quietly meaningless.
         """
         self.console.print("\n[bold]re-measuring the two baselines on this host[/bold]")
-        bootstrap_ms = self._measure(
+        bootstrap_ms, achieved, _ = self._measure(
             self.config.bootstrap_repo, "the bootstrapped module (1 core)", cores="1",
         )
+        if achieved:
+            self.console.print(
+                "    achieved "
+                + ", ".join(f"{k}={v:g}" for k, v in sorted(achieved.items()))
+            )
         # The submodule is measured at the *commit the assembly is built from*, not at `HEAD`. With
         # 5% of regression slack those differ, and measuring one while assembling the other would
         # make the 1.1x ceiling describe code that is not in the assembly.
         best_commit, _ = _best_from_summary(self.config.submodule_repo)
         with self._at_commit(self.config.submodule_repo, best_commit) as repo:
-            submodule_ms = self._measure(
+            # Several draws, because this one number sets check (i)'s ceiling. See `_measure`.
+            submodule_ms, _, spread = self._measure(
                 repo, f"the optimized submodule at {(best_commit or 'HEAD')[:12]} (1 core)",
-                cores="1",
+                cores="1", draws=self.BASELINE_DRAWS,
             )
         self._record("baselines", {
             "bootstrap_latency_ms": bootstrap_ms,
             "submodule_latency_ms": submodule_ms,
+            "submodule_spread_ms": round(spread, 6),
             "overhead_ceiling_ms": round(submodule_ms * 1.10, 6),
+            "bootstrap_achieved": achieved,
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
-        return bootstrap_ms, submodule_ms
+        return bootstrap_ms, submodule_ms, achieved
 
     @contextmanager
     def _at_commit(self, repo: Path, commit: str | None):
@@ -704,26 +979,66 @@ class Pipeline:
         finally:
             target.write_text(original)
 
-    def _measure(self, repo: Path, label: str, cores: str) -> float:
+    #: The numerics a validator prints beside its latency. Read from the same run, because they
+    #: describe the same kernel on the same host — and because a bar derived from the recorded
+    #: output alone is not a bar the pipeline can be held to. See `materialize.tighten_bar`.
+    ACHIEVED_MARKERS = ("max_abs_err", "cosine", "pass_fraction")
+
+    #: Draws behind the submodule baseline, whose median sets check (i)'s ceiling. Three is enough
+    #: to drop a single outlier and cheap: the validator run is seconds, and this happens once.
+    BASELINE_DRAWS = 3
+
+    def _measure(self, repo: Path, label: str, cores: str,
+                 draws: int = 1) -> tuple[float, dict[str, float], float]:
+        """The validator's median latency over `draws` runs, with the median run's numerics.
+
+        The median, because one draw is not a latency. `latency_ms` on this host carries a few
+        percent of run-to-run spread, and a bound built from a single draw is a bound that the code
+        which set it cannot reproduce: `mtp.0.attention`'s submodule drew 0.445173 ms once, which
+        put check (i)'s ceiling at 0.48969 ms, below every one of twelve later draws of the module
+        kernel that ceiling admitted. Three of its five stage-5 iterations died on that.
+
+        The numerics come from the median run rather than from any run, so the recorded accuracy and
+        the recorded latency describe the same execution.
+        """
         from optimization import candidate
 
-        self.console.print(f"  measuring {label} in {repo}")
-        outcome = candidate.run_candidate(
-            repo, [sys.executable, "inference.py"],
-            env_overrides={"NEURON_RT_NUM_CORES": cores},
-        )
-        latency = candidate.marker_value(outcome.output, METRIC)
-        if outcome.return_code != 0 or latency is None:
-            tail = "\n".join(outcome.output.strip().splitlines()[-15:])
-            raise StageError(
-                f"could not measure {label}: exit {outcome.return_code}, "
-                f"latency {latency}\n{tail}"
+        self.console.print(f"  measuring {label} in {repo}"
+                           + (f" ({draws} draws, median)" if draws > 1 else ""))
+        taken: list[tuple[float, dict[str, float]]] = []
+        for draw in range(1, max(1, draws) + 1):
+            outcome = candidate.run_candidate(
+                repo, [sys.executable, "inference.py"],
+                env_overrides={"NEURON_RT_NUM_CORES": cores},
             )
-        self.console.print(f"    {latency:g} ms")
-        return latency
+            latency = candidate.marker_value(outcome.output, METRIC)
+            if outcome.return_code != 0 or latency is None:
+                tail = "\n".join(outcome.output.strip().splitlines()[-15:])
+                raise StageError(
+                    f"could not measure {label}: exit {outcome.return_code}, "
+                    f"latency {latency}\n{tail}"
+                )
+            achieved = {name: value for name in self.ACHIEVED_MARKERS
+                        if (value := candidate.marker_value(outcome.output, name)) is not None}
+            taken.append((latency, achieved))
+            if draws > 1:
+                self.console.print(f"    draw {draw}: {latency:g} ms")
 
-    def assemble(self) -> StageOutcome:
+        taken.sort(key=lambda pair: pair[0])
+        median, numerics = taken[len(taken) // 2]
+        spread = taken[-1][0] - taken[0][0]
+        if draws > 1:
+            self.console.print(
+                f"    [bold]{median:g} ms[/bold] median, spread {spread:g} ms "
+                f"({spread / median * 100:.1f}%)"
+            )
+        else:
+            self.console.print(f"    {median:g} ms")
+        return median, numerics, spread
+
+    def assemble(self, rebuild: bool = False) -> StageOutcome:
         """Rebuild the whole module across all ranks, and accept it only when the gate agrees."""
+        self._refuse_to_clobber("assemble", rebuild)
         projection = self.projection()
         repo = self.config.full_repo
         submodule_repo = self.config.submodule_repo
@@ -731,7 +1046,7 @@ class Pipeline:
             raise StageError(f"{submodule_repo} does not exist — run the submodule stages first")
 
         best_commit, best_ms = _best_from_summary(submodule_repo)
-        bootstrap_ms, submodule_ms = self.measure_baselines()
+        bootstrap_ms, submodule_ms, achieved = self.measure_baselines()
         ranks = projection.projected_units
         prompt_template = presets.assemble_prompt()
 
@@ -743,16 +1058,19 @@ class Pipeline:
                 artifact=self.config.artifact, submodule_repo=submodule_repo,
                 projection=projection, module_id=self.config.module_id,
                 bootstrap_latency_ms=bootstrap_ms, submodule_latency_ms=submodule_ms,
-                best_commit=best_commit,
+                best_commit=best_commit, achieved=achieved,
             )
             for line in prepared.get("stripped") or []:
                 self.console.print(f"  [dim]stripped {line}[/dim]")
+            memory_block = self._seed_preparation_memory(repo, self.config.full.memory)
             prompt = _render(prompt_template, {
                 "repo": str(repo), "module": self.config.module_id, "entry_point": "kernel",
                 "ranks": ranks, "last_rank": ranks - 1,
                 "bootstrap_latency": f"{bootstrap_ms:g}",
                 "submodule_latency": f"{submodule_ms:g}",
                 "overhead_ceiling": f"{submodule_ms * 1.10:g}",
+                "memory": memory_block,
+                "archive": self._seed_archive(repo),
             })
             held = custody.take_custody(
                 prepared, custody.MODULE_OWNED,
@@ -768,7 +1086,10 @@ class Pipeline:
                 self.console.print(f"  [yellow]![/yellow] manifest: {line}")
 
             ok, report = self._run_gate(repo, "optimization.module_checker", "module")
-            self._record(f"assemble-attempt-{attempt}", {"passed": ok, "report": report})
+            self._record(f"assemble-attempt-{attempt}", {
+                "passed": ok, "report": report,
+                "validator_sha256": _validator_sha256(repo),
+            })
             if ok:
                 materialize.git_init(
                     repo, f"Assembly baseline: {self.config.module_id} on {ranks} ranks",
@@ -1106,6 +1427,7 @@ class Pipeline:
 
         deliverables = fb.snapshot_deliverables(sub, full)
         fb.repro_dir(self.config.workspace_root).mkdir(parents=True, exist_ok=True)
+        filed = archive.read_entries(self.config.feedback_archive)
         prompt = _render(presets.feedback_prompt(), {
             "module": self.config.module_id,
             "corpus": listing,
@@ -1121,6 +1443,8 @@ class Pipeline:
             "bootstrap_latency": _ms(baselines.get("bootstrap_latency_ms")),
             "submodule_latency": _ms(sub_summary.get("best_ms")),
             "full_latency": _ms(full_summary.get("best_ms")),
+            "archive": self._seed_archive(self.config.workspace_root, feedback=True),
+            "rulings": ", ".join(archive.RULINGS),
         })
 
         self.console.print(
@@ -1128,6 +1452,10 @@ class Pipeline:
             f"~{words:,} words"
         )
         for attempt in range(1, self.config.preparation_retries + 1):
+            # `_run_one_shot` drops the seeded copy when it returns, and this prompt was rendered
+            # once, so a retry has to put the archive back or it points at a directory not there.
+            if attempt > 1:
+                self._seed_archive(self.config.workspace_root, feedback=True)
             ok = self._run_one_shot(
                 self.config.workspace_root, prompt, f"feedback-{attempt}",
                 self.config.feedback_timeout, model=self.config.feedback_model,
@@ -1139,6 +1467,9 @@ class Pipeline:
             # `build/`, which is harmless, but nothing was stopping it editing `source.py`.
             touched = fb.restore_deliverables(deliverables)
             problems = fb.validate_report(self.config.workspace_root)
+            # Rulings on already-filed findings are checked the same way and for the same reason:
+            # a verdict naming an id that is in no entry is one nobody can act on.
+            problems += archive.validate_rulings(self.config.workspace_root, filed)
             self._record(f"feedback-attempt-{attempt}",
                          {"agent_ok": ok, "problems": problems, "restored": touched})
             for name in touched:
@@ -1153,6 +1484,9 @@ class Pipeline:
                     f"  [green]feedback written[/green] — {counts['findings']} finding(s) "
                     f"({levels}) in {fb.REPORT_NAME}"
                 )
+                # After the structural check, never before: the archive is read by every later
+                # run, so only a report that passed its own gate belongs in it.
+                self._deposit_feedback()
                 return StageOutcome("feedback", True,
                                     f"{counts['findings']} finding(s)", counts)
             for problem in problems:
@@ -1165,6 +1499,226 @@ class Pipeline:
         )
 
     # -- the whole thing -----------------------------------------------------------
+
+    def _tighten_submodule_bar(self, repo: Path) -> list[str]:
+        """Re-pin the submodule's numerical bar to what its own cut achieved, before the loop runs.
+
+        The bar the agent derived is a property of the rank's recorded output — `RTOL` times its
+        largest element plus `ATOL` — so on a cut far better than that, the bar never binds and the
+        loop can spend a large multiple of the achievable error with nothing objecting. That is what
+        happened on `layers.2.attention`: the cut reached `max_abs_err = 0.0389` against a bar of
+        0.7875, iteration 1 bought 4x of latency for 2.2x of error, and the assembly and stage 5
+        then inherited it unchanged.
+
+        Done here rather than by the agent because the cut can only be measured after the validator
+        is written, and the validator may not move afterwards without the manifest and the recorded
+        hash moving with it — which is why all three are rewritten together. The pipeline may do
+        that; the agent may not, and `check_frozen_validator` is what keeps the distinction.
+
+        10% of slack, calibrated on the runs that have finished: `00-Attention-B` ended +1.0% from
+        its own baseline, `00-Attention-C` -3.5%, `24-Attention` -49.3%, and `02-Attention` +77.0%.
+
+        Called from the submodule stage and again from the start of the loop, and idempotent across
+        both: `tolerance_achieved` in the manifest is the record that it has already happened. Both
+        call sites because reaching the re-pin used to mean running the submodule stage, and running
+        the submodule stage means rebuilding the cut — so "restart the loop under a tighter bar"
+        cost a tuned kernel and an hour of agent time to ask for.
+        """
+        from optimization import candidate
+
+        manifest_path = repo / ".autohelix" / "optimization" / "submodule.json"
+        validator = repo / "inference.py"
+        if not (manifest_path.is_file() and validator.is_file()):
+            return []
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        derived = manifest.get("tolerance") or {}
+        if not derived:
+            return []
+        already = manifest.get("tolerance_achieved") or {}
+        if already:
+            return [
+                f"bar already re-pinned: MAX_ABS_ERR {derived.get('MAX_ABS_ERR')} "
+                f"(the cut measured {already.get(ACCURACY_MARKER)})"
+            ]
+
+        achieved = self._cut_accuracy(repo)
+        if achieved is None:
+            return [
+                f"[yellow]![/yellow] no {ACCURACY_MARKER} for the cut, so the bar stays as the "
+                f"agent derived it (MAX_ABS_ERR {derived.get('MAX_ABS_ERR')}) — the loop is free "
+                f"to spend accuracy up to it"
+            ]
+
+        tightened = materialize.tighten_bar(derived, {ACCURACY_MARKER: achieved})
+        if tightened == derived:
+            return []
+
+        text, unreachable = candidate.rewrite_pinned_constants(validator.read_text(), tightened)
+        if unreachable:
+            return [f"[yellow]![/yellow] could not re-pin {', '.join(unreachable)} in "
+                    f"inference.py; leaving the bar as the agent derived it"]
+        validator.write_text(text)
+        manifest["tolerance"] = tightened
+        manifest["tolerance_derived"] = derived
+        manifest["tolerance_achieved"] = {ACCURACY_MARKER: achieved}
+        frozen = manifest.get("frozen")
+        if isinstance(frozen, dict) and "inference.py" in frozen:
+            frozen["inference.py"] = _validator_sha256(repo)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        self._refresh_recorded_validator("submodule", _validator_sha256(repo))
+        # The two namespaces differ on purpose and are easy to confuse: the bar is keyed by the
+        # constant names the validator declares (`MAX_ABS_ERR`), the verdict and the marker by the
+        # statistic's own name (`max_abs_err`).
+        return [
+            f"[green]bar re-pinned[/green] to this cut's own accuracy: MAX_ABS_ERR "
+            f"{derived.get('MAX_ABS_ERR')} -> {tightened.get('MAX_ABS_ERR'):g} "
+            f"(the cut measured {achieved:g})"
+        ]
+
+    def _refresh_recorded_validator(self, stage: str, digest: str) -> None:
+        """Re-record the frozen validator's hash in the stage's passing records.
+
+        The pipeline is allowed to rewrite `inference.py` — re-pinning the bar is that — but
+        `_prepared` tells a half-replaced stage from a finished one by comparing the repo's
+        validator against the hash the passing record carries. Leave the record behind and the next
+        `optimize all` reads its own edit as a replaced repo and rebuilds the stage, which is the
+        destruction this was meant to prevent.
+        """
+        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json")):
+            try:
+                payload = json.loads(record.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not payload.get("passed") or payload.get("validator_sha256") == digest:
+                continue
+            payload["validator_sha256"] = digest
+            record.write_text(json.dumps(payload, indent=2))
+
+    def _cut_accuracy(self, repo: Path) -> float | None:
+        """What the cut's own frozen validator measured for `ACCURACY_MARKER`, or None.
+
+        `submodule-gate.json` and not `gate.json`. The loop points its per-iteration gate at
+        `gate.json` (`config.write_loop_config`), so one iteration in, that file describes the
+        newest candidate rather than the cut — and a bar re-pinned from it would be pinned to
+        whatever the loop had already drifted to. `submodule-gate.json` is written once, by the
+        submodule stage's own gate, and nothing afterwards touches it.
+
+        A verdict written before that gate published this marker carries a latency and no accuracy.
+        The validator is frozen and the cut is sitting in the repo, so measure it rather than let
+        the loop run unbounded: one validator run against hours of iterations.
+        """
+        verdict = repo / ".autohelix" / "optimization" / "submodule-gate.json"
+        try:
+            recorded = json.loads(verdict.read_text()).get(ACCURACY_MARKER)
+        except (OSError, json.JSONDecodeError):
+            recorded = None
+        if isinstance(recorded, (int, float)):
+            return float(recorded)
+
+        self.console.print(
+            f"  {verdict.name} carries no {ACCURACY_MARKER}; running the frozen validator once to "
+            f"find what the cut achieves"
+        )
+        try:
+            _, measured, _ = self._measure(repo, "the cut's accuracy", "1")
+        except StageError as exc:
+            self.console.print(f"  [yellow]![/yellow] {exc}")
+            return None
+        measured_value = measured.get(ACCURACY_MARKER)
+        return float(measured_value) if isinstance(measured_value, (int, float)) else None
+
+    def _refuse_to_clobber(self, stage: str, rebuild: bool) -> None:
+        """Stop a preparation stage from archiving a repo whose own gate already passed.
+
+        `submodule` and `assemble` both open with `_set_aside`, which moves the finished repo into
+        `.optimization/attempts/` and materializes a fresh one for the agent to fill. On a stage
+        that has not passed that is the whole point. On a stage that has, it costs the tuned kernel,
+        its git history, its notes and reviews, and an hour of agent time to rebuild something
+        nobody asked to change — recoverable only because `_set_aside` archives rather than deletes.
+
+        So rebuilding is opt-in. Neither reason an operator reaches for `optimize submodule` on a
+        passed stage needs it: re-pinning the numerical bar happens at the start of the loop
+        (`_tighten_submodule_bar`), and re-running the loop is `optimize run`.
+        """
+        if rebuild or self._prepared(stage, quiet=True) is None:
+            return
+        repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
+        nxt = "run" if stage == "submodule" else "run-full"
+        raise StageError(
+            f"{stage} already passed its gate and {repo.name} is still there, so this would "
+            f"archive it to {self.state_dir / 'attempts'} and have an agent build another one.\n"
+            f"To re-run the loop over the repo you have: `optimize {nxt}`.\n"
+            f"To change its numerical bar: that happens at the start of the loop now, so "
+            f"`optimize {nxt}` is enough.\n"
+            f"To replace the repo on purpose: `optimize {stage} --rebuild`."
+        )
+
+    def _prepared(self, stage: str, *, quiet: bool = False) -> StageOutcome | None:
+        """The recorded outcome of a preparation stage that already passed, or None.
+
+        `submodule` and `assemble` both open with `_set_aside`, so calling either one again moves
+        the finished repo into `.optimization/attempts/` and builds a new one from the bootstrap.
+        That is the right behaviour for `optimize submodule` run on purpose, and the wrong
+        behaviour for `optimize all` run to pick a pipeline up where it stopped — which is what
+        `all`'s own docstring promises. Resuming a run that died in stage 5 cost a tuned
+        single-rank kernel and five iterations of history before this guard existed; they were
+        recoverable only because `_set_aside` archives rather than deletes.
+
+        Both halves have to hold. A record says the gate passed once; the repo being present says
+        the thing it passed on is still there to run.
+
+        Every passing record is considered, not the first one found. A stage rebuilt after it had
+        already passed keeps the earlier attempt's record — a rebuild that fails before writing one
+        of its own leaves no failure beside it — so the oldest `passed: true` can describe a repo
+        that is gone while a later one describes the repo in front of us. Stopping at the first
+        mismatch rebuilt the good repo it had not got to yet.
+        """
+        repo = self.config.submodule_repo if stage == "submodule" else self.config.full_repo
+        if not (repo / "source.py").is_file():
+            return None
+        current = _validator_sha256(repo)
+        passes: list[tuple[Path, dict[str, Any]]] = []
+        for record in sorted(self.state_dir.glob(f"{stage}-attempt-*.json"), key=_attempt_number):
+            try:
+                payload = json.loads(record.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if payload.get("passed"):
+                passes.append((record, payload))
+        if not passes:
+            return None
+
+        # A pass record alone is not enough. A rebuild interrupted after `_set_aside` materialized
+        # a fresh repo but before its own record was written leaves an older `passed: true` beside
+        # a repo of stubs, and skipping the gate for *that* is how a half-replaced stage reaches
+        # the loop. The frozen validator's hash is what ties a verdict to the repo it was about.
+        matched = [(r, p) for r, p in passes if p.get("validator_sha256") == current]
+        unhashed = [(r, p) for r, p in passes if p.get("validator_sha256") is None]
+        if not (matched or unhashed):
+            if not quiet:
+                names = ", ".join(r.name for r, _ in passes)
+                self.console.print(
+                    f"  [yellow]![/yellow] {names} passed against a different inference.py than "
+                    f"{repo.name} now has — rebuilding {stage} rather than trusting it"
+                )
+            return None
+        record, _ = (matched or unhashed)[-1]
+        if not quiet:
+            if not matched:
+                self.console.print(
+                    f"  [yellow]![/yellow] {record.name} records a pass but no validator hash "
+                    f"(written before this was recorded); skipping {stage} on the weaker evidence "
+                    f"that {repo.name} is present"
+                )
+            self.console.print(
+                f"  [green]{stage} already passed[/green] ({record.name}) and {repo.name} "
+                f"is present — skipping it. Run `optimize {stage} --rebuild` to replace it "
+                f"on purpose."
+            )
+        return StageOutcome(stage=stage, ok=True, detail="already recorded as passing")
 
     def all(self) -> list[StageOutcome]:
         """Every stage in order, stopping at the first that did not succeed.
@@ -1187,10 +1741,10 @@ class Pipeline:
                 )
 
         step(self.init())
-        step(self.submodule())
+        step(self._prepared("submodule") or self.submodule())
         step(self.compile_constraints("submodule"))
         step(self.run_loop("submodule"))
-        step(self.assemble())
+        step(self._prepared("assemble") or self.assemble())
         if self.config.full.schedule.enforceable():
             step(self.compile_constraints("full"))
         step(self.run_loop("full"))

@@ -66,6 +66,9 @@ CHECK_TITLES: dict[str, str] = {
 #: constraint schedule permits a torch implementation, and a gate that forbade it would contradict
 #: the schedule. Keeping NKI-only is the schedule's job, checked per iteration by a script the
 #: agent cannot see.
+#: The accuracy statistic every validator in this pipeline prints and the gate already checks.
+ACCURACY_MARKER = "max_abs_err"
+
 SOURCE_ALLOWED_IMPORTS = frozenset({"nki", "neuronxcc", "torch", "torch_neuronx", "torch_xla", "numpy"})
 
 #: What `inference.py` may have on top. It loads `.bin` bytes and drives the device.
@@ -87,8 +90,10 @@ def find_manifest(repo: Path) -> Path:
     Walking up is what lets the gate's command line be a fixed string with no per-repo path in
     it — so the command never names anything the agent could read to learn what is checked.
     """
-    for candidate in [repo, *repo.parents]:
-        path = candidate / MANIFEST_REL
+    # `directory`, not `candidate`: this module imports `candidate` and the loop variable shadowed
+    # it, so a reader inside this function sees the wrong meaning for the name.
+    for directory in [repo, *repo.parents]:
+        path = directory / MANIFEST_REL
         if path.is_file():
             return path
     raise CheckerError(
@@ -135,11 +140,15 @@ def check_shape(repo: Path, manifest: dict[str, Any]) -> CheckResult:
     findings: list[str] = []
 
     source = candidate._parse(repo / SOURCE_FILE)
-    functions = candidate.top_level_functions(source)
-    if entry not in functions:
+    # Any top-level binding, not only a `def`. `kernel = _impl[2]` binds the NKI launch grid at
+    # module scope, which is how a kernel reaches both physical cores of an LNC=2 pair while the
+    # frozen validator still calls `kernel(*args)` with no subscript. Requiring a `FunctionDef`
+    # rejected that, and it is the shape the 2x dual-core split needs.
+    names = candidate.top_level_names(source)
+    if entry not in names:
         findings.append(
             f"{SOURCE_FILE} defines no top-level '{entry}'. "
-            f"Found: {', '.join(sorted(functions)) or 'nothing'}"
+            f"Found: {', '.join(sorted(names)) or 'nothing'}"
         )
 
     inference = candidate._parse(repo / INFERENCE_FILE)
@@ -344,14 +353,17 @@ def evaluate(repo: Path, manifest: dict[str, Any],
         repo, [sys.executable, INFERENCE_FILE], timeout=timeout,
         env_overrides={"NEURON_RT_NUM_CORES": SUBMODULE_CORES},
     )
+    # Every check behind `guarded`, for the reason given there: a defect in one of them used to
+    # escape as a traceback the harness books against the candidate.
+    g = candidate.guarded
     results = [
-        check_shape(repo, manifest),
-        check_self_contained(repo),
-        check_measurement(run),
-        check_baseline(run, bar, repo),
-        check_provenance(repo, manifest),
-        check_declaration(repo, manifest),
-        check_single_core(repo),
+        g("a", CHECK_TITLES["a"], check_shape, repo, manifest),
+        g("b", CHECK_TITLES["b"], check_self_contained, repo),
+        g("c", CHECK_TITLES["c"], check_measurement, run),
+        g("d", CHECK_TITLES["d"], check_baseline, run, bar, repo),
+        g("e", CHECK_TITLES["e"], check_provenance, repo, manifest),
+        g("f", CHECK_TITLES["f"], check_declaration, repo, manifest),
+        g("g", CHECK_TITLES["g"], check_single_core, repo),
     ]
     return results, run
 
@@ -383,6 +395,12 @@ def main(argv: list[str] | None = None) -> int:
     if latency is not None:
         extra[LATENCY_MARKER] = latency
 
+    # The accuracy the validator reported, published beside the latency for the same reason: the
+    # verdict is the only thing that outlives the worktree, and `optimization.readback` turns it
+    # into a recorded metric the loop can gate on.
+    worst = candidate.marker_value(run.output, ACCURACY_MARKER)
+    if worst is not None:
+        extra[ACCURACY_MARKER] = worst
     verdict = candidate.write_verdict(
         results, run, "submodule gate", Path(args.json) if args.json else None, extra=extra,
     )

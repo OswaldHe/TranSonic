@@ -670,6 +670,24 @@ def read_slot_verdict(iteration: int, label: str | None, path: Path, output: str
     )
 
 
+#: Imports a checker may have. It reads one file and writes one JSON report, so the standard
+#: library's text, parsing and path tools are the whole job. `subprocess` is absent deliberately:
+#: a checker that can spawn a process can do anything this list is trying to prevent.
+#:
+#: Quoted verbatim into `CHECKER_CONTRACT` below, so the compiler is told this list rather than
+#: "the standard library". The two disagreeing stalled a stage: a checker that imported `operator`
+#: to dispatch `ast.Add` — the ordinary way to evaluate a trace-time constant like
+#: `SEQ // WORLD_SIZE` — obeyed the contract it was given and was rejected by the code that read
+#: it. Keep them in sync by construction, not by memory.
+CHECKER_ALLOWED_IMPORTS = frozenset({
+    "argparse", "ast", "json", "os", "pathlib", "re", "sys", "collections", "dataclasses",
+    "itertools", "functools", "typing", "textwrap", "difflib", "tokenize", "io", "math",
+    "string", "enum", "keyword", "symtable", "hashlib", "warnings",
+    # Pure computation: no I/O, no dynamic import, so none of them reaches anything this list
+    # exists to keep out.
+    "operator", "bisect", "heapq", "statistics", "token", "numbers", "fractions", "decimal",
+})
+
 #: The contract the compiler agent is held to. Extracted as a constant because it appears both in
 #: the compiler's prompt and in the validation that its output is usable. The timeout is
 #: interpolated from where it is enforced: the prompt used to promise 30 seconds while
@@ -680,7 +698,9 @@ Each checker is a standalone Python script, run from the candidate repository's 
     python <checker> --repo <dir> --json <report.json>
 
 It must:
-  - import nothing outside the standard library
+  - import only these modules, and nothing else — the rest of the standard library is rejected,
+    so if you want something outside this list, write it inline instead:
+        {", ".join(sorted(CHECKER_ALLOWED_IMPORTS))}
   - read only files under `--repo` (the constraint is about the candidate, nothing else)
   - write `--json` as {{"passed": true|false, "findings": ["...", ...]}}
   - exit 0 when the constraint was followed and non-zero when it was not
@@ -742,15 +762,6 @@ def validate_checker_source(path: Path) -> list[str]:
     findings += _side_effect_findings(tree, path.name)
     return findings
 
-
-#: Imports a checker may have. It reads one file and writes one JSON report, so the standard
-#: library's text, parsing and path tools are the whole job. `subprocess` is absent deliberately:
-#: a checker that can spawn a process can do anything this list is trying to prevent.
-CHECKER_ALLOWED_IMPORTS = frozenset({
-    "argparse", "ast", "json", "os", "pathlib", "re", "sys", "collections", "dataclasses",
-    "itertools", "functools", "typing", "textwrap", "difflib", "tokenize", "io", "math",
-    "string", "enum", "keyword", "symtable", "hashlib", "warnings",
-})
 
 #: Calls that delete, replace or execute. Writing is *not* here: a checker's whole output is the
 #: JSON report, so it legitimately writes one file, and banning writes would reject every checker

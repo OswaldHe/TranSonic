@@ -24,6 +24,7 @@ import yaml
 
 from optimization import PROJECTION_TARGET_UNITS
 from optimization.constraints import Schedule, ScheduleError
+from optimization.memory import MemorySpec, MemoryError_
 
 
 class ConfigError(ValueError):
@@ -57,6 +58,7 @@ class StageConfig:
     iteration_time: str | None = None
     max_regression_pct: float = 5.0
     schedule: Schedule = field(default_factory=Schedule)
+    memory: MemorySpec = field(default_factory=MemorySpec)
     reviewer_prompt: str = ""
     reviewer_model: str | None = None
     reviewer_timeout_seconds: int = REVIEWER_TIMEOUT_SECONDS
@@ -89,6 +91,10 @@ class PipelineConfig:
     #: and searches for documentation links, so it gets longer than the constraint compiler.
     feedback_model: str | None = None
     feedback_timeout: str = "3h"
+    #: The cross-run feedback archive: every finished run's `FEEDBACK.md`, deposited here when its
+    #: report passes and seeded read-only into every later run. Unset disables the mechanism
+    #: entirely, because it is the one path this pipeline writes to outside its own workspace.
+    feedback_archive: Path | None = None
     source: Path | None = None
 
     # -- derived paths -------------------------------------------------------------
@@ -124,23 +130,27 @@ class PipelineConfig:
             data = yaml.safe_load(path.read_text()) or {}
         except yaml.YAMLError as exc:
             raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
-        config = cls.from_dict(data)
+        # The config's own directory, so `memory.path` may be written relative to the file the
+        # operator edits rather than to whatever directory the command was run from.
+        config = cls.from_dict(data, base_dir=path.resolve().parent)
         config.source = path.resolve()
         return config
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PipelineConfig":
+    def from_dict(cls, data: dict[str, Any], base_dir: Path | None = None) -> "PipelineConfig":
         if not isinstance(data, dict):
             raise ConfigError("the config did not parse as a mapping")
         unknown = set(data) - {
             "module", "floorplan", "workspace", "submodule", "full", "agent", "preparation",
             "feedback",
             "constraint_compiler",
+            # Shared defaults both stages' `memory:` blocks inherit, so `path:` is written once.
+            "memory",
         }
         if unknown:
             raise ConfigError(
                 f"unknown top-level key(s): {', '.join(sorted(unknown))}. Known: module, "
-                f"floorplan, workspace, submodule, full, agent, preparation, "
+                f"floorplan, workspace, submodule, full, memory, agent, preparation, "
                 f"constraint_compiler, feedback"
             )
 
@@ -180,8 +190,8 @@ class PipelineConfig:
             on_oversized=on_oversized,
             workspace_root=Path(str(root)).expanduser(),
             venv=Path(str(venv)).expanduser() if venv and str(venv) != PLACEHOLDER else None,
-            submodule=_stage(data, "submodule"),
-            full=_stage(data, "full"),
+            submodule=_stage(data, "submodule", base_dir, data.get("memory")),
+            full=_stage(data, "full", base_dir, data.get("memory")),
             agent_type=str(agent.get("type", "claude")),
             preparation_retries=int(preparation.get("retries", 3)),
             preparation_timeout=str(preparation.get("timeout", "4h")),
@@ -189,6 +199,7 @@ class PipelineConfig:
             compiler_timeout=str(compiler.get("timeout", "1h")),
             feedback_model=feedback_section.get("model"),
             feedback_timeout=str(feedback_section.get("timeout", "3h")),
+            feedback_archive=_archive_path(feedback_section.get("archive"), base_dir),
         )
 
     # -- validation ----------------------------------------------------------------
@@ -240,6 +251,8 @@ class PipelineConfig:
         for stage in (self.submodule, self.full):
             for warning in stage.schedule.validate(stage.iterations):
                 found.append(f"{stage.name}: {warning}")
+            for warning in stage.memory.validate():
+                found.append(f"{stage.name}: {warning}")
         return found
 
     # -- the derived AutoHelix config ----------------------------------------------
@@ -256,12 +269,16 @@ class PipelineConfig:
         from optimization import candidate, module_checker
 
         if stage == "submodule":
-            spec, checker, timeout = (
-                self.submodule, "optimization.submodule_checker", candidate.DEFAULT_RUN_TIMEOUT,
+            spec, checker, timeout, extra = (
+                self.submodule, "optimization.submodule_checker",
+                candidate.DEFAULT_RUN_TIMEOUT, "",
             )
         elif stage == "full":
-            spec, checker, timeout = (
-                self.full, "optimization.module_checker", module_checker.DEFAULT_RUN_TIMEOUT,
+            # `--loop` drops the admission-only checks: re-asking check (i) every iteration
+            # rejects candidates for measurement noise. See `module_checker.evaluate`.
+            spec, checker, timeout, extra = (
+                self.full, "optimization.module_checker",
+                module_checker.DEFAULT_RUN_TIMEOUT, " --loop",
             )
         else:
             raise ConfigError(f"unknown stage '{stage}' (expected 'submodule' or 'full')")
@@ -273,7 +290,7 @@ class PipelineConfig:
                 # interpreter. The preflight proves it can import what the gate needs.
                 "command": (
                     f"{GATE_PYTHON} -m {checker} --repo . "
-                    f"--json .autohelix/optimization/gate.json --timeout {timeout}"
+                    f"--json .autohelix/optimization/gate.json --timeout {timeout}{extra}"
                 ),
                 "timeout": timeout + 300,
             }],
@@ -327,6 +344,15 @@ class PipelineConfig:
                 }
                 for slot in spec.schedule.slots
             ]
+        if spec.memory.enabled:
+            # The loop re-reads this derived file, so the memory has to survive the round trip the
+            # same way the schedule does. Absolute path: the derived config lives beside the repos,
+            # not beside the operator's config, so a relative path would resolve somewhere else.
+            payload["memory"] = spec.memory.to_payload()
+        if self.feedback_archive is not None:
+            # Every iteration of every stage, with no selector. Unlike the operator's memory this
+            # is not about *this* module, so there is no iteration it would be wrong for.
+            payload["feedback_archive"] = str(self.feedback_archive)
         if spec.has_reviewer:
             payload["reviewer"] = {
                 "prompt": spec.reviewer_prompt,
@@ -380,11 +406,30 @@ def _required_path(section: dict[str, Any], key: str, where: str) -> Path:
     return Path(_required_str(section, key, where)).expanduser()
 
 
-def _stage(data: dict[str, Any], name: str) -> StageConfig:
+def _archive_path(raw: Any, base_dir: Path | None) -> Path | None:
+    """`feedback.archive`, resolved against the operator's config file like `memory.path` is.
+
+    Absent, blank or still the placeholder all mean off. Relative resolves against the config's
+    own directory, because the archive is shared by every module's config in a project and those
+    configs sit together.
+    """
+    if raw is None or not str(raw).strip() or str(raw).strip() == PLACEHOLDER:
+        return None
+    path = Path(str(raw).strip()).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    return path
+
+
+def _stage(
+    data: dict[str, Any], name: str, base_dir: Path | None = None,
+    shared_memory: Any = None,
+) -> StageConfig:
     section = data.get(name) or {}
     if not isinstance(section, dict):
         raise ConfigError(f"'{name}:' must be a mapping")
-    unknown = set(section) - {"goal", "budget", "acceptance", "iteration_constraints", "reviewer"}
+    unknown = set(section) - {"goal", "budget", "acceptance", "iteration_constraints", "reviewer",
+                              "memory"}
     if unknown:
         raise ConfigError(f"{name}: unknown key(s) {', '.join(sorted(unknown))}")
 
@@ -400,6 +445,14 @@ def _stage(data: dict[str, Any], name: str) -> StageConfig:
     except ScheduleError as exc:
         raise ConfigError(f"{name}.iteration_constraints: {exc}") from exc
 
+    try:
+        memory = MemorySpec.from_config(
+            MemorySpec.merge(shared_memory, section.get("memory"), where=f"{name}.memory"),
+            max_iterations=iterations, base_dir=base_dir, where=f"{name}.memory",
+        )
+    except MemoryError_ as exc:
+        raise ConfigError(str(exc)) from exc
+
     return StageConfig(
         name=name,
         goal=str(section.get("goal") or ""),
@@ -407,6 +460,7 @@ def _stage(data: dict[str, Any], name: str) -> StageConfig:
         iteration_time=(str(budget["iteration_time"]) if budget.get("iteration_time") else None),
         max_regression_pct=float(acceptance.get("max_regression_pct", 5)),
         schedule=schedule,
+        memory=memory,
         reviewer_prompt=str(reviewer.get("prompt") or ""),
         reviewer_model=reviewer.get("model"),
         reviewer_timeout_seconds=int(
