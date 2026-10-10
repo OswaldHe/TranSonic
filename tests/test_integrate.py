@@ -382,3 +382,80 @@ def test_failing_constraints_do_not_reject_the_iteration(repo):
     assert len(ran) == 2
     assert all(r.accepted for r in ran), "a failing constraint rejected the iteration"
     assert not loop.satisfied()
+
+
+def test_a_dead_agent_costs_an_iteration_not_the_run(repo, monkeypatch):
+    """A SIGTERMed agent must not end an unattended run.
+
+    `Harness.run_iteration` raises `AutoHelixRunError` when the agent exits non-zero, and
+    `Harness` lets that kill the whole run. That is right for a bounded `optimize` budget and
+    wrong for a pass designed to iterate for days: a single transient kill cost a real run its
+    place, and the work the dead attempt had already validated.
+    """
+    from autohelix.harness import AutoHelixRunError
+
+    from integrate.loop import BaselineLoop
+
+    data = _base_config()
+    data["budget"]["iterations"] = 3
+    data["agent"]["settings"] = {
+        "change_file": "impl.py",
+        "change_content": "VALUE = 42\ndef ready(): return True",
+    }
+    loop = BaselineLoop(_write(repo, data))
+
+    calls = {"n": 0}
+    real_run = BaselineLoop.__mro__[1].run
+
+    def flaky(self, max_iterations=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AutoHelixRunError("Iteration 1 agent failed: Claude Code exited with status 143")
+        return real_run(self, max_iterations=max_iterations)
+
+    monkeypatch.setattr(BaselineLoop.__mro__[1], "run", flaky)
+    loop.run()
+
+    assert calls["n"] == 2, "the loop did not retry after the agent died"
+    assert loop.satisfied(), "the retry did not produce a passing iteration"
+
+
+def test_repeated_agent_deaths_stop_the_loop(repo, monkeypatch):
+    """A permanently broken agent must stop, not spin forever."""
+    from autohelix.harness import AutoHelixRunError
+
+    from integrate.loop import MAX_AGENT_FAILURES, BaselineLoop
+
+    data = _base_config()
+    data["agent"]["settings"] = {"change_file": "impl.py", "change_content": "# nothing"}
+    loop = BaselineLoop(_write(repo, data))
+
+    calls = {"n": 0}
+
+    def always_dead(self, max_iterations=None):
+        calls["n"] += 1
+        raise AutoHelixRunError("Iteration 1 agent failed: killed")
+
+    monkeypatch.setattr(BaselineLoop.__mro__[1], "run", always_dead)
+    loop.run()
+
+    assert calls["n"] == MAX_AGENT_FAILURES
+    assert not loop.satisfied()
+
+
+def test_an_operator_error_is_not_retried(repo, monkeypatch):
+    """A dirty tree or failed preflight is not transient; retrying cannot fix it."""
+    from autohelix.harness import AutoHelixRunError
+
+    from integrate.loop import BaselineLoop
+
+    data = _base_config()
+    data["agent"]["settings"] = {"change_file": "impl.py", "change_content": "# nothing"}
+    loop = BaselineLoop(_write(repo, data))
+
+    def dirty_tree(self, max_iterations=None):
+        raise AutoHelixRunError("Uncommitted changes in editable files")
+
+    monkeypatch.setattr(BaselineLoop.__mro__[1], "run", dirty_tree)
+    with pytest.raises(AutoHelixRunError, match="Uncommitted"):
+        loop.run()

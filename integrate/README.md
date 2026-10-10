@@ -182,6 +182,18 @@ working directory, so `--json` lands in a tree that is discarded; the copy under
 `.autohelix/integrate/gate.json` is what the next prompt and the `status` command read. Safe —
 `.autohelix/` is gitignored, and the gate is pipeline-owned, not agent-owned.
 
+**A dead agent costs an iteration, not the run.** `Harness` raises `AutoHelixRunError` when
+the agent exits non-zero and lets that end everything, which is right for a bounded `optimize`
+budget and wrong for a pass meant to run unattended for days — one transient SIGTERM otherwise
+discards the whole run. `BaselineLoop.run` absorbs up to `MAX_AGENT_FAILURES` (3) *consecutive*
+agent deaths, retrying the same iteration; any iteration that completes resets the count, so a
+permanently broken agent still stops. Operator errors — a dirty tree, a failed preflight, a
+missing editable file — are re-raised unretried, since retrying cannot fix them.
+
+A retry starts from the repo again, so whatever the dead attempt had only in its worktree is
+gone. What survives is `.autohelix/notes/`, which is why the prompt insists on writing findings
+down as they are made rather than at the end.
+
 **Nothing stops an unbounded run that cannot converge.** That is the intended mode, but set
 `budget.max_cost_usd` or `budget.max_time` if the run is unattended. `check` warns when none of
 the three is set.

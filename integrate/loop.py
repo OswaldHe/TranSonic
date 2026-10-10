@@ -34,11 +34,18 @@ from pathlib import Path
 
 from rich.console import Console
 
-from autohelix.harness import Harness
+from autohelix.harness import AutoHelixRunError, Harness
 from integrate.config import METRIC, IntegrateConfig
 
 #: Where this pass keeps what it owns, inside the repo's gitignored `.autohelix/`.
 STATE_DIR = ".autohelix/integrate"
+
+#: How many agent deaths in a row to absorb before giving up. `Harness` treats a dead agent as
+#: fatal to the whole run, which is right for a bounded `optimize` budget and wrong here: this
+#: pass is designed to run unattended for days, so one transient kill should cost an iteration
+#: rather than the run. Consecutive, and reset by any iteration that completes, so a permanently
+#: broken agent still stops instead of spinning.
+MAX_AGENT_FAILURES = 3
 
 
 class BaselineLoop(Harness):
@@ -221,6 +228,8 @@ class BaselineLoop(Harness):
         cap = max_iterations or config.max_iterations or self.config.max_iterations
         self._ensure_baseline_verdict()
 
+        agent_failures = 0
+
         while True:
             done = self.history.get_last_iteration()
             if done >= cap:
@@ -231,7 +240,28 @@ class BaselineLoop(Harness):
                 )
                 break
 
-            super().run(max_iterations=done + 1)
+            try:
+                super().run(max_iterations=done + 1)
+            except AutoHelixRunError as exc:
+                if not self._is_agent_failure(exc):
+                    raise
+                agent_failures += 1
+                self.log.warn(f"iter {done + 1} agent died ({exc}); attempt {agent_failures}")
+                self.console.print(
+                    f"\n[yellow]Iteration {done + 1}'s agent died[/yellow] — {exc}\n"
+                    f"  Retrying ({agent_failures} of {MAX_AGENT_FAILURES}). The dead attempt's "
+                    f"notes survive in `.autohelix/notes/`, so the retry inherits what it "
+                    f"wrote down; anything it had only in its worktree is gone."
+                )
+                if agent_failures >= MAX_AGENT_FAILURES:
+                    self.console.print(
+                        f"\n[red]Stopping: {agent_failures} agent deaths in a row.[/red] That is "
+                        "a broken agent rather than a transient kill — check the backend and the "
+                        "iteration log, then re-run to resume from the last merged iteration."
+                    )
+                    break
+                continue
+            agent_failures = 0
 
             if self.history.get_last_iteration() == done:
                 # Harness.run stopped without iterating and has already reported the reason.
@@ -245,6 +275,19 @@ class BaselineLoop(Harness):
         self._summarizing = True
         self._print_summary()
         self.write_summary()
+
+    @staticmethod
+    def _is_agent_failure(exc: AutoHelixRunError) -> bool:
+        """Whether this error is a dead agent, as opposed to something worth stopping for.
+
+        `Harness` raises `AutoHelixRunError` for several unrelated things — a dirty tree, a
+        failed preflight, a missing editable file — and those are operator errors that retrying
+        cannot fix. Only the agent-failure path is transient, and it is identified by the
+        message `run_iteration` builds for it (`harness.py`: "Iteration N agent failed: ...").
+        Matching on the message is narrow, but the alternative is a new exception type in the
+        shared `Harness`, which this pass has no business adding for its own retry policy.
+        """
+        return "agent failed" in str(exc)
 
     def _ensure_baseline_verdict(self) -> None:
         """Evaluate the constraints against the repo once, before the loop starts.
