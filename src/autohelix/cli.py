@@ -828,10 +828,40 @@ class _OptimizeGroup(click.Group):
         return self._delegate().get_command(ctx, name)
 
 
+class _IntegrateGroup(click.Group):
+    """Lazy proxy for the `integrate` CLI.
+
+    Same reasoning as the other proxies: the integrate pass reads a repo, runs its constraints
+    and drives agents, and no other `autohelix` invocation should pay to import them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="integrate",
+            help="Drive a repo that does not satisfy its constraints to one that does.",
+        )
+
+    def _delegate(self) -> click.Group:
+        try:
+            from integrate.cli import integrate
+        except ImportError as exc:
+            raise click.ClickException(
+                f"The integrate subsystem is unavailable ({exc})."
+            ) from exc
+        return integrate
+
+    def list_commands(self, ctx):
+        return self._delegate().list_commands(ctx)
+
+    def get_command(self, ctx, name):
+        return self._delegate().get_command(ctx, name)
+
+
 main.add_command(_PartitionGroup())
 main.add_command(_BootstrapGroup())
 main.add_command(_FloorplanGroup())
 main.add_command(_OptimizeGroup())
+main.add_command(_IntegrateGroup())
 
 
 if __name__ == "__main__":
