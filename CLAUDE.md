@@ -46,6 +46,12 @@ uv pip install -e ".[dev]"
   per-iteration constraint schedule), `assemble` (an agent rejoins the ranks with
   `nki.collectives`), `run-full`, `feedback` (an agent reconciles both loops' notes into a report
   of what blocked further optimization). See `optimization/README.md`
+- `integrate/` - the integration pass (`autohelix integrate`): drives a repo that does NOT
+  satisfy its constraints to one that does — the inverse of `optimization/`, where the baseline
+  passes and the loop makes it faster. First stage: `run-baseline`, an unbounded loop whose
+  metric is `constraints_passing` and which exits when every constraint holds. A constraint is
+  either a script (exit code decides) or an agent (a prompt and a criteria, judged by a model,
+  for what a script cannot express without becoming gameable). See `integrate/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -67,6 +73,7 @@ autohelix partition    # Model partitioning / tracing / verification (see partit
 autohelix bootstrap    # Bootstrap a Trainium NKI kernel for one module (see bootstrap/)
 autohelix floorplan    # Decide what runs where on a Trainium instance (see floorplan/)
 autohelix optimize     # Make one bootstrapped module fast on one device (see optimization/)
+autohelix integrate    # Drive a repo to a state where its constraints hold (see integrate/)
 ```
 
 ## Testing
@@ -77,6 +84,7 @@ pytest -k partition       # just the model-partitioning suite (no network, no GP
 pytest -m bootstrap       # just the NKI bootstrap suite (no network, no device)
 pytest -m floorplan       # just the floorplan suite (no network, no device)
 pytest -m optimization    # just the optimization suite (no network, no device)
+pytest -m integrate       # just the integrate suite (no network, no device, no model calls)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers
