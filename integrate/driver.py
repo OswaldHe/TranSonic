@@ -194,7 +194,7 @@ class IntegratePass:
             for finding in result.findings[:3]:
                 self.console.print(f"        {finding}")
 
-        passing, total = payload["constraints_passing"], payload["constraints_total"]
+        passing, total = payload["all_constraints_passing"], payload["constraints_total"]
         if payload["satisfied"]:
             self.console.print(f"\n  [green]{passing}/{total} — every constraint holds[/green]")
             return StageOutcome(True, f"{passing}/{total}")

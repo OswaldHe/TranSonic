@@ -31,11 +31,16 @@ rejected.
 
 Two things, and both matter:
 
-**The count of constraints that hold may not go down.** It is the metric. An iteration that
-satisfies fewer than the best so far is rejected and its work is discarded — so trading a
-passing constraint for a failing one loses the iteration entirely. If you are about to
-restructure something that currently works, make the replacement work before you remove what
-it replaces.
+**The count of *script* constraints that hold may not go down.** It is the metric. An iteration
+that holds fewer of them than the best so far is rejected and its work is discarded — so
+trading a passing script constraint for a failing one loses the iteration entirely. If you are
+about to restructure something that currently works, make the replacement work before you
+remove what it replaces.
+
+The agent-judged constraints are deliberately not in that count. A judge can reach a different
+verdict on an unchanged tree, and an iteration is not thrown away over that. They are not
+optional, though: the run is not finished until every constraint holds, both kinds, and a
+judge's FAIL names something to fix rather than something to discount.
 
 **The constraint has to be satisfied, not defeated.** Making a check pass by weakening the
 check, stubbing the value it reads, hard-coding what it compares against, or catching the

@@ -1,5 +1,6 @@
 """Tests for agent backend line parsing (_handle_line)."""
 
+import io
 import json
 
 import pytest
@@ -662,3 +663,86 @@ class TestOpenCodeHandleLine:
         line = json.dumps({"type": "new_event_type"})
         events = _collect_events(self._agent(), line)
         assert events[0].kind == AgentEventKind.STATUS
+
+
+class TestSelfKillGuard:
+    """The PreToolUse guard: `bin/guard_self_kill.py`.
+
+    `_build_command` passes the prompt as the last argv element, so the agent's own command
+    line contains every string the prompt does — including each constraint's command. A
+    `pkill -f`/`pgrep -f | kill` on any of them matches the agent. Iteration 5 of the
+    vllm-neuron run ended itself that way, two hours in, with `exited with status -9`.
+    """
+
+    @staticmethod
+    def _guard():
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).parent.parent / "src" / "autohelix" / "bin" / "guard_self_kill.py"
+        spec = importlib.util.spec_from_file_location("guard_self_kill", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    #: What the hook sees of its own ancestry: the agent carrying the prompt, and the harness.
+    TREE = [
+        (4242, "claude", "/usr/bin/claude --print --verbose "
+                         "iteration 6 ... checked by: `python -m pkg.verifier.run_verifier "
+                         "--model /data/hf` ..."),
+        (4100, "python", "/venv/bin/python /venv/bin/autohelix integrate run-baseline"),
+    ]
+
+    @pytest.mark.parametrize("command", [
+        # iteration 5's actual last command
+        'kill -9 3682816; pgrep -f "run_verifier --model /data" | xargs -r kill -9',
+        'pkill -9 -f "pkg.verifier"',
+        "pgrep -x python | xargs kill -9",
+        "killall python3",
+        "kill -9 4242",
+        "kill -TERM 4100",
+    ])
+    def test_refuses_a_command_that_would_signal_the_agent(self, command):
+        assert self._guard().offence(command, self.TREE) is not None
+
+    @pytest.mark.parametrize("command", [
+        "pkill -9 -x neuronx-cc",
+        "pkill -9 -f 'max-num-batched-tokens 1024'",
+        "kill -9 3682816",
+        # inspection is not killing: the agent has to be able to look
+        'pgrep -f "run_verifier --model" | wc -l',
+        "neuron-ls | tail -3",
+        'echo "I had to kill the compiler"',
+        "pkill -9 -f 'VLLM::'",
+    ])
+    def test_allows_everything_else(self, command):
+        assert self._guard().offence(command, self.TREE) is None
+
+    def test_a_bare_pgrep_of_our_own_pattern_is_inspection_not_a_kill(self):
+        guard = self._guard()
+        pattern = 'pgrep -af "run_verifier --model /data"'
+        assert guard.offence(pattern, self.TREE) is None
+        assert guard.offence(pattern + " | xargs kill", self.TREE) is not None
+
+    def test_the_hook_blocks_with_exit_2_and_explains_itself(self, monkeypatch, capsys):
+        guard = self._guard()
+        monkeypatch.setattr(guard, "ancestors", lambda: self.TREE)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "run_verifier --model /data"'},
+        })))
+        assert guard.main() == 2
+        err = capsys.readouterr().err
+        assert "would kill the agent running it" in err
+
+    def test_a_non_bash_tool_is_never_blocked(self, monkeypatch):
+        guard = self._guard()
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+            "tool_name": "Edit", "tool_input": {"file_path": "/x", "old_string": "kill 4242"},
+        })))
+        assert guard.main() == 0
+
+    def test_malformed_input_fails_open(self, monkeypatch):
+        guard = self._guard()
+        monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+        assert guard.main() == 0

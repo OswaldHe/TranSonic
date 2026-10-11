@@ -48,10 +48,12 @@ uv pip install -e ".[dev]"
   of what blocked further optimization). See `optimization/README.md`
 - `integrate/` - the integration pass (`autohelix integrate`): drives a repo that does NOT
   satisfy its constraints to one that does — the inverse of `optimization/`, where the baseline
-  passes and the loop makes it faster. First stage: `run-baseline`, an unbounded loop whose
-  metric is `constraints_passing` and which exits when every constraint holds. A constraint is
-  either a script (exit code decides) or an agent (a prompt and a criteria, judged by a model,
-  for what a script cannot express without becoming gameable). See `integrate/README.md`
+  passes and the loop makes it faster. First stage: `run-baseline`, an unbounded loop which
+  exits when every constraint holds. A constraint is either a script (exit code decides) or an
+  agent (a prompt and a criteria, judged by a model, for what a script cannot express without
+  becoming gameable). Acceptance gates on `constraints_passing`, the script constraints only —
+  `all_constraints_passing` covers both kinds and is recorded but not gated, because a judge can
+  flip over an unchanged tree. See `integrate/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,

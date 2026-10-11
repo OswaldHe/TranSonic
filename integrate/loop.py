@@ -20,7 +20,7 @@ everywhere else.
 
 **A failing baseline.** `_capture_baseline` records iteration 0's metrics without checking
 constraints, so a baseline with nothing passing records as `constraints_passing: 0` and the run
-proceeds. That is the starting condition, not an error — which is why this is a separate pass
+proceeds (and `all_constraints_passing: 0` with it — the gated count and the whole count). That is the starting condition, not an error — which is why this is a separate pass
 rather than a mode of `optimize`.
 
 **A prompt that says what is still failing.** The agent is told which constraints hold, and for
@@ -35,7 +35,7 @@ from pathlib import Path
 from rich.console import Console
 
 from autohelix.harness import AutoHelixRunError, Harness
-from integrate.config import METRIC, IntegrateConfig
+from integrate.config import METRIC, METRIC_ALL, IntegrateConfig
 
 #: Where this pass keeps what it owns, inside the repo's gitignored `.autohelix/`.
 STATE_DIR = ".autohelix/integrate"
@@ -81,12 +81,18 @@ class BaselineLoop(Harness):
             return {}
 
     def best_passing(self) -> int:
-        """The most constraints any recorded iteration satisfied."""
+        """The most constraints any recorded iteration satisfied, of both kinds.
+
+        `METRIC_ALL`, not the gated `METRIC`: the gated one counts only the script constraints,
+        so measuring the exit condition on it would call a run finished — or never finished —
+        on a fraction of the bar. A record without `METRIC_ALL` predates the split, where
+        `METRIC` was the whole count.
+        """
         return max(
             (
-                int(r.metrics.get(METRIC, 0))
+                int(r.metrics.get(METRIC_ALL, r.metrics.get(METRIC, 0)))
                 for r in self.history.load()
-                if METRIC in r.metrics
+                if METRIC_ALL in r.metrics or METRIC in r.metrics
             ),
             default=0,
         )
@@ -132,8 +138,9 @@ class BaselineLoop(Harness):
 
         status: list[str] = []
         if results:
+            held = sum(1 for entry in results if entry.get("passed"))
             status.append(
-                f"As of the last check, {payload.get(METRIC, 0)} of "
+                f"As of the last check, {held} of "
                 f"{payload.get('constraints_total', len(results))} constraint(s) hold.\n"
             )
             for entry in results:
@@ -311,7 +318,7 @@ class BaselineLoop(Harness):
         results, payload = gate_mod.evaluate(config, config.project_path)
         self.gate_json.parent.mkdir(parents=True, exist_ok=True)
         self.gate_json.write_text(json.dumps(payload, indent=2) + "\n")
-        passing, total = payload[METRIC], payload["constraints_total"]
+        passing, total = payload[METRIC_ALL], payload["constraints_total"]
         colour = "green" if payload["satisfied"] else "yellow"
         self.console.print(
             f"  baseline    [{colour}]{passing}/{total}[/{colour}] constraint(s) hold"
@@ -339,12 +346,16 @@ class BaselineLoop(Harness):
     def write_summary(self) -> Path:
         """What this run reached, for the next stage and for a human."""
         history = self.history.load()
-        best = max((r.metrics.get(METRIC, 0) for r in history if r.iteration > 0), default=0)
+        ran = [r for r in history if r.iteration > 0]
+        best = max((r.metrics.get(METRIC_ALL, r.metrics.get(METRIC, 0)) for r in ran), default=0)
         summary = {
             "pass": "integrate",
             "stage": "baseline",
             "target_id": self.integrate_config.target_id,
-            "metric": METRIC,
+            # Both, named: `best_passing` is the whole bar, and the gate acceptance acted on is
+            # the script count. Reporting only one of them would read as the other.
+            "metric": METRIC_ALL,
+            "gated_metric": METRIC,
             "satisfied": self.satisfied(),
             "constraints_total": len(self.integrate_config.constraints),
             "best_passing": best,
@@ -353,6 +364,7 @@ class BaselineLoop(Harness):
                 {
                     "iteration": r.iteration,
                     "accepted": r.accepted,
+                    METRIC_ALL: r.metrics.get(METRIC_ALL),
                     METRIC: r.metrics.get(METRIC),
                     "reason": r.reason,
                 }

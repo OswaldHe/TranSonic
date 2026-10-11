@@ -14,9 +14,11 @@ list without a schema fork — the same way `optimization/` carries `iteration_c
 `memory` and `feedback_archive` in a config the shared dataclass does not know about.
 
 **Derived: the metric and the acceptance rule.** Both are the pass's, not the operator's. The
-metric is `constraints_passing`; acceptance refuses any iteration satisfying fewer than the best
-so far. A config that set either could let an unbounded loop wander, so setting them is an
-error rather than an override.
+gated metric is `constraints_passing`, counting the script constraints; acceptance refuses any
+iteration holding fewer of them than the best so far. `all_constraints_passing` carries the whole
+count — ranked, recorded, and the loop's exit condition, but not gated, because an agent judge
+can flip over an unchanged tree. A config that set either could let an unbounded loop wander, so
+setting them is an error rather than an override.
 """
 
 from __future__ import annotations
@@ -52,10 +54,23 @@ KINDS = ("script", "agent")
 DEFAULT_SCRIPT_TIMEOUT = 1800
 DEFAULT_AGENT_TIMEOUT = 1800
 
-#: The metric this pass runs on: how many constraints currently hold. Fixed, for the same reason
-#: `optimization`'s `latency_ms` is — the acceptance rule, the gate's verdict and the loop's exit
-#: condition all name it.
+#: The metric acceptance gates on: how many *script* constraints currently hold. Fixed, for the
+#: same reason `optimization`'s `latency_ms` is — the acceptance rule, the gate's verdict and the
+#: readback all name it.
+#:
+#: Script constraints only, because this is the count an iteration is *rejected* for. A script
+#: constraint is deterministic: the same tree gives the same verdict, so a drop is a regression
+#: the iteration caused. An agent constraint is a model call, and two calls over the same tree can
+#: disagree — in the vllm-neuron run `heavy-ops-use-nki-kernels` went PASS at iteration 3 and FAIL
+#: at iteration 4 over lines that were byte-identical between them, and the zero-tolerance rule
+#: below discarded the first iteration that had ever produced a token. Agent verdicts still decide
+#: `satisfied`, so the loop does not finish until every constraint holds, and they still reach the
+#: next iteration as findings. They just cannot cost an iteration its work.
 METRIC = "constraints_passing"
+
+#: Every constraint, script and agent alike. What the run is actually trying to reach, so it is
+#: what the loop's exit condition and the summary are measured on — but never gated, per `METRIC`.
+METRIC_ALL = "all_constraints_passing"
 
 #: Where the gate writes its verdict, relative to the project.
 GATE_JSON = ".autohelix/integrate/gate.json"
@@ -318,8 +333,9 @@ class IntegrateConfig:
         # quietly losing it in the derived file.
         if self.raw.get("metrics") or self.raw.get("observables"):
             problems.append(
-                "`metrics:`/`observables:` is set, but this pass supplies its own metric "
-                f"({METRIC}) and would overwrite it. Express what you wanted as a constraint."
+                "`metrics:`/`observables:` is set, but this pass supplies its own metrics "
+                f"({METRIC}, {METRIC_ALL}) and would overwrite them. Express what you wanted as "
+                "a constraint."
             )
         if (self.raw.get("acceptance") or {}).get("metric_gates"):
             problems.append(
@@ -396,12 +412,15 @@ class IntegrateConfig:
             # cost — for agent constraints, paying for every judge twice — and the two runs could
             # disagree, leaving an iteration accepted on one count and ranked on another.
             "command": f"{GATE_PYTHON} -m integrate.readback --json {GATE_JSON}",
-            "values": {METRIC: "higher"},
+            "values": {METRIC: "higher", METRIC_ALL: "higher"},
             "timeout": 120,
         }]
-        # Zero tolerance: an iteration satisfying fewer constraints than the best so far is
-        # rejected and its work discarded. That is what turns "run until it passes" into
-        # something that converges rather than oscillates.
+        # Zero tolerance, on the script count only: an iteration holding fewer script constraints
+        # than the best so far is rejected and its work discarded. That is what turns "run until
+        # it passes" into something that converges rather than oscillates. `METRIC_ALL` is
+        # deliberately not gated — it moves with judge verdicts, which can differ between two
+        # runs over the same tree, and a flip there is not a regression to discard an iteration
+        # for. See `METRIC`.
         payload["acceptance"] = {
             "metric_gates": [{"metric": METRIC, "max_regression_pct": 0.0}],
         }

@@ -12,8 +12,11 @@
 #      the repo, for conditions a script cannot express without becoming gameable.
 #
 # `metrics:` and `acceptance:` are NOT yours here. This pass supplies them: the metric is how
-# many constraints hold, and acceptance refuses any iteration that satisfies fewer than the best
-# so far. Setting either is what would let an unbounded loop wander.
+# many constraints hold, and acceptance refuses any iteration that holds fewer *script*
+# constraints than the best so far. Agent verdicts are reported and have to hold for the run to
+# finish, but they are not gated — a judge can decide differently on an unchanged tree, and an
+# iteration is not discarded over that. Setting either key is what would let an unbounded loop
+# wander.
 #
 # All paths below are relative to the project root — they resolve inside the per-iteration
 # worktree, so use relative paths (src/, tests/), not absolute.
@@ -25,7 +28,7 @@ goal: |
   looks like beyond the constraints, and name anything deliberately out of scope.
 
 # Must all hold for the run to be finished. Evaluated in order; the count that hold is the
-# metric, so an iteration that satisfies fewer than the best so far is rejected.
+# metric, and an iteration holding fewer *script* constraints than the best so far is rejected.
 #
 # A bare string is a script constraint, exactly as in `autohelix.yaml`:
 constraints:

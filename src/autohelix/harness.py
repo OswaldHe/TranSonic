@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -151,6 +152,7 @@ class Harness:
             self._time_left_script = self._install_time_left(claude_hooks)
         if self.config.agent.require_notes is not None:
             self._install_require_notes(claude_hooks)
+        self._install_self_kill_guard(claude_hooks)
         self._write_claude_settings(claude_hooks)
 
         self.agent = create_agent(self.config.agent, heartbeat_seconds=heartbeat_seconds)
@@ -415,6 +417,26 @@ class Harness:
             hooks["Stop"] = [
                 {"hooks": [{"type": "command", "command": str(notes_hook)}]}
             ]
+
+    def _install_self_kill_guard(self, hooks: dict[str, list]) -> None:
+        """Install the PreToolUse hook that stops the agent killing its own process (claude only).
+
+        Unconditional, because the failure it prevents costs an entire iteration and the agent
+        cannot see it coming: `agents/claudecode.py` passes the prompt as the last argv element,
+        so `pkill -f`/`pgrep -f | kill` on any string the prompt contains — a constraint's
+        command line, a module name — matches the agent itself. `bin/guard_self_kill.py` has the
+        incident that motivated it. The hook fails open, so a guard bug cannot block real work.
+        """
+        if self.config.agent.type.lower() != "claude":
+            return
+        guard = self._copy_bin("guard_self_kill.py")
+        if guard is None:
+            return
+        entry = {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": f"{sys.executable} {guard}"}],
+        }
+        hooks.setdefault("PreToolUse", []).append(entry)
 
     def _write_claude_settings(self, hooks: dict[str, list]) -> None:
         """Write the accumulated Claude Code hooks to claude_settings.json (if any)."""

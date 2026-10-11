@@ -238,10 +238,17 @@ def status(path: str, config: str | None) -> None:
         return
 
     payload = json.loads(gate_path.read_text())
-    passing = payload.get("constraints_passing", 0)
-    total = payload.get("constraints_total", 0)
+    entries = payload.get("constraints") or []
+    passing = sum(1 for e in entries if e.get("passed"))
+    total = payload.get("constraints_total", len(entries))
+    gated, gated_total = payload.get("constraints_passing"), payload.get(
+        "script_constraints_total"
+    )
     colour = "green" if payload.get("satisfied") else "yellow"
-    console.print(f"\n  [{colour}]{passing}/{total}[/{colour}] constraint(s) hold\n")
+    console.print(f"\n  [{colour}]{passing}/{total}[/{colour}] constraint(s) hold")
+    if gated is not None and gated_total is not None:
+        console.print(f"  [dim]{gated}/{gated_total} script, the count acceptance gates on[/dim]")
+    console.print()
     for entry in payload.get("constraints") or []:
         mark = "PASS" if entry.get("passed") else "FAIL"
         c = "green" if entry.get("passed") else "red"

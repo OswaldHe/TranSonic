@@ -18,8 +18,11 @@ difference from `optimization`'s gate. There, a failing gate means a broken cand
 rejecting it is right. Here a failing constraint is the *normal* state for most of the run — it
 is what the loop exists to fix — so a nonzero exit would reject every iteration and discard its
 progress, and the loop could only succeed by accident on a single iteration. What prevents a
-regression instead is the metric: `constraints_passing` can never go down, enforced by the
-loop's acceptance rule.
+regression instead is the metric: `constraints_passing` — the *script* constraints that hold —
+can never go down, enforced by the loop's acceptance rule. The verdict counts the agent
+constraints separately, in `all_constraints_passing`, which is reported and ranked on but not
+gated: a judge can reach a different verdict over an unchanged tree, and that is not something
+to discard an iteration's work for. `satisfied` still means every constraint, both kinds.
 
 Without `--advisory` it exits 1 when anything fails, which is what an operator wants by hand or
 from CI.
@@ -33,7 +36,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from integrate.config import GATE_JSON, METRIC, Constraint, IntegrateConfig
+from integrate.config import GATE_JSON, METRIC, METRIC_ALL, Constraint, IntegrateConfig
 
 
 @dataclass
@@ -119,10 +122,16 @@ def evaluate(
             stopped = True
 
     passing = sum(1 for r in results if r.passed)
+    script = [r for r in results if r.kind == "script"]
     payload = {
         "target_id": config.target_id,
         "repo": str(repo),
-        METRIC: passing,
+        # The gated count and its denominator: script constraints only, deterministic, so a drop
+        # is the iteration's doing. See `METRIC`.
+        METRIC: sum(1 for r in script if r.passed),
+        "script_constraints_total": len(script),
+        # The whole bar, which is what `satisfied` and the loop's exit condition are about.
+        METRIC_ALL: passing,
         "constraints_total": len(results),
         "satisfied": passing == len(results) and len(results) > 0,
         "stopped_early": stopped,
@@ -170,14 +179,18 @@ def main(argv: list[str] | None = None) -> int:
         mirror.parent.mkdir(parents=True, exist_ok=True)
         mirror.write_text(serialized)
 
-    passing, total = payload[METRIC], payload["constraints_total"]
+    passing, total = payload[METRIC_ALL], payload["constraints_total"]
+    script, script_total = payload[METRIC], payload["script_constraints_total"]
     print(f"constraints: {passing}/{total} satisfied  (repo: {repo})")
+    print(f"             {script}/{script_total} of them script, which is the gated count")
     for result in results:
         print(result.line())
     for result in results:
         for item in result.evidence[:2]:
             print(f"    evidence [{result.name}]: {item}")
-    print(f"\n##autohelix[{METRIC}={passing}]")
+    print(f"\n##autohelix[{METRIC}={script}]")
+    print(f"##autohelix[{METRIC_ALL}={passing}]")
+    print(f"##autohelix[script_constraints_total={script_total}]")
     print(f"##autohelix[constraints_total={total}]")
     if payload["satisfied"]:
         print("##autohelix[satisfied=1]")

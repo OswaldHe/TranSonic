@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reporting the constraint count the gate already measured, as AutoHelix's metric command.
+"""Reporting the constraint counts the gate already measured, as AutoHelix's metric command.
 
 Same reasoning as `optimization/readback.py`: the loop runs constraints, then runs the metric
 commands, and the obvious metric command here would be the gate itself. That would be wrong
@@ -11,6 +11,16 @@ accepted on one count and ranked on another.
 
 So the gate is the only thing that evaluates the constraints, and this reads its verdict back.
 One evaluation per iteration, by construction.
+
+**Two counts, and only one of them is gated.** `constraints_passing` is the script constraints
+that hold; `all_constraints_passing` is every constraint. Acceptance gates the first, because a
+script constraint's verdict is a property of the tree, so a drop in it is a regression the
+iteration caused. The second moves with agent judges, which can reach opposite verdicts over an
+unchanged tree — so it is recorded, reported and ranked on, but a drop in it never rejects an
+iteration. `integrate.config.METRIC` has the case that forced this. Both counts come from the
+verdict's per-constraint entries rather than its summary keys, so a verdict written before the
+split — where `constraints_passing` meant every constraint — reads correctly instead of
+reporting its whole count as the gated one.
 """
 
 from __future__ import annotations
@@ -18,24 +28,60 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-from integrate.config import METRIC
+from integrate.config import METRIC, METRIC_ALL
 
 
-def read_counts(path: Path) -> tuple[int | None, int | None, str]:
-    """`(passing, total, note)` out of a gate verdict."""
+@dataclass
+class Counts:
+    """What the gate found, split by what acceptance may act on."""
+
+    script_passing: int
+    script_total: int
+    passing: int
+    total: int
+
+
+def read_counts(path: Path) -> tuple[Counts | None, str]:
+    """The counts out of a gate verdict, or `None` and why not."""
     if not path.is_file():
-        return None, None, f"{path} does not exist — did the gate run?"
+        return None, f"{path} does not exist — did the gate run?"
     try:
         payload = json.loads(path.read_text())
     except json.JSONDecodeError as exc:
-        return None, None, f"{path} is not valid JSON: {exc}"
-    passing = payload.get(METRIC)
-    total = payload.get("constraints_total")
-    if not isinstance(passing, int):
-        return None, None, f"no {METRIC} in {path}"
-    return passing, (total if isinstance(total, int) else None), "from the gate's verdict"
+        return None, f"{path} is not valid JSON: {exc}"
+
+    entries = payload.get("constraints")
+    entries = entries if isinstance(entries, list) else []
+    if entries:
+        # From the per-constraint entries, not the summary keys, because they are unambiguous:
+        # they carry `kind` and `passed`, and they are in every verdict the gate has ever
+        # written. A verdict from before the script/all split holds the *whole* count under
+        # `constraints_passing`, so reading that key would report it as the script count and
+        # inflate the gated metric — which is the one number acceptance acts on.
+        script = [e for e in entries if e.get("kind") == "script"]
+        return Counts(
+            script_passing=sum(1 for e in script if e.get("passed")),
+            script_total=len(script),
+            passing=sum(1 for e in entries if e.get("passed")),
+            total=len(entries),
+        ), "from the gate's verdict"
+
+    script_passing, passing = payload.get(METRIC), payload.get(METRIC_ALL)
+    if not isinstance(script_passing, int) or not isinstance(passing, int):
+        return None, f"no constraint entries and no {METRIC}/{METRIC_ALL} in {path}"
+    return Counts(
+        script_passing=script_passing,
+        script_total=_int(payload.get("script_constraints_total"), script_passing),
+        passing=passing,
+        total=_int(payload.get("constraints_total"), passing),
+    ), "from the gate's verdict"
+
+
+def _int(value: object, fallback: int) -> int:
+    return value if isinstance(value, int) else fallback
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,12 +90,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     path = Path(args.json)
-    passing, total, note = read_counts(path)
-    if passing is None:
+    counts, note = read_counts(path)
+    if counts is None:
         print(f"could not read {METRIC}: {note}", file=sys.stderr)
         return 1
-    print(note if total is None else f"{note}: {passing}/{total}")
-    print(f"##autohelix[{METRIC}={passing}]")
+    print(
+        f"{note}: {counts.script_passing}/{counts.script_total} script constraint(s) hold "
+        f"— the gated count — and {counts.passing}/{counts.total} overall"
+    )
+    print(f"##autohelix[{METRIC}={counts.script_passing}]")
+    print(f"##autohelix[{METRIC_ALL}={counts.passing}]")
     return 0
 
 

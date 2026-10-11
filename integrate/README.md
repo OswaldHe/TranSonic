@@ -43,11 +43,23 @@ satisfied.
 Two things differ, and each one changes the loop's shape rather than its settings.
 
 **There is no metric to improve.** `optimize` ranks iterations by `latency_ms` and keeps the
-fastest. Nothing here is a speed. So the metric is `constraints_passing` — how many of the
-declared constraints hold — and the run ends when it equals the total. That is also what makes
+fastest. Nothing here is a speed. So the metric is how many of the declared constraints hold —
+`all_constraints_passing` — and the run ends when it equals the total. That is also what makes
 an unbounded loop converge: acceptance is a metric gate at **zero** tolerance, so an iteration
-satisfying fewer constraints than the best so far is rejected and its work discarded. Without
-it a loop with no end can trade one constraint for another forever.
+holding fewer constraints than the best so far is rejected and its work discarded. Without it a
+loop with no end can trade one constraint for another forever.
+
+**The gate is on the script constraints only.** The gated metric is `constraints_passing`, which
+counts the `kind: script` constraints, and `all_constraints_passing` — both kinds — is recorded
+and ranked on but never gated. A script constraint is a property of the tree: the same tree
+gives the same verdict, so a drop is a regression the iteration caused and discarding its work
+is right. An agent constraint is a model call, and two calls over the same tree can disagree.
+In the vllm-neuron run one did: `heavy-ops-use-nki-kernels` went PASS at iteration 3 and FAIL at
+iteration 4 citing lines that were byte-identical between them, and zero tolerance threw away
+the first iteration that had ever produced a token — three hours and $60 of work, over a flip.
+Agent verdicts still decide `satisfied`, so the run does not finish until every constraint
+holds, and they still reach the next iteration as findings. They just cannot cost an iteration
+its work.
 
 **The gate is advisory.** In `optimize`, a failing gate means a broken candidate and rejecting
 it is right. Here a failing constraint is the normal state for most of the run — it is what the
@@ -64,7 +76,7 @@ and makes the starting count — "you begin at 1 of 3" — a recorded fact.
 ## Constraints
 
 The point of the pass. Evaluated in the order the config lists them; the count that hold is the
-metric.
+metric, and the script ones among them are the count acceptance gates on.
 
 ### `kind: script`
 
@@ -164,7 +176,7 @@ budget valves and the resume logic keep working as they do everywhere else.
 | `config.py` | the operator's config, the `Constraint` model, and the derived loop config |
 | `gate.py` | runs every constraint once, writes the verdict, reports the count |
 | `agentcheck.py` | runs one agent constraint and reads back its verdict |
-| `readback.py` | reports the count the gate already measured, as the loop's metric command |
+| `readback.py` | reports the counts the gate already measured, as the loop's metric command |
 | `loop.py` | `BaselineLoop`: the exit condition, the failing baseline, the prompt |
 | `driver.py` | the `init` and `run-baseline` stages |
 | `templates/` | the config template and the per-iteration prompt |

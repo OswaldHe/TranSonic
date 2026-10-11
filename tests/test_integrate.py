@@ -18,7 +18,7 @@ import pytest
 import yaml
 
 from integrate import gate as gate_mod
-from integrate.config import METRIC, Constraint, IntegrateConfig
+from integrate.config import METRIC, METRIC_ALL, Constraint, IntegrateConfig
 
 pytestmark = pytest.mark.integrate
 
@@ -200,7 +200,14 @@ def test_derived_config_has_no_metric_gate_on_latency(repo):
     gates = derived["acceptance"]["metric_gates"]
     assert [g["metric"] for g in gates] == [METRIC]
     assert gates[0]["max_regression_pct"] == 0.0
-    assert list(derived["metrics"][0]["values"]) == [METRIC]
+    assert list(derived["metrics"][0]["values"]) == [METRIC, METRIC_ALL]
+
+
+def test_only_the_script_count_is_gated(repo):
+    """Both counts are recorded; only the deterministic one can reject an iteration."""
+    derived = _write(repo, _base_config()).derive_loop_config()
+    assert METRIC_ALL in derived["metrics"][0]["values"]
+    assert METRIC_ALL not in [g["metric"] for g in derived["acceptance"]["metric_gates"]]
 
 
 def test_derived_gate_command_is_advisory(repo):
@@ -216,9 +223,30 @@ def test_gate_counts_the_failing_baseline(repo):
     config = _write(repo, _base_config())
     results, payload = gate_mod.evaluate(config, repo)
     assert payload[METRIC] == 1
+    assert payload[METRIC_ALL] == 1
     assert payload["constraints_total"] == 3
+    assert payload["script_constraints_total"] == 3
     assert payload["satisfied"] is False
     assert [r.passed for r in results] == [True, False, False]
+
+
+def test_gate_counts_the_two_kinds_apart(repo):
+    """The gated count is the script constraints; the agent verdict lands in the other."""
+    data = _base_config()
+    data["constraints"].append({
+        "name": "judged", "kind": "agent",
+        "prompt": "p", "criteria": "c", "timeout": 60,
+    })
+    data["agent"] = {"type": "mock", "settings": {
+        "change_file": ".autohelix/integrate/judge/judged.json",
+        "change_content": '{"verdict":"PASS","reason":"r","evidence":["impl.py:1"]}',
+    }}
+    config = _write(repo, data)
+    _, payload = gate_mod.evaluate(config, repo)
+    assert payload[METRIC] == 1, "the agent PASS must not raise the gated count"
+    assert payload["script_constraints_total"] == 3
+    assert payload[METRIC_ALL] == 2
+    assert payload["constraints_total"] == 4
 
 
 def test_gate_reports_satisfied_once_the_repo_is_fixed(repo):
@@ -315,6 +343,71 @@ def test_all_agent_constraints_warns(repo):
     assert any("kind: agent" in w for w in config.warnings())
 
 
+# ---------------------------------------------------------------------------- readback
+
+
+def _verdict(tmp_path, entries, **summary):
+    path = tmp_path / "gate.json"
+    path.write_text(json.dumps({"constraints": entries, **summary}))
+    return path
+
+
+def test_readback_reports_both_counts(tmp_path):
+    from integrate.readback import read_counts
+
+    path = _verdict(tmp_path, [
+        {"name": "a", "kind": "script", "passed": True},
+        {"name": "b", "kind": "script", "passed": False},
+        {"name": "c", "kind": "agent", "passed": True},
+    ])
+    counts, _ = read_counts(path)
+    assert (counts.script_passing, counts.script_total) == (1, 2)
+    assert (counts.passing, counts.total) == (2, 3)
+
+
+def test_readback_ignores_a_pre_split_summary_key(tmp_path):
+    """`constraints_passing` used to mean every constraint; reading it would inflate the gate."""
+    from integrate.readback import read_counts
+
+    path = _verdict(
+        tmp_path,
+        [
+            {"name": "a", "kind": "script", "passed": True},
+            {"name": "b", "kind": "script", "passed": False},
+            {"name": "c", "kind": "agent", "passed": True},
+        ],
+        constraints_passing=2,  # the old meaning: two of the three, one of them an agent's
+        constraints_total=3,
+    )
+    counts, _ = read_counts(path)
+    assert counts.script_passing == 1, "an old verdict's whole count read as the gated count"
+
+
+def test_readback_says_why_when_there_is_no_verdict(tmp_path):
+    from integrate.readback import read_counts
+
+    counts, note = read_counts(tmp_path / "missing.json")
+    assert counts is None and "does not exist" in note
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    counts, note = read_counts(bad)
+    assert counts is None and "not valid JSON" in note
+
+
+def test_readback_emits_one_marker_per_metric(tmp_path, capsys):
+    from integrate.readback import main
+
+    path = _verdict(tmp_path, [
+        {"name": "a", "kind": "script", "passed": True},
+        {"name": "c", "kind": "agent", "passed": False},
+    ])
+    assert main(["--json", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert f"##autohelix[{METRIC}=1]" in out
+    assert f"##autohelix[{METRIC_ALL}=1]" in out
+
+
 # ---------------------------------------------------------------------------- the loop
 
 
@@ -382,6 +475,68 @@ def test_failing_constraints_do_not_reject_the_iteration(repo):
     assert len(ran) == 2
     assert all(r.accepted for r in ran), "a failing constraint rejected the iteration"
     assert not loop.satisfied()
+
+
+def test_an_agent_verdict_flipping_does_not_reject_the_iteration(repo):
+    """The acceptance rule, which is the thing an agent constraint must not be able to trip.
+
+    A judge can reach the opposite verdict over an unchanged tree. When it does, the whole count
+    drops while every script constraint still holds, and rejecting on that discards an
+    iteration's work for a coin flip. A script constraint going from passing to failing is the
+    iteration's own doing, and still rejects.
+    """
+    from autohelix.harness import IterationResult
+    from integrate.loop import BaselineLoop
+
+    data = _base_config()
+    data["constraints"].append({
+        "name": "judged", "kind": "agent",
+        "prompt": "p", "criteria": "c", "timeout": 60,
+    })
+    loop = BaselineLoop(_write(repo, data))
+    loop.history.append(IterationResult(
+        iteration=1, accepted=True, metrics={METRIC: 3.0, METRIC_ALL: 4.0},
+    ))
+
+    assert loop._check_metric_gates({METRIC: 3.0, METRIC_ALL: 3.0}) is None, (
+        "a judge flip on an unchanged tree rejected the iteration"
+    )
+    reason = loop._check_metric_gates({METRIC: 2.0, METRIC_ALL: 3.0})
+    assert reason and METRIC in reason, "a broken script constraint was accepted"
+
+
+def test_the_exit_condition_is_the_whole_bar_not_the_gated_count(repo):
+    """Only gating the script count must not let the loop finish on the script count."""
+    from autohelix.harness import IterationResult
+    from integrate.loop import BaselineLoop
+
+    data = _base_config()
+    data["constraints"].append({
+        "name": "judged", "kind": "agent",
+        "prompt": "p", "criteria": "c", "timeout": 60,
+    })
+    loop = BaselineLoop(_write(repo, data))
+    loop.history.append(IterationResult(
+        iteration=1, accepted=True, metrics={METRIC: 3.0, METRIC_ALL: 3.0},
+    ))
+    assert loop.best_passing() == 3
+    assert not loop.satisfied(), "every script constraint holding is not every constraint holding"
+
+    loop.history.append(IterationResult(
+        iteration=2, accepted=True, metrics={METRIC: 3.0, METRIC_ALL: 4.0},
+    ))
+    assert loop.satisfied()
+
+
+def test_a_pre_split_history_record_still_reads_as_the_whole_count(repo):
+    """A run resumed across this change has records with only `METRIC`, meaning all of them."""
+    from autohelix.harness import IterationResult
+    from integrate.loop import BaselineLoop
+
+    loop = BaselineLoop(_write(repo, _base_config()))
+    loop.history.append(IterationResult(iteration=1, accepted=True, metrics={METRIC: 3.0}))
+    assert loop.best_passing() == 3
+    assert loop.satisfied()
 
 
 def test_a_dead_agent_costs_an_iteration_not_the_run(repo, monkeypatch):
