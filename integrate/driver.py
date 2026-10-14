@@ -82,8 +82,11 @@ class IntegratePass:
         self.console.print(f"  [green]OK[/green] workspace at {state}")
         self.console.print(f"  [green]OK[/green] derived loop config at {loop_config}")
         self._describe_constraints()
+        if config.stage == "run":
+            self._describe_metrics()
+        stage_command = "run-baseline" if config.stage == "baseline" else "run"
         self.console.print(
-            "\n  Next: [cyan]autohelix integrate run-baseline[/cyan]"
+            f"\n  Next: [cyan]autohelix integrate {stage_command}[/cyan]"
             f"{'' if config.source is None else f' --config {config.source}'}"
         )
         return StageOutcome(True, f"initialized {config.target_id}")
@@ -140,6 +143,35 @@ class IntegratePass:
                 first = constraint.criteria.strip().splitlines()[0] if constraint.criteria else ""
                 self.console.print(f"       judged by {model} (effort {effort}): {first}")
 
+    def _describe_metrics(self) -> None:
+        """What the run stage will measure, and what rejects an iteration."""
+        config = self.config
+        self.console.print(f"\n  {len(config.metric_names)} metric(s):")
+        for measurement in config.measurements:
+            source = (
+                "read back from the constraints' own output" if measurement.from_constraints
+                else f"`{measurement.command}`"
+            )
+            for name, direction in measurement.values.items():
+                gated = (
+                    f"rejects over {config.max_regression_pct:g}% regression"
+                    if measurement.gate else "recorded, not gated"
+                )
+                self.console.print(
+                    f"    [cyan]{name}[/cyan]  ({direction} is better, {gated})"
+                )
+            self.console.print(f"       {source}")
+        from integrate.schedule import Schedule
+
+        schedule = Schedule.from_config(
+            config.iteration_constraints, max_iterations=config.iterations
+        )
+        if schedule.slots:
+            self.console.print(f"\n  {len(schedule.slots)} iteration slot(s):")
+            for slot in schedule.slots:
+                first = (slot.text.strip().splitlines() or [""])[0]
+                self.console.print(f"    {slot.label}: {first[:72]}")
+
     # ------------------------------------------------------------------ stage: run-baseline
 
     def run_baseline(self, max_iterations: int | None = None) -> StageOutcome:
@@ -169,6 +201,83 @@ class IntegratePass:
         return StageOutcome(
             False,
             f"{len(failing)} constraint(s) still failing: {', '.join(failing) or 'unknown'}",
+        )
+
+    # ------------------------------------------------------------------ stage: run
+
+    def run(self, max_iterations: int | None = None) -> StageOutcome:
+        """Run the loop for its budget, improving the metrics while the constraints hold."""
+        from integrate.runloop import RunLoop
+
+        config = self.config
+        problems = config.validate()
+        if problems:
+            for problem in problems:
+                self.console.print(f"  [red]FAIL[/red] {problem}")
+            raise StageError(
+                "the config has problems; run `autohelix integrate check --stage run`"
+            )
+        for warning in config.warnings():
+            self.console.print(f"  [yellow]note[/yellow] {warning}")
+
+        state = config.project_path / STATE_DIR
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "notes").mkdir(exist_ok=True)
+
+        foreign = self._foreign_history()
+        if foreign:
+            raise StageError(foreign)
+
+        loop = RunLoop(config, console=self.console, verbose=self.verbose)
+        loop.run(max_iterations=max_iterations)
+
+        summary = json.loads((config.project_path / STATE_DIR / "run-summary.json").read_text())
+        improved = [
+            f"{name} {entry['improvement_pct']:+.1f}%"
+            for name, entry in (summary.get("metrics") or {}).items()
+            if entry.get("improvement_pct") is not None
+        ]
+        failing = loop.failing_names()
+        if failing:
+            return StageOutcome(
+                False,
+                f"{len(failing)} constraint(s) failing at the end: {', '.join(failing)}"
+                + (f"; {', '.join(improved)}" if improved else ""),
+            )
+        return StageOutcome(
+            True,
+            ", ".join(improved) if improved else "no metric moved",
+        )
+
+    def _foreign_history(self) -> str:
+        """Why this stage cannot start on the history already in the repo, or "".
+
+        The Harness keeps one history per project, so a `run` started in a repo that still holds
+        the baseline stage's iterations would continue its numbering — iteration 14 of a
+        13-iteration budget is already spent — and compare its metrics against records that have
+        none. Upstream notices the config changed and offers to archive interactively, which is
+        no use to a run started from a terminal nobody is watching. So it is refused here, with
+        the command that fixes it.
+        """
+        history = self.config.project_path / ".autohelix" / "history.jsonl"
+        if not history.is_file():
+            return ""
+        from autohelix.history import History
+
+        records = [r for r in History(self.config.project_path).load() if r.iteration > 0]
+        if not records:
+            return ""
+        names = set(self.config.metric_names)
+        if any(names & set(r.metrics or {}) for r in records):
+            return ""  # this stage's own history: resume
+        return (
+            f"{len(records)} iteration(s) already recorded in {history}, none of them carrying "
+            f"this stage's metrics ({', '.join(sorted(names)) or 'none declared'}). That is "
+            "another run's history — most likely `run-baseline`'s — and continuing it would "
+            "count its iterations against this budget and judge these metrics against records "
+            "that have none.\n"
+            f"        Archive it first: `autohelix clear -p {self.config.project_path}` "
+            "(it moves the state aside rather than deleting it), then start this stage."
         )
 
     # ------------------------------------------------------------------ one-shot gate
@@ -207,4 +316,7 @@ class IntegratePass:
     # ------------------------------------------------------------------ reporting
 
     def summary_path(self) -> Path:
-        return self.config.project_path / STATE_DIR / "baseline-summary.json"
+        name = (
+            "baseline-summary.json" if self.config.stage == "baseline" else "run-summary.json"
+        )
+        return self.config.project_path / STATE_DIR / name

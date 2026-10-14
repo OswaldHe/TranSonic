@@ -20,6 +20,10 @@ _PKG = "integrate.templates"
 #: The config `autohelix integrate init` copies into a project for the operator to fill in.
 CONFIG_TEMPLATE = "integrate.yaml"
 
+#: The config `autohelix integrate init --stage run` writes: the same constraints, plus the
+#: measurements the loop then improves.
+RUN_CONFIG_TEMPLATE = "integrate-run.yaml"
+
 
 def read(name: str) -> str:
     """One packaged template, by filename."""
@@ -31,8 +35,17 @@ def baseline_prompt() -> str:
     return read("baseline_prompt.md")
 
 
+def run_prompt() -> str:
+    """The per-iteration prompt for the run loop."""
+    return read("run_prompt.md")
+
+
 def config_template() -> str:
     return read(CONFIG_TEMPLATE)
+
+
+def run_config_template() -> str:
+    return read(RUN_CONFIG_TEMPLATE)
 
 
 def project_prompt(repo: Path) -> str:
@@ -46,3 +59,16 @@ def project_prompt(repo: Path) -> str:
     if override.is_file():
         return override.read_text()
     return baseline_prompt()
+
+
+def project_run_prompt(repo: Path) -> str:
+    """The run loop's prompt template, with the same override rule under its own filename.
+
+    A separate file from the baseline stage's, because the two prompts say different things —
+    one asks for a constraint to be reached, the other for a number to come down while they all
+    keep holding — and overriding one should not silently change the other.
+    """
+    override = repo / ".autohelix" / "integrate" / "run-prompt.md"
+    if override.is_file():
+        return override.read_text()
+    return run_prompt()

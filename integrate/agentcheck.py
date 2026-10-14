@@ -53,8 +53,9 @@ JUDGE_DIR = ".autohelix/integrate/judge"
 _RUBRIC = """\
 You are checking ONE condition against this repository and reporting a verdict.
 
-You are a gate, not a collaborator. Do not fix anything, do not suggest fixes, and do not run
-anything that writes. Read the repository and answer.
+You are a gate, not a collaborator. Do not fix anything and do not suggest fixes. Change nothing
+in the repository: the verdict file named at the bottom is the only file you may write, and
+reading is the only thing you should do to everything else. Read the repository and answer.
 
 === WHAT TO CHECK ===
 {prompt}
@@ -75,15 +76,19 @@ anything that writes. Read the repository and answer.
 - Absence of proof is FAIL. You are confirming the condition holds, not failing to disprove it.
 
 === HOW TO REPORT ===
-Write your verdict to `{verdict_path}` as a JSON object, and nothing else to it:
+Your last action is to write this JSON object to `{verdict_path}`, with the Write tool, and
+nothing else into that file:
 
 {{"verdict": "PASS" or "FAIL",
   "reason": "<one or two sentences: why this verdict>",
   "evidence": ["<path:line or quoted snippet>", "..."],
   "findings": ["<what is missing or wrong; empty when PASS>"]}}
 
-That file is the only thing read back. If you do not write it, the constraint is recorded as
-failing.
+Write it to exactly that path -- not beside it, not under a name of your own -- and write it
+even when the answer is obvious or you ran out of things to check. Answering in your reply
+instead of in the file is the one way to make a judgement that was correctly reached count for
+nothing: a `heavy-ops-use-nki-kernels` judge did exactly that after 92 seconds of reading, and
+the constraint was recorded as failing with no finding anyone could act on.
 """
 
 
@@ -124,6 +129,119 @@ def _fail(constraint: Constraint, error: str, seconds: float = 0.0) -> AgentVerd
 
 def verdict_path(repo: Path, constraint: Constraint) -> Path:
     return repo / JUDGE_DIR / f"{constraint.slug}.json"
+
+
+def _json_objects(text: str) -> list[dict]:
+    """Every balanced top-level JSON object in `text` that is a dict. Cheap and forgiving."""
+    out: list[dict] = []
+    depth = start = 0
+    in_string = escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    out.append(value)
+    return out
+
+
+def _log_tail(log_path: Path, limit: int = 220) -> str:
+    """The last thing the judge said, for a failure message that can be acted on.
+
+    Its log is stream-json, so the raw tail is a token delta rather than a sentence. The last
+    assistant text is what a judge that answered in prose instead of in the file actually
+    produced, which is the thing worth seeing.
+    """
+    try:
+        blob = log_path.read_text(errors="replace")
+    except OSError:
+        return "no log"
+    said = ""
+    for line in blob.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "assistant":
+            continue
+        for block in record.get("message", {}).get("content", []) or []:
+            if block.get("type") == "text" and str(block.get("text", "")).strip():
+                said = " ".join(str(block["text"]).split())
+    if not said:
+        return (" ".join(blob.split())[-limit:] or "empty log")
+    return said[-limit:]
+
+
+def verdict_from_log(log_path: Path) -> tuple[str, str] | None:
+    """`(json_text, where)` for a verdict the judge produced but did not leave in its file.
+
+    Two ways a correctly-reached verdict goes missing: the judge answers in its reply instead of
+    writing the file, or it writes to a path of its own invention. Both are recoverable from its
+    own transcript, which is already captured -- and recovering one is strictly better than
+    recording a FAIL with no finding, which is what iteration 5 of the vllm-neuron run got out
+    of 92 seconds of correct reading.
+
+    A `Write`/`Edit` call wins over narration: it is what the judge decided to commit, and a
+    verdict quoted mid-reasoning ("if it were PASS I would write...") is not a decision. The
+    last one wins, since a judge that writes twice meant the second.
+    """
+    try:
+        blob = log_path.read_text(errors="replace")
+    except OSError:
+        return None
+
+    written: list[str] = []
+    said: list[str] = []
+    for line in blob.splitlines():
+        line = line.strip()
+        # `verdict` unquoted: inside a stream-json record the payload is an encoded string, so
+        # the key arrives as `\"verdict\"`. Matching on the quoted form skips every line.
+        if not line.startswith("{") or "verdict" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") != "assistant":
+            continue
+        for block in record.get("message", {}).get("content", []) or []:
+            kind = block.get("type")
+            if kind == "tool_use" and block.get("name") in ("Write", "Edit", "MultiEdit"):
+                inp = block.get("input") or {}
+                for key in ("content", "new_string", "file_text"):
+                    candidate = inp.get(key)
+                    if isinstance(candidate, str) and '"verdict"' in candidate:
+                        written.append(candidate)
+            elif kind == "text" and '"verdict"' in str(block.get("text", "")):
+                said.append(str(block["text"]))
+
+    for source, where in ((written, "a Write call"), (said, "its reply")):
+        for text in reversed(source):
+            for obj in reversed(_json_objects(text)):
+                if str(obj.get("verdict", "")).strip().upper() in ("PASS", "FAIL"):
+                    return json.dumps(obj), where
+    return None
 
 
 def run_agent_constraint(
@@ -203,14 +321,28 @@ def run_agent_constraint(
             f"the judge did not finish: {result.error or f'exit {result.exit_code}'}",
             seconds=seconds,
         )
-    if not out.is_file():
-        return _fail(
-            constraint,
-            f"the judge wrote no verdict to {out.relative_to(repo)}",
-            seconds=seconds,
-        )
+    recovered = ""
+    if out.is_file():
+        text = out.read_text()
+    else:
+        # Not a failure yet: the judgement may be in the transcript. Recovering it beats
+        # discarding a verdict that was reached, and a judge that produced nothing at all still
+        # fails below -- with the tail of its own log, so the next occurrence is diagnosable
+        # rather than just repeatable.
+        found = verdict_from_log(log_path)
+        if found is None:
+            return _fail(
+                constraint,
+                f"the judge wrote no verdict to {out.relative_to(repo)} and none was in its "
+                f"transcript. Last of {log_path.name}: {_log_tail(log_path)}",
+                seconds=seconds,
+            )
+        text, where = found
+        recovered = where
+        # Left where the verdict belongs, so the rest of the pass sees one shape of truth.
+        out.write_text(text + "\n")
 
-    text = out.read_text().strip()
+    text = text.strip()
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         return _fail(constraint, "the judge's verdict file held no JSON object", seconds=seconds)
@@ -229,6 +361,10 @@ def run_agent_constraint(
     evidence = [str(e) for e in (payload.get("evidence") or []) if str(e).strip()]
     findings = [str(f) for f in (payload.get("findings") or []) if str(f).strip()]
     reason = str(payload.get("reason", "") or "")
+    if recovered:
+        # Said rather than hidden: the verdict is the judge's, but it did not land where it was
+        # asked to put it, and that is worth knowing when the rubric is next revised.
+        reason = f"[recovered from {recovered}, not the verdict file] {reason}".strip()
 
     # A PASS with no evidence is downgraded rather than trusted. The rubric asks for it, so its
     # absence means the judge either did not read the repo or is asserting rather than showing.

@@ -29,11 +29,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from autohelix.config import Config, load_config
+from autohelix.config import Config
 
 #: The config filename `init` writes and `run-baseline` looks for, in the project directory.
 #: Not `autohelix.yaml`: a repo may have one of those already, for a plain `autohelix run`.
 DEFAULT_CONFIG_NAME = "integrate.yaml"
+
+#: What `run` looks for. A separate file from the baseline stage's, because the two stages ask
+#: for different things — the baseline has no metrics and runs unbounded, `run` has metrics and a
+#: budget — and because keeping them apart is what lets a repo hold both at once: the
+#: constraints that were reached, and the measurements now being improved.
+RUN_CONFIG_NAME = "integrate-run.yaml"
+
+#: The two stages. `baseline` drives a failing repo to a passing one; `run` keeps it passing and
+#: makes its measurements better.
+STAGES = ("baseline", "run")
 
 #: What an unfilled field looks like in the template.
 PLACEHOLDER = "<FILL IN"
@@ -75,6 +85,23 @@ METRIC_ALL = "all_constraints_passing"
 #: Where the gate writes its verdict, relative to the project.
 GATE_JSON = ".autohelix/integrate/gate.json"
 
+#: How much a metric may regress, in percent, before `run` rejects the iteration that did it.
+#: The operator's `acceptance.max_regression_pct` overrides it.
+#:
+#: Not zero. A measurement on real hardware is noisy — this pass's first user measured the same
+#: prefill at 21 s and 33 s — so a zero-tolerance gate would reject work for the noise floor and
+#: a loop would spend its budget re-measuring. Not large either: the point of the gate is that an
+#: iteration cannot trade away what earlier ones won.
+DEFAULT_MAX_REGRESSION_PCT = 5.0
+
+#: Iterations `run` takes when the config does not say. A measured iteration here is expensive —
+#: the gate runs the constraints, one of which is usually the thing being measured — so the
+#: budget is small and deliberate rather than a backstop.
+DEFAULT_RUN_ITERATIONS = 10
+
+#: How long the readback gets. It parses a JSON file; a minute is already generous.
+READBACK_TIMEOUT = 120
+
 #: The loop runs until the constraints are satisfied, so an iteration count is a backstop rather
 #: than a budget. Large enough not to be the thing that stops a real run.
 UNBOUNDED_ITERATIONS = 10_000
@@ -84,9 +111,30 @@ UNBOUNDED_ITERATIONS = 10_000
 CONSTRAINT_KEYS = {"name", "kind", "rationale", "command", "timeout", "prompt", "criteria",
                    "model", "effort"}
 
+#: Keys a `metrics:` entry may carry in `run`. `command`, `values`, `timeout`, `capture` and
+#: `capture_stdout` are `autohelix.config`'s; `gate` is this pass's.
+METRIC_KEYS = {"command", "values", "timeout", "capture", "capture_stdout", "gate"}
+
 
 class ConfigError(ValueError):
     """The config is unusable, with the reason in the message."""
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    """The config file as a dict, with the same not-found error `load_config` raises.
+
+    Read here rather than through `autohelix.config.load_config` because this pass has to
+    normalize the YAML *before* a `Config` is built from it — see `IntegrateConfig.load`.
+    `load_config` is two lines over this, so nothing is lost but the indirection.
+    """
+    import yaml
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} is not a YAML mapping")
+    return data
 
 
 @dataclass
@@ -212,6 +260,82 @@ class Constraint:
 
 
 @dataclass
+class Measurement:
+    """One `metrics:` entry of a `run` config.
+
+    The shape is `autohelix.yaml`'s, with one addition and one relaxation.
+
+    **`command:` may be omitted.** The measurements this pass is built for are the ones a
+    *constraint* already produces: the thing that decides whether the port still works is also
+    the thing that prints its latencies, and running it a second time to get a number would
+    double the most expensive part of an iteration and let the two runs disagree. So an entry
+    with no command is read back out of the gate's verdict, where every
+    `##autohelix[name=value]` a constraint printed was recorded.
+
+    **`gate:` decides whether acceptance acts on it.** Default true. Some numbers are worth
+    recording and wrong to gate — a ratio that moves with what the model happened to generate,
+    a figure measured on one sample — and declaring them anyway is how they stay visible.
+    """
+
+    values: dict[str, str] = field(default_factory=dict)
+    command: str = ""
+    timeout: int = 0
+    gate: bool = True
+    capture: list[str] = field(default_factory=list)
+    capture_stdout: bool = True
+
+    @property
+    def from_constraints(self) -> bool:
+        """Whether this entry is read back from the gate rather than run."""
+        return not self.command.strip()
+
+    @property
+    def names(self) -> list[str]:
+        return list(self.values)
+
+    def problems(self, index: int) -> list[str]:
+        out: list[str] = []
+        where = f"metrics[{index}]"
+        if not self.values:
+            out.append(
+                f"{where}: no `values:`. A metric entry exists to name the numbers it produces "
+                "and which direction is better, so one with none measures nothing."
+            )
+        for name, direction in self.values.items():
+            if direction not in ("higher", "lower"):
+                out.append(
+                    f"{where}: metric '{name}' has direction '{direction}' — it has to be "
+                    "'higher' or 'lower', which is what says whether a change is an improvement"
+                )
+        if self.timeout < 0:
+            out.append(f"{where}: `timeout:` cannot be negative")
+        return out
+
+    @classmethod
+    def from_entry(cls, raw: Any, index: int) -> "Measurement":
+        if not isinstance(raw, dict):
+            raise ConfigError(f"metrics[{index}] is not a mapping")
+        unknown = set(raw) - METRIC_KEYS
+        if unknown:
+            raise ConfigError(
+                f"metrics[{index}] has unknown key(s): {', '.join(sorted(unknown))}. "
+                f"Known: {', '.join(sorted(METRIC_KEYS))}"
+            )
+        values = raw.get("values") or {}
+        if not isinstance(values, dict):
+            raise ConfigError(f"metrics[{index}].values must be a mapping of name to direction")
+        capture = raw.get("capture") or []
+        return cls(
+            values={str(k): str(v) for k, v in values.items()},
+            command=str(raw.get("command", "") or ""),
+            timeout=int(raw.get("timeout") or 0),
+            gate=bool(raw.get("gate", True)),
+            capture=[str(c) for c in capture] if isinstance(capture, list) else [],
+            capture_stdout=bool(raw.get("capture_stdout", True)),
+        )
+
+
+@dataclass
 class IntegrateConfig:
     """An AutoHelix config read for this pass: the native parts, plus the constraint kinds."""
 
@@ -223,6 +347,15 @@ class IntegrateConfig:
     raw: dict[str, Any] = field(default_factory=dict)
     constraints: list[Constraint] = field(default_factory=list)
     source: Path | None = None
+    #: Which stage this config is for: one of `STAGES`. It decides whether `metrics:` is the
+    #: operator's (`run`) or the pass's (`baseline`), and what acceptance gates on.
+    stage: str = "baseline"
+    #: The `metrics:` entries, in `run`. Empty in `baseline`, where the pass supplies them.
+    measurements: list[Measurement] = field(default_factory=list)
+    #: The raw YAML with any command-less metric entry filled in, which is what the native
+    #: `Config` was built from — `Config.validate` rejects an empty observable command, and here
+    #: an empty one means "read it back from the gate".
+    normalized: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ native passthroughs
 
@@ -254,9 +387,44 @@ class IntegrateConfig:
 
         Read from the raw config rather than `Config.max_iterations`, which defaults to a
         number — and a default would silently cap a pass whose whole point is to run until done.
+        Unbounded is a `baseline` notion only; `run` has a budget, so see `iterations`.
         """
         raw = (self.raw.get("budget") or {}).get("iterations")
         return int(raw) if raw else None
+
+    @property
+    def iterations(self) -> int:
+        """How many iterations this stage runs.
+
+        `run` is bounded: its iterations each pay for a full constraint evaluation, and the thing
+        being measured is usually one of the constraints, so "until it stops improving" is not a
+        budget anyone should discover by accident.
+        """
+        return self.max_iterations or DEFAULT_RUN_ITERATIONS
+
+    @property
+    def max_regression_pct(self) -> float:
+        """How far a gated metric may regress before the iteration is rejected."""
+        raw = (self.raw.get("acceptance") or {}).get("max_regression_pct")
+        try:
+            return DEFAULT_MAX_REGRESSION_PCT if raw is None else float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_REGRESSION_PCT
+
+    @property
+    def metric_names(self) -> list[str]:
+        """Every metric the operator declared, in declaration order."""
+        return [name for m in self.measurements for name in m.names]
+
+    @property
+    def gated_metric_names(self) -> list[str]:
+        """The operator's metrics acceptance acts on."""
+        return [name for m in self.measurements if m.gate for name in m.names]
+
+    @property
+    def iteration_constraints(self) -> Any:
+        """The raw `iteration_constraints:` block, parsed by `integrate.schedule`."""
+        return self.raw.get("iteration_constraints")
 
     @property
     def gate_json(self) -> Path:
@@ -264,7 +432,15 @@ class IntegrateConfig:
 
     @property
     def loop_config_path(self) -> Path:
-        return self.project_path / ".autohelix" / "integrate" / "loop.yaml"
+        """Where the derived loop config goes — one per stage.
+
+        Separate files because the Harness records which config a run was started with and
+        prompts to archive when it changes. Two stages sharing one path would look like the same
+        run continuing, and `run` would inherit the baseline's iteration count and believe its
+        budget was already spent.
+        """
+        name = "loop.yaml" if self.stage == "baseline" else f"{self.stage}-loop.yaml"
+        return self.project_path / ".autohelix" / "integrate" / name
 
     @property
     def has_reviewer(self) -> bool:
@@ -274,13 +450,26 @@ class IntegrateConfig:
 
     @classmethod
     def load(
-        cls, project_path: str | Path, config_file: str | Path | None = None
+        cls,
+        project_path: str | Path,
+        config_file: str | Path | None = None,
+        stage: str = "baseline",
     ) -> "IntegrateConfig":
-        """Parse the config with `autohelix.config.load_config`, then read the constraint kinds."""
+        """Parse the config, then read the constraint kinds and (in `run`) the metrics.
+
+        The native `Config` is built from a *normalized* copy of the YAML rather than the file
+        itself: in `run` a metric entry may omit its command, meaning "read it back from the
+        gate", and `Config.validate` rejects an empty observable command. Filling it in here
+        keeps the operator's file declarative and the shared validator honest — rather than
+        teaching this pass to ignore one of the validator's errors.
+        """
+        if stage not in STAGES:
+            raise ConfigError(f"unknown stage '{stage}' (expected one of {', '.join(STAGES)})")
         root = Path(project_path).resolve()
-        path = Path(config_file) if config_file else root / DEFAULT_CONFIG_NAME
+        default = DEFAULT_CONFIG_NAME if stage == "baseline" else RUN_CONFIG_NAME
+        path = Path(config_file) if config_file else root / default
         try:
-            config, raw = load_config(root, path)
+            raw = _read_yaml(path)
         except FileNotFoundError as exc:
             raise ConfigError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surfaced as a config error either way
@@ -293,9 +482,66 @@ class IntegrateConfig:
             raise ConfigError("`constraints:` is not a list")
         constraints = [Constraint.from_entry(e, i) for i, e in enumerate(entries)]
 
-        out = cls(project_path=root, config=config, raw=raw, constraints=constraints)
+        measurements: list[Measurement] = []
+        if stage == "run":
+            raw_metrics = raw.get("metrics")
+            if raw_metrics is None:
+                raw_metrics = raw.get("observables") or []
+            if isinstance(raw_metrics, dict):
+                raw_metrics = [raw_metrics]
+            if not isinstance(raw_metrics, list):
+                raise ConfigError("`metrics:` is not a list")
+            measurements = [Measurement.from_entry(e, i) for i, e in enumerate(raw_metrics)]
+
+        out = cls(
+            project_path=root,
+            config=Config.from_dict(raw),
+            raw=raw,
+            constraints=constraints,
+            stage=stage,
+            measurements=measurements,
+        )
         out.source = path
+        # Built once the paths are known, since a filled-in readback command names the gate's
+        # verdict file. The native config is then re-made from it, so what `Config.validate`
+        # sees is what the Harness will run.
+        out.normalized = out._normalize_raw()
+        out.config = Config.from_dict(out.normalized)
         return out
+
+    def _normalize_raw(self) -> dict[str, Any]:
+        """The operator's YAML with command-less metric entries filled in."""
+        if self.stage != "run" or not self.measurements:
+            return dict(self.raw)
+        payload = dict(self.raw)
+        payload.pop("observables", None)
+        payload["metrics"] = [self._metric_entry(m) for m in self.measurements]
+        return payload
+
+    def _metric_entry(self, measurement: Measurement) -> dict[str, Any]:
+        """One metrics entry as the Harness should see it: always with a command."""
+        entry: dict[str, Any] = {
+            "command": measurement.command.strip() or self.readback_command(measurement.names),
+            "values": dict(measurement.values),
+            "timeout": measurement.timeout or (
+                DEFAULT_SCRIPT_TIMEOUT if measurement.command.strip() else READBACK_TIMEOUT
+            ),
+        }
+        if measurement.capture:
+            entry["capture"] = list(measurement.capture)
+        if not measurement.capture_stdout:
+            entry["capture_stdout"] = False
+        return entry
+
+    def readback_command(self, names: list[str] | None = None) -> str:
+        """The command that reports the gate's counts, and optionally named measurements.
+
+        Relative `GATE_JSON`, like the gate's own `--json`: both run with the iteration's
+        worktree as the working directory, so this reads the verdict that iteration produced
+        rather than whatever was last written to the project.
+        """
+        extra = f" --metrics {','.join(names)}" if names else ""
+        return f"{GATE_PYTHON} -m integrate.readback --json {GATE_JSON}{extra}"
 
     # ------------------------------------------------------------------ checking
 
@@ -309,7 +555,7 @@ class IntegrateConfig:
         """
         problems: list[str] = [
             issue.message
-            for issue in self.config.validate(self.raw)
+            for issue in self.config.validate(self.normalized or self.raw)
             if issue.level == "error"
         ]
         if not (self.project_path / ".git").exists():
@@ -328,20 +574,9 @@ class IntegrateConfig:
                 "with nothing to satisfy there is nothing for the loop to do"
             )
 
-        # The metric and the acceptance rule are the pass's. A config that set either would be
-        # overriding the thing that makes an unbounded loop converge, so say so rather than
-        # quietly losing it in the derived file.
-        if self.raw.get("metrics") or self.raw.get("observables"):
-            problems.append(
-                "`metrics:`/`observables:` is set, but this pass supplies its own metrics "
-                f"({METRIC}, {METRIC_ALL}) and would overwrite them. Express what you wanted as "
-                "a constraint."
-            )
-        if (self.raw.get("acceptance") or {}).get("metric_gates"):
-            problems.append(
-                "`acceptance.metric_gates:` is set, but this pass supplies its own — refusing "
-                "any iteration that satisfies fewer constraints than the best so far. Remove it."
-            )
+        problems.extend(
+            self._baseline_problems() if self.stage == "baseline" else self._run_problems()
+        )
 
         seen: set[str] = set()
         for constraint in self.constraints:
@@ -351,6 +586,90 @@ class IntegrateConfig:
             seen.add(constraint.name)
         return problems
 
+    def _baseline_problems(self) -> list[str]:
+        """What is wrong with this config *as a baseline config*.
+
+        The metric and the acceptance rule are the pass's there. A config that set either would
+        be overriding the thing that makes an unbounded loop converge, so say so rather than
+        quietly losing it in the derived file.
+        """
+        out: list[str] = []
+        if self.raw.get("metrics") or self.raw.get("observables"):
+            out.append(
+                "`metrics:`/`observables:` is set, but the baseline stage supplies its own "
+                f"metrics ({METRIC}, {METRIC_ALL}) and would overwrite them. Express what you "
+                "wanted as a constraint, or write a `run` config — that stage is the one that "
+                "takes measurements."
+            )
+        if (self.raw.get("acceptance") or {}).get("metric_gates"):
+            out.append(
+                "`acceptance.metric_gates:` is set, but the baseline stage supplies its own — "
+                "refusing any iteration that satisfies fewer constraints than the best so far. "
+                "Remove it."
+            )
+        if self.raw.get("iteration_constraints"):
+            out.append(
+                "`iteration_constraints:` is set, but the baseline stage has no schedule: it "
+                "runs until the constraints hold, so there is no iteration count for slots to "
+                "be indexed against. It belongs in a `run` config."
+            )
+        return out
+
+    def _run_problems(self) -> list[str]:
+        """What is wrong with this config *as a run config*."""
+        out: list[str] = []
+        if not self.measurements:
+            out.append(
+                "no `metrics:` — this stage keeps the constraints holding while making a "
+                "measurement better, so with nothing measured it would accept every iteration "
+                "that did not break anything. Declare at least one metric and its direction."
+            )
+        for index, measurement in enumerate(self.measurements):
+            out.extend(measurement.problems(index))
+
+        names = self.metric_names
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            out.append(
+                f"metric name(s) declared twice: {', '.join(duplicates)}. A name is the loop's "
+                "handle on a number, so two entries claiming one leaves the gate reading "
+                "whichever ran last."
+            )
+        reserved = sorted(set(names) & {METRIC, METRIC_ALL})
+        if reserved:
+            out.append(
+                f"metric name(s) {', '.join(reserved)} are this pass's own constraint counts. "
+                "Rename yours."
+            )
+        if names and not self.gated_metric_names:
+            out.append(
+                "every metric is `gate: false`, so nothing can reject an iteration for "
+                "regressing. At least one measurement has to count."
+            )
+
+        gates = (self.raw.get("acceptance") or {}).get("metric_gates") or []
+        for gate in gates:
+            if isinstance(gate, dict) and gate.get("metric") not in names:
+                out.append(
+                    f"`acceptance.metric_gates` names '{gate.get('metric')}', which no "
+                    "`metrics:` entry produces"
+                )
+        pct = (self.raw.get("acceptance") or {}).get("max_regression_pct")
+        if pct is not None:
+            try:
+                if float(pct) < 0:
+                    out.append("`acceptance.max_regression_pct:` cannot be negative")
+            except (TypeError, ValueError):
+                out.append(f"`acceptance.max_regression_pct:` '{pct}' is not a number")
+
+        from integrate.schedule import Schedule, ScheduleError
+
+        try:
+            Schedule.from_config(self.iteration_constraints, max_iterations=self.iterations)
+        except ScheduleError as exc:
+            out.append(f"`iteration_constraints:` {exc}")
+        return out
+
     def warnings(self) -> list[str]:
         """Things worth saying that are not failures.
 
@@ -359,9 +678,30 @@ class IntegrateConfig:
         """
         out: list[str] = [
             issue.message
-            for issue in self.config.validate(self.raw)
+            for issue in self.config.validate(self.normalized or self.raw)
             if issue.level != "error"
         ]
+        if self.stage == "run":
+            from integrate.schedule import Schedule, ScheduleError
+
+            try:
+                schedule = Schedule.from_config(
+                    self.iteration_constraints, max_iterations=self.iterations
+                )
+            except ScheduleError:
+                schedule = Schedule()  # reported as an error by `validate`
+            out.extend(schedule.validate(self.iterations))
+            ungated = [n for m in self.measurements if not m.gate for n in m.names]
+            if ungated:
+                out.append(
+                    f"recorded but never gated: {', '.join(ungated)} — a regression in one of "
+                    "those cannot reject an iteration"
+                )
+            if not self.iteration_constraints:
+                out.append(
+                    "no `iteration_constraints:`, so every iteration gets the same prompt. That "
+                    "is the mode where a run tends to repeat its first idea."
+                )
         agents = [c for c in self.constraints if c.kind == "agent"]
         if agents and len(agents) == len(self.constraints):
             out.append(
@@ -386,10 +726,11 @@ class IntegrateConfig:
         return sum(c.timeout for c in self.constraints) + 300
 
     def derive_loop_config(self) -> dict[str, Any]:
-        """The loop config the Harness is driven with: the operator's, with two keys replaced.
+        """The loop config the Harness is driven with: the operator's, with keys replaced.
 
         Everything the operator wrote carries through — `goal`, `scope`, `agent`, `budget`,
-        `reviewer`. Only `constraints` and `metrics` are the pass's.
+        `reviewer`, and in `run` the `iteration_constraints` schedule. What the pass replaces is
+        `constraints` (one command, the gate), `metrics` and `acceptance`.
         """
         payload: dict[str, Any] = {
             k: v for k, v in self.raw.items()
@@ -400,6 +741,11 @@ class IntegrateConfig:
         # measurement, not a gate, because here a failing check is the *normal* state and
         # rejecting on it would discard every iteration's progress before the last one. What
         # stops a regression is the metric gate below.
+        #
+        # `run` keeps it advisory for a different reason: its constraints *do* hold at the
+        # baseline, but one of them is usually an agent judge, and a judge that flips over an
+        # unchanged tree would otherwise throw away an iteration's work. The zero-tolerance gate
+        # on the script count is what makes a real constraint loss cost the iteration.
         payload["constraints"] = [{
             "command": (
                 f"{GATE_PYTHON} -m integrate.gate --config {self._config_ref()} "
@@ -407,28 +753,70 @@ class IntegrateConfig:
             ),
             "timeout": self.gate_timeout(),
         }]
-        payload["metrics"] = [{
-            # The gate already evaluated everything; re-running it would double each iteration's
-            # cost — for agent constraints, paying for every judge twice — and the two runs could
-            # disagree, leaving an iteration accepted on one count and ranked on another.
-            "command": f"{GATE_PYTHON} -m integrate.readback --json {GATE_JSON}",
-            "values": {METRIC: "higher", METRIC_ALL: "higher"},
-            "timeout": 120,
-        }]
-        # Zero tolerance, on the script count only: an iteration holding fewer script constraints
-        # than the best so far is rejected and its work discarded. That is what turns "run until
-        # it passes" into something that converges rather than oscillates. `METRIC_ALL` is
-        # deliberately not gated — it moves with judge verdicts, which can differ between two
-        # runs over the same tree, and a flip there is not a regression to discard an iteration
-        # for. See `METRIC`.
-        payload["acceptance"] = {
-            "metric_gates": [{"metric": METRIC, "max_regression_pct": 0.0}],
-        }
+        payload["metrics"] = self._derive_metrics()
+        payload["acceptance"] = {"metric_gates": self._derive_gates()}
 
         budget = dict(payload.get("budget") or {})
-        budget["iterations"] = self.max_iterations or UNBOUNDED_ITERATIONS
+        budget["iterations"] = (
+            (self.max_iterations or UNBOUNDED_ITERATIONS) if self.stage == "baseline"
+            else self.iterations
+        )
         payload["budget"] = budget
         return payload
+
+    def _derive_metrics(self) -> list[dict[str, Any]]:
+        """The metric commands the Harness runs after the gate.
+
+        The gate already evaluated everything; re-running it would double each iteration's cost —
+        for agent constraints, paying for every judge twice — and the two runs could disagree,
+        leaving an iteration accepted on one count and ranked on another. So the first entry
+        *reads back* the gate's verdict, and in `run` it reads the operator's measurements out of
+        it too: a constraint that prints `##autohelix[...]` has already produced them.
+        """
+        from_constraints = [
+            name for m in self.measurements if m.from_constraints for name in m.names
+        ]
+        counts: dict[str, Any] = {
+            "command": self.readback_command(from_constraints),
+            "values": {METRIC: "higher", METRIC_ALL: "higher"},
+            "timeout": READBACK_TIMEOUT,
+        }
+        for measurement in self.measurements:
+            if measurement.from_constraints:
+                counts["values"].update(measurement.values)
+        out = [counts]
+        # Anything the operator gave its own command runs as an ordinary observable, which is
+        # what `autohelix run` would have done with it.
+        out.extend(
+            self._metric_entry(m) for m in self.measurements if not m.from_constraints
+        )
+        return out
+
+    def _derive_gates(self) -> list[dict[str, Any]]:
+        """The acceptance gates: the constraint count, and in `run` each gated measurement.
+
+        Zero tolerance on the script count, in both stages: an iteration holding fewer script
+        constraints than the best so far is rejected and its work discarded. In `baseline` that
+        is what turns "run until it passes" into something that converges rather than
+        oscillates; in `run` it is what stops a faster iteration from being a broken one.
+        `METRIC_ALL` is deliberately never gated — it moves with judge verdicts, which can
+        differ between two runs over the same tree, and a flip there is not a regression to
+        discard an iteration for. See `METRIC`.
+        """
+        gates: list[dict[str, Any]] = [{"metric": METRIC, "max_regression_pct": 0.0}]
+        if self.stage != "run":
+            return gates
+        explicit = {
+            str(g.get("metric")): float(g.get("max_regression_pct", self.max_regression_pct))
+            for g in ((self.raw.get("acceptance") or {}).get("metric_gates") or [])
+            if isinstance(g, dict) and g.get("metric")
+        }
+        for name in self.gated_metric_names:
+            gates.append({
+                "metric": name,
+                "max_regression_pct": explicit.get(name, self.max_regression_pct),
+            })
+        return gates
 
     def _config_ref(self) -> str:
         """How the derived gate command refers back to this config.
@@ -436,7 +824,8 @@ class IntegrateConfig:
         Absolute: the gate runs with the iteration's worktree as its working directory, so a
         relative path would resolve inside a tree that does not hold the operator's config.
         """
-        return str((self.source or Path(DEFAULT_CONFIG_NAME)).resolve())
+        default = DEFAULT_CONFIG_NAME if self.stage == "baseline" else RUN_CONFIG_NAME
+        return str((self.source or Path(default)).resolve())
 
     def write_loop_config(self) -> Path:
         """Write the derived loop config under the project's `.autohelix/` and return its path."""

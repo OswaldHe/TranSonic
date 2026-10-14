@@ -614,3 +614,97 @@ def test_an_operator_error_is_not_retried(repo, monkeypatch):
     monkeypatch.setattr(BaselineLoop.__mro__[1], "run", dirty_tree)
     with pytest.raises(AutoHelixRunError, match="Uncommitted"):
         loop.run()
+
+
+# ------------------------------------------------- a verdict the judge did not leave in its file
+
+
+def _judge_log(tmp_path, *blocks):
+    """A claude stream-json judge log carrying the given assistant content blocks."""
+    lines = [json.dumps({"type": "system", "subtype": "init"})]
+    for b in blocks:
+        lines.append(json.dumps({"type": "assistant", "message": {"content": [b]}}))
+    path = tmp_path / "judge.log"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+VERDICT = {"verdict": "FAIL", "reason": "the indexer score is a torch einsum",
+           "evidence": ["model.py:1523"], "findings": ["Indexer.forward uses torch.einsum"]}
+
+
+def test_a_verdict_answered_in_the_reply_is_recovered(tmp_path):
+    """iteration 5's `heavy-ops-use-nki-kernels`: 92s of correct reading, recorded as no finding.
+
+    The judge reaches a verdict and reports it in its reply rather than in the file it was told
+    to write. Discarding that is strictly worse than reading it back out of the transcript.
+    """
+    from integrate.agentcheck import verdict_from_log
+
+    log = _judge_log(tmp_path, {
+        "type": "text",
+        "text": "I read model.py.\n\n```json\n" + json.dumps(VERDICT) + "\n```\n",
+    })
+    text, where = verdict_from_log(log)
+    assert json.loads(text)["verdict"] == "FAIL"
+    assert where == "its reply"
+
+
+def test_a_verdict_written_to_the_wrong_path_is_recovered(tmp_path):
+    from integrate.agentcheck import verdict_from_log
+
+    log = _judge_log(tmp_path, {
+        "type": "tool_use", "name": "Write",
+        "input": {"file_path": "/tmp/elsewhere.json", "content": json.dumps(VERDICT)},
+    })
+    text, where = verdict_from_log(log)
+    assert json.loads(text)["verdict"] == "FAIL"
+    assert where == "a Write call"
+
+
+def test_what_the_judge_wrote_beats_what_it_narrated(tmp_path):
+    """A verdict quoted mid-reasoning is not a decision; the committed write is."""
+    from integrate.agentcheck import verdict_from_log
+
+    log = _judge_log(
+        tmp_path,
+        {"type": "text", "text": 'If it held I would write {"verdict": "PASS", "reason": "x"}'},
+        {"type": "tool_use", "name": "Write",
+         "input": {"file_path": "x.json", "content": json.dumps(VERDICT)}},
+    )
+    text, _ = verdict_from_log(log)
+    assert json.loads(text)["verdict"] == "FAIL"
+
+
+def test_the_last_verdict_written_wins(tmp_path):
+    from integrate.agentcheck import verdict_from_log
+
+    log = _judge_log(
+        tmp_path,
+        {"type": "tool_use", "name": "Write",
+         "input": {"file_path": "x.json", "content": json.dumps({**VERDICT, "verdict": "PASS"})}},
+        {"type": "tool_use", "name": "Write",
+         "input": {"file_path": "x.json", "content": json.dumps(VERDICT)}},
+    )
+    text, _ = verdict_from_log(log)
+    assert json.loads(text)["verdict"] == "FAIL"
+
+
+@pytest.mark.parametrize("block", [
+    {"type": "text", "text": "I ran out of time before I could check the MoE path."},
+    {"type": "text", "text": '{"verdict": "MAYBE", "reason": "unsure"}'},
+])
+def test_nothing_is_invented_when_there_is_no_verdict(tmp_path, block):
+    """Recovery must not turn a judge that answered nothing into a verdict."""
+    from integrate.agentcheck import verdict_from_log
+
+    assert verdict_from_log(_judge_log(tmp_path, block)) is None
+
+
+def test_the_failure_message_carries_what_the_judge_last_said(tmp_path):
+    """A judge log is stream-json, so the raw tail is a token delta. This has to be readable."""
+    from integrate.agentcheck import _log_tail
+
+    log = _judge_log(tmp_path, {"type": "text", "text": "I could not reach the kernels."})
+    assert "could not reach the kernels" in _log_tail(log)
+    assert _log_tail(tmp_path / "absent.log") == "no log"

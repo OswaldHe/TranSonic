@@ -1,0 +1,116 @@
+# An AutoHelix config for `autohelix integrate run`: hold the constraints, improve the numbers.
+#
+# The stage after `run-baseline`. There the constraints did not hold and the loop drove the repo
+# until they did; here they hold, and the loop makes something measurable better while they keep
+# holding. It is the ordinary AutoHelix loop — a fixed iteration budget, metrics you declare,
+# acceptance that rejects a regression — with three things this pass contributes:
+#
+#   1. `constraints:` may be `kind: agent`, exactly as in the baseline config. The repo is kept
+#      to the bar it was driven to, including the parts no script can express.
+#
+#   2. `metrics:` may omit `command:`. The measurement then comes out of the *constraints*: the
+#      gate records every `##autohelix[name=value]` they print, and the loop reads those back.
+#      That is the point — when the check that decides whether the repo still works is also the
+#      thing that reports how fast it is, running it twice an iteration doubles the expensive
+#      part and lets the two runs disagree.
+#
+#   3. `iteration_constraints:` attaches prose to iteration ranges, so early and late iterations
+#      can be asked for different things. Guidance only here: nothing checks it, and only the
+#      `constraints:` list and the metric gates decide whether work is kept.
+#
+# All paths are relative to the project root — they resolve inside the per-iteration worktree.
+
+goal: |
+  Describe what should get faster (or smaller, or cheaper), and what must not change to get
+  there.
+
+  The agent is told this every iteration. Worth more than one line: say which numbers matter and
+  why, what has already been tried, and what is deliberately out of scope.
+
+# Must keep holding. Same shape as the baseline config: a bare string, a named script, or
+# `kind: agent`. Copy them across from `integrate.yaml` — these are what the repo was driven to
+# satisfy, and this stage exists to not lose them.
+#
+# One of them should print the numbers below as `##autohelix[name=value]`.
+constraints:
+  - pytest tests/
+
+# What the loop is trying to improve. `values` names each number and which direction is better.
+#
+# With no `command:`, the numbers are read back from the gate's verdict — i.e. a constraint
+# above printed them. With a `command:`, it runs as an ordinary benchmark, like `autohelix run`.
+#
+# `gate: false` records a number without gating on it, for figures that move with something
+# other than the work (a ratio that depends on what the model generated, a single-sample
+# measurement). At least one metric has to be gated.
+metrics:
+  - values:
+      latency_ms: lower
+  # - values:
+  #     tokens_per_step: higher
+  #   gate: false
+  # - command: python bench.py
+  #   values:
+  #     throughput: higher
+  #   timeout: 1800
+
+acceptance:
+  # How far any gated metric may regress from the best value an earlier iteration reached before
+  # the iteration is rejected and its work discarded. Compared against the *best so far*, not
+  # the previous iteration, so progress cannot be given back a few percent at a time.
+  #
+  # Not zero: a measurement on real hardware is noisy, and a zero-tolerance gate spends the
+  # budget rejecting work for the noise floor. Per-metric overrides go in `metric_gates:`.
+  max_regression_pct: 5
+  # metric_gates:
+  #   - metric: latency_ms
+  #     max_regression_pct: 2
+
+# What may the agent modify? (everything else is reverted)
+scope:
+  editable: [src/]
+
+budget:
+  iterations: 10
+  iteration_time: 1h      # per-iteration deadline; the agent sees the countdown
+  # time: 24h             # total wall-clock
+  # max_cost_usd: 200
+
+# Different guidance for different iterations. Prose, because the useful instructions are prose.
+# Slots are indexed by iteration number, not by accepted count: if iteration 3 is rejected,
+# iteration 4 still gets slot 4.
+#
+# Ranges may not overlap, and a slot naming an iteration past `budget.iterations` is an error
+# rather than a slot that never runs.
+# iteration_constraints:
+#   - from: 1
+#     to: 3
+#     text: |
+#       Measure before changing anything. Spend these iterations finding where the time goes and
+#       writing it down; a change you cannot attribute to a measurement is one the next
+#       iteration cannot build on.
+#   - at: 4
+#     text: |
+#       Take the single largest cost the profile named and attack only that.
+#   - from: 5
+#     to: 10
+#     text: |
+#       Free choice, but consolidate: the run ends with whatever is merged, so prefer a smaller
+#       change you can show is correct over a larger one you cannot.
+
+# agent:
+#   type: claude
+#   # model: claude-opus-4-8
+
+# A reviewer reads each iteration and can reject it independently of the metrics. Worth having
+# here above all: a number that improved because less was measured looks exactly like a number
+# that improved.
+# reviewer:
+#   prompt: |
+#     Review this iteration's changes. Report a problem if any of these is true:
+#       1. a measurement improved because the work being measured got smaller — a shorter input,
+#          skipped computation, a cache spanning the timed region, or a reported figure the run
+#          did not produce;
+#       2. a constraint was weakened rather than satisfied;
+#       3. a file outside scope.editable was modified.
+#   model: claude-sonnet-5

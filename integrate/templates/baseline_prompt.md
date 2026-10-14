@@ -55,6 +55,17 @@ satisfied as written — say that in your notes rather than working around it. T
 are the operator's, and a wrong one is worth more as a reported problem than as a thing you
 bent the repo around.
 
+## What earlier iterations left you
+
+Both of these are already in the worktree, and neither is optional reading:
+
+- `.autohelix/notes/` — every earlier iteration's notes. This is where the dead ends are
+  recorded, and rediscovering one costs an iteration.
+- `.autohelix/hints.md` — the operator's hints, each timestamped. They outrank your own prior
+  conclusions and the notes: a hint exists because someone watching the run knew something the
+  notes did not say, and some of them are there to stop you repeating a failure that cost real
+  time. Read the whole file, every iteration.
+
 ## Leave notes
 
 Write what you tried, what the gate said, and what you learned to

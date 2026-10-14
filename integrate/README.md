@@ -9,6 +9,7 @@ condition, and the loop's only job is to reach a passing one.
 ```bash
 autohelix integrate init           # write or validate the config, check the repo
 autohelix integrate run-baseline   # run the loop until every constraint holds
+autohelix integrate run            # then: keep them holding, improve what the repo measures
 ```
 
 Takes AutoHelix's own `--path/-p` (project directory, default `.`) and `--config/-c` (default
@@ -72,6 +73,76 @@ A consequence worth knowing: `Harness._capture_baseline` runs the metric command
 constraints, and this pass's metric command only *reads back* a verdict. So the loop evaluates
 the constraints against the repo once before iterating, which both gives the baseline a metric
 and makes the starting count — "you begin at 1 of 3" — a recorded fact.
+
+## `run` — the stage after the constraints hold
+
+`run-baseline` ends when every constraint holds. `run` starts there: the same constraints, now
+treated as invariants, plus measurements the loop is trying to move. It is the ordinary AutoHelix
+loop — a fixed iteration budget, metrics from the config, acceptance that rejects a regression —
+which is the point; what the pass contributes is three things upstream has no key for.
+
+```bash
+autohelix integrate init --stage run     # writes integrate-run.yaml
+autohelix integrate run
+```
+
+A separate config file (`integrate-run.yaml`), separate derived loop config
+(`.autohelix/integrate/run-loop.yaml`) and separate summary (`run-summary.json`), because the two
+stages ask for different things and a repo may want to keep both: the constraints it reached,
+and the numbers it is now improving.
+
+**The constraints keep being checked, both kinds.** One gate per iteration, exactly as in the
+baseline stage, so a repo cannot be made faster by giving back what it was driven to satisfy.
+Losing a *script* constraint rejects the iteration at zero tolerance. An agent constraint
+flipping to FAIL does not — same reason as ever, a judge can decide differently on an unchanged
+tree — but it is reported, reaches the next prompt, and the summary records the run as ending
+with it failing.
+
+**The measurements come out of the constraints.** A `metrics:` entry may omit `command:`:
+
+```yaml
+metrics:
+  - values:
+      device_ttft_ms_long: lower
+      device_tpot_ms_long: lower
+  - gate: false
+    values:
+      tokens_per_step: higher
+```
+
+The gate parses every `##autohelix[name=value]` its constraints print — before truncating the
+output it stores, so a chatty command cannot cut them off — and records them in the verdict.
+The loop's metric command reads them back from there. That is the whole reason this stage is not
+`autohelix run` with a benchmark command: when the check that decides whether the repo still
+works is also the thing that reports how fast it is, running it twice an iteration doubles the
+expensive part and lets the two runs disagree about which number to keep. The first user's
+verifier is 60-90 minutes of Trainium time an iteration.
+
+An entry *with* a command runs as an ordinary observable, like `autohelix run`. `gate: false`
+records a number without gating on it.
+
+**Acceptance.** `acceptance.max_regression_pct` (default 5) is how far any gated metric may fall
+back from the best value an earlier iteration reached — the best so far, not the previous
+iteration, so progress cannot be returned a few percent at a time. Per-metric overrides go in
+`acceptance.metric_gates`. Not zero, because a measurement on real hardware is noisy: the first
+user's prefill measured 12.9 s and 33.0 s for the same work, and a zero-tolerance gate spends
+the budget rejecting work for the noise floor.
+
+**Per-iteration guidance.** `iteration_constraints:` attaches prose to iteration ranges, with
+`optimization/`'s spellings (`iterations:`, `at:`, `from:`/`to:`). Guidance only here —
+`integrate/schedule.py` says why — so `enforcement: hard` warns rather than quietly meaning
+something weaker. A run with one fixed prompt converges on whatever its first iteration tried.
+
+**Starting it.** The Harness keeps one history per project, so a `run` started in a repo still
+holding the baseline stage's iterations would continue its numbering and judge these metrics
+against records that have none. It refuses, naming `autohelix clear` (which archives rather than
+deletes). Resuming its *own* history works as everywhere else.
+
+| what rejects an iteration | |
+|---|---|
+| a script constraint stopped holding | `constraints_passing`, zero tolerance |
+| a gated metric regressed past the allowance | its metric gate |
+| the reviewer said so | the reviewer |
 
 ## Constraints
 
@@ -172,14 +243,16 @@ budget valves and the resume logic keep working as they do everywhere else.
 
 | file | what it is |
 |---|---|
-| `cli.py` | `init`, `run-baseline`, plus `template`, `check`, `gate`, `check-constraint`, `status` |
-| `config.py` | the operator's config, the `Constraint` model, and the derived loop config |
-| `gate.py` | runs every constraint once, writes the verdict, reports the count |
+| `cli.py` | `init`, `run-baseline`, `run`, plus `template`, `check`, `gate`, `check-constraint`, `status` |
+| `config.py` | the operator's config, the `Constraint` and `Measurement` models, and the derived loop config for either stage |
+| `gate.py` | runs every constraint once, writes the verdict, reports the count — and records the metrics the constraints printed |
 | `agentcheck.py` | runs one agent constraint and reads back its verdict |
-| `readback.py` | reports the counts the gate already measured, as the loop's metric command |
+| `readback.py` | reports the counts and measurements the gate already took, as the loop's metric command |
 | `loop.py` | `BaselineLoop`: the exit condition, the failing baseline, the prompt |
-| `driver.py` | the `init` and `run-baseline` stages |
-| `templates/` | the config template and the per-iteration prompt |
+| `runloop.py` | `RunLoop`: the bounded loop, the metric prompt, the schedule, the run summary |
+| `schedule.py` | `iteration_constraints:` — per-iteration guidance, parsed and rendered |
+| `driver.py` | the `init`, `run-baseline` and `run` stages |
+| `templates/` | both config templates and both per-iteration prompts |
 
 ## Gotchas
 

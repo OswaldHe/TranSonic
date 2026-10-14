@@ -53,12 +53,29 @@ class ConstraintResult:
     seconds: float = 0.0
     skipped: bool = False
     output: str = ""
+    #: Any `##autohelix[name=value]` this constraint printed, parsed from its *whole* output
+    #: before `output` is truncated. What makes a measurement a constraint already produces
+    #: usable as the loop's metric: `integrate run` reads these back rather than running a
+    #: benchmark command of its own, so a verifier that takes an hour runs once an iteration
+    #: instead of twice. See `integrate/readback.py`.
+    metrics: dict[str, float] = field(default_factory=dict)
 
     def line(self) -> str:
         if self.skipped:
             return f"  [skip] {self.name}"
         mark = "PASS" if self.passed else "FAIL"
         return f"  [{mark}] {self.name} ({self.kind}, {self.seconds:.1f}s) {self.detail}".rstrip()
+
+
+def parse_structured_metrics(output: str) -> dict[str, float]:
+    """Any `##autohelix[name=value]` in a constraint's output.
+
+    AutoHelix's own parser, so the protocol a constraint prints is the one every other part of
+    the tool reads — a second implementation here would be a second set of accepted spellings.
+    """
+    from autohelix.checks import parse_structured_metrics as parse
+
+    return parse(output or "")
 
 
 def run_script_constraint(constraint: Constraint, repo: Path) -> ConstraintResult:
@@ -83,6 +100,11 @@ def run_script_constraint(constraint: Constraint, repo: Path) -> ConstraintResul
         returncode=result.return_code, seconds=seconds,
         # Bounded: this lands in a JSON the loop reads back every iteration.
         output=output[-4000:],
+        # Parsed from the *whole* output, above the truncation. A constraint that prints its
+        # metrics early — anything more than 4000 characters before it exits — would otherwise
+        # have them silently cut off, and a metric the loop gates on must not depend on how
+        # chatty the command was afterwards.
+        metrics=parse_structured_metrics(output),
     )
 
 
@@ -99,6 +121,21 @@ def run_one(constraint: Constraint, repo: Path, agent: dict | None = None) -> Co
             seconds=verdict.seconds,
         )
     return run_script_constraint(constraint, repo)
+
+
+def _collect_metrics(results: list[ConstraintResult]) -> dict[str, float]:
+    """Every constraint's parsed metrics in one dict, in the order they were run.
+
+    A later constraint printing a name an earlier one already printed wins, which is the only
+    resolution that does not need a rule: the operator sees both in `metric_sources` and can
+    rename one. Skipped constraints contribute nothing, so a `--stop-early` run reports fewer
+    metrics rather than stale ones.
+    """
+    out: dict[str, float] = {}
+    for result in results:
+        if not result.skipped:
+            out.update(result.metrics)
+    return out
 
 
 def evaluate(
@@ -126,6 +163,14 @@ def evaluate(
     payload = {
         "target_id": config.target_id,
         "repo": str(repo),
+        # Every measurement the constraints printed, flattened, with the constraint that produced
+        # each one recorded beside it. Flattened because a metric name is the loop's handle on a
+        # number and two constraints printing the same name is a config mistake worth seeing, not
+        # a namespace to resolve.
+        "metrics": _collect_metrics(results),
+        "metric_sources": {
+            name: r.name for r in results for name in r.metrics
+        },
         # The gated count and its denominator: script constraints only, deterministic, so a drop
         # is the iteration's doing. See `METRIC`.
         METRIC: sum(1 for r in script if r.passed),

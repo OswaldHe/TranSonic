@@ -12,7 +12,12 @@ import click
 from rich.console import Console
 
 from integrate import presets
-from integrate.config import DEFAULT_CONFIG_NAME, ConfigError, IntegrateConfig
+from integrate.config import (
+    DEFAULT_CONFIG_NAME,
+    RUN_CONFIG_NAME,
+    ConfigError,
+    IntegrateConfig,
+)
 from integrate.driver import IntegratePass, StageError
 
 console = Console()
@@ -22,24 +27,29 @@ console = Console()
 DEFAULT_CONFIG = DEFAULT_CONFIG_NAME
 
 
-def _config_path(path: str, config: str | None) -> Path:
-    return Path(config) if config else Path(path) / DEFAULT_CONFIG
+def _config_path(path: str, config: str | None, stage: str = "baseline") -> Path:
+    if config:
+        return Path(config)
+    return Path(path) / (DEFAULT_CONFIG if stage == "baseline" else RUN_CONFIG_NAME)
 
 
-def _load(path: str, config: str | None) -> IntegrateConfig:
-    target = _config_path(path, config)
+def _load(path: str, config: str | None, stage: str = "baseline") -> IntegrateConfig:
+    target = _config_path(path, config, stage)
     if not target.is_file():
+        hint = "init" if stage == "baseline" else "init --stage run"
         raise click.ClickException(
-            f"no config at {target}. Write one with `autohelix integrate init` and fill it in."
+            f"no config at {target}. Write one with `autohelix integrate {hint}` and fill it in."
         )
     try:
-        return IntegrateConfig.load(path, target)
+        return IntegrateConfig.load(path, target, stage=stage)
     except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
 
 
-def _pass(path: str, config: str | None, verbose: bool = False) -> IntegratePass:
-    return IntegratePass(_load(path, config), console=console, verbose=verbose)
+def _pass(
+    path: str, config: str | None, verbose: bool = False, stage: str = "baseline"
+) -> IntegratePass:
+    return IntegratePass(_load(path, config, stage), console=console, verbose=verbose)
 
 
 def _run(stage_name: str, fn) -> int:
@@ -70,6 +80,13 @@ _config_option = click.option(
     help=f"the config file (default: <path>/{DEFAULT_CONFIG})",
 )
 _verbose_option = click.option("--verbose", "-v", is_flag=True, help="stream agent output")
+#: Which stage's config to read. `baseline` drives a failing repo to a passing one; `run` keeps
+#: it passing and improves what it measures.
+_stage_option = click.option(
+    "--stage", type=click.Choice(["baseline", "run"]), default="baseline",
+    help=f"which stage's config (default: baseline, i.e. {DEFAULT_CONFIG_NAME}; "
+         f"run reads {RUN_CONFIG_NAME})",
+)
 
 
 @click.group(name="integrate")
@@ -84,6 +101,7 @@ def integrate() -> None:
     \b
       init           write or validate the config, check the repo, make the workspace
       run-baseline   run the loop until every constraint holds
+      run            then: keep them holding, and improve what the repo measures
 
     \b
     And for working on the config itself, without running a loop:
@@ -103,17 +121,21 @@ def integrate() -> None:
 
 
 @integrate.command()
-def template() -> None:
-    """Print the config template. Redirect it to integrate.yaml and fill it in."""
-    click.echo(presets.config_template())
+@_stage_option
+def template(stage: str) -> None:
+    """Print the config template. Redirect it to the config file and fill it in."""
+    click.echo(
+        presets.config_template() if stage == "baseline" else presets.run_config_template()
+    )
 
 
 @integrate.command()
 @_path_option
 @_config_option
-def check(path: str, config: str | None) -> None:
+@_stage_option
+def check(path: str, config: str | None, stage: str) -> None:
     """Say what the config is still missing, without creating anything."""
-    cfg = _load(path, config)
+    cfg = _load(path, config, stage)
     problems = cfg.validate()
     if problems:
         for problem in problems:
@@ -125,10 +147,18 @@ def check(path: str, config: str | None) -> None:
         console.print(f"  [yellow]note[/yellow] {warning}")
 
     console.print(f"\n  project     {cfg.project_path}")
-    console.print(
-        "  budget      "
-        f"{f'{cfg.max_iterations} iteration(s)' if cfg.max_iterations else 'unbounded'}"
-    )
+    if cfg.stage == "run":
+        console.print(f"  budget      {cfg.iterations} iteration(s)")
+        console.print(
+            f"  metrics     {', '.join(cfg.metric_names) or 'none'} "
+            f"(gated: {', '.join(cfg.gated_metric_names) or 'none'}, "
+            f"allowance {cfg.max_regression_pct:g}%)"
+        )
+    else:
+        console.print(
+            "  budget      "
+            f"{f'{cfg.max_iterations} iteration(s)' if cfg.max_iterations else 'unbounded'}"
+        )
     console.print(f"  editable    {', '.join(cfg.editable)}")
     console.print(f"\n  {len(cfg.constraints)} constraint(s), evaluated in this order:")
     for i, constraint in enumerate(cfg.constraints, start=1):
@@ -143,22 +173,27 @@ def check(path: str, config: str | None) -> None:
 @_path_option
 @_config_option
 @_verbose_option
-def init(path: str, config: str | None, verbose: bool) -> None:
+@_stage_option
+def init(path: str, config: str | None, verbose: bool, stage: str) -> None:
     """Write the config template, or validate it and make the workspace.
 
     With no config present this writes the template for you to fill in, and stops.
+    `--stage run` writes the config for the optimizing stage instead of the baseline one.
     """
-    target = _config_path(path, config)
+    target = _config_path(path, config, stage)
+    suffix = "" if stage == "baseline" else " --stage run"
     if not target.is_file():
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(presets.config_template())
+        target.write_text(
+            presets.config_template() if stage == "baseline" else presets.run_config_template()
+        )
         console.print(f"[green]Wrote[/green] {target}")
         console.print(
-            "\nFill it in, then run [cyan]autohelix integrate init[/cyan] again.\n"
-            "`autohelix integrate check` lists what is still missing at any point."
+            f"\nFill it in, then run [cyan]autohelix integrate init{suffix}[/cyan] again.\n"
+            f"`autohelix integrate check{suffix}` lists what is still missing at any point."
         )
         return
-    raise SystemExit(_run("init", _pass(path, config, verbose).init))
+    raise SystemExit(_run("init", _pass(path, config, verbose, stage).init))
 
 
 @integrate.command(name="run-baseline")
@@ -187,19 +222,49 @@ def run_baseline(
     )
 
 
+@integrate.command(name="run")
+@_path_option
+@click.option(
+    "--config", "-c", default=None,
+    help=f"the config file (default: <path>/{RUN_CONFIG_NAME})",
+)
+@_verbose_option
+@click.option(
+    "--max-iterations", "-n", type=int, default=None,
+    help="stop after this many iterations instead of the config's budget. Use it to take one "
+         "careful step at a time.",
+)
+def run_stage(
+    path: str, config: str | None, verbose: bool, max_iterations: int | None
+) -> None:
+    """Improve what the repo measures, while every constraint keeps holding.
+
+    The stage after `run-baseline`. Reads `integrate-run.yaml` by default: the same constraints,
+    plus the `metrics:` the loop is trying to move and the allowance it rejects a regression on.
+    A metric with no `command:` is read back from the constraints' own `##autohelix[...]` output,
+    so the expensive check runs once an iteration rather than twice.
+
+    Bounded by `budget.iterations`. Resumable — re-running picks up from the last recorded
+    iteration, and refuses to start on another run's history rather than continuing it.
+    """
+    pipeline = _pass(path, config, verbose, stage="run")
+    raise SystemExit(_run("run", lambda: pipeline.run(max_iterations=max_iterations)))
+
+
 @integrate.command()
 @_path_option
 @_config_option
+@_stage_option
 @click.option("--stop-early", is_flag=True,
               help="stop at the first failing constraint instead of running them all")
-def gate(path: str, config: str | None, stop_early: bool) -> None:
+def gate(path: str, config: str | None, stage: str, stop_early: bool) -> None:
     """Run every constraint once against the repo as it stands.
 
     Exits 0 only when all of them hold, so this is the form for CI or for answering "is it done
     yet". The loop runs the same evaluation in advisory mode, where a failure is the expected
     state rather than an error.
     """
-    outcome = _pass(path, config).gate(stop_early=stop_early)
+    outcome = _pass(path, config, stage=stage).gate(stop_early=stop_early)
     raise SystemExit(0 if outcome.ok else 1)
 
 
@@ -227,11 +292,12 @@ def check_constraint(path: str, config: str | None, name: str, verbose: bool) ->
 @integrate.command()
 @_path_option
 @_config_option
-def status(path: str, config: str | None) -> None:
+@_stage_option
+def status(path: str, config: str | None, stage: str) -> None:
     """Show the last verdict and how the loop is progressing."""
     import json
 
-    cfg = _load(path, config)
+    cfg = _load(path, config, stage)
     gate_path = cfg.gate_json
     if not gate_path.is_file():
         console.print(f"no verdict at {gate_path} yet — the loop has not run.")
@@ -257,13 +323,37 @@ def status(path: str, config: str | None) -> None:
         if detail and not entry.get("passed"):
             console.print(f"       {detail}")
 
+    measured = payload.get("metrics") or {}
+    if measured:
+        console.print("\n  what the constraints measured:")
+        for name, value in measured.items():
+            marker = " [dim](gated)[/dim]" if name in cfg.gated_metric_names else ""
+            console.print(f"    {name} = {value:.6g}{marker}")
+
     summary_path = IntegratePass(cfg, console=console).summary_path()
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text())
         ran = [i for i in summary.get("iterations", []) if i.get("iteration", 0) > 0]
-        console.print(
-            f"\n  {len(ran)} iteration(s) recorded; best {summary.get('best_passing')}/{total}"
-        )
+        if cfg.stage == "run":
+            console.print(
+                f"\n  {len(ran)} of {summary.get('iterations_budget')} iteration(s) run, "
+                f"{len(summary.get('accepted') or [])} accepted"
+            )
+            for name, entry in (summary.get("metrics") or {}).items():
+                pct = entry.get("improvement_pct")
+                best, start = entry.get("best"), entry.get("baseline")
+                if best is None:
+                    continue
+                move = "" if pct is None else f"  ({pct:+.1f}%)"
+                console.print(
+                    f"    {name}: {start:.6g} -> {best:.6g}{move}"
+                    if start is not None else f"    {name}: {best:.6g}"
+                )
+        else:
+            console.print(
+                f"\n  {len(ran)} iteration(s) recorded; best "
+                f"{summary.get('best_passing')}/{total}"
+            )
 
 
 if __name__ == "__main__":
