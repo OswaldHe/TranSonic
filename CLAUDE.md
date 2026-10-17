@@ -46,6 +46,18 @@ uv pip install -e ".[dev]"
   per-iteration constraint schedule), `assemble` (an agent rejoins the ranks with
   `nki.collectives`), `run-full`, `feedback` (an agent reconciles both loops' notes into a report
   of what blocked further optimization). See `optimization/README.md`
+- `integrate/` - the integration pass (`autohelix integrate`): drives a repo that does NOT
+  satisfy its constraints to one that does — the inverse of `optimization/`, where the baseline
+  passes and the loop makes it faster. Two stages: `run-baseline`, an unbounded loop which exits
+  when every constraint holds, and `run`, a bounded one that keeps them holding while improving
+  what the repo measures. A constraint is either a script (exit code decides) or an
+  agent (a prompt and a criteria, judged by a model, for what a script cannot express without
+  becoming gameable). Acceptance gates on `constraints_passing`, the script constraints only —
+  `all_constraints_passing` covers both kinds and is recorded but not gated, because a judge can
+  flip over an unchanged tree. In `run` the metrics come out of the constraints' own
+  `##autohelix[...]` output, so the expensive check runs once an iteration rather than twice;
+  acceptance adds a per-metric regression allowance (`max_regression_pct`, default 5), and
+  `iteration_constraints:` gives each iteration its own guidance. See `integrate/README.md`
 - `tests/` - test suite (pytest)
 - `examples/` - example projects (sorting, ml-recipe, writing,
   task-queue, research, workflow-optimization, algotune, posttrain,
@@ -67,6 +79,7 @@ autohelix partition    # Model partitioning / tracing / verification (see partit
 autohelix bootstrap    # Bootstrap a Trainium NKI kernel for one module (see bootstrap/)
 autohelix floorplan    # Decide what runs where on a Trainium instance (see floorplan/)
 autohelix optimize     # Make one bootstrapped module fast on one device (see optimization/)
+autohelix integrate    # Drive a repo to a state where its constraints hold (see integrate/)
 ```
 
 ## Testing
@@ -77,6 +90,7 @@ pytest -k partition       # just the model-partitioning suite (no network, no GP
 pytest -m bootstrap       # just the NKI bootstrap suite (no network, no device)
 pytest -m floorplan       # just the floorplan suite (no network, no device)
 pytest -m optimization    # just the optimization suite (no network, no device)
+pytest -m integrate       # just the integrate suite (no network, no device, no model calls)
 pytest -m slow            # run slow tests (requires real agent)
 bash scripts/run_dev_test.sh              # manual test with real agent (sorting, 1 iteration)
 bash scripts/run_dev_test.sh sorting --parallel 2  # exercise `autohelix parallel` with identical workers

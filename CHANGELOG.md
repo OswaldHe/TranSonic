@@ -205,6 +205,21 @@
 
 ### Changed
 
+- `integrate`: acceptance gates on the **script** constraints only. The gated metric
+  `constraints_passing` now counts the `kind: script` constraints, and the new
+  `all_constraints_passing` counts both kinds — recorded, ranked on, the loop's exit condition,
+  but never gated. A script constraint is a property of the tree, so a drop in it is a regression
+  the iteration caused; an agent constraint is a model call, and two calls over the same tree can
+  disagree. One did: in the vllm-neuron run, `heavy-ops-use-nki-kernels` went PASS at iteration 3
+  and FAIL at iteration 4 over `model.py` lines that were byte-identical between them (the
+  indexer's `torch.einsum` and the Engram gating dot, both present in iteration 3's merged
+  commit), and zero tolerance discarded a three-hour, $60 iteration — the first one that had ever
+  produced a token. Agent verdicts still decide `satisfied`, still gate the run's completion, and
+  still reach the next iteration as findings. `readback` computes both counts from the verdict's
+  per-constraint entries rather than its summary keys, so a verdict written before the split
+  (where `constraints_passing` meant every constraint) does not read its whole count as the gated
+  one. A history written before the split records only `constraints_passing`, which `best_passing`
+  reads as the whole count, so a resumed run's exit condition is unaffected.
 - `CONTEXT.md` at the repo root is the project's glossary, and `docs/adr/` holds the decisions that
   were hard to reverse and surprising without their reasons. `optimization/` coined a lot of
   vocabulary and defined none of it; worse, "gate" was doing three jobs — the submodule checker, the
